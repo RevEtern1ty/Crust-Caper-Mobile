@@ -6,11 +6,13 @@ import { copy, money } from '../src/ui/format';
 import { menuPhoto } from '../src/ui/menu-photos';
 
 export default function CartScreen() {
-  const { locale, menu, status, count, cart, hydrated, setQuantity, total, refreshMenu, refreshing } = useShop();
+  const { locale, menu, status, count, cart, hydrated, draftSaving, draftStorageError, changeQuantity, total, refreshMenu, refreshing } = useShop();
   const router = useRouter();
-  const checkoutReady = count > 0 && status === 'ready';
+  const checkoutReady = count > 0 && status === 'ready' && !draftSaving && !draftStorageError;
   if (!hydrated) {
-    return <Screen safeBottom><Text accessibilityLiveRegion="polite">{copy(locale, 'Opening cart…', 'Turimo gufungura agatebo…')}</Text></Screen>;
+    return <Screen safeBottom>{!draftStorageError && <Text accessibilityLiveRegion="polite">
+      {copy(locale, 'Opening cart…', 'Turimo gufungura agatebo…')}
+    </Text>}</Screen>;
   }
   return (
     <Screen safeBottom bottom={count > 0 && <Button label={copy(locale, 'Choose pickup time', 'Hitamo igihe cyo kwakira')}
@@ -39,14 +41,14 @@ export default function CartScreen() {
           <View style={styles.itemBar}>
             <View style={styles.stepper}>
               <Pressable accessibilityRole="button" accessibilityLabel={copy(locale, `Remove one ${name}`, `Kuramo imwe muri ${name}`)}
-                style={styles.quantityButton} onPress={() => setQuantity(key, line.quantity - 1)}>
+                style={styles.quantityButton} onPress={() => changeQuantity(key, -1)}>
                 <Icon name={line.quantity === 1 ? 'trash-outline' : 'remove'} size={20} />
               </Pressable>
               <Text variant="label" accessibilityLiveRegion="polite">{line.quantity}</Text>
               <Pressable accessibilityRole="button" accessibilityLabel={copy(locale, `Add one ${name}`, `Ongeramo imwe muri ${name}`)}
                 accessibilityState={{ disabled: line.quantity >= MAX_QUANTITY }}
                 disabled={line.quantity >= MAX_QUANTITY} style={[styles.quantityButton, line.quantity >= MAX_QUANTITY && styles.disabled]}
-                onPress={() => setQuantity(key, line.quantity + 1)}>
+                onPress={() => changeQuantity(key, 1)}>
                 <Icon name="add" size={20} />
               </Pressable>
             </View>

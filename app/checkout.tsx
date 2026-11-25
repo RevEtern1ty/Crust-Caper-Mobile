@@ -13,7 +13,7 @@ import { copy, money, slotLabel } from '../src/ui/format';
 const demoPhoneLabel = '+250 700 000 000';
 
 export default function CheckoutScreen() {
-  const { api, locale, menu, cart, total, hydrated, refreshing, refreshMenu } = useShop();
+  const { api, locale, menu, cart, total, hydrated, draftSaving, draftStorageError, refreshing, refreshMenu } = useShop();
   const { beginCheckout, journal, busy, restoreFailed } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const [selectedSlot, setSlot] = useState('');
@@ -86,7 +86,7 @@ export default function CheckoutScreen() {
   }
 
   async function submit() {
-    if (checking.current || !menu || !slot || !cart.length || busy || !journal) return;
+    if (checking.current || !menu || !slot || !cart.length || busy || !journal || draftSaving || draftStorageError) return;
     if (phone.replace(/\s/g, '') !== DEMO_PHONE) {
       setPhoneInvalid(true);
       phoneInput.current?.focus();
@@ -119,7 +119,9 @@ export default function CheckoutScreen() {
   }
 
   if (!hydrated || (!journal && !restoreFailed)) {
-    return <Screen safeBottom><Text>{t('Opening checkout…', 'Turimo gufungura aho kwishyurira…')}</Text></Screen>;
+    return <Screen safeBottom>{!draftStorageError && <Text>
+      {t('Opening checkout…', 'Turimo gufungura aho kwishyurira…')}
+    </Text>}</Screen>;
   }
 
   if (restoreFailed || unfinished || cart.length === 0) {
@@ -146,19 +148,22 @@ export default function CheckoutScreen() {
 
   return (
     <Screen key={quote ? 'review' : 'details'} safeBottom bottom={(
-      <Button
-        label={quote
-          ? quote.lines.length
-            ? t(`Confirm ${money(quote.total)} & continue`, `Emeza ${money(quote.total)} ukomeze`)
-            : t('Edit cart', 'Hindura agatebo')
-          : t('Review order', 'Reba komande')}
-        onPress={() => {
-          if (quote && !quote.lines.length) router.replace('/cart');
-          else void submit();
-        }}
-        busy={controlsLocked}
-        disabled={!journal || !slot}
-      />
+      <View style={styles.stack}>
+        {problem && <Text tone="red" accessibilityRole="alert">{problem}</Text>}
+        <Button
+          label={quote
+            ? quote.lines.length
+              ? t(`Confirm ${money(quote.total)} & continue`, `Emeza ${money(quote.total)} ukomeze`)
+              : t('Edit cart', 'Hindura agatebo')
+            : t('Review order', 'Reba komande')}
+          onPress={() => {
+            if (quote && !quote.lines.length) router.replace('/cart');
+            else void submit();
+          }}
+          busy={controlsLocked}
+          disabled={!journal || !slot || draftSaving || !!draftStorageError}
+        />
+      </View>
     )}>
       <View style={styles.stack}>
         <Text ref={stepHeading} tabIndex={Platform.OS === 'web' ? -1 : undefined} variant="title" accessibilityRole="header">{quote
@@ -241,20 +246,20 @@ export default function CheckoutScreen() {
               <Text>{line.quantity} × {itemName(line.sku, locale, menu)}</Text>
               {line.modifierIds.length > 0 && <Text variant="small" tone="muted">{itemOptions(line, locale, menu)}</Text>}
             </View>
-            <Text>{money(line.quantity * line.unitPrice)}</Text>
+            <Text style={styles.amount}>{money(line.quantity * line.unitPrice)}</Text>
           </View>
         ))}
         {quote && (
           <>
             <View style={styles.row}>
               <Text style={styles.shrink} tone="muted">{t('Included tax', 'Umusoro urimo')}</Text>
-              <Text tone="muted">{money(quote.tax)}</Text>
+              <Text tone="muted" style={styles.amount}>{money(quote.tax)}</Text>
             </View>
           </>
         )}
         <View style={[styles.row, styles.total]}>
           <Text variant="label" style={styles.shrink}>{quote ? t('Total', 'Igiteranyo') : t('Estimated total', 'Igiteranyo cy’agateganyo')}</Text>
-          <Text variant="label">{money(quote?.total ?? total)}</Text>
+          <Text variant="label" style={styles.amount}>{money(quote?.total ?? total)}</Text>
         </View>
         {quote && <Button label={t('Edit pickup or contact', 'Hindura igihe cyangwa nimero')} variant="secondary"
           disabled={controlsLocked} onPress={() => { setReview(null); setProblem(null); }} />}
@@ -262,12 +267,6 @@ export default function CheckoutScreen() {
           ? t('Confirm the shown items, total and time to open demo payment.', 'Emeza ibyo ubonye, igiteranyo n’igihe kugira ngo wishyure mu igerageza.')
           : t('We’ll confirm the items, price and time before payment.', 'Tuzemeza ibiribwa, igiciro n’igihe mbere yo kwishyura.')}</Text>
       </Card>
-      {problem && (
-        <Card>
-          <Text accessibilityRole="alert" tone="red">{problem}</Text>
-          <Button label={t('Go to Orders', 'Jya muri Komande')} onPress={() => router.replace('/(tabs)/orders')} variant="ghost" />
-        </Card>
-      )}
     </Screen>
   );
 }
@@ -275,7 +274,8 @@ export default function CheckoutScreen() {
 const styles = StyleSheet.create({
   stack: { gap: 6 },
   slotGroup: { gap: 9 },
-  row: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', gap: 12 },
+  row: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'baseline', gap: 12 },
+  amount: { maxWidth: '100%', flexShrink: 1, marginLeft: 'auto', textAlign: 'right' },
   shrink: { flexShrink: 1 },
   total: { borderTopColor: colors.border, borderTopWidth: 1, paddingTop: 10 },
   slot: {

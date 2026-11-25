@@ -105,8 +105,95 @@ async function confirmCheckout(page, validatePhone = false) {
   await shown(page, /This payment is being checked/);
 }
 
+const draftStorageKey = 'crustcaper.draft.v1';
+
+function savedCartQuantity(page) {
+  return page.evaluate(key => JSON.parse(sessionStorage[key]).cart[0].quantity, draftStorageKey);
+}
+
+test('rapid quantity changes accumulate while respecting the cart limit', async t => {
+  const { page, errors } = await newPage(await newContext(t));
+  await fillCart(page);
+  const add = button(page, 'Add one Double Smash');
+  const remove = button(page, 'Remove one Double Smash');
+  await add.evaluate(element => { element.click(); element.click(); });
+  await shown(page, '27,600 RWF');
+  assert.equal(await savedCartQuantity(page), 3);
+  await add.evaluate(element => { for (let press = 0; press < 12; press++) element.click(); });
+  await shown(page, '82,800 RWF');
+  assert.equal(await add.isDisabled(), true);
+  await remove.evaluate(element => { element.click(); element.click(); });
+  await shown(page, '64,400 RWF');
+  assert.equal(await savedCartQuantity(page), 7);
+  assert.deepEqual(errors, []);
+});
+
+test('a failed cart read keeps saved data and can recover without reloading', async t => {
+  const { page, errors } = await newPage(await newContext(t, 320, 568));
+  await fillCart(page);
+  assert.equal(await savedCartQuantity(page), 1);
+  await page.addInitScript(key => {
+    const getItem = Storage.prototype.getItem;
+    Storage.prototype.getItem = function (name) {
+      if (this === sessionStorage && name === key && !window.allowDraftRead) {
+        throw new DOMException('Injected cart read failure', 'SecurityError');
+      }
+      return getItem.call(this, name);
+    };
+  }, draftStorageKey);
+  await page.reload();
+  await shown(page, 'Your saved cart could not be opened.');
+  assert.equal(await page.getByText('Your cart is empty', { exact: true }).count(), 0);
+  assert.equal(await page.getByText('Opening cart…', { exact: true }).count(), 0);
+  assert.equal(await savedCartQuantity(page), 1);
+  await capture(page, '320-en-cart-read-failure');
+
+  await page.evaluate(() => localStorage.setItem('crustcaper.locale.v1', 'rw'));
+  await page.reload();
+  await shown(page, 'Agatebo kawe kabitswe ntikashoboye gufunguka.');
+  assert.equal(await savedCartQuantity(page), 1);
+  await capture(page, '320-rw-cart-read-failure');
+
+  await page.evaluate(() => { window.allowDraftRead = true; });
+  await button(page, 'Ongera ugerageze kubika agatebo').click();
+  await button(page, 'Ongeramo imwe muri Double Smash').waitFor();
+  await page.getByRole('alert').filter({ hasText: 'Agatebo kawe kabitswe ntikashoboye gufunguka.' }).waitFor({ state: 'hidden' });
+  assert.equal(await savedCartQuantity(page), 1);
+  assert.deepEqual(errors, []);
+});
+
+test('an unsaved cart write is shown and retry persists the latest cart', async t => {
+  const { page, errors } = await newPage(await newContext(t));
+  await fillCart(page);
+  await page.evaluate(key => {
+    const setItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (name, value) {
+      if (this === sessionStorage && name === key && !window.allowDraftWrite) {
+        throw new DOMException('Injected cart write failure', 'QuotaExceededError');
+      }
+      return setItem.call(this, name, value);
+    };
+  }, draftStorageKey);
+  await button(page, 'Add one Double Smash').click();
+  await shown(page, 'Your cart changes are unsaved. Keep this screen open and retry.');
+  assert.equal(await button(page, 'Choose pickup time').isDisabled(), true);
+  await button(page, 'Add one Double Smash').click();
+  await shown(page, '27,600 RWF');
+  assert.equal(await savedCartQuantity(page), 1);
+  await capture(page, '390-en-cart-write-failure');
+
+  await page.evaluate(() => { window.allowDraftWrite = true; });
+  await button(page, 'Retry cart storage').click();
+  await page.getByRole('alert').filter({ hasText: 'Your cart changes are unsaved.' }).waitFor({ state: 'hidden' });
+  assert.equal(await button(page, 'Choose pickup time').isEnabled(), true);
+  assert.equal(await savedCartQuantity(page), 3);
+  await page.reload();
+  await shown(page, '27,600 RWF');
+  assert.deepEqual(errors, []);
+});
+
 function lastOrderId(page) {
-  return page.evaluate(() => JSON.parse(sessionStorage.getItem('crustcaper.checkout.v1')).orderIds[0]);
+  return page.evaluate(() => JSON.parse(sessionStorage.getItem('crustcaper.checkout.v1'))?.orderIds[0]);
 }
 
 test('guest pickup survives reload, failed payment, retry and reorder', async t => {
@@ -125,6 +212,8 @@ test('guest pickup survives reload, failed payment, retry and reorder', async t 
   await button(page, 'Simulate payment decline').click();
   await button(page, 'Retry demo payment').click();
   await button(page, 'Simulate successful payment').click();
+  await shown(page, 'Order accepted');
+  assert.equal(await page.getByText('Pickup code', { exact: true }).count(), 0);
   await button(page, 'Simulate preparation').click();
   await button(page, 'Simulate ready for pickup').click();
   await shown(page, 'Pickup code');
@@ -132,6 +221,9 @@ test('guest pickup survives reload, failed payment, retry and reorder', async t 
   await page.reload();
   await shown(page, 'Pickup code');
   assert.equal(await lastOrderId(page), orderId);
+  await button(page, 'Simulate pickup').click();
+  await shown(page, 'Picked up');
+  assert.equal(await page.getByText('Pickup code', { exact: true }).count(), 0);
   await button(page, 'Review reorder').click();
   await button(page, 'Add these items to cart').click();
   await shown(page, '9,200 RWF');
@@ -244,6 +336,28 @@ async function capture(page, name) {
   await page.screenshot({ path: resolve(directory, `${name}.png`), animations: 'disabled' });
 }
 
+async function isInViewport(locator) {
+  return locator.evaluate(element => {
+    const { left, right, top, bottom } = element.getBoundingClientRect();
+    if (left < 0 || top < 0 || right > window.innerWidth || bottom > window.innerHeight) return false;
+    return element.contains(document.elementFromPoint((left + right) / 2, (top + bottom) / 2));
+  });
+}
+
+async function doubleVisibleText(page) {
+  await page.evaluate(() => {
+    const textElements = [...document.querySelectorAll('div, span, p, h1, h2, h3')].flatMap(element => {
+      if (element.children.length || !element.textContent.trim() || element.closest('[aria-hidden=true], [hidden]')) return [];
+      const { fontSize, lineHeight } = getComputedStyle(element);
+      return [{ element, fontSize: parseFloat(fontSize), lineHeight: parseFloat(lineHeight) }];
+    });
+    for (const { element, fontSize, lineHeight } of textElements) {
+      element.style.fontSize = `${fontSize * 2}px`;
+      if (Number.isFinite(lineHeight)) element.style.lineHeight = `${lineHeight * 2}px`;
+    }
+  });
+}
+
 test('opening settings directly still provides a path back to the menu', async t => {
   const context = await newContext(t, 320);
   const page = await context.newPage();
@@ -287,18 +401,129 @@ test('pickup time can be selected with arrow keys without adding tab stops', asy
   assert.deepEqual(errors, []);
 });
 
+test('checkout amounts fit the narrow Kinyarwanda screen at 200% text size', async t => {
+  const { page, errors } = await newPage(await newContext(t, 320, 568));
+  await button(page, /^Double Smash,/).click();
+  await button(page, /Extra cheese/).click();
+  await button(page, 'Add to cart · 9,700 RWF').click();
+  await page.goto(base + '/settings');
+  await button(page, 'Kinyarwanda').click();
+  await shown(page, 'Amagenamiterere');
+  await page.goto(base + '/checkout');
+  await shown(page, 'Igiteranyo cy’agateganyo');
+  await doubleVisibleText(page);
+  const amounts = page.getByText('9,700 RWF', { exact: true }).filter({ visible: true });
+  assert.equal(await amounts.count(), 2);
+  const allFit = await amounts.evaluateAll(elements => elements.every(element => {
+    const text = document.createRange();
+    text.selectNodeContents(element);
+    const { left, right } = text.getBoundingClientRect();
+    return parseFloat(getComputedStyle(element).fontSize) >= 32
+      && left >= 0 && right <= document.documentElement.clientWidth;
+  }));
+  assert.equal(allFit, true);
+  assert.deepEqual(errors, []);
+});
+
+test('menu header controls and tab labels remain usable at 200% text size', async t => {
+  const { page, errors } = await newPage(await newContext(t, 320, 568));
+  await page.goto(base + '/settings');
+  await button(page, 'Kinyarwanda').click();
+  await shown(page, 'Amagenamiterere');
+  await page.goto(base);
+  await shown(page, 'Ifunguro');
+  await doubleVisibleText(page);
+  const wordmark = page.getByText('CrustCaper', { exact: true });
+  assert.equal(await wordmark.evaluate(element => getComputedStyle(element).fontSize), '42px');
+  const wordmarkBox = await wordmark.boundingBox();
+  const languageBox = await button(page, 'Guhitamo ururimi').boundingBox();
+  assert.ok(wordmarkBox && languageBox && wordmarkBox.x + wordmarkBox.width <= languageBox.x);
+  for (const name of ['Ifunguro', 'Komande', 'Kwakira']) {
+    const label = page.getByRole('tab', { name, exact: true }).getByText(name, { exact: true });
+    const fits = await label.evaluate(element => {
+      const text = document.createRange();
+      text.selectNodeContents(element);
+      const tabBottom = element.closest('[role=tab]').getBoundingClientRect().bottom;
+      const limit = Math.min(tabBottom, document.documentElement.clientHeight);
+      return getComputedStyle(element).fontSize === '24px' && text.getBoundingClientRect().bottom <= limit + 1;
+    });
+    assert.ok(fits, name);
+  }
+  await capture(page, '320-rw-menu-enlarged');
+  assert.deepEqual(errors, []);
+});
+
 
 test('expired review keeps the cart and requires a new quote', async t => {
-  const { page, errors } = await newPage(await newContext(t, 320, 640));
+  const { page, errors } = await newPage(await newContext(t, 320, 568));
   await fillCart(page);
   await reviewCheckout(page);
   await page.clock.setFixedTime(new Date('2026-06-15T10:09:00Z'));
   await button(page, /^Confirm 9,200 RWF/).click();
-  await shown(page, 'Your quote changed or expired. Review the order again.');
+  const alert = page.getByRole('alert').filter({ hasText: 'Your quote changed or expired. Review the order again.' });
+  await alert.waitFor({ state: 'visible' });
+  assert.equal(await isInViewport(alert), true, 'Checkout must surface a failed confirmation without scrolling');
   assert.equal(await lastOrderId(page), undefined);
   await page.goto(base + '/cart');
   await shown(page, '9,200 RWF');
   assert.deepEqual(errors, []);
+});
+
+test('a failed quote write shows an actionable error, retains the cart and allows a retry', async t => {
+  const { page, errors } = await newPage(await newContext(t, 320, 568));
+  await fillCart(page);
+  await button(page, 'Choose pickup time').click();
+  await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio').first().click();
+  await button(page, 'Use demo number').click();
+  await page.evaluate(() => {
+    const setItem = Storage.prototype.setItem;
+    window.restoreStorageForTest = () => { Storage.prototype.setItem = setItem; };
+    Storage.prototype.setItem = function (key, value) {
+      if (this === sessionStorage && key === 'crustcaper.demo.v1') throw new DOMException('Fixture quota', 'QuotaExceededError');
+      return setItem.call(this, key, value);
+    };
+  });
+  await button(page, 'Review order').click();
+  const alert = page.getByRole('alert');
+  await alert.waitFor();
+  assert.equal(await isInViewport(alert), true, 'A customer needs to see why checkout stayed on the form');
+  assert.equal(await alert.textContent(), 'Saved checkout data is unavailable. Try again.');
+  assert.equal(await lastOrderId(page), undefined);
+  await page.evaluate(() => window.restoreStorageForTest());
+  await button(page, 'Review order').click();
+  await button(page, /^Confirm 9,200 RWF/).click();
+  await button(page, 'Simulate successful payment').click();
+  await shown(page, 'Paid');
+  assert.deepEqual(errors, []);
+});
+
+test('offline demo keeps the same amount through cart, quote, payment and the persisted order after repeated confirmation', async t => {
+  const context = await newContext(t, 430, 820);
+  const { page, errors } = await newPage(context);
+  await button(page, /^Double Smash,/).click();
+  await button(page, /Extra cheese/).click();
+  await button(page, 'Add to cart · 9,700 RWF').click();
+  await button(page, /^View cart/).click();
+  await button(page, 'Add one Double Smash').click();
+  await shown(page, '19,400 RWF');
+  await context.setOffline(true);
+  try {
+    await reviewCheckout(page);
+    const confirm = button(page, /^Confirm 19,400 RWF/);
+    await confirm.evaluate(element => { element.click(); element.click(); });
+    await shown(page, '19,400 RWF');
+    await button(page, 'Simulate successful payment').click();
+    await shown(page, 'Paid');
+    await shown(page, '19,400 RWF');
+    const ledger = await page.evaluate(() => JSON.parse(sessionStorage.getItem('crustcaper.demo.v1')));
+    assert.equal(ledger.orders.length, 1);
+    assert.equal(ledger.orders[0].attempts.length, 1);
+    assert.equal(ledger.orders[0].order.total, 19400);
+    assert.deepEqual(ledger.orders[0].order.lines, [{ sku: 'double-smash', modifierIds: ['extra-cheese'], quantity: 2, unitPrice: 9700 }]);
+    assert.deepEqual(errors, []);
+  } finally {
+    await context.setOffline(false);
+  }
 });
 
 test('damaged demo journal recovers its pending payment without a new order', async t => {
@@ -310,9 +535,34 @@ test('damaged demo journal recovers its pending payment without a new order', as
   await page.reload();
   await shown(page, /This payment is being checked/);
   assert.equal(await lastOrderId(page), orderId);
+  await page.evaluate(() => sessionStorage.removeItem('crustcaper.checkout.v1'));
+  await page.reload();
+  await shown(page, /This payment is being checked/);
+  assert.equal(await lastOrderId(page), orderId);
+  const orderCount = await page.evaluate(() => JSON.parse(sessionStorage.getItem('crustcaper.demo.v1')).orders.length);
+  assert.equal(orderCount, 1);
   await button(page, 'Open existing demo payment').click();
   await button(page, 'Simulate successful payment').click();
   await shown(page, 'Paid');
   assert.equal(await lastOrderId(page), orderId);
+  assert.deepEqual(errors, []);
+});
+
+test('a late payment requires a refund and does not produce a pickup code after reload', async t => {
+  const { page, errors } = await newPage(await newContext(t));
+  await fillCart(page);
+  await confirmCheckout(page);
+  const orderId = await lastOrderId(page);
+  await page.clock.setFixedTime(new Date('2026-06-15T10:11:00Z'));
+  await page.reload();
+  await shown(page, 'Order cancelled');
+  await button(page, 'Open existing demo payment').click();
+  await button(page, 'Simulate successful payment').click();
+  await shown(page, 'Refund pending');
+  await page.reload();
+  await shown(page, 'Refund pending');
+  assert.equal(await lastOrderId(page), orderId);
+  assert.equal(await page.getByText('Pickup code', { exact: true }).count(), 0);
+  assert.equal(await button(page, 'Simulate preparation').count(), 0);
   assert.deepEqual(errors, []);
 });

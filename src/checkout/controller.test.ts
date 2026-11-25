@@ -103,6 +103,7 @@ function fixture() {
     blockJournal: () => { failJournalWrite = true; },
     blockOrderReads: () => { failOrderRead = true; },
     resetDemoStorage: () => { data.clear(); },
+    removeJournal: () => { journal.clear(); },
     corruptDemoStorage: () => { data.set('crustcaper.demo.v1', 'invalid-demo-data'); },
     setTime: (time: string) => { now = Date.parse(time); },
     delayPayment: (ms: number) => { delayedPaymentMs = ms; },
@@ -279,4 +280,34 @@ test('a broken ledger or connected mode cannot discard a damaged journal', async
   f.corruptDemoStorage();
   await rejects(f.restart(true, true).restore(), { code: 'storage_unavailable' });
   deepEqual(f.savedJournal(), original);
+});
+
+
+test('a missing demo journal is reconstructed from the ledger and transparently resumes', async () => {
+  const f = fixture();
+  const order = await f.restart().begin(await f.quote(), 'cart');
+  f.removeJournal();
+
+  const restored = f.restart(true, true);
+  deepEqual((await restored.restore()).orderIds, [order.id]);
+  equal((await restored.resume()).paymentAttempt?.id, order.paymentAttempt?.id);
+  deepEqual(f.paymentCalls, ['key-2']);
+});
+
+test('explicit retry reconciles a decline after a lost response and starts exactly one new attempt', async () => {
+  const f = fixture();
+  f.dropPaymentResponse();
+  await rejects(f.restart().begin(await f.quote(), 'cart'), /Payment response lost/);
+
+  const { orderId } = f.savedJournal().active;
+  const saved = await f.api.getOrder(orderId);
+  ok(saved.paymentAttempt);
+  await f.api.setDemoPaymentResult(orderId, saved.paymentAttempt.id, 'declined');
+
+  const restored = f.restart();
+  const retried = await restored.resume(true);
+  equal(retried.id, orderId);
+  equal(retried.paymentStatus, 'processing');
+  ok(retried.paymentAttempt?.id !== saved.paymentAttempt.id);
+  deepEqual(f.paymentCalls, ['key-2', 'key-2', 'key-3']);
 });

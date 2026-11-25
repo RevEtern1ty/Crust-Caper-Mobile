@@ -123,7 +123,7 @@ export default function OrdersScreen() {
             </View>
           </View>
 
-          {order.pickupCode && (
+          {order.status === 'ready' && order.paymentStatus === 'paid' && order.pickupCode && (
             <Card style={styles.pickupCode}>
               <Text variant="label">{t('Pickup code', 'Kode yo gufata komande')}</Text>
               <Text style={styles.code}>{order.pickupCode}</Text>

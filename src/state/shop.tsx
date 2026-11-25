@@ -8,8 +8,9 @@ import { AppState, Platform } from 'react-native';
 import { CHECKOUT_JOURNAL_KEY } from '../checkout/controller';
 import { createDemoApi } from '../domain/demo-api';
 import type { CartLine, Locale, Menu } from '../domain/types';
-import { DRAFT_KEY, MAX_QUANTITY, readBrowserDraft, readDraft, writeBrowserDraft, type Draft } from './draft-storage';
+import { MAX_QUANTITY, type Draft } from './draft-storage';
 import { privateStorage } from './private-storage';
+import { useShopDraft } from './use-shop-draft';
 
 export { MAX_QUANTITY } from './draft-storage';
 
@@ -68,11 +69,14 @@ type Shop = Draft & {
   status: MenuStatus;
   refreshing: boolean;
   hydrated: boolean;
+  draftSaving: boolean;
+  draftStorageError: 'read' | 'write' | null;
+  retryDraftStorage: () => Promise<void>;
   total: number;
   count: number;
   setLocale: (locale: Locale) => void;
   addLine: (line: CartLine) => void;
-  setQuantity: (key: string, quantity: number) => void;
+  changeQuantity: (key: string, delta: -1 | 1) => void;
   editLine: (key: string, line: CartLine) => void;
   replaceCart: (lines: CartLine[]) => void;
   clearCart: (snapshot: CartLine[]) => Promise<void>;
@@ -82,10 +86,7 @@ type Shop = Draft & {
 const ShopContext = createContext<Shop | null>(null);
 
 export function ShopProvider({ children }: PropsWithChildren) {
-  const [draft, setDraft] = useState<Draft>({ locale: 'en', cart: [] });
-  const currentDraft = useRef(draft);
-  const writeQueue = useRef(Promise.resolve());
-  const [hydrated, setHydrated] = useState(false);
+  const { draft, hydrated, draftSaving, draftStorageError, retryDraftStorage, updateDraft } = useShopDraft();
   const [menu, setMenu] = useState<Menu | null>(null);
   const [status, setStatus] = useState<MenuStatus>('loading');
   const [refreshing, setRefreshing] = useState(false);
@@ -112,24 +113,16 @@ export function ShopProvider({ children }: PropsWithChildren) {
 
   useEffect(() => {
     let active = true;
-    const storedDraft = Platform.OS === 'web'
-      ? Promise.resolve().then(() => readBrowserDraft(window.sessionStorage, () => window.localStorage))
-      : AsyncStorage.getItem(DRAFT_KEY).then(readDraft);
-    const storedMenu = AsyncStorage.getItem(MENU_KEY).catch(() => null);
-    void Promise.all([storedDraft.catch(() => readDraft(null)), storedMenu]).then(([savedDraft, rawMenu]) => {
+    void AsyncStorage.getItem(MENU_KEY).catch(() => null).then(rawMenu => {
       if (!active) return;
-      currentDraft.current = savedDraft;
-      setDraft(savedDraft);
       const cached = readMenu(rawMenu);
       if (cached && !cachedMenu.current) {
         cachedMenu.current = cached;
         setMenu(cached);
         setStatus('stale');
       }
-    }).catch(() => undefined).finally(() => {
-      if (!active) return;
-      setHydrated(true);
-      void refreshMenu();
+    }).finally(() => {
+      if (active) void refreshMenu();
     });
     const handle = AppState.addEventListener('change', state => {
       if (state === 'active') void refreshMenu();
@@ -139,29 +132,6 @@ export function ShopProvider({ children }: PropsWithChildren) {
       handle.remove();
     };
   }, [refreshMenu]);
-
-  const updateDraft = useCallback((update: (current: Draft) => Draft, durable = false) => {
-    const previous = currentDraft.current;
-    const next = update(previous);
-    currentDraft.current = next;
-    setDraft(next);
-    const write = writeQueue.current.then(() => {
-      if (Platform.OS === 'web') {
-        writeBrowserDraft(window.sessionStorage, () => window.localStorage, next, previous.locale !== next.locale);
-        return;
-      }
-      return AsyncStorage.setItem(DRAFT_KEY, JSON.stringify(next));
-    });
-    writeQueue.current = write.catch(() => undefined);
-    if (!durable) return writeQueue.current;
-    return write.catch(error => {
-      if (currentDraft.current === next) {
-        currentDraft.current = previous;
-        setDraft(previous);
-      }
-      throw error;
-    });
-  }, []);
 
   const setLocale = (locale: Locale) => updateDraft(current => ({ ...current, locale }));
   const replaceCart = (cart: CartLine[]) => updateDraft(current => ({ ...current, cart }));
@@ -175,13 +145,15 @@ export function ShopProvider({ children }: PropsWithChildren) {
       : [...current.cart, line];
     return { ...current, cart };
   });
-  const setQuantity = (key: string, quantity: number) => updateDraft(current => ({
-    ...current,
-    cart: current.cart.flatMap(item => {
-      if (lineKey(item) !== key) return [item];
-      return quantity <= 0 ? [] : [{ ...item, quantity: Math.min(MAX_QUANTITY, quantity) }];
-    }),
-  }));
+  const changeQuantity = (key: string, delta: -1 | 1) => updateDraft(current => {
+    const target = current.cart.find(item => lineKey(item) === key);
+    if (!target) return current;
+    const quantity = Math.min(MAX_QUANTITY, target.quantity + delta);
+    if (quantity === target.quantity) return current;
+    const cart = quantity <= 0 ? current.cart.filter(item => item !== target)
+      : current.cart.map(item => item === target ? { ...item, quantity } : item);
+    return { ...current, cart };
+  });
   const editLine = (key: string, line: CartLine) => updateDraft(current => {
     const target = current.cart.find(item => lineKey(item) === key);
     if (!target) return current;
@@ -203,8 +175,8 @@ export function ShopProvider({ children }: PropsWithChildren) {
   const count = draft.cart.reduce((sum, line) => sum + line.quantity, 0);
   return (
     <ShopContext.Provider value={{
-      ...draft, api, menu, status, refreshing, hydrated, total, count,
-      setLocale, addLine, setQuantity, editLine, replaceCart, clearCart, refreshMenu,
+      ...draft, api, menu, status, refreshing, hydrated, draftSaving, draftStorageError, retryDraftStorage, total, count,
+      setLocale, addLine, changeQuantity, editLine, replaceCart, clearCart, refreshMenu,
     }}>
       {children}
     </ShopContext.Provider>

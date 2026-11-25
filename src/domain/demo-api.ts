@@ -19,6 +19,7 @@ const DATA_KEY = 'crustcaper.demo.v1'
 const QUOTE_LIFETIME = 5 * 60_000
 const RESERVATION_LIFETIME = 10 * 60_000
 const SLOT_CAPACITY = 2
+const ledgerQueues = new WeakMap<Storage, Promise<unknown>>()
 const KITCHEN_PREDECESSOR: Record<DemoKitchenStatus, Order['status']> = {
   preparing: 'accepted',
   ready: 'preparing',
@@ -101,6 +102,20 @@ function validTimestamp(value: unknown): value is string {
   return typeof value === 'string' && Number.isFinite(Date.parse(value))
 }
 
+function includedTax(total: number): number {
+  // Split the quotient before multiplying to preserve integer precision for every valid total.
+  return Math.floor(total / 118) * 18 + Math.round((total % 118) * 18 / 118)
+}
+
+function totalAmount(lines: CartLine[]): number {
+  return lines.reduce((amount, line) => amount + line.unitPrice * line.quantity, 0)
+}
+
+function validAmounts(lines: CartLine[], total: number, tax: number): boolean {
+  return Number.isSafeInteger(total) && total >= 0
+    && total === totalAmount(lines) && tax === includedTax(total)
+}
+
 function validSavedQuote(quote: SavedQuote): boolean {
   return quote != null
     && typeof quote.id === 'string'
@@ -109,7 +124,7 @@ function validSavedQuote(quote: SavedQuote): boolean {
     && validTimestamp(quote.expiresAt)
     && Array.isArray(quote.lines) && quote.lines.every(validQuoteLine)
     && Array.isArray(quote.changes)
-    && Number.isSafeInteger(quote.subtotal) && Number.isSafeInteger(quote.total) && Number.isSafeInteger(quote.tax)
+    && validAmounts(quote.lines, quote.total, quote.tax) && quote.subtotal === quote.total - quote.tax
     && quote.currency === 'RWF'
     && ((quote.pickupStartsAt === undefined && quote.pickupEndsAt === undefined)
       || (validTimestamp(quote.pickupStartsAt) && validTimestamp(quote.pickupEndsAt)))
@@ -133,7 +148,7 @@ function validSavedOrder(record: SavedOrder): boolean {
     && ['awaiting_payment', 'accepted', 'preparing', 'ready', 'collected', 'cancelled'].includes(order.status)
     && ['unpaid', 'processing', 'paid', 'declined', 'refund_pending', 'refunded'].includes(order.paymentStatus)
     && Array.isArray(order.lines) && order.lines.every(validQuoteLine)
-    && Number.isSafeInteger(order.total) && Number.isSafeInteger(order.tax)
+    && validAmounts(order.lines, order.total, order.tax)
     && order.currency === 'RWF'
     && (order.pickupCode === null || typeof order.pickupCode === 'string')
     && ['pending', 'issued', 'corrected'].includes(order.receiptStatus)
@@ -181,10 +196,10 @@ export function createDemoApi({
   newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`,
   menu = createDemoMenu,
 }: DemoOptions): DemoApi {
-  let pending: Promise<unknown> = Promise.resolve()
-
   function withData<T>(write: boolean, operation: (data: DemoData, timestamp: number) => T): Promise<T> {
-    const result = pending.then(async () => {
+    // API instances backed by the same adapter share one serialized ledger.
+    const previous = ledgerQueues.get(storage) ?? Promise.resolve()
+    const result = previous.then(async () => {
       let data: DemoData
       try {
         data = parseData(await storage.getItem(DATA_KEY))
@@ -192,10 +207,16 @@ export function createDemoApi({
         throw new ApiError('storage_unavailable')
       }
       const value = operation(data, now())
-      if (write) await storage.setItem(DATA_KEY, JSON.stringify(data))
+      if (write) {
+        try {
+          await storage.setItem(DATA_KEY, JSON.stringify(data))
+        } catch (error) {
+          throw new ApiError('storage_unavailable', { cause: error })
+        }
+      }
       return value
     })
-    pending = result.catch(() => {})
+    ledgerQueues.set(storage, result.catch(() => {}))
     return result
   }
 
@@ -226,8 +247,11 @@ export function createDemoApi({
         const slot = findAvailableSlot(availableMenu, input.slotId)
         if (!slot) throw new ApiError('slot_unavailable')
         const { lines, changes } = canonicalLines(input.lines, availableMenu)
-        const total = lines.reduce((amount, line) => amount + line.unitPrice * line.quantity, 0)
-        const tax = Math.round((total * 18) / 118)
+        const total = totalAmount(lines)
+        if (!Number.isSafeInteger(total) || total < 0 || !lines.every(validQuoteLine)) {
+          throw new ApiError('invalid_input')
+        }
+        const tax = includedTax(total)
         const quote: Quote = {
           id: newId(),
           storeId: input.storeId,
@@ -344,7 +368,9 @@ export function createDemoApi({
         const { order } = record
         expireReservation(order, timestamp)
         const active = record.attempts.at(-1)?.attempt
-        if (active?.id !== attemptId || active.status !== 'processing') throw new ApiError('conflict')
+        if (active?.id !== attemptId) throw new ApiError('conflict')
+        if (active.status === result) return order
+        if (active.status !== 'processing') throw new ApiError('conflict')
         active.status = result
         order.paymentAttempt = active
         order.paymentStatus = result

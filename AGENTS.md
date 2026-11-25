@@ -10,7 +10,7 @@
 - `npm run build:web` собирает превью. `npm run build:android` и `npm run build:ios` экспортируют JS-пакеты целевых платформ. `npm run android` и `npm run ios` собирают и запускают development build при наличии нативного SDK.
 - После `npm run build:web` команда `npm run test:web` прогоняет сценарии через установленный Google Chrome.
 - `npm run --silent sbom` выводит SBOM зависимостей в формате CycloneDX.
-- [Mobile CI](.github/workflows/mobile.yml) проверяет исходники и зависимости, экспортирует JS и собирает отладочный Android APK для pull request, main и ручного запуска. Превью, снимки и SBOM прикрепляются к кандидату. [Порядок приёмки](docs/runbooks/MOBILE_RELEASE.md) содержит матрицу проверок и доказательств.
+- [Mobile CI](.github/workflows/mobile.yml) проверяет исходники и зависимости, экспортирует JS, собирает отладочный Android APK и запускает Release-сборку на симуляторе iPhone для pull request, main и ручного запуска. Превью, снимки и SBOM прикрепляются к кандидату. [Порядок приёмки](docs/runbooks/MOBILE_RELEASE.md) содержит матрицу проверок и доказательств.
 
 ## Реализация и проверка
 

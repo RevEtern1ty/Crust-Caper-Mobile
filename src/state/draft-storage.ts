@@ -34,18 +34,23 @@ function trySharedStorage<Result>(getShared: GetSharedStorage, operation: (stora
   }
 }
 
+export function readBrowserLocale(getShared: GetSharedStorage): Locale | null {
+  const locale = trySharedStorage(getShared, shared => shared.getItem(LOCALE_KEY));
+  return locale === 'en' || locale === 'rw' ? locale : null;
+}
+
 export function readBrowserDraft(tab: BrowserStorage, getShared: GetSharedStorage): Draft {
   const tabDraft = tab.getItem(DRAFT_KEY);
   const legacyDraft = tabDraft === null ? trySharedStorage(getShared, shared => shared.getItem(DRAFT_KEY)) : null;
   const draft = readDraft(tabDraft ?? legacyDraft);
-  const locale = trySharedStorage(getShared, shared => shared.getItem(LOCALE_KEY));
+  const locale = readBrowserLocale(getShared);
   if (legacyDraft !== null) {
     // Claim the old shared cart only after its tab-scoped copy is durable.
     tab.setItem(DRAFT_KEY, JSON.stringify(draft));
     trySharedStorage(getShared, shared => shared.removeItem(DRAFT_KEY));
     if (locale === null) trySharedStorage(getShared, shared => shared.setItem(LOCALE_KEY, draft.locale));
   }
-  return { ...draft, locale: locale === 'en' || locale === 'rw' ? locale : draft.locale };
+  return { ...draft, locale: locale ?? draft.locale };
 }
 
 export function writeBrowserDraft(tab: BrowserStorage, getShared: GetSharedStorage, draft: Draft, localeChanged: boolean): void {

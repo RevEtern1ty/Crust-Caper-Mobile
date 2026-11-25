@@ -135,8 +135,8 @@ export type ApiErrorCode =
 export class ApiError extends Error {
   readonly code: ApiErrorCode
 
-  constructor(code: ApiErrorCode) {
-    super(code)
+  constructor(code: ApiErrorCode, options?: ErrorOptions) {
+    super(code, options)
     this.name = 'ApiError'
     this.code = code
   }
