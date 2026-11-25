@@ -1,10 +1,10 @@
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
-import { ActivityIndicator, Image, Platform, Pressable, ScrollView, StyleSheet, useWindowDimensions, View } from 'react-native';
+import { ActivityIndicator, Image, Platform, Pressable, StyleSheet, useWindowDimensions, View } from 'react-native';
 import type { Category, Product } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
-import { copy, kigaliTime, money, slotLabel } from '../../src/ui/format';
+import { copy, kigaliTime, money, nextPickupSlot, slotLabel } from '../../src/ui/format';
 import { menuPhoto } from '../../src/ui/menu-photos';
 
 const categories = [
@@ -23,6 +23,7 @@ function ProductTile({ product, featured = false, wide = false }: { product: Pro
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={`${label}, ${money(product.price)}${product.available ? '' : copy(locale, ', sold out', ', byashize')}`}
+      accessibilityHint={copy(locale, 'Opens item details.', 'Ifungura ibisobanuro by’ifunguro.')}
       onPress={() => router.push({ pathname: '/product/[sku]', params: { sku: product.sku } })}
       style={({ pressed }) => [styles.tile, featured && styles.featured, wide && styles.half, pressed && styles.pressed]}
     >
@@ -34,11 +35,11 @@ function ProductTile({ product, featured = false, wide = false }: { product: Pro
         </View>
         <View style={styles.tileBottom}>
           <Text variant="label">{money(product.price)}</Text>
-          {product.available ? (
-            <View style={styles.productAction}>
-              <Icon name="add" size={24} />
-            </View>
-          ) : <Text variant="small" tone="red">{copy(locale, 'Sold out', 'Byashize')}</Text>}
+          {!product.available && <Text variant="small" tone="red">{copy(locale, 'Sold out', 'Byashize')}</Text>}
+          <View style={styles.productAction}>
+            <Text variant="small" style={styles.actionLabel}>{copy(locale, 'Details', 'Ibisobanuro')}</Text>
+            <Icon name="chevron-forward" size={16} />
+          </View>
         </View>
       </View>
     </Pressable>
@@ -48,13 +49,20 @@ function ProductTile({ product, featured = false, wide = false }: { product: Pro
 export default function MenuScreen() {
   const { locale, menu, status, refreshing, refreshMenu, count, total } = useShop();
   const { width } = useWindowDimensions();
+  const compactCategories = width < 380;
   const wide = width >= 620;
   const router = useRouter();
   const [category, setCategory] = useState<Category>('burgers');
   const products = menu?.products.filter(product => product.category === category) ?? [];
   const featured = products.find(product => product.sku === 'double-smash');
   const rest = products.filter(product => product !== featured);
-  const next = menu?.slots.find(slot => slot.available && Date.parse(slot.startsAt) > Date.now());
+  const next = status === 'ready' ? nextPickupSlot(menu) : undefined;
+  let pickupAvailability = copy(locale, 'Pickup availability unconfirmed', 'Igihe cyo gufata komande ntikiramenyekana');
+  if (status === 'ready' && menu) {
+    if (!menu.store.open) pickupAvailability = copy(locale, 'Closed', 'Hafunze');
+    else if (next) pickupAvailability = slotLabel(next, locale);
+    else pickupAvailability = copy(locale, 'No slots available', 'Nta mwanya uhari');
+  }
 
   return (
     <Screen onRefresh={() => { void refreshMenu(); }} refreshing={refreshing}
@@ -65,9 +73,7 @@ export default function MenuScreen() {
           <View style={styles.pickupText}>
             <Text variant="label" tone="green">{copy(locale, 'Pickup in Kigali', 'Kwakirira i Kigali')}</Text>
             <Text variant="small" tone="muted">
-              {copy(locale, 'Demo store', 'Aho kugeragereza')} · {copy(locale, menu.store.open ? 'Open' : 'Closed', menu.store.open ? 'Harafunguye' : 'Hafunze')} · {next
-                ? slotLabel(next, locale)
-                : copy(locale, 'No slots available', 'Nta mwanya uhari')}
+              {copy(locale, 'Demo store', 'Aho kugeragereza')} · {pickupAvailability}
             </Text>
           </View>
           <Icon name="chevron-forward" size={17} color={colors.green} />
@@ -95,17 +101,17 @@ export default function MenuScreen() {
                 busy={refreshing} onPress={() => { void refreshMenu(); }} />
             </Card>
           )}
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.categories}>
+          <View style={styles.categories}>
             {categories.map(item => {
               const selected = category === item.id;
               return <Pressable key={item.id} onPress={() => setCategory(item.id)} accessibilityRole="button"
                 aria-pressed={Platform.OS === 'web' ? selected : undefined}
-                accessibilityState={{ selected }} accessibilityLanguage={locale}
-                style={[styles.category, selected && styles.selectedCategory]}>
-                <Text variant="label" tone={selected ? 'cream' : 'ink'}>{item[locale]}</Text>
+                accessibilityState={Platform.OS === 'web' ? undefined : { selected }} accessibilityLanguage={locale}
+                style={[styles.category, compactCategories && styles.compactCategory, selected && styles.selectedCategory]}>
+                <Text variant="label" tone={selected ? 'cream' : 'ink'} style={styles.categoryLabel}>{item[locale]}</Text>
               </Pressable>;
             })}
-          </ScrollView>
+          </View>
           {featured && <ProductTile product={featured} featured />}
           <View style={[styles.grid, wide && styles.wideGrid]}>
             {rest.map(product => <ProductTile key={product.sku} product={product} wide={wide} />)}
@@ -124,9 +130,14 @@ const styles = StyleSheet.create({
   },
   pin: { backgroundColor: colors.white, borderRadius: 10, width: 37, height: 37, alignItems: 'center', justifyContent: 'center' },
   pickupText: { flex: 1, gap: 1 },
-  categories: { gap: 7, alignItems: 'center' },
-  category: { minHeight: 48, paddingVertical: 10, paddingHorizontal: 12, justifyContent: 'center', borderRadius: 11 },
-  selectedCategory: { backgroundColor: colors.plum },
+  categories: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
+  category: {
+    minHeight: 48, maxWidth: '100%', paddingVertical: 10, paddingHorizontal: 12,
+    justifyContent: 'center', borderRadius: 11, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.white,
+  },
+  compactCategory: { flexBasis: '45%', flexGrow: 1 },
+  categoryLabel: { textAlign: 'center' },
+  selectedCategory: { backgroundColor: colors.plum, borderColor: colors.plum },
   grid: { gap: 14 },
   wideGrid: { flexDirection: 'row', flexWrap: 'wrap' },
   tile: { borderRadius: 16, overflow: 'hidden', borderWidth: 1, borderColor: colors.border, backgroundColor: colors.white },
@@ -139,5 +150,9 @@ const styles = StyleSheet.create({
   tileCopy: { gap: 4 },
   heroTitle: { fontSize: 25, lineHeight: 30 },
   tileBottom: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
-  productAction: { paddingHorizontal: 14, minHeight: 42, borderRadius: 10, backgroundColor: colors.mustard, justifyContent: 'center' },
+  productAction: {
+    paddingHorizontal: 12, paddingVertical: 10, minHeight: 42, maxWidth: '100%', borderRadius: 10,
+    backgroundColor: colors.mustard, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 5,
+  },
+  actionLabel: { flexShrink: 1, fontWeight: '700' },
 });

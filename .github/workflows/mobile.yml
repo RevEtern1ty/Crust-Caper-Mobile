@@ -42,16 +42,34 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build:web
-      - run: npm run test:web
+      - name: Verify checkout and reachable screens in Chrome
+        run: npm run test:web
+        env:
+          CRUST_SCREENSHOT_DIR: ${{ runner.temp }}/crustcaper-web-screenshots
+      - name: Retain browser screenshots for visual review
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-web-screenshots-${{ github.sha }}
+          path: ${{ runner.temp }}/crustcaper-web-screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
       - run: npm run build:android
       - run: npm run build:ios
       - name: Generate dependency SBOM
         run: npm run --silent sbom > "$RUNNER_TEMP/crustcaper.cdx.json"
 
+      - name: Package the local browser demo
+        run: |
+          preview="$RUNNER_TEMP/crustcaper-web-preview"
+          mkdir -p "$preview"
+          cp -R dist "$preview/"
+          cp tooling/Start_Demo.cmd tooling/Start_Here.txt tooling/preview-server.cjs "$preview/"
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mobile-web-preview-${{ github.sha }}
-          path: dist/
+          path: ${{ runner.temp }}/crustcaper-web-preview/
           if-no-files-found: error
           retention-days: 14
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -63,7 +81,7 @@ jobs:
 
   android-demo:
     name: Compile Android demo APK
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
@@ -85,15 +103,74 @@ jobs:
           bash ./gradlew --no-daemon --max-workers=2 ':app:assembleRelease' \
             '-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8' \
             '-PreactNativeArchitectures=arm64-v8a,x86_64'
-      - name: Verify the APK signature and embedded bundle
+      - name: Verify the demo APK identity, permissions, signature and bundled JS
+        shell: bash
         run: |
           apk=android/app/build/outputs/apk/release/app-release.apk
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
-          unzip -Z1 "$apk" | grep -Fx assets/index.android.bundle
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          expected_package=$(node -p 'require("./app.json").expo.android.package')
+          expected_min_sdk=$(node -p 'require("./app.json").expo.plugins.find(plugin => Array.isArray(plugin) && plugin[0] === "expo-build-properties")[1].android.minSdkVersion')
+          signer=$("$tools/apksigner" verify --print-certs "$apk")
+          printf '%s\n' "$signer"
+          grep -Eq '^Signer #[[:digit:]]+ certificate DN: .*CN=Android Debug([,[:space:]]|$)' <<< "$signer"
+          manifest=$("$tools/aapt" dump badging "$apk")
+          grep -Fq "package: name='$expected_package'" <<< "$manifest"
+          grep -Fxq "sdkVersion:'$expected_min_sdk'" <<< "$manifest"
+          architectures=$(grep '^native-code:' <<< "$manifest")
+          grep -Fq "'arm64-v8a'" <<< "$architectures"
+          grep -Fq "'x86_64'" <<< "$architectures"
+          permissions=$("$tools/aapt" dump permissions "$apk")
+          for permission in android.permission.READ_EXTERNAL_STORAGE android.permission.WRITE_EXTERNAL_STORAGE android.permission.SYSTEM_ALERT_WINDOW; do
+            if grep -Fq "name='$permission'" <<< "$permissions"; then
+              printf 'Found an unexpected permission: %s\n' "$permission" >&2
+              exit 1
+            fi
+          done
+          manifest_tree=$("$tools/aapt" dump xmltree "$apk" AndroidManifest.xml)
+          grep -Eq 'android:allowBackup\(0x[0-9a-f]+\)=\(type 0x12\)0x0$' <<< "$manifest_tree"
+          bundle_size=$(unzip -p "$apk" assets/index.android.bundle | wc -c)
+          test "$bundle_size" -gt 0
+          printf '%s\n' "$architectures"
+          printf 'APK package: %s\nAPK minimum SDK: %s\nBundled JS size: %s bytes\n' \
+            "$expected_package" "$expected_min_sdk" "$bundle_size"
+          sha256sum "$apk"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mobile-android-demo-${{ github.sha }}
           path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  ios-simulator:
+    name: Build and launch iOS demo on simulator
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      EXPO_NO_TELEMETRY: 1
+      COCOAPODS_DISABLE_STATS: 'true'
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Build unsigned Release and verify simulator launch
+        id: simulator_smoke
+        shell: bash
+        run: |
+          evidence_dir="$RUNNER_TEMP/crustcaper-ios-smoke"
+          mkdir -p "$evidence_dir"
+          bash tooling/ios-simulator-smoke.sh "$evidence_dir" 2>&1 | tee "$evidence_dir/smoke.log"
+      - name: Retain simulator evidence
+        if: ${{ !cancelled() && steps.simulator_smoke.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-ios-simulator-smoke-${{ github.sha }}
+          path: ${{ runner.temp }}/crustcaper-ios-smoke/
           if-no-files-found: error
           retention-days: 14
 

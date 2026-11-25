@@ -1,0 +1,11 @@
+CRUSTCAPER MOBILE BROWSER DEMO
+
+1. Extract the whole ZIP to a folder.
+2. Install Node.js 24 LTS if needed: https://nodejs.org/en/download/archive/v24
+3. On Windows, open Start_Demo.cmd. On macOS or Linux, run
+   node preview-server.cjs from the extracted folder.
+4. Copy the address shown in the window into your browser. Keep the window open.
+
+Order a Double Smash, choose a pickup time, and select Use demo number.
+Confirm the order and simulate payment. Orders lets you simulate preparation
+and pickup. The demo uses synthetic data and runs on your computer.

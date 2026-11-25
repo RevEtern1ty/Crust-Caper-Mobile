@@ -13,6 +13,7 @@ type Context = {
   journal: CheckoutJournal | null;
   restoreFailed: boolean;
   busy: boolean;
+  retryRestore: () => Promise<void>;
   beginCheckout: (quote: Quote, cart: CartLine[]) => Promise<Order>;
   resumeCheckout: (retryDeclined?: boolean) => Promise<Order>;
 };
@@ -42,6 +43,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     storage: privateStorage,
     newKey: randomUUID,
     allowMissingDemoOrders: true,
+    listDemoOrderRefs: api.listDemoOrderRefs,
     onOrderCreated: async (expected) => {
       const current = cartRef.current;
       if (await fingerprint(current) === expected) {
@@ -53,7 +55,10 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     let active = true;
     void controller.restore().then((saved) => {
-      if (active) setJournal(saved);
+      if (active) {
+        setJournal(saved);
+        setRestoreFailed(false);
+      }
     }, () => {
       if (active) setRestoreFailed(true);
     });
@@ -78,6 +83,14 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     journal,
     restoreFailed,
     busy,
+    retryRestore: async () => {
+      setRestoreFailed(false);
+      try {
+        setJournal(await controller.restore());
+      } catch {
+        setRestoreFailed(true);
+      }
+    },
     beginCheckout: (quote, snapshot) => run(async () => controller.begin(quote, await fingerprint(snapshot))),
     resumeCheckout: (retryDeclined) => run(() => controller.resume(retryDeclined)),
   };
@@ -140,9 +153,9 @@ export function useOrderStatus(orderId: string | null) {
 
     async function poll(pollCycle: number, count: number) {
       const order = await refresh(count > 0);
-      if (pollCycle !== cycle || count >= maxPolls || !order) return;
+      if (pollCycle !== cycle || count >= maxPolls) return;
 
-      if (order.paymentStatus === 'processing' || order.status === 'accepted' || order.status === 'preparing') {
+      if (!order || order.paymentStatus === 'processing' || order.status === 'accepted' || order.status === 'preparing') {
         timer = setTimeout(() => { void poll(pollCycle, count + 1); }, statusRefreshMs);
       }
     }

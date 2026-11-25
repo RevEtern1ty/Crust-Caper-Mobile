@@ -24,6 +24,7 @@ type Dependencies = {
   newKey: () => string;
   onOrderCreated: (cartFingerprint: string) => Promise<void>;
   allowMissingDemoOrders?: boolean;
+  listDemoOrderRefs?: (limit: number) => Promise<{ orderId: string; key: string }[]>;
 };
 
 export class CheckoutError extends Error {
@@ -82,6 +83,7 @@ export function canStartNewOrder(order: Order): boolean {
 export class CheckoutController {
   private journal = emptyJournal;
   private loaded = false;
+  private loading: Promise<void> | null = null;
   private running = false;
 
   constructor(private readonly dependencies: Dependencies) {}
@@ -136,19 +138,30 @@ export class CheckoutController {
       }
 
       if (active.phase === 'paying') {
-        return this.startPayment(active);
+        // Reconcile the saved attempt before interpreting a decline as permission to retry.
+        const reconciled = await this.startPayment(active);
+        if (!retryDeclined || reconciled.paymentStatus !== 'declined' || reconciled.status === 'cancelled') {
+          return reconciled;
+        }
+        return this.retryDeclinedPayment(reconciled.id);
       }
-      if (order.paymentStatus === 'declined' && !retryDeclined) {
-        return order;
+      if (order.paymentStatus === 'declined') {
+        return retryDeclined ? this.retryDeclinedPayment(order.id) : order;
       }
 
       const intent: Progress = {
         phase: 'paying', orderId: order.id,
-        key: order.paymentStatus === 'declined' ? this.dependencies.newKey() : active.key,
+        key: active.key,
       };
       await this.save(intent);
       return this.startPayment(intent);
     });
+  }
+
+  private async retryDeclinedPayment(orderId: string): Promise<Order> {
+    const intent = { phase: 'paying', orderId, key: this.dependencies.newKey() } as const;
+    await this.save(intent);
+    return this.startPayment(intent);
   }
 
   private async placeOrder(intent: Extract<Progress, { phase: 'creating' }>): Promise<Order> {
@@ -167,11 +180,11 @@ export class CheckoutController {
     const payment = {
       phase: 'paying', orderId: order.id, key: this.dependencies.newKey(), cartFingerprint: intent.cartFingerprint,
     } as const;
-    if (order.status === 'cancelled') {
-      await this.save({ phase: 'tracking', orderId: order.id, key: payment.key }, orderIds);
+    await this.save(payment, orderIds);
+    if (order.status === 'cancelled' || order.paymentStatus !== 'unpaid') {
+      await this.finishPayment(payment, order);
       return order;
     }
-    await this.save(payment, orderIds);
     return this.startPayment(payment);
   }
 
@@ -213,13 +226,40 @@ export class CheckoutController {
     await this.save({ phase: 'tracking', orderId, key });
   }
 
-  private async load(): Promise<void> {
-    if (!this.loaded) {
-      const journal = parseJournal(await this.dependencies.storage.getItem(CHECKOUT_JOURNAL_KEY));
-      if (!this.loaded) {
-        this.journal = journal;
-        this.loaded = true;
+  private load(): Promise<void> {
+    if (this.loaded) return Promise.resolve();
+    this.loading ??= this.readJournal().finally(() => { this.loading = null; });
+    return this.loading;
+  }
+
+  private async readJournal(): Promise<void> {
+    const raw = await this.dependencies.storage.getItem(CHECKOUT_JOURNAL_KEY);
+    const listDemoOrderRefs = this.dependencies.allowMissingDemoOrders
+      ? this.dependencies.listDemoOrderRefs : undefined;
+    if (raw === null && listDemoOrderRefs) {
+      await this.recoverDemoJournal(await listDemoOrderRefs(maxRecentOrders), false);
+    } else {
+      try {
+        this.journal = parseJournal(raw);
+      } catch (error) {
+        if (!listDemoOrderRefs) throw error;
+
+        await this.recoverDemoJournal(await listDemoOrderRefs(maxRecentOrders), true);
       }
+    }
+    this.loaded = true;
+  }
+
+  private async recoverDemoJournal(orders: { orderId: string; key: string }[], replaceMalformed: boolean): Promise<void> {
+    // A readable demo ledger can recover committed orders without clearing the cart.
+    const latest = orders[0];
+    if (latest) {
+      await this.save(
+        { phase: 'tracking', orderId: latest.orderId, key: latest.key },
+        orders.map(({ orderId }) => orderId),
+      );
+    } else if (replaceMalformed) {
+      await this.save(null);
     }
   }
 

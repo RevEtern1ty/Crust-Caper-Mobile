@@ -2,7 +2,7 @@ import { deepEqual, equal, match, ok, rejects } from 'node:assert/strict'
 import { test } from 'node:test'
 import { createDemoApi, DEMO_PHONE } from './demo-api'
 import { createDemoMenu } from './demo-menu'
-import type { CartLine } from './types'
+import { ApiError, type CartLine } from './types'
 
 const doubleSmash: CartLine = {
   sku: 'double-smash',
@@ -18,10 +18,15 @@ function setup() {
   let price = 9200
   let available = true
   let loseSavedResponse = false
+  let blockNextWrite = false
   let rescheduled = false
   const storage = {
     async getItem() { return saved },
     async setItem(_key: string, value: string) {
+      if (blockNextWrite) {
+        blockNextWrite = false
+        throw new Error('Storage quota exceeded')
+      }
       saved = value
       if (loseSavedResponse) {
         loseSavedResponse = false
@@ -63,6 +68,7 @@ function setup() {
     stopProduct: () => { available = false },
     rescheduleFirstSlot: () => { rescheduled = true },
     loseNextSavedResponse: () => { loseSavedResponse = true },
+    rejectNextWrite: () => { blockNextWrite = true },
     snapshot: () => saved,
     replaceSnapshot: (value: string) => { saved = value },
   }
@@ -103,7 +109,9 @@ test('lost response and restart reuse one order even after the quote expires', a
   const second = await fixture.quote()
   const input = { quoteId: first.id, phone: DEMO_PHONE }
   fixture.loseNextSavedResponse()
-  await rejects(fixture.api.createOrder(input, 'order-one'), /Response lost after save/)
+  await rejects(fixture.api.createOrder(input, 'order-one'), (error: unknown) =>
+    error instanceof ApiError && error.code === 'storage_unavailable'
+    && error.cause instanceof Error && error.cause.message === 'Response lost after save')
   fixture.advance(6)
   const recovered = fixture.restart()
   const order = await recovered.createOrder(input, 'order-one')
@@ -262,4 +270,146 @@ test('late successful payment stays out of the kitchen and repeat recalculates c
     { kind: 'price', sku: 'double-smash', previousPrice: 9200, currentPrice: 9900 },
   ])
   await rejects(fixture.api.getOrder('unknown-order'), { code: 'not_found' })
+})
+
+
+test('expired quotes are pruned without affecting committed order retries', async () => {
+  const f = setup();
+  const old = await f.quote();
+  const unused = await f.quote();
+  const input = { quoteId: old.id, phone: DEMO_PHONE };
+  const recorded = await f.api.createOrder(input, 'known-order');
+  f.advance(6);
+
+  const fresh = await f.quote();
+  const saved = f.snapshot();
+  ok(saved);
+  deepEqual(JSON.parse(saved).quotes.map(({ id }: { id: string }) => id), [fresh.id]);
+  equal((await f.restart().createOrder(input, 'known-order')).id, recorded.id);
+  await rejects(f.api.createOrder({ quoteId: unused.id, phone: DEMO_PHONE }, 'expired-order'), {
+    code: 'quote_expired',
+  });
+});
+
+
+test('a failed write is classified and the same order request can safely retry', async () => {
+  const f = setup()
+  const quote = await f.quote()
+  const input = { quoteId: quote.id, phone: DEMO_PHONE }
+  f.rejectNextWrite()
+  await rejects(f.api.createOrder(input, 'order-one'), (error: unknown) =>
+    error instanceof ApiError && error.code === 'storage_unavailable'
+    && error.cause instanceof Error && error.cause.message === 'Storage quota exceeded')
+  deepEqual(await f.api.listDemoOrderRefs(10), [])
+  const order = await f.restart().createOrder(input, 'order-one')
+  equal((await f.api.listDemoOrderRefs(10)).length, 1)
+  equal((await f.api.createOrder(input, 'order-one')).id, order.id)
+})
+
+test('a duplicate payment result after a lost response is idempotent for the same attempt', async () => {
+  const f = setup()
+  const quote = await f.quote()
+  const order = await f.api.createOrder({ quoteId: quote.id, phone: DEMO_PHONE }, 'order-one')
+  const first = await f.api.startPayment(order.id, 'attempt-one')
+  f.loseNextSavedResponse()
+  await rejects(f.api.setDemoPaymentResult(order.id, first.id, 'paid'), { code: 'storage_unavailable' })
+  const replay = await f.restart().setDemoPaymentResult(order.id, first.id, 'paid')
+  equal(replay.status, 'accepted')
+  equal(replay.paymentStatus, 'paid')
+  match(replay.pickupCode ?? '', /^\d{4}$/)
+  await rejects(f.api.setDemoPaymentResult(order.id, first.id, 'declined'), { code: 'conflict' })
+  deepEqual(await f.api.getOrder(order.id), replay)
+})
+
+test('a syntactically valid but inconsistent saved total blocks order creation and preserves the ledger', async () => {
+  const f = setup()
+  const quote = await f.quote()
+  const saved = f.snapshot()
+  ok(saved)
+  const invalid = JSON.parse(saved)
+  invalid.quotes[0].total += 100
+  invalid.quotes[0].subtotal += 100
+  const raw = JSON.stringify(invalid)
+  f.replaceSnapshot(raw)
+
+  await rejects(f.restart().createOrder({ quoteId: quote.id, phone: DEMO_PHONE }, 'order-one'), {
+    code: 'storage_unavailable',
+  })
+  equal(f.snapshot(), raw)
+  equal((await f.api.getMenu()).orderingUnavailable, true)
+})
+
+test('a burst across API instances sharing one adapter preserves capacity and both committed orders', async () => {
+  const f = setup()
+  const quotes = await Promise.all(Array.from({ length: 48 }, () => f.quote()))
+  const results = await Promise.allSettled(quotes.map((quote, index) =>
+    f.restart().createOrder({ quoteId: quote.id, phone: DEMO_PHONE }, `burst-${index}`)))
+  const successful = results.filter(result => result.status === 'fulfilled')
+  const rejected = results.filter(result => result.status === 'rejected')
+  equal(successful.length, 2)
+  equal(rejected.length, 46)
+  for (const result of rejected) equal(result.reason.code, 'slot_unavailable')
+  const saved = await f.api.listDemoOrderRefs(48)
+  deepEqual(new Set(saved.map(record => record.orderId)), new Set(successful.map(result => result.value.id)))
+})
+
+test('192 synthetic checkout lifecycles preserve totals, attempt identity and kitchen gating', async () => {
+  const optionSets = [[], ['extra-cheese'], ['no-pickles'], ['no-pickles', 'extra-cheese']]
+  const quantities = [1, 4, 9]
+  const outcomes = ['paid', 'declined', 'retry', 'late'] as const
+  const interruptions = ['none', 'order', 'attempt', 'result'] as const
+  let scenarios = 0
+
+  for (const modifierIds of optionSets) {
+    for (const quantity of quantities) {
+      for (const outcome of outcomes) {
+        for (const interruption of interruptions) {
+          const f = setup()
+          const quote = await f.quote([{ ...doubleSmash, modifierIds, quantity }])
+          const expected = (9200 + (modifierIds.includes('extra-cheese') ? 500 : 0)) * quantity
+          equal(quote.total, expected)
+          equal(quote.subtotal + quote.tax, expected)
+          const input = { quoteId: quote.id, phone: DEMO_PHONE }
+          if (interruption === 'order') {
+            f.loseNextSavedResponse()
+            await rejects(f.api.createOrder(input, 'order-key'), { code: 'storage_unavailable' })
+          }
+          const order = await f.restart().createOrder(input, 'order-key')
+          equal((await f.api.createOrder(input, 'order-key')).id, order.id)
+          if (interruption === 'attempt') {
+            f.loseNextSavedResponse()
+            await rejects(f.api.startPayment(order.id, 'attempt-key'), { code: 'storage_unavailable' })
+          }
+          const attempt = await f.restart().startPayment(order.id, 'attempt-key')
+          equal((await f.api.startPayment(order.id, 'attempt-key')).id, attempt.id)
+          if (outcome === 'late') f.advance(11)
+          const result = outcome === 'declined' || outcome === 'retry' ? 'declined' : 'paid'
+          if (interruption === 'result') {
+            f.loseNextSavedResponse()
+            await rejects(f.api.setDemoPaymentResult(order.id, attempt.id, result), { code: 'storage_unavailable' })
+          }
+          let final = await f.restart().setDemoPaymentResult(order.id, attempt.id, result)
+          if (outcome === 'retry') {
+            const retried = await f.restart().startPayment(order.id, 'attempt-two')
+            await rejects(f.api.setDemoPaymentResult(order.id, attempt.id, 'paid'), { code: 'conflict' })
+            final = await f.api.setDemoPaymentResult(order.id, retried.id, 'paid')
+          }
+          equal(final.total, expected)
+          equal(final.paymentStatus, outcome === 'late' ? 'refund_pending' : outcome === 'declined' ? 'declined' : 'paid')
+          if (final.paymentStatus === 'paid') {
+            equal(final.status, 'accepted')
+            await f.api.setDemoOrderStatus(order.id, 'preparing')
+            await f.api.setDemoOrderStatus(order.id, 'ready')
+            equal((await f.api.setDemoOrderStatus(order.id, 'collected')).status, 'collected')
+          } else {
+            equal(final.pickupCode, null)
+            await rejects(f.api.setDemoOrderStatus(order.id, 'preparing'), { code: 'conflict' })
+          }
+          equal((await f.restart().listDemoOrderRefs(10)).length, 1)
+          scenarios += 1
+        }
+      }
+    }
+  }
+  equal(scenarios, 192)
 })

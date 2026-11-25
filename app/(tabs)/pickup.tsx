@@ -3,27 +3,31 @@ import { Linking, StyleSheet, View } from 'react-native';
 import { useState } from 'react';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
-import { copy, slotLabel } from '../../src/ui/format';
+import { copy, nextPickupSlot, slotLabel } from '../../src/ui/format';
+
+type LinkAction = 'directions' | 'support';
 
 export default function PickupScreen() {
-  const { locale, menu } = useShop();
+  const { locale, menu, status, refreshing, refreshMenu } = useShop();
   const router = useRouter();
-  const [linkError, setLinkError] = useState(false);
+  const [linkErrors, setLinkErrors] = useState({ directions: false, support: false });
   const store = menu?.store;
-  const next = menu?.slots.find(slot => slot.available && Date.parse(slot.startsAt) > Date.now());
+  const next = status === 'ready' ? nextPickupSlot(menu) : undefined;
+  const directionsUrl = store?.directionsUrl;
+  const supportUrl = store?.supportUrl;
 
-  async function open(url: string) {
+  async function open(action: LinkAction, url: string) {
+    setLinkErrors(current => ({ ...current, [action]: false }));
     try {
       if (!['https:', 'mailto:', 'tel:'].includes(new URL(url).protocol)) throw new Error('Unsupported link');
       await Linking.openURL(url);
-      setLinkError(false);
     } catch {
-      setLinkError(true);
+      setLinkErrors(current => ({ ...current, [action]: true }));
     }
   }
 
   return (
-    <Screen>
+    <Screen onRefresh={() => { void refreshMenu(); }} refreshing={refreshing}>
       <Text variant="title" accessibilityRole="header">{copy(locale, 'Pickup', 'Kwakira')}</Text>
       <Card style={styles.location}>
         <View style={styles.pin}><Icon name="location-outline" size={29} color={colors.green} /></View>
@@ -31,8 +35,19 @@ export default function PickupScreen() {
         <Text>{store?.area[locale] ?? copy(locale, 'Kigali, Rwanda', 'Kigali, u Rwanda')}</Text>
         <Text variant="small" tone="muted">{store?.hours[locale] ?? copy(locale, 'Demo store · Kigali time', 'Aho kugeragereza · Isaha ya Kigali')}</Text>
         {next && <Text variant="label" tone="green">{copy(locale, 'Next demo slot', 'Igihe gikurikira cy’igerageza')} · {slotLabel(next, locale)}</Text>}
-        {store?.directionsUrl ? <Button label={copy(locale, 'Get directions', 'Reba inzira')} onPress={() => { void open(store.directionsUrl!); }} variant="secondary" />
+        {status === 'ready' && !next && <Text variant="label" tone="muted">{store?.open
+          ? copy(locale, 'No slots available', 'Nta mwanya uhari')
+          : copy(locale, 'Closed', 'Hafunze')}</Text>}
+        {(status === 'stale' || status === 'unavailable') && (
+          <>
+            <Text tone="muted" accessibilityLiveRegion="polite">{copy(locale, 'Pickup availability unconfirmed.', 'Igihe cyo gufata komande ntikiramenyekana.')}</Text>
+            <Button label={copy(locale, 'Refresh availability', 'Reba niba komande zakirwa')} variant="secondary"
+              busy={refreshing} onPress={() => { void refreshMenu(); }} />
+          </>
+        )}
+        {directionsUrl ? <Button label={copy(locale, 'Get directions', 'Reba inzira')} onPress={() => { void open('directions', directionsUrl); }} variant="secondary" />
           : <Text variant="small" tone="muted">{copy(locale, 'Pickup address will be published before the pilot.', 'Aderesi yo kwakiriraho izatangazwa mbere y’igerageza.')}</Text>}
+        {linkErrors.directions && <Text tone="red" accessibilityRole="alert">{copy(locale, 'Could not open the directions.', 'Inzira ntiyafungutse.')}</Text>}
       </Card>
       <Card>
         <Text variant="heading" accessibilityRole="header">{copy(locale, 'At the counter', 'Aho bakirira abakiriya')}</Text>
@@ -41,9 +56,9 @@ export default function PickupScreen() {
       </Card>
       <Card>
         <Text variant="heading" accessibilityRole="header">{copy(locale, 'Order help', 'Ubufasha kuri komande')}</Text>
-        {store?.supportUrl ? <Button label={copy(locale, 'Contact support', 'Saba ubufasha')} onPress={() => { void open(store.supportUrl!); }} variant="secondary" />
+        {supportUrl ? <Button label={copy(locale, 'Contact support', 'Saba ubufasha')} onPress={() => { void open('support', supportUrl); }} variant="secondary" />
           : <Text>{copy(locale, 'Contact details will be available when the pickup point launches.', 'Uburyo bwo gusaba ubufasha buzaboneka aho kwakirira hamaze gufungura.')}</Text>}
-        {linkError && <Text tone="red" accessibilityLiveRegion="polite">{copy(locale, 'Could not open this link.', 'Iri huriro ntiryafungutse.')}</Text>}
+        {linkErrors.support && <Text tone="red" accessibilityRole="alert">{copy(locale, 'Could not open the support link.', 'Ihuriro ry’ubufasha ntiryafungutse.')}</Text>}
       </Card>
       <Button label={copy(locale, 'Settings', 'Amagenamiterere')} onPress={() => router.push('/settings')} variant="ghost" />
     </Screen>

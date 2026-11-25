@@ -135,8 +135,8 @@ export type ApiErrorCode =
 export class ApiError extends Error {
   readonly code: ApiErrorCode
 
-  constructor(code: ApiErrorCode) {
-    super(code)
+  constructor(code: ApiErrorCode, options?: ErrorOptions) {
+    super(code, options)
     this.name = 'ApiError'
     this.code = code
   }
@@ -155,6 +155,7 @@ export type DemoPaymentResult = 'paid' | 'declined' | 'processing'
 export type DemoKitchenStatus = 'preparing' | 'ready' | 'collected'
 
 export interface DemoApi extends ShopApi {
+  listDemoOrderRefs(limit: number): Promise<{ orderId: string; key: string }[]>
   setDemoPaymentResult(orderId: string, attemptId: string, result: DemoPaymentResult): Promise<Order>
   setDemoOrderStatus(orderId: string, status: DemoKitchenStatus): Promise<Order>
 }

@@ -14,12 +14,14 @@ export default function PaymentScreen() {
   const { api, locale } = useShop();
   const { journal } = useCheckout();
   const guardNavigation = useRouteActionGuard();
-  const { order, failed, loading, refresh } = useOrderStatus(journal?.orderIds[0] ?? null);
+  const active = journal?.active;
+  const orderId = active && active.phase !== 'creating' ? active.orderId : null;
+  const { order, failed, loading, refresh } = useOrderStatus(orderId);
   const [busy, setBusy] = useState<DemoPaymentResult | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const running = useRef(false);
   const t = (en: string, rw: string) => copy(locale, en, rw);
-  const processing = order?.paymentStatus === 'processing' && order.paymentAttempt !== null;
+  const processing = !failed && order?.paymentStatus === 'processing' && order.paymentAttempt !== null;
   function goToOrders() {
     if (from === 'orders' && router.canGoBack()) router.back();
     else router.replace('/(tabs)/orders');
