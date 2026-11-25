@@ -41,6 +41,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     api,
     storage: privateStorage,
     newKey: randomUUID,
+    allowMissingDemoOrders: true,
     onOrderCreated: async (expected) => {
       const current = cartRef.current;
       if (await fingerprint(current) === expected) {
@@ -89,6 +90,16 @@ export function useCheckout() {
   if (!context) throw new Error('CheckoutProvider is missing');
 
   return context;
+}
+
+export function useRouteActionGuard() {
+  const revision = useRef(0);
+  useFocusEffect(useCallback(() => () => { revision.current++; }, []));
+
+  return () => {
+    const started = revision.current;
+    return () => revision.current === started;
+  };
 }
 
 const statusRefreshMs = 3000;

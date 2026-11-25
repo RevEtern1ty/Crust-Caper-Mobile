@@ -2,7 +2,7 @@ import { router } from 'expo-router';
 import { useRef, useState } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 
-import { useCheckout, useOrderStatus } from '../../src/checkout/context';
+import { useCheckout, useOrderStatus, useRouteActionGuard } from '../../src/checkout/context';
 import { checkoutError, changeLabel, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
 import type { DemoKitchenStatus, ReorderResult } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
@@ -14,6 +14,7 @@ type Action = 'resume' | 'reorder' | 'kitchen';
 export default function OrdersScreen() {
   const { api, locale, menu, cart, hydrated, replaceCart } = useShop();
   const { journal, restoreFailed, resumeCheckout, busy } = useCheckout();
+  const guardNavigation = useRouteActionGuard();
   const latestId = journal?.orderIds[0] ?? null;
   const [choice, setChoice] = useState<{ latest: string | null; id: string } | null>(null);
   const [action, setAction] = useState<Action | null>(null);
@@ -51,10 +52,12 @@ export default function OrdersScreen() {
   }
 
   function resume(retryDeclined = false) {
+    const shouldNavigate = guardNavigation();
     void run('resume', async () => {
       const resumed = await resumeCheckout(retryDeclined);
-      if (resumed.paymentStatus === 'processing') router.push('/payment');
-      else await refresh();
+      if (resumed.paymentStatus === 'processing' && shouldNavigate()) {
+        router.push({ pathname: '/payment', params: { from: 'orders' } });
+      } else await refresh();
     });
   }
 
@@ -75,6 +78,12 @@ export default function OrdersScreen() {
 
       {restoreFailed && <Text tone="red" accessibilityRole="alert">{t('The saved order could not be opened.', 'Komande yabitswe ntishobora gufungurwa.')}</Text>}
       {!journal && !restoreFailed && <Text tone="muted">{t('Opening saved orders…', 'Turimo gufungura komande zabitswe…')}</Text>}
+      {activeOrder && !order && failed && (
+        <Button
+          label={t('Restore saved checkout', 'Ongera ufungure ubwishyu bwabitswe')}
+          onPress={() => resume()} variant="secondary" busy={busy || action === 'resume'} disabled={!hydrated}
+        />
+      )}
       {ongoingCreate && (
         <Card>
           <Text variant="heading">{t('Finish your last checkout', 'Rangiza kwishyura komande ya nyuma')}</Text>

@@ -20,11 +20,12 @@ npm run web
 ```sh
 npm run check
 npm run build:web
+npm run test:web
 npm run build:android
 npm run build:ios
 ```
 
-`npm run check` запускает линт, проверку типов и тесты. В `dist/` будет статическое превью, в `dist-android/` и `dist-ios/` — JS-пакеты для соответствующих платформ. CI также сканирует историю и npm-зависимости и формирует SBOM.
+`npm run check` запускает линт, проверку типов и тесты. Для `npm run test:web` нужен Google Chrome. В `dist/` будет статическое превью, в `dist-android/` и `dist-ios/` — JS-пакеты для соответствующих платформ. CI сканирует историю и npm-зависимости и формирует SBOM. На `main` CI также собирает Android APK с демо-данными и отладочной подписью для ARM64 и x86-64.
 
 - [Профиль и подтверждённые границы проекта](docs/PROJECT_PROFILE.md)
 - [Архитектура и решение по интеграции](docs/architecture/MOBILE.md)

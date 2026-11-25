@@ -32,7 +32,8 @@ type SavedOrder = {
   attempts: { key: string; attempt: PaymentAttempt }[]
 }
 
-type DemoData = { version: 1; quotes: Quote[]; orders: SavedOrder[] }
+type SavedQuote = Quote & { pickupStartsAt?: string; pickupEndsAt?: string }
+type DemoData = { version: 1; quotes: SavedQuote[]; orders: SavedOrder[] }
 
 type DemoOptions = {
   storage: Storage
@@ -43,11 +44,13 @@ type DemoOptions = {
 
 function parseData(raw: string | null): DemoData {
   if (raw === null) return { version: 1, quotes: [], orders: [] }
-  const data: DemoData = JSON.parse(raw)
-  if (data?.version !== 1 || !Array.isArray(data.quotes) || !Array.isArray(data.orders)) {
+  const data = JSON.parse(raw) as Partial<DemoData> | null
+  if (data?.version !== 1
+    || !Array.isArray(data.quotes) || !data.quotes.every(validSavedQuote)
+    || !Array.isArray(data.orders) || !data.orders.every(validSavedOrder)) {
     throw new Error('Invalid demo storage format')
   }
-  return data
+  return { ...data, version: data.version, quotes: data.quotes, orders: data.orders }
 }
 
 function orderRecord(data: DemoData, id: string): SavedOrder {
@@ -77,7 +80,8 @@ function canonicalLines(lines: CartLine[], menu: Menu): ReorderResult {
 }
 
 function validQuoteLine(line: CartLine): boolean {
-  return typeof line.sku === 'string'
+  return line != null
+    && typeof line.sku === 'string'
     && line.sku.length > 0
     && Number.isSafeInteger(line.unitPrice)
     && line.unitPrice >= 0
@@ -90,7 +94,57 @@ function validQuoteLine(line: CartLine): boolean {
 }
 
 function validKey(key: string): boolean {
-  return /^[A-Za-z0-9._:-]{1,128}$/.test(key)
+  return typeof key === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(key)
+}
+
+function validTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+}
+
+function validSavedQuote(quote: SavedQuote): boolean {
+  return quote != null
+    && typeof quote.id === 'string'
+    && typeof quote.storeId === 'string'
+    && typeof quote.slotId === 'string'
+    && validTimestamp(quote.expiresAt)
+    && Array.isArray(quote.lines) && quote.lines.every(validQuoteLine)
+    && Array.isArray(quote.changes)
+    && Number.isSafeInteger(quote.subtotal) && Number.isSafeInteger(quote.total) && Number.isSafeInteger(quote.tax)
+    && quote.currency === 'RWF'
+    && ((quote.pickupStartsAt === undefined && quote.pickupEndsAt === undefined)
+      || (validTimestamp(quote.pickupStartsAt) && validTimestamp(quote.pickupEndsAt)))
+}
+
+function validAttempt(attempt: PaymentAttempt): boolean {
+  return attempt != null
+    && typeof attempt.id === 'string'
+    && ['processing', 'paid', 'declined'].includes(attempt.status)
+    && attempt.checkoutUrl === null
+}
+
+function validSavedOrder(record: SavedOrder): boolean {
+  const order = record?.order
+  return order != null
+    && validKey(record.key)
+    && typeof record.quoteId === 'string'
+    && typeof order.id === 'string'
+    && typeof order.storeId === 'string'
+    && typeof order.slotId === 'string'
+    && ['awaiting_payment', 'accepted', 'preparing', 'ready', 'collected', 'cancelled'].includes(order.status)
+    && ['unpaid', 'processing', 'paid', 'declined', 'refund_pending', 'refunded'].includes(order.paymentStatus)
+    && Array.isArray(order.lines) && order.lines.every(validQuoteLine)
+    && Number.isSafeInteger(order.total) && Number.isSafeInteger(order.tax)
+    && order.currency === 'RWF'
+    && (order.pickupCode === null || typeof order.pickupCode === 'string')
+    && ['pending', 'issued', 'corrected'].includes(order.receiptStatus)
+    && (order.receiptUrl === null || typeof order.receiptUrl === 'string')
+    && validTimestamp(order.createdAt)
+    && validTimestamp(order.reservationExpiresAt)
+    && validTimestamp(order.pickupStartsAt)
+    && validTimestamp(order.pickupEndsAt)
+    && (order.paymentAttempt === null || validAttempt(order.paymentAttempt))
+    && Array.isArray(record.attempts)
+    && record.attempts.every((entry) => entry != null && validKey(entry.key) && validAttempt(entry.attempt))
 }
 
 function expireReservation(order: Order, now: number): void {
@@ -131,7 +185,12 @@ export function createDemoApi({
 
   function withData<T>(write: boolean, operation: (data: DemoData, timestamp: number) => T): Promise<T> {
     const result = pending.then(async () => {
-      const data = parseData(await storage.getItem(DATA_KEY))
+      let data: DemoData
+      try {
+        data = parseData(await storage.getItem(DATA_KEY))
+      } catch {
+        throw new ApiError('storage_unavailable')
+      }
       const value = operation(data, now())
       if (write) await storage.setItem(DATA_KEY, JSON.stringify(data))
       return value
@@ -141,8 +200,18 @@ export function createDemoApi({
   }
 
   return {
-    getMenu() {
-      return withData(false, (data, timestamp) => currentMenu(menu(timestamp), data, timestamp))
+    async getMenu() {
+      try {
+        return await withData(false, (data, timestamp) => currentMenu(menu(timestamp), data, timestamp))
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.code !== 'storage_unavailable') throw error
+        const catalog = menu(now())
+        return {
+          ...catalog,
+          slots: catalog.slots.map((slot) => ({ ...slot, available: false })),
+          orderingUnavailable: true,
+        }
+      }
     },
 
     createQuote(input) {
@@ -171,7 +240,7 @@ export function createDemoApi({
           expiresAt: new Date(Math.min(timestamp + QUOTE_LIFETIME, Date.parse(slot.startsAt))).toISOString(),
           changes,
         }
-        data.quotes.push(quote)
+        data.quotes.push({ ...quote, pickupStartsAt: slot.startsAt, pickupEndsAt: slot.endsAt })
         return quote
       })
     },
@@ -188,11 +257,16 @@ export function createDemoApi({
         if (data.orders.some((record) => record.quoteId === quoteId)) throw new ApiError('conflict')
 
         const quote = data.quotes.find(({ id }) => id === quoteId)
-        if (!quote || Date.parse(quote.expiresAt) <= timestamp) throw new ApiError('quote_expired')
+        // An old, unused quote cannot prove which pickup window the customer reviewed.
+        if (!quote?.pickupStartsAt || !quote.pickupEndsAt || Date.parse(quote.expiresAt) <= timestamp) {
+          throw new ApiError('quote_expired')
+        }
         const availableMenu = currentMenu(menu(timestamp), data, timestamp)
         const slot = findAvailableSlot(availableMenu, quote.slotId)
         if (!slot) throw new ApiError('slot_unavailable')
-        if (!quote.lines.length || canonicalLines(quote.lines, availableMenu).changes.length) {
+        if (Date.parse(quote.pickupStartsAt) !== Date.parse(slot.startsAt)
+          || Date.parse(quote.pickupEndsAt) !== Date.parse(slot.endsAt)
+          || !quote.lines.length || canonicalLines(quote.lines, availableMenu).changes.length) {
           throw new ApiError('quote_changed')
         }
         const order: Order = {
@@ -255,13 +329,13 @@ export function createDemoApi({
       })
     },
 
-    setDemoPaymentResult(orderId, result) {
+    setDemoPaymentResult(orderId, attemptId, result) {
       return withData(true, (data, timestamp) => {
         const record = orderRecord(data, orderId)
         const { order } = record
         expireReservation(order, timestamp)
         const active = record.attempts.at(-1)?.attempt
-        if (active?.status !== 'processing') throw new ApiError('conflict')
+        if (active?.id !== attemptId || active.status !== 'processing') throw new ApiError('conflict')
         active.status = result
         order.paymentAttempt = active
         order.paymentStatus = result

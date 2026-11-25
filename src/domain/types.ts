@@ -43,6 +43,7 @@ export type Menu = {
   store: Store
   products: Product[]
   slots: PickupSlot[]
+  orderingUnavailable?: true
 }
 
 export type CartLine = {
@@ -129,6 +130,7 @@ export type ApiErrorCode =
   | 'conflict'
   | 'reservation_expired'
   | 'payment_pending'
+  | 'storage_unavailable'
 
 export class ApiError extends Error {
   readonly code: ApiErrorCode
@@ -153,7 +155,7 @@ export type DemoPaymentResult = 'paid' | 'declined' | 'processing'
 export type DemoKitchenStatus = 'preparing' | 'ready' | 'collected'
 
 export interface DemoApi extends ShopApi {
-  setDemoPaymentResult(orderId: string, result: DemoPaymentResult): Promise<Order>
+  setDemoPaymentResult(orderId: string, attemptId: string, result: DemoPaymentResult): Promise<Order>
   setDemoOrderStatus(orderId: string, status: DemoKitchenStatus): Promise<Order>
 }
 

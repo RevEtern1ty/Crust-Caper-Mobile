@@ -38,7 +38,7 @@ export function Text({
 export function Icon({ name, color = colors.ink, size = 22 }: {
   name: ComponentProps<typeof Ionicons>['name']; color?: string; size?: number;
 }) {
-  return <Ionicons name={name} size={size} color={color} accessible={false} />;
+  return <Ionicons name={name} size={size} color={color} accessible={false} aria-hidden />;
 }
 
 export function Button({ label, onPress, variant = 'primary', disabled, busy }: {

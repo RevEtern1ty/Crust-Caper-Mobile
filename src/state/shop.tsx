@@ -4,14 +4,28 @@ import {
   createContext, useCallback, useContext, useEffect, useRef, useState,
 } from 'react';
 import type { PropsWithChildren } from 'react';
-import { AppState } from 'react-native';
+import { AppState, Platform } from 'react-native';
+import { CHECKOUT_JOURNAL_KEY } from '../checkout/controller';
 import { createDemoApi } from '../domain/demo-api';
 import type { CartLine, Locale, Menu } from '../domain/types';
+import { privateStorage } from './private-storage';
 
 const DRAFT_KEY = 'crustcaper.draft.v1';
 const MENU_KEY = 'crustcaper.menu.v1';
 export const MAX_QUANTITY = 9;
-const api = createDemoApi({ storage: AsyncStorage, newId: randomUUID });
+const demoStorage = Platform.OS === 'web' ? {
+  async getItem(key: string) {
+    const saved = await privateStorage.getItem(key);
+    if (saved !== null || await privateStorage.getItem(CHECKOUT_JOURNAL_KEY) === null) return saved;
+
+    // Migrate the previous browser ledger only for a tab with a checkout journal.
+    const legacy = await AsyncStorage.getItem(key);
+    if (legacy !== null) await privateStorage.setItem(key, legacy);
+    return legacy;
+  },
+  setItem: privateStorage.setItem,
+} : AsyncStorage;
+const api = createDemoApi({ storage: demoStorage, newId: randomUUID });
 
 type Draft = { locale: Locale; cart: CartLine[] };
 type MenuStatus = 'loading' | 'ready' | 'stale' | 'unavailable';
@@ -78,7 +92,7 @@ type Shop = Draft & {
   setQuantity: (key: string, quantity: number) => void;
   editLine: (key: string, line: CartLine) => void;
   replaceCart: (lines: CartLine[]) => void;
-  clearCart: (snapshot?: CartLine[]) => Promise<void>;
+  clearCart: (snapshot: CartLine[]) => Promise<void>;
   refreshMenu: () => Promise<void>;
 };
 
@@ -101,7 +115,7 @@ export function ShopProvider({ children }: PropsWithChildren) {
     const load = api.getMenu().then(next => {
       cachedMenu.current = next;
       setMenu(next);
-      setStatus('ready');
+      setStatus(next.orderingUnavailable ? 'stale' : 'ready');
       return AsyncStorage.setItem(MENU_KEY, JSON.stringify(next)).catch(() => undefined);
     }, () => {
       setStatus(cachedMenu.current ? 'stale' : 'unavailable');
@@ -188,14 +202,8 @@ export function ShopProvider({ children }: PropsWithChildren) {
       cart: [...remaining.filter(item => lineKey(item) !== nextKey), { ...line, quantity }],
     };
   });
-  const clearCart = useCallback((snapshot?: CartLine[]) => updateDraft(current => {
-    if (!snapshot) return { ...current, cart: [] };
-    const quantities = new Map(snapshot.map(item => [lineKey(item), item.quantity]));
-    const cart = current.cart.flatMap(item => {
-      const quantity = item.quantity - (quantities.get(lineKey(item)) ?? 0);
-      return quantity > 0 ? [{ ...item, quantity }] : [];
-    });
-    return { ...current, cart };
+  const clearCart = useCallback((snapshot: CartLine[]) => updateDraft(current => {
+    return current.cart === snapshot ? { ...current, cart: [] } : current;
   }, true), [updateDraft]);
 
   const total = draft.cart.reduce((sum, line) => sum + line.unitPrice * line.quantity, 0);

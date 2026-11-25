@@ -1,6 +1,6 @@
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useState } from 'react';
-import { ActivityIndicator, Image, Pressable, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Image, Platform, Pressable, StyleSheet, View } from 'react-native';
 import type { CartLine, Product } from '../../src/domain/types';
 import { lineKey, MAX_QUANTITY, useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
@@ -53,8 +53,11 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
         <Text variant="heading" accessibilityRole="header">{copy(locale, 'Make it yours', 'Hitamo ibyo wongeramo')}</Text>
         {product.modifiers.map(option => {
           const checked = selected.includes(option.id);
-          return <Pressable key={option.id} accessibilityRole="checkbox" accessibilityState={{ checked }}
-            onPress={() => setSelected(current => checked ? current.filter(id => id !== option.id) : [...current, option.id])}
+          return <Pressable key={option.id} accessibilityRole={Platform.OS === 'web' ? 'button' : 'checkbox'}
+            aria-pressed={Platform.OS === 'web' ? checked : undefined}
+            accessibilityState={{ checked }} accessibilityLanguage={locale}
+            onPress={() => setSelected(current => current.includes(option.id)
+              ? current.filter(id => id !== option.id) : [...current, option.id])}
             style={[styles.option, checked && styles.selected]}>
             <Icon name={checked ? 'checkbox' : 'square-outline'} color={colors.green} />
             <Text style={styles.optionLabel}>{option.name[locale]}</Text>

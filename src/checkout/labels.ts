@@ -74,6 +74,8 @@ export function checkoutError(error: unknown, locale: Locale) {
         return copy(locale, 'The payment is still being checked. Check Orders for updates.', 'Ubwishyu buracyagenzurwa. Reba muri Komande.');
       case 'not_found':
         return copy(locale, 'This order is unavailable on this device.', 'Iyi komande ntiboneka kuri iki gikoresho.');
+      case 'storage_unavailable':
+        return copy(locale, 'Saved checkout data is unavailable. Try again.', 'Amakuru y’ubwishyu yabitswe ntaboneka. Ongera ugerageze.');
       case 'conflict':
         return copy(locale, 'Your last request is unresolved. Check its status in Orders.', 'Icyifuzo cya nyuma ntikirarangira. Reba uko gihagaze muri Komande.');
     }

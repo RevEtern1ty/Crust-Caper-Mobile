@@ -1,8 +1,8 @@
-import { router } from 'expo-router';
-import { useRef, useState } from 'react';
-import { Pressable, StyleSheet, TextInput, View } from 'react-native';
+import { router, useFocusEffect } from 'expo-router';
+import { useCallback, useRef, useState } from 'react';
+import { Platform, Pressable, StyleSheet, TextInput, View } from 'react-native';
 
-import { useCheckout } from '../src/checkout/context';
+import { useCheckout, useRouteActionGuard } from '../src/checkout/context';
 import { checkoutError, changeLabel, itemName, itemOptions } from '../src/checkout/labels';
 import { DEMO_PHONE } from '../src/domain/demo-api';
 import { ApiError, type Quote } from '../src/domain/types';
@@ -13,21 +13,29 @@ import { copy, money, slotLabel } from '../src/ui/format';
 const demoPhoneLabel = '+250 700 000 000';
 
 export default function CheckoutScreen() {
-  const { api, locale, menu, cart, total, refreshMenu } = useShop();
+  const { api, locale, menu, cart, total, hydrated, refreshing, refreshMenu } = useShop();
   const { beginCheckout, journal, busy, restoreFailed } = useCheckout();
+  const guardNavigation = useRouteActionGuard();
   const [selectedSlot, setSlot] = useState('');
   const [phone, setPhone] = useState('');
   const [phoneInvalid, setPhoneInvalid] = useState(false);
-  const [review, setReview] = useState<{ quote: Quote; cartKey: string } | null>(null);
+  const [review, setReview] = useState<{ quote: Quote; cartKey: string; slotKey: string } | null>(null);
   const [requestingQuote, setRequestingQuote] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const checking = useRef(false);
   const t = (en: string, rw: string) => copy(locale, en, rw);
 
   const slot = menu?.slots.find((option) => option.id === selectedSlot && option.available);
+  const slotKey = slot ? JSON.stringify([slot.id, slot.startsAt, slot.endsAt]) : '';
   const cartKey = JSON.stringify(cart);
-  const quote = review && review.cartKey === cartKey && review.quote.slotId === slot?.id ? review.quote : null;
+  const quote = review && review.cartKey === cartKey && review.slotKey === slotKey ? review.quote : null;
   const unfinished = journal?.active && journal.active.phase !== 'tracking';
+  const savedOrder = !!journal?.orderIds.length;
+  const noAvailableSlots = !menu?.slots.some((option) => option.available);
+
+  useFocusEffect(useCallback(() => {
+    void refreshMenu();
+  }, [refreshMenu]));
 
   function updatePhone(value: string) {
     setPhone(value);
@@ -42,21 +50,22 @@ export default function CheckoutScreen() {
     }
 
     checking.current = true;
+    const shouldNavigate = guardNavigation();
     setProblem(null);
     if (!quote) setRequestingQuote(true);
     try {
       if (!quote) {
         const result = await api.createQuote({ storeId: menu.store.id, slotId: slot.id, lines: cart });
-        setReview({ quote: result, cartKey });
+        setReview({ quote: result, cartKey, slotKey });
         return;
       }
       const order = await beginCheckout(quote, cart);
-      router.replace(order.paymentStatus === 'processing' ? '/payment' : '/(tabs)/orders');
+      if (shouldNavigate()) router.replace(order.paymentStatus === 'processing' ? '/payment' : '/(tabs)/orders');
     } catch (error) {
       setProblem(checkoutError(error, locale));
-      if (error instanceof ApiError && ['quote_expired', 'quote_changed', 'slot_unavailable'].includes(error.code)) {
+      if (error instanceof ApiError && ['quote_expired', 'quote_changed', 'slot_unavailable', 'reservation_expired'].includes(error.code)) {
         setReview(null);
-        if (error.code === 'slot_unavailable') setSlot('');
+        if (error.code === 'slot_unavailable' || error.code === 'reservation_expired') setSlot('');
         await refreshMenu().catch(() => {});
       }
     } finally {
@@ -65,7 +74,12 @@ export default function CheckoutScreen() {
     }
   }
 
+  if (!hydrated || (!journal && !restoreFailed)) {
+    return <Screen safeBottom><Text>{t('Opening checkout…', 'Turimo gufungura aho kwishyurira…')}</Text></Screen>;
+  }
+
   if (restoreFailed || unfinished || cart.length === 0) {
+    const viewOrders = restoreFailed || unfinished || savedOrder;
     return (
       <Screen safeBottom>
         <Text variant="title" accessibilityRole="header">{t('Checkout', 'Kwishyura')}</Text>
@@ -74,10 +88,12 @@ export default function CheckoutScreen() {
             ? t('The saved order could not be opened.', 'Komande yabitswe ntishobora gufungurwa.')
             : unfinished
               ? t('An order is waiting to be restored.', 'Hari komande itegereje kongera gufungurwa.')
-              : t('Your cart is empty.', 'Agatebo kawe karimo ubusa.')}</Text>
+              : savedOrder ? t('Your latest order is in Orders.', 'Komande yawe ya nyuma iri muri Komande.')
+                : t('Your cart is empty.', 'Agatebo kawe karimo ubusa.')}</Text>
+          {problem && <Text tone="red" accessibilityRole="alert">{problem}</Text>}
           <Button
-            label={restoreFailed || unfinished ? t('Go to Orders', 'Jya muri Komande') : t('Browse menu', 'Reba ibiribwa')}
-            onPress={() => router.replace(restoreFailed || unfinished ? '/(tabs)/orders' : '/(tabs)')}
+            label={viewOrders ? t('Go to Orders', 'Jya muri Komande') : t('Browse menu', 'Reba ibiribwa')}
+            onPress={() => router.replace(viewOrders ? '/(tabs)/orders' : '/(tabs)')}
           />
         </Card>
       </Screen>
@@ -102,27 +118,51 @@ export default function CheckoutScreen() {
 
       <Card>
         <Text variant="heading" accessibilityRole="header">{t('Pickup time', 'Igihe cyo gufata')}</Text>
-        {menu?.slots.length ? menu.slots.map((option) => (
-          <Pressable
-            key={option.id}
-            accessibilityRole="radio"
-            accessibilityState={{ selected: option.id === slot?.id, disabled: !option.available || busy }}
-            disabled={!option.available || requestingQuote || busy}
-            onPress={() => {
+        <View accessibilityRole="radiogroup" accessibilityLabel={t('Pickup time', 'Igihe cyo gufata')} style={styles.slotGroup}>
+          {menu?.slots.map((option) => {
+            const checked = option.id === slot?.id;
+            const disabled = !option.available || requestingQuote || busy;
+            const choose = () => {
+              if (disabled || checked) return;
               setSlot(option.id);
               setReview(null);
               setProblem(null);
-            }}
-            style={({ pressed }) => [
-              styles.slot,
-              option.id === slot?.id && styles.selected,
-              (pressed || !option.available) && styles.dimmed,
-            ]}
-          >
-            <Icon name={option.id === slot?.id ? 'radio-button-on' : 'radio-button-off'} size={20} />
-            <Text style={styles.shrink}>{slotLabel(option, locale)}{!option.available && ` · ${t('Full', 'Cyuzuye')}`}</Text>
-          </Pressable>
-        )) : <Text tone="muted">{t('No pickup times are available right now.', 'Nta gihe cyo gufata komande kiboneka ubu.')}</Text>}
+            };
+            const webKeyboard = Platform.OS === 'web' ? {
+              onKeyDown: (event: { key: string; preventDefault: () => void }) => {
+                if (event.key === ' ' && !disabled) {
+                  event.preventDefault();
+                  choose();
+                }
+              },
+            } : {};
+
+            return (
+              <Pressable
+                key={option.id}
+                accessibilityRole="radio"
+                accessibilityState={{ checked, disabled }}
+                aria-checked={checked}
+                aria-disabled={disabled}
+                disabled={disabled}
+                onPress={choose}
+                {...webKeyboard}
+                style={({ pressed }) => [styles.slot, checked && styles.selected, (pressed || !option.available) && styles.dimmed]}
+              >
+                <Icon name={checked ? 'radio-button-on' : 'radio-button-off'} size={20} />
+                <Text style={styles.shrink}>{slotLabel(option, locale)}{!option.available && ` · ${t('Unavailable', 'Ntikiboneka')}`}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+        {noAvailableSlots && (
+          <>
+            <Text tone="muted">{refreshing
+              ? t('Checking pickup times…', 'Turimo kugenzura ibihe byo gufata…')
+              : t('No pickup times are available right now.', 'Nta gihe cyo gufata komande kiboneka ubu.')}</Text>
+            <Button label={t('Refresh pickup times', 'Vugurura ibihe byo gufata')} variant="secondary" busy={refreshing} onPress={() => { void refreshMenu(); }} />
+          </>
+        )}
       </Card>
 
       <Card>
@@ -186,6 +226,7 @@ export default function CheckoutScreen() {
 
 const styles = StyleSheet.create({
   stack: { gap: 6 },
+  slotGroup: { gap: 9 },
   row: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', gap: 12 },
   shrink: { flexShrink: 1 },
   total: { borderTopColor: colors.border, borderTopWidth: 1, paddingTop: 10 },

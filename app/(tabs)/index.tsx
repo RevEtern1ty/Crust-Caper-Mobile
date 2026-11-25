@@ -1,6 +1,6 @@
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
-import { ActivityIndicator, Image, Pressable, ScrollView, StyleSheet, useWindowDimensions, View } from 'react-native';
+import { ActivityIndicator, Image, Platform, Pressable, ScrollView, StyleSheet, useWindowDimensions, View } from 'react-native';
 import type { Category, Product } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
@@ -83,14 +83,25 @@ export default function MenuScreen() {
       )}
       {menu && (
         <>
-          {status === 'stale' && <Text variant="small" tone="red" accessibilityLiveRegion="polite">
-            {copy(locale, 'Saved menu', 'Ifunguro ryabitswe')} · {kigaliTime(menu.updatedAt, locale)}
-          </Text>}
+          {status === 'stale' && (
+            <Card>
+              <Text variant="small" tone="red" accessibilityLiveRegion="polite">
+                {menu.orderingUnavailable
+                  ? copy(locale, 'Orders are temporarily unavailable. Refresh the menu to retry.',
+                    'Ntibishoboka gutanga komande muri aka kanya. Vugurura amafunguro wongere ugerageze.')
+                  : `${copy(locale, 'Saved menu', 'Ifunguro ryabitswe')} · ${kigaliTime(menu.updatedAt, locale)}`}
+              </Text>
+              <Button label={copy(locale, 'Refresh menu', 'Vugurura amafunguro')} variant="secondary"
+                busy={refreshing} onPress={() => { void refreshMenu(); }} />
+            </Card>
+          )}
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.categories}>
             {categories.map(item => {
               const selected = category === item.id;
               return <Pressable key={item.id} onPress={() => setCategory(item.id)} accessibilityRole="button"
-                accessibilityState={{ selected }} style={[styles.category, selected && styles.selectedCategory]}>
+                aria-pressed={Platform.OS === 'web' ? selected : undefined}
+                accessibilityState={{ selected }} accessibilityLanguage={locale}
+                style={[styles.category, selected && styles.selectedCategory]}>
                 <Text variant="label" tone={selected ? 'cream' : 'ink'}>{item[locale]}</Text>
               </Pressable>;
             })}

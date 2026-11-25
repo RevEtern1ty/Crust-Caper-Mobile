@@ -1,5 +1,6 @@
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
+import { useEffect } from 'react';
 import { Platform, StyleSheet, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { CheckoutProvider } from '../src/checkout/context';
@@ -9,6 +10,12 @@ import { copy } from '../src/ui/format';
 
 function Routes() {
   const { locale } = useShop();
+  useEffect(() => {
+    if (Platform.OS === 'web' && typeof document !== 'undefined') {
+      document.documentElement.lang = locale;
+    }
+  }, [locale]);
+
   return (
     <Stack screenOptions={{
       contentStyle: { backgroundColor: colors.cream },

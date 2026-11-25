@@ -8,6 +8,7 @@
 - `npm start` запускает Metro, `npm run web` открывает браузерное превью.
 - `npm run lint`, `npm run typecheck`, `npm test` проверяют код и поведение. `npm run check` запускает их вместе.
 - `npm run build:web` собирает превью. `npm run build:android` и `npm run build:ios` экспортируют JS-пакеты целевых платформ. `npm run android` и `npm run ios` собирают и запускают development build при наличии нативного SDK.
+- После `npm run build:web` команда `npm run test:web` прогоняет сценарии через установленный Google Chrome.
 - `npm run --silent sbom` выводит SBOM зависимостей в формате CycloneDX.
 - [Mobile CI](.github/workflows/mobile.yml) проверяет исходники и зависимости, собирает JS и архивирует превью и SBOM. [Порядок приёмки](docs/runbooks/MOBILE_RELEASE.md) описывает проверки устройства и подключённой среды.
 

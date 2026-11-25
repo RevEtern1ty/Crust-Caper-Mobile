@@ -1,7 +1,7 @@
 import { DEMO_PHONE } from '../domain/demo-api';
 import { ApiError, type Order, type Quote, type ShopApi } from '../domain/types';
 
-const journalKey = 'crustcaper.checkout.v1';
+export const CHECKOUT_JOURNAL_KEY = 'crustcaper.checkout.v1';
 const maxRecentOrders = 10;
 
 type Progress =
@@ -23,6 +23,7 @@ type Dependencies = {
   };
   newKey: () => string;
   onOrderCreated: (cartFingerprint: string) => Promise<void>;
+  allowMissingDemoOrders?: boolean;
 };
 
 export class CheckoutError extends Error {
@@ -97,8 +98,12 @@ export class CheckoutController {
   async begin(quote: Quote, cartFingerprint: string): Promise<Order> {
     return this.exclusive(async () => {
       const { active } = this.journal;
+      if (active?.phase === 'creating') {
+        throw new CheckoutError('active_checkout');
+      }
       if (active) {
-        if (active.phase !== 'tracking' || !canStartNewOrder(await this.dependencies.api.getOrder(active.orderId))) {
+        const order = await this.getTrackedOrder(active.orderId);
+        if (order && (active.phase !== 'tracking' || !canStartNewOrder(order))) {
           throw new CheckoutError('active_checkout');
         }
       }
@@ -121,13 +126,11 @@ export class CheckoutController {
         return this.placeOrder(active);
       }
 
-      const order = await this.dependencies.api.getOrder(active.orderId);
-      if (active.phase === 'paying' && active.cartFingerprint && order.status !== 'cancelled') {
-        await this.dependencies.onOrderCreated(active.cartFingerprint);
-      }
+      const order = await this.getTrackedOrder(active.orderId);
+      if (!order) throw new ApiError('not_found');
       if (canStartNewOrder(order) || order.paymentStatus === 'processing') {
         if (active.phase === 'paying') {
-          await this.track(active);
+          await this.finishPayment(active, order);
         }
         return order;
       }
@@ -169,7 +172,6 @@ export class CheckoutController {
       return order;
     }
     await this.save(payment, orderIds);
-    await this.dependencies.onOrderCreated(intent.cartFingerprint);
     return this.startPayment(payment);
   }
 
@@ -182,8 +184,29 @@ export class CheckoutController {
       }
       throw error;
     }
+    const order = await this.dependencies.api.getOrder(intent.orderId);
+    await this.finishPayment(intent, order);
+    return order;
+  }
+
+  private async finishPayment(intent: Extract<Progress, { phase: 'paying' }>, order: Order) {
+    if (intent.cartFingerprint && order.status !== 'cancelled') {
+      await this.dependencies.onOrderCreated(intent.cartFingerprint);
+    }
     await this.track(intent);
-    return this.dependencies.api.getOrder(intent.orderId);
+  }
+
+  private async getTrackedOrder(orderId: string): Promise<Order | null> {
+    try {
+      return await this.dependencies.api.getOrder(orderId);
+    } catch (error) {
+      // Demo records and the secure journal have different storage lifecycles.
+      if (this.dependencies.allowMissingDemoOrders && error instanceof ApiError && error.code === 'not_found') {
+        await this.save(null, this.journal.orderIds.filter((id) => id !== orderId));
+        return null;
+      }
+      throw error;
+    }
   }
 
   private async track({ orderId, key }: Extract<Progress, { phase: 'paying' }>) {
@@ -192,7 +215,7 @@ export class CheckoutController {
 
   private async load(): Promise<void> {
     if (!this.loaded) {
-      const journal = parseJournal(await this.dependencies.storage.getItem(journalKey));
+      const journal = parseJournal(await this.dependencies.storage.getItem(CHECKOUT_JOURNAL_KEY));
       if (!this.loaded) {
         this.journal = journal;
         this.loaded = true;
@@ -202,7 +225,7 @@ export class CheckoutController {
 
   private async save(active: Progress | null, orderIds = this.journal.orderIds): Promise<void> {
     const next = { version: 1, active, orderIds } as const;
-    await this.dependencies.storage.setItem(journalKey, JSON.stringify(next));
+    await this.dependencies.storage.setItem(CHECKOUT_JOURNAL_KEY, JSON.stringify(next));
     this.journal = next;
   }
 

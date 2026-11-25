@@ -42,6 +42,7 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build:web
+      - run: npm run test:web
       - run: npm run build:android
       - run: npm run build:ios
       - name: Generate dependency SBOM
@@ -57,6 +58,42 @@ jobs:
         with:
           name: mobile-dependency-sbom-${{ github.sha }}
           path: ${{ runner.temp }}/crustcaper.cdx.json
+          if-no-files-found: error
+          retention-days: 14
+
+  android-demo:
+    name: Compile Android demo APK
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      EXPO_NO_TELEMETRY: 1
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - run: npx expo prebuild --platform android --no-install
+      - name: Build demo with bundled JS and debug signing
+        working-directory: android
+        run: |
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          bash ./gradlew --no-daemon --max-workers=2 ':app:assembleRelease' \
+            '-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8' \
+            '-PreactNativeArchitectures=arm64-v8a,x86_64'
+      - name: Verify the APK signature and embedded bundle
+        run: |
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$apk"
+          unzip -Z1 "$apk" | grep -Fx assets/index.android.bundle
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-android-demo-${{ github.sha }}
+          path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 14
 

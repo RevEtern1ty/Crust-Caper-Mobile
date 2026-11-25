@@ -46,7 +46,7 @@ paths:
             schema: { $ref: '#/components/schemas/QuoteRequest' }
       responses:
         '200':
-          description: Current total and changes requiring client acknowledgement.
+          description: Current total and pickup window bound to this quote, with changes requiring client acknowledgement.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Quote' }

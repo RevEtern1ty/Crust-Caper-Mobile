@@ -18,6 +18,7 @@ function setup() {
   let price = 9200
   let available = true
   let loseSavedResponse = false
+  let rescheduled = false
   const storage = {
     async getItem() { return saved },
     async setItem(_key: string, value: string) {
@@ -38,6 +39,11 @@ function setup() {
         ...menu,
         products: menu.products.map((product) =>
           product.sku === doubleSmash.sku ? { ...product, price, available } : product),
+        slots: rescheduled
+          ? menu.slots.map((slot, index) => index === 0
+            ? { ...slot, endsAt: new Date(Date.parse(slot.endsAt) + 5 * 60_000).toISOString() }
+            : slot)
+          : menu.slots,
       }
     },
   })
@@ -55,8 +61,10 @@ function setup() {
     advance: (minutes: number) => { now += minutes * 60_000 },
     changePrice: (value: number) => { price = value },
     stopProduct: () => { available = false },
+    rescheduleFirstSlot: () => { rescheduled = true },
     loseNextSavedResponse: () => { loseSavedResponse = true },
     snapshot: () => saved,
+    replaceSnapshot: (value: string) => { saved = value },
   }
 }
 
@@ -106,6 +114,74 @@ test('lost response and restart reuse one order even after the quote expires', a
   equal(fixture.snapshot()?.includes(DEMO_PHONE), false)
 })
 
+test('an offer needs renewed consent if the same slot ID changes its pickup window', async () => {
+  const fixture = setup()
+  const quote = await fixture.quote()
+  const previous = (await fixture.api.getMenu()).slots[0]
+  ok(previous)
+  fixture.rescheduleFirstSlot()
+  await rejects(fixture.api.createOrder({ quoteId: quote.id, phone: DEMO_PHONE }, 'order-one'), {
+    code: 'quote_changed',
+  })
+  const reviewed = await fixture.quote()
+  equal(reviewed.slotId, quote.slotId)
+  const order = await fixture.api.createOrder({ quoteId: reviewed.id, phone: DEMO_PHONE }, 'order-two')
+  equal(Date.parse(order.pickupEndsAt) - Date.parse(previous.endsAt), 5 * 60_000)
+})
+
+test('legacy quotes cannot start new orders and still replay orders already recorded', async () => {
+  const fixture = setup()
+  const created = await fixture.quote()
+  const unused = await fixture.quote()
+  const order = await fixture.api.createOrder({ quoteId: created.id, phone: DEMO_PHONE }, 'order-one')
+  const attempt = await fixture.api.startPayment(order.id, 'attempt-one')
+  const stored = fixture.snapshot()
+  ok(stored)
+  const legacy = JSON.parse(stored) as { quotes: { pickupStartsAt?: string; pickupEndsAt?: string }[] }
+  for (const quote of legacy.quotes) {
+    delete quote.pickupStartsAt
+    delete quote.pickupEndsAt
+  }
+  fixture.replaceSnapshot(JSON.stringify(legacy))
+  const api = fixture.restart()
+  await rejects(api.createOrder({ quoteId: unused.id, phone: DEMO_PHONE }, 'order-two'), {
+    code: 'quote_expired',
+  })
+  const replay = await api.createOrder({ quoteId: created.id, phone: DEMO_PHONE }, 'order-one')
+  equal(replay.id, order.id)
+  deepEqual(replay.paymentAttempt, attempt)
+  equal((await api.setDemoPaymentResult(order.id, attempt.id, 'paid')).paymentStatus, 'paid')
+})
+
+test('a damaged ledger leaves the catalog readable, prevents ordering and preserves stored confirmations', async () => {
+  const fixture = setup()
+  const quote = await fixture.quote()
+  const order = await fixture.api.createOrder({ quoteId: quote.id, phone: DEMO_PHONE }, 'order-one')
+  const attempt = await fixture.api.startPayment(order.id, 'attempt-one')
+  const paid = await fixture.api.setDemoPaymentResult(order.id, attempt.id, 'paid')
+  const original = fixture.snapshot()
+  ok(original)
+  const damaged = JSON.parse(original) as { orders: unknown[] }
+  damaged.orders.push(null)
+  const raw = JSON.stringify(damaged)
+  fixture.replaceSnapshot(raw)
+
+  const api = fixture.restart()
+  const menu = await api.getMenu()
+  equal(menu.products.some(({ sku }) => sku === doubleSmash.sku), true)
+  equal(menu.orderingUnavailable, true)
+  ok(menu.slots.length > 0)
+  equal(menu.slots.some(({ available }) => available), false)
+  await rejects(api.createQuote({ storeId: menu.store.id, slotId: quote.slotId, lines: [doubleSmash] }), {
+    code: 'storage_unavailable',
+  })
+  await rejects(api.getOrder(order.id), { code: 'storage_unavailable' })
+  equal(fixture.snapshot(), raw)
+  fixture.replaceSnapshot(original)
+  deepEqual(await api.getOrder(order.id), paid)
+  equal((await api.getMenu()).orderingUnavailable, undefined)
+})
+
 test('demo accepts only its sample contact and order data stays in the creating storage', async () => {
   const { api, quote } = setup()
   const { id: quoteId } = await quote()
@@ -141,11 +217,11 @@ test('attempt survives restart, blocks a second attempt while open, and advances
   equal((await recovered.getOrder(order.id)).paymentStatus, 'processing')
   await rejects(recovered.startPayment(order.id, 'attempt-two'), { code: 'payment_pending' })
   await rejects(recovered.setDemoOrderStatus(order.id, 'preparing'), { code: 'conflict' })
-  await recovered.setDemoPaymentResult(order.id, 'declined')
+  await recovered.setDemoPaymentResult(order.id, attempts[0].id, 'declined')
   deepEqual(await recovered.startPayment(order.id, 'attempt-one'), { ...attempts[0], status: 'declined' })
   const nextAttempt = await recovered.startPayment(order.id, 'attempt-two')
   equal(nextAttempt.id === attempts[0].id, false)
-  const paid = await recovered.setDemoPaymentResult(order.id, 'paid')
+  const paid = await recovered.setDemoPaymentResult(order.id, nextAttempt.id, 'paid')
   equal(paid.status, 'accepted')
   match(paid.pickupCode ?? '', /^\d{4}$/)
   equal(paid.receiptUrl, null)
@@ -154,14 +230,28 @@ test('attempt survives restart, blocks a second attempt while open, and advances
   equal((await recovered.setDemoOrderStatus(order.id, 'collected')).status, 'collected')
 })
 
+test('a payment result displayed for a declined attempt cannot settle a later attempt', async () => {
+  const fixture = setup()
+  const quote = await fixture.quote()
+  const order = await fixture.api.createOrder({ quoteId: quote.id, phone: DEMO_PHONE }, 'order-one')
+  const first = await fixture.api.startPayment(order.id, 'attempt-one')
+  await fixture.api.setDemoPaymentResult(order.id, first.id, 'declined')
+  const second = await fixture.api.startPayment(order.id, 'attempt-two')
+  await rejects(fixture.api.setDemoPaymentResult(order.id, first.id, 'paid'), { code: 'conflict' })
+  const after = await fixture.api.getOrder(order.id)
+  equal(after.paymentStatus, 'processing')
+  deepEqual(after.paymentAttempt, second)
+  equal(after.pickupCode, null)
+})
+
 test('late successful payment stays out of the kitchen and repeat recalculates catalog data', async () => {
   const fixture = setup()
   const quote = await fixture.quote()
   const order = await fixture.api.createOrder({ quoteId: quote.id, phone: DEMO_PHONE }, 'order-one')
-  await fixture.api.startPayment(order.id, 'attempt-one')
+  const attempt = await fixture.api.startPayment(order.id, 'attempt-one')
   fixture.advance(11)
   equal((await fixture.api.getOrder(order.id)).status, 'cancelled')
-  const late = await fixture.api.setDemoPaymentResult(order.id, 'paid')
+  const late = await fixture.api.setDemoPaymentResult(order.id, attempt.id, 'paid')
   equal(late.paymentStatus, 'refund_pending')
   equal(late.status, 'cancelled')
   equal(late.pickupCode, null)
