@@ -6,9 +6,9 @@ import { copy, money } from '../src/ui/format';
 import { menuPhoto } from '../src/ui/menu-photos';
 
 export default function CartScreen() {
-  const { locale, menu, status, count, cart, hydrated, draftSaving, draftStorageError, changeQuantity, total, refreshMenu, refreshing } = useShop();
+  const { locale, fixturePhotos, checkoutAllowed, menu, status, count, cart, hydrated, draftSaving, draftStorageError, changeQuantity, total, refreshMenu, refreshing } = useShop();
   const router = useRouter();
-  const checkoutReady = count > 0 && status === 'ready' && !draftSaving && !draftStorageError;
+  const checkoutReady = checkoutAllowed && count > 0 && status === 'ready' && !draftSaving && !draftStorageError;
   if (!hydrated) {
     return <Screen safeBottom>{!draftStorageError && <Text accessibilityLiveRegion="polite">
       {copy(locale, 'Opening cart…', 'Turimo gufungura agatebo…')}
@@ -26,7 +26,7 @@ export default function CartScreen() {
       {cart.map(line => {
         const key = lineKey(line);
         const product = menu?.products.find(item => item.sku === line.sku);
-        const photo = menuPhoto(line.sku);
+        const photo = menuPhoto(line.sku, fixturePhotos, product?.photoUrl);
         const name = product?.name[locale] ?? line.sku;
         const options = product?.modifiers.filter(option => line.modifierIds.includes(option.id)) ?? [];
         return <Card key={key}>
@@ -66,6 +66,7 @@ export default function CartScreen() {
           <Text variant="heading">{money(total)}</Text>
         </View>
         <Text variant="small" tone="muted">{copy(locale, 'Availability, tax and final price are confirmed at checkout.', 'Kuboneka, umusoro n’igiciro cya nyuma byemezwa mbere yo kwishyura.')}</Text>
+        {!checkoutAllowed && <Text variant="small" tone="muted">{copy(locale, 'Use the CrustCaper mobile app to place an order.', 'Koresha porogaramu ya CrustCaper kuri telefoni kugira ngo utange komande.')}</Text>}
         {status !== 'ready' && <Button label={copy(locale, 'Refresh menu', 'Vugurura amafunguro')} variant="secondary"
           busy={refreshing} onPress={() => { void refreshMenu(); }} />}
       </View>}

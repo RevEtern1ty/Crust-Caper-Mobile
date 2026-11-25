@@ -15,9 +15,9 @@ const categories = [
 ] as const;
 
 function ProductTile({ product, featured = false, wide = false }: { product: Product; featured?: boolean; wide?: boolean }) {
-  const { locale } = useShop();
+  const { locale, fixturePhotos } = useShop();
   const router = useRouter();
-  const photo = menuPhoto(product.sku);
+  const photo = menuPhoto(product.sku, fixturePhotos, product.photoUrl);
   const label = product.name[locale];
   return (
     <Pressable
@@ -47,7 +47,7 @@ function ProductTile({ product, featured = false, wide = false }: { product: Pro
 }
 
 export default function MenuScreen() {
-  const { locale, menu, status, refreshing, refreshMenu, count, total } = useShop();
+  const { locale, mode, menu, status, refreshing, refreshMenu, count, total } = useShop();
   const { width } = useWindowDimensions();
   const compactCategories = width < 380;
   const wide = width >= 620;
@@ -71,9 +71,10 @@ export default function MenuScreen() {
         <Pressable accessibilityRole="button" onPress={() => router.navigate('/pickup')} style={styles.pickup}>
           <View style={styles.pin}><Icon name="location-outline" size={23} color={colors.green} /></View>
           <View style={styles.pickupText}>
-            <Text variant="label" tone="green">{copy(locale, 'Pickup in Kigali', 'Kwakirira i Kigali')}</Text>
+            <Text variant="label" tone="green">{mode === 'demo'
+              ? copy(locale, 'Pickup in Kigali', 'Kwakirira i Kigali') : menu.store.name[locale]}</Text>
             <Text variant="small" tone="muted">
-              {copy(locale, 'Demo store', 'Aho kugeragereza')} · {pickupAvailability}
+              {mode === 'demo' ? copy(locale, 'Demo store', 'Aho kugeragereza') : menu.store.area[locale]} · {pickupAvailability}
             </Text>
           </View>
           <Icon name="chevron-forward" size={17} color={colors.green} />

@@ -8,7 +8,7 @@ import { copy, nextPickupSlot, slotLabel } from '../../src/ui/format';
 type LinkAction = 'directions' | 'support';
 
 export default function PickupScreen() {
-  const { locale, menu, status, refreshing, refreshMenu } = useShop();
+  const { locale, mode, menu, status, refreshing, refreshMenu } = useShop();
   const router = useRouter();
   const [linkErrors, setLinkErrors] = useState({ directions: false, support: false });
   const store = menu?.store;
@@ -33,8 +33,10 @@ export default function PickupScreen() {
         <View style={styles.pin}><Icon name="location-outline" size={29} color={colors.green} /></View>
         <Text variant="heading">{store?.name[locale] ?? 'CrustCaper Kigali'}</Text>
         <Text>{store?.area[locale] ?? copy(locale, 'Kigali, Rwanda', 'Kigali, u Rwanda')}</Text>
-        <Text variant="small" tone="muted">{store?.hours[locale] ?? copy(locale, 'Demo store · Kigali time', 'Aho kugeragereza · Isaha ya Kigali')}</Text>
-        {next && <Text variant="label" tone="green">{copy(locale, 'Next demo slot', 'Igihe gikurikira cy’igerageza')} · {slotLabel(next, locale)}</Text>}
+        {store && <Text variant="small" tone="muted">{store.hours[locale]}</Text>}
+        {next && <Text variant="label" tone="green">{mode === 'demo'
+          ? copy(locale, 'Next demo slot', 'Igihe gikurikira cy’igerageza')
+          : copy(locale, 'Next pickup time', 'Igihe gikurikira cyo kwakira')} · {slotLabel(next, locale)}</Text>}
         {status === 'ready' && !next && <Text variant="label" tone="muted">{store?.open
           ? copy(locale, 'No slots available', 'Nta mwanya uhari')
           : copy(locale, 'Closed', 'Hafunze')}</Text>}

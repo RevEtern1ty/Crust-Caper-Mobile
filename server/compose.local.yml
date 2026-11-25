@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    environment:
+      POSTGRES_DB: crustcaper_dev
+      POSTGRES_USER: crustcaper
+      POSTGRES_PASSWORD: crustcaper-local
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crustcaper -d crustcaper_dev"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+volumes:
+  data:

@@ -1,0 +1,20 @@
+{
+  "cli": {
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "stage": {
+      "distribution": "internal",
+      "environment": "preview",
+      "env": { "CRUSTCAPER_BUILD_PROFILE": "stage" },
+      "android": { "buildType": "apk" }
+    },
+    "production": {
+      "distribution": "store",
+      "environment": "production",
+      "autoIncrement": true,
+      "env": { "CRUSTCAPER_BUILD_PROFILE": "production" },
+      "android": { "buildType": "app-bundle" }
+    }
+  }
+}

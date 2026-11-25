@@ -5,20 +5,21 @@ import { Platform } from 'react-native';
 import type { Locale } from '../domain/types';
 import { DRAFT_KEY, readBrowserDraft, readBrowserLocale, readDraft, writeBrowserDraft, type Draft } from './draft-storage';
 
-async function readStoredDraft(): Promise<Draft> {
-  if (Platform.OS === 'web') return readBrowserDraft(window.sessionStorage, () => window.localStorage);
-  return readDraft(await AsyncStorage.getItem(DRAFT_KEY));
+async function readStoredDraft(key: string): Promise<Draft> {
+  if (Platform.OS === 'web') return readBrowserDraft(window.sessionStorage, () => window.localStorage, key);
+  return readDraft(await AsyncStorage.getItem(key));
 }
 
-async function writeStoredDraft(draft: Draft, localeChanged: boolean): Promise<void> {
+async function writeStoredDraft(key: string, draft: Draft, localeChanged: boolean): Promise<void> {
   if (Platform.OS === 'web') {
-    writeBrowserDraft(window.sessionStorage, () => window.localStorage, draft, localeChanged);
+    writeBrowserDraft(window.sessionStorage, () => window.localStorage, draft, localeChanged, key);
     return;
   }
-  await AsyncStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+  await AsyncStorage.setItem(key, JSON.stringify(draft));
 }
 
-export function useShopDraft() {
+export function useShopDraft(scope: string | null = null) {
+  const key = scope ? DRAFT_KEY + '.' + scope : DRAFT_KEY;
   const [draft, setDraft] = useState<Draft>({ locale: 'en', cart: [] });
   const [hydrated, setHydrated] = useState(false);
   const [draftSaving, setDraftSaving] = useState(false);
@@ -33,7 +34,7 @@ export function useShopDraft() {
   const restoreDraft = useCallback(() => {
     if (readRequest.current) return readRequest.current;
 
-    const load = readStoredDraft().then(saved => {
+    const load = readStoredDraft(key).then(saved => {
       current.current = saved;
       setDraft(saved);
       ready.current = true;
@@ -53,7 +54,7 @@ export function useShopDraft() {
     });
     readRequest.current = load;
     return load;
-  }, []);
+  }, [key]);
 
   useEffect(() => { void restoreDraft(); }, [restoreDraft]);
 
@@ -67,12 +68,12 @@ export function useShopDraft() {
     }
     const write = writeQueue.current.then(async () => {
       const localeChanged = pendingLanguage.current === next.locale;
-      await writeStoredDraft(next, localeChanged);
+      await writeStoredDraft(key, next, localeChanged);
       if (localeChanged && pendingLanguage.current === next.locale) pendingLanguage.current = null;
     });
     writeQueue.current = write.then(() => finishSave(null), () => finishSave('write'));
     return write;
-  }, []);
+  }, [key]);
 
   const retryDraftStorage = useCallback(async () => {
     if (!ready.current) return restoreDraft();

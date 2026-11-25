@@ -2,8 +2,8 @@ import { deepEqual, equal, ok, rejects } from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { createDemoApi, DEMO_PHONE } from '../domain/demo-api';
-import type { CartLine } from '../domain/types';
-import { CHECKOUT_JOURNAL_KEY, CheckoutController } from './controller';
+import { ApiError, type CartLine, type OrderInput } from '../domain/types';
+import { CHECKOUT_JOURNAL_KEY, CheckoutController, type CheckoutContact } from './controller';
 
 const line: CartLine = { sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: 9200 };
 
@@ -32,6 +32,7 @@ function fixture() {
   });
 
   const restart = (allowMissingDemoOrders = true, recoverFromLedger = false) => new CheckoutController({
+    demoContact: { phone: DEMO_PHONE },
     allowMissingDemoOrders,
     listDemoOrderRefs: recoverFromLedger ? api.listDemoOrderRefs : undefined,
     api: {
@@ -136,6 +137,33 @@ test('a lost payment response recovers the existing attempt and prevents another
   equal(next.paymentAttempt?.id, existing.paymentAttempt?.id);
   deepEqual(f.paymentCalls, ['key-2']);
   deepEqual(f.orderCalls, ['key-1']);
+});
+
+test('a cancelled hold lets a guest start a separate order while the old payment is still checked', async () => {
+  const f = fixture();
+  f.dropPaymentResponse();
+  await rejects(f.restart().begin(await f.quote(), 'first-cart'), /Payment response lost/);
+  const originalId = f.savedJournal().active.orderId;
+  const original = await f.api.getOrder(originalId);
+  f.setTime('2026-11-25T10:11:00Z');
+
+  const controller = f.restart();
+  const expired = await controller.resume();
+  equal(expired.id, originalId);
+  equal(expired.status, 'cancelled');
+  equal(expired.paymentStatus, 'processing');
+  equal(controller.snapshot.active?.phase, 'tracking');
+  deepEqual(f.paymentCalls, ['key-2']);
+
+  const replacement = await controller.begin(await f.quote(), 'second-cart');
+  equal(replacement.id === originalId, false);
+  equal(replacement.paymentStatus, 'processing');
+  deepEqual(controller.snapshot.orderIds, [replacement.id, originalId]);
+  deepEqual(f.orderCalls, ['key-1', 'key-3']);
+  deepEqual(f.paymentCalls, ['key-2', 'key-4']);
+  const unchanged = await f.api.getOrder(originalId);
+  equal(unchanged.paymentAttempt?.id, original.paymentAttempt?.id);
+  equal(unchanged.reservationExpiresAt, original.reservationExpiresAt);
 });
 
 test('a terminal payment can be reconciled after restart and the next order can start', async () => {
@@ -310,4 +338,95 @@ test('explicit retry reconciles a decline after a lost response and starts exact
   equal(retried.paymentStatus, 'processing');
   ok(retried.paymentAttempt?.id !== saved.paymentAttempt.id);
   deepEqual(f.paymentCalls, ['key-2', 'key-2', 'key-3']);
+});
+
+const connectedContact: CheckoutContact = { phone: '+12025550100', email: 'guest@example.invalid' };
+
+function connectedFixture(failCreate: 'before_commit' | 'after_commit') {
+  const { api, quote } = fixture();
+  const merchantJournalKey = 'checkout.connected.test';
+  const oldDemoState = JSON.stringify({ version: 1, orderIds: ['demo-previous-order'], active: null });
+  const journal = new Map([[CHECKOUT_JOURNAL_KEY, oldDemoState]]);
+  const serverOrders = new Map<string, string>();
+  const createCalls: { key: string; input: OrderInput }[] = [];
+  const recoveryKeys: string[] = [];
+  let key = 0;
+  let recoveryDenied = false;
+
+  const restart = () => new CheckoutController({
+    storageKey: merchantJournalKey,
+    storage: {
+      async getItem(name) { return journal.get(name) ?? null; },
+      async setItem(name, value) { journal.set(name, value); },
+    },
+    api: {
+      async createOrder(input, orderKey) {
+        createCalls.push({ key: orderKey, input });
+        if (createCalls.length === 1 && failCreate === 'before_commit') throw new ApiError('network_unavailable');
+        // The in-memory fixture stands in for an authorized server with a separate demo contact policy.
+        const committed = await api.createOrder({ quoteId: input.quoteId, phone: DEMO_PHONE }, orderKey);
+        serverOrders.set(orderKey, committed.id);
+        if (createCalls.length === 1 && failCreate === 'after_commit') throw new ApiError('network_unavailable');
+        return committed;
+      },
+      async recoverOrder(orderKey) {
+        recoveryKeys.push(orderKey);
+        if (recoveryDenied) throw new ApiError('unauthenticated');
+        const orderId = serverOrders.get(orderKey);
+        return orderId ? api.getOrder(orderId) : null;
+      },
+      getOrder: api.getOrder,
+      startPayment: api.startPayment,
+    },
+    newKey: () => `connected-key-${++key}`,
+    onOrderCreated: async () => {},
+  });
+
+  return {
+    quote, restart, createCalls, recoveryKeys, journal, merchantJournalKey, oldDemoState,
+    denyRecovery: () => { recoveryDenied = true; },
+  };
+}
+
+test('connected checkout recovers a committed order by key without persisting or resending guest contact', async () => {
+  const f = connectedFixture('after_commit');
+  await rejects(f.restart().begin(await f.quote(), 'cart', connectedContact), { code: 'network_unavailable' });
+  const saved = f.journal.get(f.merchantJournalKey);
+  ok(saved);
+  equal(saved.includes(connectedContact.phone), false);
+  ok(connectedContact.email);
+  equal(saved.includes(connectedContact.email), false);
+
+  const recovered = await f.restart().resume();
+  equal(recovered.paymentStatus, 'processing');
+  deepEqual(f.recoveryKeys, ['connected-key-1']);
+  equal(f.createCalls.length, 1);
+  equal(f.createCalls[0]?.input.email, connectedContact.email);
+  equal(f.journal.get(CHECKOUT_JOURNAL_KEY), f.oldDemoState);
+});
+
+test('an uncommitted connected checkout asks for contact again and reuses the confirmed request key', async () => {
+  const f = connectedFixture('before_commit');
+  await rejects(f.restart().begin(await f.quote(), 'cart', connectedContact), { code: 'network_unavailable' });
+
+  const restored = f.restart();
+  await rejects(restored.resume(), { code: 'contact_required' });
+  equal(f.createCalls.length, 1);
+  equal(restored.snapshot.active?.phase, 'creating');
+
+  const resumed = await restored.resume(false, connectedContact);
+  equal(resumed.paymentStatus, 'processing');
+  deepEqual(f.createCalls[0], f.createCalls[1]);
+  deepEqual(f.recoveryKeys, ['connected-key-1', 'connected-key-1']);
+});
+
+test('unauthorized connected recovery preserves the pending journal without posting another order', async () => {
+  const f = connectedFixture('after_commit');
+  await rejects(f.restart().begin(await f.quote(), 'cart', connectedContact), { code: 'network_unavailable' });
+  const saved = f.journal.get(f.merchantJournalKey);
+  f.denyRecovery();
+
+  await rejects(f.restart().resume(false, connectedContact), { code: 'unauthenticated' });
+  equal(f.createCalls.length, 1);
+  equal(f.journal.get(f.merchantJournalKey), saved);
 });

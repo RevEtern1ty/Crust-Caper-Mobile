@@ -18,6 +18,7 @@ export type Product = {
   price: number
   available: boolean
   modifiers: Modifier[]
+  photoUrl?: string
 }
 
 export type Store = {
@@ -71,6 +72,8 @@ export type Quote = {
   currency: 'RWF'
   expiresAt: string
   changes: QuoteChange[]
+  pickupStartsAt?: string
+  pickupEndsAt?: string
 }
 
 export type PaymentStatus =
@@ -118,7 +121,7 @@ export type Order = {
 }
 
 export type QuoteInput = { storeId: string; slotId: string; lines: CartLine[] }
-export type OrderInput = { quoteId: string; phone: string }
+export type OrderInput = { quoteId: string; phone: string; email?: string }
 export type ReorderResult = { lines: CartLine[]; changes: QuoteChange[] }
 
 export type ApiErrorCode =
@@ -131,6 +134,10 @@ export type ApiErrorCode =
   | 'reservation_expired'
   | 'payment_pending'
   | 'storage_unavailable'
+  | 'unauthenticated'
+  | 'network_unavailable'
+  | 'invalid_response'
+  | 'service_unavailable'
 
 export class ApiError extends Error {
   readonly code: ApiErrorCode
@@ -146,6 +153,7 @@ export interface ShopApi {
   getMenu(): Promise<Menu>
   createQuote(input: QuoteInput): Promise<Quote>
   createOrder(input: OrderInput, key: string): Promise<Order>
+  recoverOrder?(key: string): Promise<Order | null>
   startPayment(orderId: string, key: string): Promise<PaymentAttempt>
   getOrder(orderId: string): Promise<Order>
   reorder(orderId: string): Promise<ReorderResult>

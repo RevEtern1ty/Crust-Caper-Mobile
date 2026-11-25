@@ -11,7 +11,7 @@ import { copy } from '../src/ui/format';
 export const unstable_settings = { anchor: '(tabs)' };
 
 function Routes() {
-  const { locale } = useShop();
+  const { locale, mode } = useShop();
   useEffect(() => {
     if (Platform.OS === 'web' && typeof document !== 'undefined') {
       document.documentElement.lang = locale;
@@ -31,7 +31,9 @@ function Routes() {
       <Stack.Screen name="product/[sku]" options={{ title: copy(locale, 'Menu item', 'Ifunguro') }} />
       <Stack.Screen name="cart" options={{ title: copy(locale, 'Your cart', 'Igitebo cyawe') }} />
       <Stack.Screen name="checkout" options={{ title: copy(locale, 'Checkout', 'Kwemeza komande') }} />
-      <Stack.Screen name="payment" options={{ title: copy(locale, 'Test payment', 'Kwishyura by’igerageza') }} />
+      <Stack.Screen name="payment" options={{ title: mode === 'demo'
+        ? copy(locale, 'Test payment', 'Kwishyura by’igerageza') : copy(locale, 'Payment', 'Kwishyura') }} />
+      <Stack.Screen name="payment-return" options={{ headerShown: false }} />
       <Stack.Screen name="settings" options={{ title: copy(locale, 'Settings', 'Amagenamiterere') }} />
     </Stack>
   );

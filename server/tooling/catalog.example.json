@@ -1,0 +1,39 @@
+{
+  "expectedVersion": null,
+  "store": {
+    "id": "kigali",
+    "name": { "en": "CrustCaper Kigali", "rw": "CrustCaper Kigali" },
+    "area": { "en": "Example pickup address", "rw": "Aderesi y’icyitegererezo" },
+    "hours": { "en": "Example hours", "rw": "Amasaha y’icyitegererezo" },
+    "open": false,
+    "taxBasisPoints": 1800,
+    "version": "catalog-001"
+  },
+  "products": [
+    {
+      "sku": "double-smash",
+      "name": { "en": "Double Smash", "rw": "Double Smash" },
+      "description": { "en": "Example description", "rw": "Ibisobanuro by’icyitegererezo" },
+      "ingredients": [{ "en": "Example ingredient", "rw": "Ikigize ifunguro cy’icyitegererezo" }],
+      "allergens": [{ "en": "Wheat", "rw": "Ingano" }],
+      "category": "burgers",
+      "price": 9200,
+      "available": false,
+      "modifiers": [
+        {
+          "id": "extra-cheese",
+          "name": { "en": "Extra cheese", "rw": "Foromaje y’inyongera" },
+          "price": 500
+        }
+      ]
+    }
+  ],
+  "slots": [
+    {
+      "id": "kigali-example-window",
+      "startsAt": "2027-01-15T12:00:00+02:00",
+      "endsAt": "2027-01-15T12:10:00+02:00",
+      "capacity": 4
+    }
+  ]
+}

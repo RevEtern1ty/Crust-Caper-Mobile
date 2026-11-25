@@ -10,7 +10,9 @@ const photos: Record<string, ImageSourcePropType> = {
   'soft-drink': require('../../assets/menu/soft-drink.jpg'),
 };
 
-export function menuPhoto(sku: string) {
+export function menuPhoto(sku: string, fixturePhotos: boolean, photoUrl?: string): ImageSourcePropType | undefined {
+  if (photoUrl) return { uri: photoUrl };
+  if (!fixturePhotos) return undefined;
   const featuredSku = sku === 'double-combo' ? 'double-smash' : sku === 'lunch-smash' ? 'classic-smash' : sku;
   return photos[featuredSku];
 }

@@ -1,0 +1,221 @@
+\set ON_ERROR_STOP on
+\if :{?catalog_database}
+\else
+    \set catalog_database ''
+\endif
+\if :{?catalog_apply}
+\else
+    \set catalog_apply false
+\endif
+
+SELECT current_database() = :'catalog_database' AS catalog_target_matches \gset
+\if :catalog_target_matches
+\else
+    DO $$ BEGIN RAISE EXCEPTION 'Set catalog_database to the exact target database name'; END $$;
+\endif
+
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SET LOCAL search_path = pg_catalog, pg_temp;
+SET LOCAL lock_timeout = '10s';
+SET LOCAL statement_timeout = '90s';
+SET LOCAL TIME ZONE 'UTC';
+
+CREATE TEMP TABLE catalog_input (encoded text NOT NULL) ON COMMIT DROP;
+\copy pg_temp.catalog_input (encoded) FROM PSTDIN
+
+CREATE FUNCTION pg_temp.catalog_assert(ok boolean, message text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    IF ok IS DISTINCT FROM true THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = message;
+    END IF;
+END
+$$;
+
+CREATE FUNCTION pg_temp.catalog_fields(value jsonb, required text[], optional text[] DEFAULT '{}')
+RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    IF jsonb_typeof(value) IS DISTINCT FROM 'object' THEN RETURN false; END IF;
+    RETURN value ?& required
+        AND NOT EXISTS (SELECT FROM jsonb_object_keys(value) AS key WHERE key <> ALL(required || optional));
+END
+$$;
+
+CREATE FUNCTION pg_temp.catalog_text(value jsonb, max_chars integer) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT jsonb_typeof(value) = 'string' AND length(btrim(value #>> '{}')) > 0
+        AND length(value #>> '{}') <= max_chars
+$$;
+
+CREATE FUNCTION pg_temp.catalog_id(value jsonb) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+    SELECT jsonb_typeof(value) = 'string' AND (value #>> '{}') ~ '^[A-Za-z0-9._:-]{1,100}$'
+$$;
+
+CREATE FUNCTION pg_temp.catalog_localized(value jsonb) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+    SELECT pg_temp.catalog_fields(value, ARRAY['en','rw'])
+        AND pg_temp.catalog_text(value->'en', 4096) AND pg_temp.catalog_text(value->'rw', 4096)
+$$;
+
+CREATE FUNCTION pg_temp.catalog_number(value jsonb, ceiling bigint) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    number numeric;
+BEGIN
+    IF jsonb_typeof(value) IS DISTINCT FROM 'number' THEN RETURN false; END IF;
+    number := (value #>> '{}')::numeric;
+    RETURN number BETWEEN 0 AND ceiling AND trunc(number) = number;
+END
+$$;
+
+CREATE FUNCTION pg_temp.catalog_url(value jsonb) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+    SELECT value IS NULL OR (pg_temp.catalog_text(value, 2048)
+        AND strpos(value #>> '{}', chr(92)) = 0
+        AND (value #>> '{}') ~ '^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:443)?([/?#][^[:space:][:cntrl:]]*)?$')
+$$;
+
+CREATE FUNCTION pg_temp.catalog_timestamp(value jsonb) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+    SELECT jsonb_typeof(value) = 'string'
+        AND (value #>> '{}') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$'
+$$;
+
+DO $import$
+DECLARE
+    source text;
+    payload jsonb;
+    location jsonb;
+    product jsonb;
+    option jsonb;
+    slot jsonb;
+    target_store_id text;
+    current_version text;
+    expected_version text;
+    target_slot_id text;
+    old_start timestamptz;
+    old_end timestamptz;
+    occupied bigint;
+    unit_max numeric;
+BEGIN
+    PERFORM pg_temp.catalog_assert((SELECT count(*) = 1 FROM pg_temp.catalog_input), 'Supply exactly one UTF-8 JSON document');
+    SELECT encoded INTO source FROM pg_temp.catalog_input;
+    PERFORM pg_temp.catalog_assert(length(source) <= 11 * 1024 * 1024, 'Catalog document is too large');
+    source := convert_from(decode(source, 'base64'), 'UTF8');
+    PERFORM pg_temp.catalog_assert(source IS JSON OBJECT WITH UNIQUE KEYS, 'Catalog must be a JSON object with unique keys');
+    payload := source::jsonb;
+    PERFORM pg_temp.catalog_assert(pg_temp.catalog_fields(payload, ARRAY['expectedVersion','store','products','slots']),
+        'Catalog must contain expectedVersion, store, products and slots');
+    location := payload->'store';
+    PERFORM pg_temp.catalog_assert(pg_temp.catalog_fields(location,
+        ARRAY['id','name','area','hours','open','taxBasisPoints','version'], ARRAY['supportUrl','directionsUrl'])
+        AND jsonb_typeof(location->'id') = 'string' AND (location->>'id') ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+        AND pg_temp.catalog_id(location->'version')
+        AND pg_temp.catalog_localized(location->'name') AND pg_temp.catalog_localized(location->'area')
+        AND pg_temp.catalog_localized(location->'hours') AND jsonb_typeof(location->'open') = 'boolean'
+        AND pg_temp.catalog_number(location->'taxBasisPoints', 10000)
+        AND pg_temp.catalog_url(location->'supportUrl') AND pg_temp.catalog_url(location->'directionsUrl'),
+        'Store contains invalid or missing fields');
+    PERFORM pg_temp.catalog_assert(payload->'expectedVersion' = 'null'::jsonb OR pg_temp.catalog_id(payload->'expectedVersion'),
+        'expectedVersion must be an existing version or null for a new store');
+    PERFORM pg_temp.catalog_assert(jsonb_typeof(payload->'products') = 'array' AND jsonb_typeof(payload->'slots') = 'array',
+        'products and slots must be arrays');
+
+    FOR product IN SELECT value FROM jsonb_array_elements(payload->'products') LOOP
+        PERFORM pg_temp.catalog_assert(pg_temp.catalog_fields(product,
+            ARRAY['sku','name','description','ingredients','allergens','category','price','available','modifiers'], ARRAY['photoUrl'])
+            AND pg_temp.catalog_id(product->'sku') AND pg_temp.catalog_localized(product->'name')
+            AND pg_temp.catalog_localized(product->'description')
+            AND product->>'category' IN ('burgers','combos','sides','drinks')
+            AND pg_temp.catalog_number(product->'price', 1000000000)
+            AND jsonb_typeof(product->'available') = 'boolean'
+            AND jsonb_typeof(product->'ingredients') = 'array' AND jsonb_typeof(product->'allergens') = 'array'
+            AND jsonb_typeof(product->'modifiers') = 'array' AND pg_temp.catalog_url(product->'photoUrl'),
+            'Product contains invalid or missing fields');
+        PERFORM pg_temp.catalog_assert(NOT EXISTS (
+            SELECT FROM jsonb_array_elements((product->'ingredients') || (product->'allergens')) AS element(value)
+            WHERE pg_temp.catalog_localized(element.value) IS DISTINCT FROM true
+        ), 'Ingredients and allergens must contain EN and RW text');
+        unit_max := (product->>'price')::numeric;
+        FOR option IN SELECT value FROM jsonb_array_elements(product->'modifiers') LOOP
+            PERFORM pg_temp.catalog_assert(pg_temp.catalog_fields(option, ARRAY['id','name','price'])
+                AND pg_temp.catalog_id(option->'id') AND pg_temp.catalog_localized(option->'name')
+                AND pg_temp.catalog_number(option->'price', 1000000000), 'Modifier contains invalid or missing fields');
+            unit_max := unit_max + (option->>'price')::numeric;
+        END LOOP;
+        PERFORM pg_temp.catalog_assert(unit_max <= 1000000000 AND jsonb_array_length(product->'modifiers') <= 25,
+            'Product exceeds supported price or modifier limit');
+        PERFORM pg_temp.catalog_assert(NOT EXISTS (
+            SELECT FROM jsonb_array_elements(product->'modifiers') GROUP BY value->>'id' HAVING count(*) > 1
+        ), 'Duplicate modifier ID on a product');
+    END LOOP;
+    PERFORM pg_temp.catalog_assert(NOT EXISTS (
+        SELECT FROM jsonb_array_elements(payload->'products') GROUP BY value->>'sku' HAVING count(*) > 1
+    ), 'Duplicate product SKU');
+
+    FOR slot IN SELECT value FROM jsonb_array_elements(payload->'slots') LOOP
+        PERFORM pg_temp.catalog_assert(pg_temp.catalog_fields(slot, ARRAY['id','startsAt','endsAt','capacity'])
+            AND pg_temp.catalog_id(slot->'id') AND pg_temp.catalog_number(slot->'capacity', 2147483647)
+            AND pg_temp.catalog_timestamp(slot->'startsAt') AND pg_temp.catalog_timestamp(slot->'endsAt'),
+            'Slot contains invalid or missing fields');
+        PERFORM pg_temp.catalog_assert((slot->>'endsAt')::timestamptz > (slot->>'startsAt')::timestamptz,
+            'Slot must end after it begins');
+    END LOOP;
+    PERFORM pg_temp.catalog_assert(NOT EXISTS (
+        SELECT FROM jsonb_array_elements(payload->'slots') GROUP BY value->>'id' HAVING count(*) > 1
+    ), 'Duplicate slot ID');
+
+    target_store_id := location->>'id';
+    expected_version := payload->>'expectedVersion';
+    -- Store row lock coordinates with order creation. The advisory lock covers first creation by two imports.
+    PERFORM pg_advisory_xact_lock(hashtextextended('crustcaper:catalog:' || target_store_id, 0));
+    SELECT saved.version INTO current_version FROM public.stores saved WHERE saved.id = target_store_id FOR UPDATE;
+    PERFORM pg_temp.catalog_assert(current_version IS NOT DISTINCT FROM expected_version,
+        'Catalog version conflict. Read the current store version and review stale changes');
+    PERFORM pg_temp.catalog_assert(current_version IS DISTINCT FROM (location->>'version'),
+        'Choose a new catalog version');
+
+    FOR slot IN SELECT value FROM jsonb_array_elements(payload->'slots') ORDER BY value->>'id' LOOP
+        target_slot_id := slot->>'id';
+        SELECT saved.starts_at, saved.ends_at INTO old_start, old_end FROM public.pickup_slots saved
+        WHERE saved.store_id = target_store_id AND saved.id = target_slot_id FOR UPDATE;
+        IF FOUND THEN
+            -- Payment capture holds the same slot lock. Evaluate live holds after acquiring the lock.
+            SELECT count(*) INTO occupied FROM public.orders saved
+            WHERE saved.store_id = target_store_id AND saved.slot_id = target_slot_id AND saved.status <> 'cancelled'
+                AND (saved.status <> 'awaiting_payment' OR saved.reservation_expires_at > clock_timestamp());
+            PERFORM pg_temp.catalog_assert((slot->>'capacity')::numeric >= occupied,
+                format('Slot %s capacity is below the occupied places', target_slot_id));
+            PERFORM pg_temp.catalog_assert(occupied = 0 OR (
+                old_start = (slot->>'startsAt')::timestamptz AND old_end = (slot->>'endsAt')::timestamptz),
+                format('Slot %s has occupied places. Use a new ID for a new time window', target_slot_id));
+        END IF;
+    END LOOP;
+
+    INSERT INTO public.stores (id, name, area, hours, open, tax_basis_points, version, updated_at, support_url, directions_url)
+    VALUES (target_store_id, location->'name', location->'area', location->'hours', (location->>'open')::boolean,
+        (location->>'taxBasisPoints')::numeric::integer, location->>'version', clock_timestamp(), location->>'supportUrl', location->>'directionsUrl')
+    ON CONFLICT (id) DO UPDATE SET name = excluded.name, area = excluded.area, hours = excluded.hours,
+        open = excluded.open, tax_basis_points = excluded.tax_basis_points, version = excluded.version,
+        updated_at = excluded.updated_at, support_url = excluded.support_url, directions_url = excluded.directions_url;
+
+    INSERT INTO public.menu_products (store_id, sku, position, product)
+    SELECT target_store_id, entry.value->>'sku', entry.position::integer, entry.value
+    FROM jsonb_array_elements(payload->'products') WITH ORDINALITY AS entry(value, position)
+    ON CONFLICT ON CONSTRAINT menu_products_pkey DO UPDATE
+        SET position = excluded.position, product = excluded.product;
+
+    INSERT INTO public.pickup_slots (store_id, id, starts_at, ends_at, capacity)
+    SELECT target_store_id, entry.value->>'id', (entry.value->>'startsAt')::timestamptz,
+        (entry.value->>'endsAt')::timestamptz, (entry.value->>'capacity')::numeric::integer
+    FROM jsonb_array_elements(payload->'slots') AS entry(value)
+    ON CONFLICT ON CONSTRAINT pickup_slots_pkey DO UPDATE
+        SET starts_at = excluded.starts_at, ends_at = excluded.ends_at, capacity = excluded.capacity;
+
+    RAISE NOTICE 'Validated store % version % with % product rows and % slot rows', target_store_id, location->>'version',
+        jsonb_array_length(payload->'products'), jsonb_array_length(payload->'slots');
+END
+$import$;
+
+\if :catalog_apply
+    COMMIT;
+\else
+    ROLLBACK;
+    \echo Dry run only. Use -v catalog_apply=true to persist a reviewed import.
+\endif

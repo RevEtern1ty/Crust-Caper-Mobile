@@ -1,5 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import Constants from 'expo-constants';
 import { randomUUID } from 'expo-crypto';
+import { fetch as expoFetch } from 'expo/fetch';
 import {
   createContext, useCallback, useContext, useEffect, useRef, useState,
 } from 'react';
@@ -7,14 +9,24 @@ import type { PropsWithChildren } from 'react';
 import { AppState, Platform } from 'react-native';
 import { CHECKOUT_JOURNAL_KEY } from '../checkout/controller';
 import { createDemoApi } from '../domain/demo-api';
-import type { CartLine, Locale, Menu } from '../domain/types';
+import type { CartLine, DemoApi, Locale, Menu, ShopApi } from '../domain/types';
+import { createLiveApi, type ConnectedConfig, type LiveShopApi } from '../live/http-api';
 import { MAX_QUANTITY, type Draft } from './draft-storage';
 import { privateStorage } from './private-storage';
 import { useShopDraft } from './use-shop-draft';
 
 export { MAX_QUANTITY } from './draft-storage';
 
-const MENU_KEY = 'crustcaper.menu.v1';
+const settings = Constants.expoConfig?.extra?.restaurant as ConnectedConfig | { profile: 'demo' } | undefined;
+if (!settings || !['demo', 'local', 'stage', 'production'].includes(settings.profile)) {
+  throw new Error('CrustCaper runtime profile is missing.');
+}
+const connected = settings.profile !== 'demo' ? settings : null;
+const runtimeScope = connected ? [
+  connected.profile, new URL(connected.apiBaseUrl).hostname, new URL(connected.apiBaseUrl).port || '443', connected.storeId,
+].join('.') : null;
+const checkoutStorageKey = runtimeScope ? CHECKOUT_JOURNAL_KEY + '.' + runtimeScope : CHECKOUT_JOURNAL_KEY;
+const menuKey = runtimeScope ? 'crustcaper.menu.v1.' + runtimeScope : 'crustcaper.menu.v1';
 const demoStorage = Platform.OS === 'web' ? {
   async getItem(key: string) {
     const saved = await privateStorage.getItem(key);
@@ -27,7 +39,15 @@ const demoStorage = Platform.OS === 'web' ? {
   },
   setItem: privateStorage.setItem,
 } : AsyncStorage;
-const api = createDemoApi({ storage: demoStorage, newId: randomUUID });
+const demoApi = connected ? null : createDemoApi({ storage: demoStorage, newId: randomUUID });
+const liveApi = connected ? createLiveApi({
+  config: connected,
+  storage: privateStorage,
+  journalKey: checkoutStorageKey,
+  // The React Native XHR-backed fetch does not enforce RequestInit.redirect.
+  fetcher: Platform.OS === 'web' ? undefined : expoFetch,
+}) : null;
+const api: ShopApi = liveApi ?? demoApi!;
 
 type MenuStatus = 'loading' | 'ready' | 'stale' | 'unavailable';
 
@@ -64,7 +84,13 @@ export function lineKey(line: Pick<CartLine, 'sku' | 'modifierIds'>) {
 }
 
 type Shop = Draft & {
-  api: ReturnType<typeof createDemoApi>;
+  mode: 'demo' | 'connected';
+  api: ShopApi;
+  demoApi: DemoApi | null;
+  settleLocalTestPayment: LiveShopApi['settleLocalTestPayment'];
+  checkoutStorageKey: string;
+  checkoutAllowed: boolean;
+  fixturePhotos: boolean;
   menu: Menu | null;
   status: MenuStatus;
   refreshing: boolean;
@@ -86,7 +112,7 @@ type Shop = Draft & {
 const ShopContext = createContext<Shop | null>(null);
 
 export function ShopProvider({ children }: PropsWithChildren) {
-  const { draft, hydrated, draftSaving, draftStorageError, retryDraftStorage, updateDraft } = useShopDraft();
+  const { draft, hydrated, draftSaving, draftStorageError, retryDraftStorage, updateDraft } = useShopDraft(runtimeScope);
   const [menu, setMenu] = useState<Menu | null>(null);
   const [status, setStatus] = useState<MenuStatus>('loading');
   const [refreshing, setRefreshing] = useState(false);
@@ -100,7 +126,7 @@ export function ShopProvider({ children }: PropsWithChildren) {
       cachedMenu.current = next;
       setMenu(next);
       setStatus(next.orderingUnavailable ? 'stale' : 'ready');
-      return AsyncStorage.setItem(MENU_KEY, JSON.stringify(next)).catch(() => undefined);
+      return AsyncStorage.setItem(menuKey, JSON.stringify(next)).catch(() => undefined);
     }, () => {
       setStatus(cachedMenu.current ? 'stale' : 'unavailable');
     }).finally(() => {
@@ -113,7 +139,7 @@ export function ShopProvider({ children }: PropsWithChildren) {
 
   useEffect(() => {
     let active = true;
-    void AsyncStorage.getItem(MENU_KEY).catch(() => null).then(rawMenu => {
+    void AsyncStorage.getItem(menuKey).catch(() => null).then(rawMenu => {
       if (!active) return;
       const cached = readMenu(rawMenu);
       if (cached && !cachedMenu.current) {
@@ -175,7 +201,11 @@ export function ShopProvider({ children }: PropsWithChildren) {
   const count = draft.cart.reduce((sum, line) => sum + line.quantity, 0);
   return (
     <ShopContext.Provider value={{
-      ...draft, api, menu, status, refreshing, hydrated, draftSaving, draftStorageError, retryDraftStorage, total, count,
+      ...draft, api, demoApi, settleLocalTestPayment: liveApi?.settleLocalTestPayment,
+      checkoutStorageKey, mode: connected ? 'connected' : 'demo',
+      checkoutAllowed: !connected || connected.profile === 'local' || Platform.OS !== 'web',
+      fixturePhotos: !connected || connected.profile === 'local',
+      menu, status, refreshing, hydrated, draftSaving, draftStorageError, retryDraftStorage, total, count,
       setLocale, addLine, changeQuantity, editLine, replaceCart, clearCart, refreshMenu,
     }}>
       {children}

@@ -33,7 +33,7 @@ Open the address printed in the terminal. Dependency installation requires inter
 
 ## How it was verified
 
-The [recorded CI run](https://github.com/RevEtern1ty/Crust-Caper-Mobile/actions/runs/45683569383) passed lint, type checks, domain tests, browser checkout scenarios and dependency auditing. It built the Android demo APK and installed and launched the iOS demo on an iPhone 17 simulator running iOS 26.5. The Android checkout and recovery were also exercised on an Android 9 emulator. The iOS configuration targets iOS 16 and newer. The simulator check covers launch, and physical iPhone distribution is outside this demo.
+The [recorded CI run](https://github.com/RevEtern1ty/Crust-Caper-Mobile/actions/runs/45699550622) passed lint, type checks, domain tests, browser checkout scenarios and dependency auditing. It built the Android demo APK and installed and launched the iOS demo on an iPhone 17 simulator running iOS 26.5. The Android checkout and recovery were also exercised on an Android 9 emulator. The iOS configuration targets iOS 16 and newer. The simulator check covers launch, and physical iPhone distribution is outside this demo.
 
 ```sh
 npm run check
@@ -42,3 +42,7 @@ npm run test:web
 ```
 
 The browser tests use Chrome. See the [architecture](docs/architecture/MOBILE.md), [API contract](contracts/) and [release checks](docs/runbooks/MOBILE_RELEASE.md) for implementation and verification details.
+
+## Connected release candidate
+
+The mobile client and operator console share the [Spring Boot API](server/README.md). The `local` build profile connects to localhost and can be exercised end-to-end against PostgreSQL without charging a customer. The `stage` and `production` builds take their catalog, amount and payment status from the configured HTTPS API. See the [connected release procedure](docs/runbooks/CONNECTED_RELEASE.md).

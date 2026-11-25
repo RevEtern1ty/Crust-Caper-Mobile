@@ -1,0 +1,33 @@
+# Платежи CrustCaper через Flutterwave
+
+Сервер использует Flutterwave Standard V3 для оплаты заказа на странице провайдера. Сумма берётся из подтверждённого заказа в целых RWF. Flutterwave требует адрес электронной почты покупателя и принимает телефон в международном формате. Реквизиты оплаты остаются на стороне провайдера. [Flutterwave Checkout API](https://developer.flutterwave.com/api/charge/standard)
+
+## Среды и секреты
+
+| Среда | Профиль Spring | `crustcaper.payment.provider` | Режим |
+| --- | --- | --- | --- |
+| Локальная | `local` | `local` | Изолированная симуляция. Провайдер возвращает пустой `checkoutUrl`. Локальный API результата ограничен профилем и владельцем заказа. |
+| Стенд | `stage` | `flutterwave` | Flutterwave Test с отдельными стендовыми адресом возврата, секретами и данными. |
+| Продакшен | `production` или `prod` | `flutterwave` | Flutterwave Live с отдельными адресом возврата, секретами и базой. |
+
+За пределами локального профиля сервер по умолчанию выбирает `flutterwave`. Неизвестный режим или пропущенные настройки Flutterwave останавливают запуск. Локальный адаптер недоступен при активном `stage`, `production` или `prod`. Параметр провайдера можно передать через `CRUSTCAPER_PAYMENT_PROVIDER`.
+
+- `FLUTTERWAVE_SECRET_KEY` поступает через окружение сервера. Для `stage` нужен ключ режима Test. Остальные профили Flutterwave используют ключ Live.
+- `FLUTTERWAVE_WEBHOOK_SECRET` совпадает со случайным секретом webhook в панели соответствующей среды. Секрет состоит из 24–256 печатных ASCII-символов без пробелов.
+- `CRUST_PAYMENT_RETURN_URL` содержит адрес HTTPS для возврата после оплаты без параметров или фрагмента. Сервер добавляет `orderId`, а Flutterwave добавляет параметры результата. Домен и публичный маршрут приложения назначает владелец среды.
+
+Ключи передаются службе через хранилище секретов. В клиентскую сборку и журналы исключаются ключ, заголовок webhook, телефон, email, токен сессии и платёжная ссылка. [Аутентификация Flutterwave](https://developer.flutterwave.com/docs/authentication)
+
+## Открытие и сверка оплаты
+
+1. Сервер сохраняет попытку и сопоставляет её идентификатор с `tx_ref`. После сохранения вызывает `POST /v3/payments` с актуальным итогом, валютой, контактом и сроком брони в `link_expiration`. Ссылка принимается только с HTTPS-хоста `checkout.flutterwave.com` по пути `/v3/hosted/pay/…`.
+2. Сервер получает `POST /api/v1/webhooks/flutterwave` и сравнивает `verif-hash` с секретом Standard V3. Событие даёт идентификатор для `GET /v3/transactions/{id}/verify`. При пропавшем клиентском возврате или webhook сервер может искать транзакцию по сохранённому `tx_ref`. [Webhooks V3](https://developer.flutterwave.com/docs/webhooks) · [Поиск по `tx_ref`](https://developer.flutterwave.com/api/transactions/verify-transaction-with-tx-ref)
+3. Подтверждение заказа использует проверенный статус `successful`, точный `tx_ref`, уникальный идентификатор транзакции провайдера, сумму и валюту. Итог записывается атомарно. Параметры перенаправления сообщают маршрут возврата. Исход показывает только сервер. [Сверка транзакции](https://developer.flutterwave.com/docs/transaction-verification)
+
+Один `failed` от Flutterwave может относиться к попытке внутри ещё открытой hosted-страницы. В течение брони клиент возвращается к существующей ссылке. После неопределённого ответа на `POST /payments` сервер сохраняет исходную попытку для сверки. Доступный статус по `tx_ref` и обработка позднего подтверждения защищают от повторной выдачи. [Повторы и сроки hosted checkout](https://developer.flutterwave.com/docs/collections-inflow/flutterwave-standard) · [Таймауты провайдера](https://developer.flutterwave.com/docs/error-timeouts)
+
+## Проверки
+
+`./gradlew test --tests 'com.crustcaper.api.payment.*'` из `server/` проверяет обмен JSON, время ожидания, отказ от перенаправления HTTP-клиента, разрешённые checkout URL, корректность суммы и сверку идентификаторов на локальном HTTP-стенде. Webhook и переходы заказа проверяются вместе с серверным API.
+
+Для приёмки на стенде владелец настраивает Flutterwave Test, домен возврата и доставку webhook. На конкретном кандидате проверить успешную и отклонённую оплату, повтор в открытой hosted-странице, отсутствие перенаправления, дубли webhook, оплату у конца брони и сверку суммы в RWF. Формат и фактическое время действия `link_expiration`, доступность карт и Mobile Money Rwanda подтвердить на подключённом мерчанте. [Способы оплаты Flutterwave](https://developer.flutterwave.com/docs/payment-methods)

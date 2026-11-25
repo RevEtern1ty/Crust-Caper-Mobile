@@ -59,6 +59,9 @@ export function checkoutError(error: unknown, locale: Locale) {
   if (error instanceof CheckoutError && error.code === 'invalid_journal') {
     return copy(locale, 'The saved order could not be opened.', 'Komande yabitswe ntishobora gufungurwa.');
   }
+  if (error instanceof CheckoutError && error.code === 'contact_required') {
+    return copy(locale, 'Enter the same contact details to resume checkout.', 'Andika nimero na imeyili wakoresheje kugira ngo ukomeze.');
+  }
   if (error instanceof ApiError) {
     switch (error.code) {
       case 'quote_expired':
@@ -67,7 +70,7 @@ export function checkoutError(error: unknown, locale: Locale) {
       case 'slot_unavailable':
         return copy(locale, 'This pickup time is unavailable. Choose a different time.', 'Iki gihe cyo gufata komande ntikiboneka. Hitamo ikindi.');
       case 'invalid_input':
-        return copy(locale, 'Check the demo phone number and the items in your cart.', 'Genzura nimero y’igerageza n’ibiri mu gatebo kawe.');
+        return copy(locale, 'Check your contact details and the items in your cart.', 'Genzura amakuru yawe n’ibiri mu gatebo kawe.');
       case 'reservation_expired':
         return copy(locale, 'Your pickup hold expired. Choose a new time.', 'Igihe cyabikiwe komande cyarangiye. Hitamo ikindi.');
       case 'payment_pending':
@@ -76,6 +79,14 @@ export function checkoutError(error: unknown, locale: Locale) {
         return copy(locale, 'This order is unavailable on this device.', 'Iyi komande ntiboneka kuri iki gikoresho.');
       case 'storage_unavailable':
         return copy(locale, 'Saved checkout data is unavailable. Try again.', 'Amakuru y’ubwishyu yabitswe ntaboneka. Ongera ugerageze.');
+      case 'unauthenticated':
+        return copy(locale, 'We couldn’t verify this order on this device. Try again or contact support.', 'Ntitwashoboye kwemeza iyi komande kuri iki gikoresho. Ongera ugerageze cyangwa usabe ubufasha.');
+      case 'network_unavailable':
+        return copy(locale, 'Unable to connect. Check your connection and try again.', 'Ntitwashoboye guhuza. Genzura interineti wongere ugerageze.');
+      case 'service_unavailable':
+        return copy(locale, 'The order service is temporarily unavailable. Try again shortly.', 'Serivisi ya komande ntiboneka by’akanya gato. Ongera ugerageze nyuma.');
+      case 'invalid_response':
+        return copy(locale, 'We couldn’t verify the latest order status. Check again in Orders.', 'Ntitwashoboye kwemeza uko komande ihagaze. Ongera urebe muri Komande.');
       case 'conflict':
         return copy(locale, 'Your last request is unresolved. Check its status in Orders.', 'Icyifuzo cya nyuma ntikirarangira. Reba uko gihagaze muri Komande.');
     }

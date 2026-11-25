@@ -1,0 +1,415 @@
+package com.crustcaper.api;
+
+import static com.crustcaper.api.ApiModels.*;
+import static com.crustcaper.api.Catalog.dbTime;
+import static com.crustcaper.api.Catalog.readTime;
+
+import com.crustcaper.api.payment.PaymentGateway;
+import com.crustcaper.api.payment.PaymentGateway.PaymentRequest;
+import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
+import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
+import com.crustcaper.api.payment.PaymentGatewayException;
+import tools.jackson.core.type.TypeReference;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.temporal.ChronoUnit;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.UUID;
+import java.security.SecureRandom;
+import java.util.regex.Pattern;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
+
+@Service
+public class OrderService {
+    private static final Pattern KEY = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
+    private static final Pattern CATALOG_ID = Pattern.compile("[A-Za-z0-9._:-]{1,100}");
+    private static final Pattern PHONE = Pattern.compile("\\+[1-9][0-9]{7,14}");
+    private static final Pattern EMAIL = Pattern.compile("[^\\s@]+@[^\\s@]+\\.[^\\s@]+");
+    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final TypeReference<List<CartLine>> CART_LINES = new TypeReference<>() {};
+    private static final String ORDER = "SELECT * FROM orders WHERE id = ?";
+    private static final String LATEST_ATTEMPT = """
+        SELECT * FROM payment_attempts WHERE order_id = ? ORDER BY sequence DESC LIMIT 1
+        """;
+    private static final long MAX_PRICE = 1_000_000_000L;
+
+    private final JdbcClient jdbc;
+    private final Catalog catalog;
+    private final CommerceJson json;
+    private final PaymentGateway gateway;
+    private final TransactionTemplate transactions;
+    private final boolean localPayments;
+
+    private record StoredQuote(
+        UUID id, String storeId, String slotId, Instant startsAt, Instant endsAt, List<CartLine> lines,
+        long total, long tax, Instant expiresAt
+    ) {}
+
+    private record StoredOrder(
+        UUID id, UUID quoteId, UUID owner, String storeId, String slotId, String phone, String email,
+        List<CartLine> lines, long total, long tax, String status, String paymentStatus, String pickupCode,
+        String receiptStatus, String receiptUrl, Instant createdAt, Instant reservationExpiresAt,
+        Instant startsAt, Instant endsAt
+    ) {}
+
+    private record Attempt(UUID id, UUID orderId, String status, String checkoutUrl, String providerTransactionId) {
+        PaymentAttempt view() {
+            return new PaymentAttempt(id, status, checkoutUrl);
+        }
+    }
+
+    private record PaymentStart(Attempt attempt, StoredOrder order, boolean openGateway) {}
+
+    OrderService(JdbcClient jdbc, Catalog catalog, CommerceJson json, PaymentGateway gateway,
+                 TransactionTemplate transactions, @Value("${crustcaper.payment.provider}") String provider) {
+        this.jdbc = jdbc;
+        this.catalog = catalog;
+        this.json = json;
+        this.gateway = gateway;
+        this.transactions = transactions;
+        this.localPayments = provider.equals("local");
+    }
+
+    @Transactional
+    public Quote createQuote(UUID guest, QuoteInput input) {
+        validateQuote(input);
+        Instant now = databaseNow();
+        Catalog.StoreData store = catalog.store(input.storeId(), false);
+        Catalog.SlotData slot = catalog.slot(input.storeId(), input.slotId(), false);
+        if (!catalog.available(store.store(), slot, now)) throw ApiFailure.conflict("slot_unavailable");
+        Reorder current = Catalog.reconcile(input.lines(), catalog.products(input.storeId(), false));
+        long total = total(current.lines());
+        requireSupportedTotal(total);
+        long divisor = 10_000L + store.taxBasisPoints();
+        long tax = (total * store.taxBasisPoints() + divisor / 2) / divisor;
+        Instant expiresAt = earlier(now.plus(5, ChronoUnit.MINUTES), slot.startsAt());
+        UUID id = UUID.randomUUID();
+        jdbc.sql("""
+            INSERT INTO quotes (id, guest_session_id, store_id, slot_id, pickup_starts_at, pickup_ends_at,
+                lines, total, tax, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?)
+            """)
+            .params(id, guest, input.storeId(), slot.id(), dbTime(slot.startsAt()), dbTime(slot.endsAt()),
+                json.write(current.lines()), total, tax, dbTime(expiresAt))
+            .update();
+        return new Quote(id, input.storeId(), slot.id(), current.lines(), total - tax, tax, total, CURRENCY,
+            expiresAt, current.changes(), slot.startsAt(), slot.endsAt());
+    }
+
+    @Transactional
+    public Order createOrder(UUID guest, String key, OrderInput input) {
+        validateKey(key);
+        if (input == null) throw ApiFailure.invalid();
+        UUID quoteId = ApiFailure.uuid(input.quoteId(), ApiFailure.invalid());
+        String phone = input.phone() == null ? "" : input.phone().replaceAll("\\s+", "");
+        String email = input.email() == null || input.email().isBlank() ? null : input.email().strip();
+        if (!PHONE.matcher(phone).matches()
+            || (email == null && !localPayments)
+            || (email != null && (email.length() > 254 || !EMAIL.matcher(email).matches()))) {
+            throw ApiFailure.invalid();
+        }
+
+        // All writes using the same guest idempotency namespace acquire this row before checking the key.
+        jdbc.sql("SELECT id FROM guest_sessions WHERE id = ? AND expires_at > now() FOR UPDATE")
+            .param(guest).query(UUID.class).optional().orElseThrow(ApiFailure::unauthenticated);
+        StoredOrder existing = recoverRecord(guest, key);
+        if (existing != null) {
+            if (!existing.quoteId().equals(quoteId) || !existing.phone().equals(phone)
+                || !Objects.equals(existing.email(), email)) throw ApiFailure.conflict("conflict");
+            return view(existing);
+        }
+        if (jdbc.sql("SELECT 1 FROM orders WHERE quote_id = ? AND guest_session_id = ?")
+            .params(quoteId, guest).query(Integer.class).optional().isPresent()) throw ApiFailure.conflict("conflict");
+
+        StoredQuote quote = jdbc.sql("SELECT * FROM quotes WHERE id = ? AND guest_session_id = ?")
+            .params(quoteId, guest).query(this::quoteRow)
+            .optional().orElseThrow(() -> ApiFailure.conflict("quote_expired"));
+        requireSupportedTotal(quote.total());
+        Catalog.StoreData store = catalog.store(quote.storeId(), true);
+        Catalog.SlotData slot = catalog.slot(quote.storeId(), quote.slotId(), true);
+        Instant now = databaseNow();
+        if (!quote.expiresAt().isAfter(now)) throw ApiFailure.conflict("quote_expired");
+        if (!slot.startsAt().equals(quote.startsAt()) || !slot.endsAt().equals(quote.endsAt())) {
+            throw ApiFailure.conflict("quote_changed");
+        }
+        if (!catalog.available(store.store(), slot, now)) throw ApiFailure.conflict("slot_unavailable");
+        Reorder current = Catalog.reconcile(quote.lines(), catalog.products(quote.storeId(), true));
+        long divisor = 10_000L + store.taxBasisPoints();
+        long tax = (quote.total() * store.taxBasisPoints() + divisor / 2) / divisor;
+        if (quote.total() <= 0 || !current.changes().isEmpty() || tax != quote.tax()) {
+            throw ApiFailure.conflict("quote_changed");
+        }
+        // PostgreSQL rechecks capacity while holding the slot row, before inserting the reservation.
+        UUID id = UUID.randomUUID();
+        Instant hold = earlier(now.plus(10, ChronoUnit.MINUTES), slot.startsAt());
+        jdbc.sql("""
+            INSERT INTO orders (id, quote_id, guest_session_id, request_key, store_id, slot_id, phone,
+                email, lines, total, tax, status, payment_status, created_at, reservation_expires_at,
+                pickup_starts_at, pickup_ends_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, 'awaiting_payment', 'unpaid', ?, ?, ?, ?)
+            """)
+            .params(id, quote.id(), guest, key, quote.storeId(), slot.id(), phone, email,
+                json.write(quote.lines()), quote.total(), quote.tax(), dbTime(now), dbTime(hold),
+                dbTime(slot.startsAt()), dbTime(slot.endsAt()))
+            .update();
+        return view(owned(guest, id, false));
+    }
+
+    public Order recover(UUID guest, String key) {
+        validateKey(key);
+        StoredOrder existing = recoverRecord(guest, key);
+        if (existing == null) throw ApiFailure.notFound();
+        return view(existing);
+    }
+
+    public Order getOrder(UUID guest, UUID id) {
+        StoredOrder order = owned(guest, id, false);
+        Attempt attempt = latest(id);
+        if (attempt != null && attempt.status().equals("processing") && !localPayments
+            && claimVerification(attempt.id())) {
+            try {
+                gateway.verifyByReference(attempt.id().toString()).ifPresent(this::settlePayment);
+                order = owned(guest, id, false);
+            } catch (PaymentGatewayException ignored) {
+                // Keep the last confirmed state during a temporary PSP outage.
+            }
+        }
+        return view(order);
+    }
+
+    public Reorder reorder(UUID guest, UUID id) {
+        StoredOrder order = owned(guest, id, false);
+        return Catalog.reconcile(order.lines(), catalog.products(order.storeId(), false));
+    }
+
+    public PaymentAttempt startPayment(UUID guest, UUID id, String key) {
+        validateKey(key);
+        PaymentStart start = Objects.requireNonNull(transactions.execute(tx -> preparePayment(guest, id, key)));
+        if (!start.openGateway()) return start.attempt().view();
+        StoredOrder order = start.order();
+        Attempt attempt = start.attempt();
+        try {
+            String checkoutUrl = gateway.open(new PaymentRequest(attempt.id().toString(), id.toString(),
+                order.total(), CURRENCY, order.phone(), order.email(), order.reservationExpiresAt())).checkoutUrl();
+            jdbc.sql("UPDATE payment_attempts SET checkout_url = ? WHERE id = ? AND status = 'processing'")
+                .params(checkoutUrl, attempt.id()).update();
+            return jdbc.sql("SELECT * FROM payment_attempts WHERE id = ?").param(attempt.id())
+                .query(OrderService::attemptRow).single().view();
+        } catch (PaymentGatewayException ignored) {
+            // The provider may have received the request. Keep this attempt for verification by reference.
+            throw ApiFailure.unavailable();
+        }
+    }
+
+    private PaymentStart preparePayment(UUID guest, UUID id, String key) {
+        StoredOrder order = owned(guest, id, true);
+        requireSupportedTotal(order.total());
+        Attempt existing = jdbc.sql("SELECT * FROM payment_attempts WHERE order_id = ? AND request_key = ?")
+            .params(id, key).query(OrderService::attemptRow).optional().orElse(null);
+        if (existing != null) return new PaymentStart(existing, order, false);
+        if (statusAt(order, databaseNow()).equals("cancelled")) throw ApiFailure.conflict("reservation_expired");
+        if (order.paymentStatus().equals("processing")) throw ApiFailure.conflict("payment_pending");
+        if (!order.status().equals("awaiting_payment")) throw ApiFailure.conflict("conflict");
+
+        UUID reference = UUID.randomUUID();
+        jdbc.sql("""
+            INSERT INTO payment_attempts (id, order_id, request_key, status)
+            VALUES (?, ?, ?, 'processing')
+            """).params(reference, id, key).update();
+        jdbc.sql("UPDATE orders SET payment_status = 'processing' WHERE id = ?").param(id).update();
+        return new PaymentStart(new Attempt(reference, id, "processing", null, null), order, true);
+    }
+
+    public void settlePayment(VerifiedPayment payment) {
+        if (payment == null || payment.result() == null || payment.transactionId() == null
+            || payment.transactionId().isBlank()) throw ApiFailure.invalid();
+        UUID attemptId = ApiFailure.uuid(payment.reference(), ApiFailure.notFound());
+        transactions.executeWithoutResult(tx -> {
+            Attempt observed = jdbc.sql("SELECT * FROM payment_attempts WHERE id = ?").param(attemptId)
+                .query(OrderService::attemptRow).optional().orElseThrow(ApiFailure::notFound);
+            StoredOrder order = owned(null, observed.orderId(), true);
+            Attempt attempt = jdbc.sql("SELECT * FROM payment_attempts WHERE id = ? FOR UPDATE").param(attemptId)
+                .query(OrderService::attemptRow).single();
+            if (order.total() != payment.amount() || !CURRENCY.equals(payment.currency())) {
+                throw ApiFailure.conflict("payment_mismatch");
+            }
+            if (payment.result() == PaymentResult.PROCESSING || (payment.result() == PaymentResult.DECLINED && !localPayments)) {
+                return;
+            }
+
+            Attempt active = latest(order.id());
+            boolean current = active != null && active.id().equals(attempt.id());
+            if (attempt.status().equals("paid")) {
+                if (payment.result() == PaymentResult.PAID
+                    && !Objects.equals(attempt.providerTransactionId(), payment.transactionId())) {
+                    recordPaymentException(attemptId, payment.transactionId(), "duplicate_transaction");
+                }
+                return;
+            }
+            if (payment.result() == PaymentResult.DECLINED) {
+                if (!current || !attempt.status().equals("processing")) return;
+                jdbc.sql("UPDATE payment_attempts SET status = 'declined', checkout_url = NULL WHERE id = ?")
+                    .param(attemptId).update();
+                jdbc.sql("UPDATE orders SET payment_status = 'declined' WHERE id = ?").param(order.id()).update();
+                return;
+            }
+
+            boolean acceptable = current && attempt.status().equals("processing") && reservationStillValid(order);
+            jdbc.sql("""
+                UPDATE payment_attempts SET status = 'paid', provider_transaction_id = ?, checkout_url = NULL
+                WHERE id = ?
+                """).params(payment.transactionId(), attemptId).update();
+            if (acceptable) {
+                jdbc.sql("UPDATE orders SET status = 'accepted', payment_status = 'paid', pickup_code = ? WHERE id = ?")
+                    .params(String.format(Locale.ROOT, "%06d", RANDOM.nextInt(1_000_000)), order.id()).update();
+                return;
+            }
+            recordPaymentException(attemptId, payment.transactionId(),
+                current ? "unavailable_reservation" : "superseded_attempt");
+            if (current && !order.paymentStatus().equals("paid")) {
+                jdbc.sql("UPDATE orders SET status = 'cancelled', payment_status = 'refund_pending' WHERE id = ?")
+                    .param(order.id()).update();
+            }
+        });
+    }
+
+    private boolean reservationStillValid(StoredOrder order) {
+        // Check the hold with PostgreSQL's clock after acquiring the slot lock used by reservations and imports.
+        Catalog.SlotData slot = catalog.slot(order.storeId(), order.slotId(), true);
+        return order.startsAt().equals(slot.startsAt()) && order.endsAt().equals(slot.endsAt())
+            && statusAt(order, databaseNow()).equals("awaiting_payment");
+    }
+
+    private void recordPaymentException(UUID attempt, String transaction, String reason) {
+        jdbc.sql("""
+            INSERT INTO payment_exceptions (attempt_id, provider_transaction_id, reason, created_at)
+            VALUES (?, ?, ?, now()) ON CONFLICT (attempt_id, provider_transaction_id) DO NOTHING
+            """).params(attempt, transaction, reason).update();
+    }
+
+    void setLocalPayment(UUID guest, UUID orderId, UUID attemptId, PaymentResult result) {
+        if (!localPayments || result == PaymentResult.PROCESSING) throw ApiFailure.invalid();
+        transactions.executeWithoutResult(tx -> {
+            StoredOrder order = owned(guest, orderId, true);
+            Attempt attempt = latest(orderId);
+            if (attempt == null || !attempt.id().equals(attemptId) || !attempt.status().equals("processing")) {
+                throw ApiFailure.conflict("conflict");
+            }
+            settlePayment(new VerifiedPayment(attemptId.toString(), "local-" + attemptId, order.total(), CURRENCY, result));
+        });
+    }
+
+    private boolean claimVerification(UUID attempt) {
+        return jdbc.sql("""
+            UPDATE payment_attempts SET last_checked_at = now()
+            WHERE id = ? AND status = 'processing'
+              AND (last_checked_at IS NULL OR last_checked_at < now() - interval '8 seconds')
+            """).param(attempt).update() > 0;
+    }
+
+    private StoredOrder recoverRecord(UUID guest, String key) {
+        return jdbc.sql("SELECT * FROM orders WHERE guest_session_id = ? AND request_key = ?")
+            .params(guest, key).query(this::orderRow).optional().orElse(null);
+    }
+
+    private StoredOrder owned(UUID guest, UUID id, boolean lock) {
+        var sql = jdbc.sql(ORDER + (guest != null ? " AND guest_session_id = ?" : "") + (lock ? " FOR UPDATE" : ""))
+            .param(id);
+        if (guest != null) sql.param(guest);
+        return sql.query(this::orderRow).optional().orElseThrow(ApiFailure::notFound);
+    }
+
+    private Order view(StoredOrder order) {
+        Attempt attempt = latest(order.id());
+        return new Order(order.id(), order.storeId(), order.slotId(), order.lines(), order.total(), order.tax(),
+            CURRENCY, order.paymentStatus(), statusAt(order, databaseNow()), order.pickupCode(), order.receiptStatus(),
+            order.receiptUrl(), attempt == null ? null : attempt.view(), order.createdAt(),
+            order.reservationExpiresAt(), order.startsAt(), order.endsAt());
+    }
+
+    private Attempt latest(UUID id) {
+        return jdbc.sql(LATEST_ATTEMPT).param(id).query(OrderService::attemptRow).optional().orElse(null);
+    }
+
+    private StoredQuote quoteRow(ResultSet rs, int row) throws SQLException {
+        return new StoredQuote(rs.getObject("id", UUID.class), rs.getString("store_id"), rs.getString("slot_id"),
+            readTime(rs, "pickup_starts_at"), readTime(rs, "pickup_ends_at"), json.read(rs.getString("lines"), CART_LINES),
+            rs.getLong("total"), rs.getLong("tax"), readTime(rs, "expires_at"));
+    }
+
+    private StoredOrder orderRow(ResultSet rs, int row) throws SQLException {
+        return new StoredOrder(rs.getObject("id", UUID.class), rs.getObject("quote_id", UUID.class),
+            rs.getObject("guest_session_id", UUID.class), rs.getString("store_id"), rs.getString("slot_id"),
+            rs.getString("phone"), rs.getString("email"), json.read(rs.getString("lines"), CART_LINES),
+            rs.getLong("total"), rs.getLong("tax"), rs.getString("status"), rs.getString("payment_status"),
+            rs.getString("pickup_code"), rs.getString("receipt_status"), rs.getString("receipt_url"),
+            readTime(rs, "created_at"), readTime(rs, "reservation_expires_at"),
+            readTime(rs, "pickup_starts_at"), readTime(rs, "pickup_ends_at"));
+    }
+
+    private static Attempt attemptRow(ResultSet rs, int row) throws SQLException {
+        return new Attempt(rs.getObject("id", UUID.class), rs.getObject("order_id", UUID.class),
+            rs.getString("status"), rs.getString("checkout_url"), rs.getString("provider_transaction_id"));
+    }
+
+    private Instant databaseNow() {
+        return jdbc.sql("SELECT clock_timestamp()").query(OffsetDateTime.class).single().toInstant();
+    }
+
+    private static String statusAt(StoredOrder order, Instant now) {
+        return order.status().equals("awaiting_payment") && !order.reservationExpiresAt().isAfter(now)
+            ? "cancelled" : order.status();
+    }
+
+    static void validateKey(String key) {
+        if (key == null || !KEY.matcher(key).matches()) throw ApiFailure.invalid();
+    }
+
+    private static boolean isId(String value) {
+        return value != null && CATALOG_ID.matcher(value).matches();
+    }
+
+    private static void validateQuote(QuoteInput input) {
+        if (input == null || !isId(input.storeId()) || !isId(input.slotId())
+            || input.lines() == null || input.lines().isEmpty() || input.lines().size() > 50) {
+            throw ApiFailure.invalid();
+        }
+        var seen = new HashSet<List<String>>();
+        for (CartLine line : input.lines()) {
+            if (line == null || !isId(line.sku()) || line.quantity() < 1 || line.quantity() > 99
+                || line.unitPrice() < 0 || line.unitPrice() > MAX_PRICE || line.modifierIds() == null
+                || line.modifierIds().size() > 25 || line.modifierIds().stream().anyMatch(id -> !isId(id))
+                || new HashSet<>(line.modifierIds()).size() != line.modifierIds().size()) throw ApiFailure.invalid();
+            var identity = new java.util.ArrayList<String>();
+            identity.add(line.sku());
+            identity.addAll(line.modifierIds().stream().sorted().toList());
+            if (!seen.add(identity)) throw ApiFailure.invalid();
+        }
+    }
+
+    private static long total(List<CartLine> lines) {
+        long total = 0;
+        for (CartLine line : lines) {
+            if (line.unitPrice() < 0 || line.unitPrice() > MAX_PRICE) throw ApiFailure.unavailable();
+            total += line.unitPrice() * line.quantity();
+        }
+        return total;
+    }
+
+    private static void requireSupportedTotal(long total) {
+        if (total > PaymentGateway.MAX_CHARGE_RWF) throw ApiFailure.invalid();
+    }
+
+    private static Instant earlier(Instant first, Instant second) {
+        return first.isBefore(second) ? first : second;
+    }
+}

@@ -1,5 +1,4 @@
-import { DEMO_PHONE } from '../domain/demo-api';
-import { ApiError, type Order, type Quote, type ShopApi } from '../domain/types';
+import { ApiError, type Order, type OrderInput, type Quote, type ShopApi } from '../domain/types';
 
 export const CHECKOUT_JOURNAL_KEY = 'crustcaper.checkout.v1';
 const maxRecentOrders = 10;
@@ -15,20 +14,24 @@ export type CheckoutJournal = {
   orderIds: string[];
 };
 
+export type CheckoutContact = Pick<OrderInput, 'phone' | 'email'>;
+
 type Dependencies = {
-  api: Pick<ShopApi, 'createOrder' | 'getOrder' | 'startPayment'>;
+  api: Pick<ShopApi, 'createOrder' | 'getOrder' | 'startPayment' | 'recoverOrder'>;
   storage: {
     getItem: (key: string) => Promise<string | null>;
     setItem: (key: string, value: string) => Promise<void>;
   };
   newKey: () => string;
   onOrderCreated: (cartFingerprint: string) => Promise<void>;
+  storageKey?: string;
+  demoContact?: CheckoutContact;
   allowMissingDemoOrders?: boolean;
   listDemoOrderRefs?: (limit: number) => Promise<{ orderId: string; key: string }[]>;
 };
 
 export class CheckoutError extends Error {
-  constructor(readonly code: 'active_checkout' | 'invalid_journal' | 'missing_checkout') {
+  constructor(readonly code: 'active_checkout' | 'invalid_journal' | 'missing_checkout' | 'contact_required') {
     super(code);
   }
 }
@@ -71,13 +74,20 @@ function parseJournal(raw: string | null): CheckoutJournal {
 }
 
 export function canStartNewOrder(order: Order): boolean {
-  if (order.paymentStatus === 'processing') {
-    return false;
-  }
   return order.status === 'cancelled'
     || order.paymentStatus === 'paid'
     || order.paymentStatus === 'refund_pending'
     || order.paymentStatus === 'refunded';
+}
+
+export function hasSavedCheckout(raw: string | null): boolean {
+  try {
+    const { active, orderIds } = parseJournal(raw);
+    return active !== null || orderIds.length > 0;
+  } catch {
+    // A corrupt or unrecognised journal cannot prove that the previous identity is unused.
+    return true;
+  }
 }
 
 export class CheckoutController {
@@ -97,8 +107,10 @@ export class CheckoutController {
     return this.journal;
   }
 
-  async begin(quote: Quote, cartFingerprint: string): Promise<Order> {
+  async begin(quote: Quote, cartFingerprint: string, contact = this.dependencies.demoContact): Promise<Order> {
     return this.exclusive(async () => {
+      if (!contact) throw new CheckoutError('contact_required');
+
       const { active } = this.journal;
       if (active?.phase === 'creating') {
         throw new CheckoutError('active_checkout');
@@ -114,18 +126,19 @@ export class CheckoutController {
         phase: 'creating', quoteId: quote.id, key: this.dependencies.newKey(), cartFingerprint,
       };
       await this.save(intent);
-      return this.placeOrder(intent);
+      return this.placeOrder(intent, contact);
     });
   }
 
-  async resume(retryDeclined = false): Promise<Order> {
+  async resume(retryDeclined = false, contact = this.dependencies.demoContact): Promise<Order> {
     return this.exclusive(async () => {
       const { active } = this.journal;
       if (!active) {
         throw new CheckoutError('missing_checkout');
       }
       if (active.phase === 'creating') {
-        return this.placeOrder(active);
+        const committed = await this.dependencies.api.recoverOrder?.(active.key);
+        return committed ? this.continueOrder(active, committed) : this.placeOrder(active, contact);
       }
 
       const order = await this.getTrackedOrder(active.orderId);
@@ -164,10 +177,12 @@ export class CheckoutController {
     return this.startPayment(intent);
   }
 
-  private async placeOrder(intent: Extract<Progress, { phase: 'creating' }>): Promise<Order> {
+  private async placeOrder(intent: Extract<Progress, { phase: 'creating' }>, contact?: CheckoutContact): Promise<Order> {
+    if (!contact) throw new CheckoutError('contact_required');
+
     let order: Order;
     try {
-      order = await this.dependencies.api.createOrder({ quoteId: intent.quoteId, phone: DEMO_PHONE }, intent.key);
+      order = await this.dependencies.api.createOrder({ quoteId: intent.quoteId, phone: contact.phone, email: contact.email }, intent.key);
     } catch (error) {
       if (error instanceof ApiError && (error.code === 'quote_expired' || error.code === 'quote_changed'
         || error.code === 'slot_unavailable' || error.code === 'invalid_input')) {
@@ -176,6 +191,10 @@ export class CheckoutController {
       throw error;
     }
 
+    return this.continueOrder(intent, order);
+  }
+
+  private async continueOrder(intent: Extract<Progress, { phase: 'creating' }>, order: Order): Promise<Order> {
     const orderIds = [order.id, ...this.journal.orderIds.filter((id) => id !== order.id)].slice(0, maxRecentOrders);
     const payment = {
       phase: 'paying', orderId: order.id, key: this.dependencies.newKey(), cartFingerprint: intent.cartFingerprint,
@@ -233,7 +252,7 @@ export class CheckoutController {
   }
 
   private async readJournal(): Promise<void> {
-    const raw = await this.dependencies.storage.getItem(CHECKOUT_JOURNAL_KEY);
+    const raw = await this.dependencies.storage.getItem(this.dependencies.storageKey ?? CHECKOUT_JOURNAL_KEY);
     const listDemoOrderRefs = this.dependencies.allowMissingDemoOrders
       ? this.dependencies.listDemoOrderRefs : undefined;
     if (raw === null && listDemoOrderRefs) {
@@ -265,7 +284,7 @@ export class CheckoutController {
 
   private async save(active: Progress | null, orderIds = this.journal.orderIds): Promise<void> {
     const next = { version: 1, active, orderIds } as const;
-    await this.dependencies.storage.setItem(CHECKOUT_JOURNAL_KEY, JSON.stringify(next));
+    await this.dependencies.storage.setItem(this.dependencies.storageKey ?? CHECKOUT_JOURNAL_KEY, JSON.stringify(next));
     this.journal = next;
   }
 

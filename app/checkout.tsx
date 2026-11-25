@@ -1,8 +1,9 @@
-import { router, useFocusEffect } from 'expo-router';
+import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Platform, Pressable, StyleSheet, type Text as NativeText, TextInput, View } from 'react-native';
 
 import { useCheckout, useRouteActionGuard } from '../src/checkout/context';
+import type { CheckoutContact } from '../src/checkout/controller';
 import { checkoutError, changeLabel, itemName, itemOptions } from '../src/checkout/labels';
 import { DEMO_PHONE } from '../src/domain/demo-api';
 import { ApiError, type Quote } from '../src/domain/types';
@@ -13,17 +14,21 @@ import { copy, money, slotLabel } from '../src/ui/format';
 const demoPhoneLabel = '+250 700 000 000';
 
 export default function CheckoutScreen() {
-  const { api, locale, menu, cart, total, hydrated, draftSaving, draftStorageError, refreshing, refreshMenu } = useShop();
-  const { beginCheckout, journal, busy, restoreFailed } = useCheckout();
+  const { resume } = useLocalSearchParams<{ resume?: string }>();
+  const { api, mode, checkoutAllowed, locale, menu, cart, total, hydrated, draftSaving, draftStorageError, refreshing, refreshMenu } = useShop();
+  const { beginCheckout, resumeCheckout, journal, busy, restoreFailed } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const [selectedSlot, setSlot] = useState('');
   const [phone, setPhone] = useState('');
+  const [email, setEmail] = useState('');
   const [phoneInvalid, setPhoneInvalid] = useState(false);
+  const [emailInvalid, setEmailInvalid] = useState(false);
   const [review, setReview] = useState<{ quote: Quote; cartKey: string; slotKey: string } | null>(null);
   const [requestingQuote, setRequestingQuote] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const checking = useRef(false);
   const phoneInput = useRef<TextInput>(null);
+  const emailInput = useRef<TextInput>(null);
   const stepHeading = useRef<NativeText>(null);
   const previousStepWasReview = useRef(false);
   const slotButtons = useRef(new Map<string, View>());
@@ -34,11 +39,15 @@ export default function CheckoutScreen() {
   const cartKey = JSON.stringify(cart);
   const quote = review && review.cartKey === cartKey && review.slotKey === slotKey ? review.quote : null;
   const unfinished = journal?.active && journal.active.phase !== 'tracking';
+  const demo = mode === 'demo';
+  const restoringContact = !demo && journal?.active?.phase === 'creating' && resume === 'contact';
   const savedOrder = !!journal?.orderIds.length;
   const availableSlots = menu?.slots.filter((option) => option.available) ?? [];
   const noAvailableSlots = availableSlots.length === 0;
   const controlsLocked = requestingQuote || busy;
   const reviewing = quote !== null;
+  const reviewedSlot = quote?.pickupStartsAt && quote.pickupEndsAt
+    ? { startsAt: quote.pickupStartsAt, endsAt: quote.pickupEndsAt } : slot;
 
   useFocusEffect(useCallback(() => {
     void refreshMenu();
@@ -54,6 +63,24 @@ export default function CheckoutScreen() {
   function updatePhone(value: string) {
     setPhone(value);
     setPhoneInvalid(false);
+  }
+
+  function readContact(): CheckoutContact | null {
+    const e164 = phone.replace(/[\s()-]/g, '');
+    if (demo ? e164 !== DEMO_PHONE : !/^\+[1-9][0-9]{7,14}$/.test(e164)) {
+      setPhoneInvalid(true);
+      phoneInput.current?.focus();
+      return null;
+    }
+    if (demo) return { phone: e164 };
+
+    const address = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)) {
+      setEmailInvalid(true);
+      emailInput.current?.focus();
+      return null;
+    }
+    return { phone: e164, email: address };
   }
 
   function chooseSlot(id: string) {
@@ -86,25 +113,26 @@ export default function CheckoutScreen() {
   }
 
   async function submit() {
-    if (checking.current || !menu || !slot || !cart.length || busy || !journal || draftSaving || draftStorageError) return;
-    if (phone.replace(/\s/g, '') !== DEMO_PHONE) {
-      setPhoneInvalid(true);
-      phoneInput.current?.focus();
-      return;
-    }
+    if (!checkoutAllowed || checking.current || busy || !journal || draftSaving || draftStorageError) return;
+    if (!restoringContact && (!menu || !slot || !cart.length)) return;
+    const contact = readContact();
+    if (!contact) return;
 
     checking.current = true;
     const shouldNavigate = guardNavigation();
     setProblem(null);
-    if (!quote) setRequestingQuote(true);
+    if (!quote && !restoringContact) setRequestingQuote(true);
     try {
-      if (!quote) {
+      if (restoringContact) {
+        const order = await resumeCheckout(false, contact);
+        if (shouldNavigate()) router.replace(order.paymentStatus === 'processing' ? '/payment' : '/(tabs)/orders');
+      } else if (quote) {
+        const order = await beginCheckout(quote, cart, contact);
+        if (shouldNavigate()) router.replace(order.paymentStatus === 'processing' ? '/payment' : '/(tabs)/orders');
+      } else if (menu && slot) {
         const result = await api.createQuote({ storeId: menu.store.id, slotId: slot.id, lines: cart });
         if (shouldNavigate()) setReview({ quote: result, cartKey, slotKey });
-        return;
       }
-      const order = await beginCheckout(quote, cart);
-      if (shouldNavigate()) router.replace(order.paymentStatus === 'processing' ? '/payment' : '/(tabs)/orders');
     } catch (error) {
       setProblem(checkoutError(error, locale));
       if (error instanceof ApiError && ['quote_expired', 'quote_changed', 'slot_unavailable', 'reservation_expired'].includes(error.code)) {
@@ -118,10 +146,83 @@ export default function CheckoutScreen() {
     }
   }
 
+  const contactCard = (
+    <Card>
+      <Text variant="heading" accessibilityRole="header">{t('Guest contact', 'Amakuru y’umushyitsi')}</Text>
+      <Text variant="small" tone="muted">{demo
+        ? t('Use the demo number below. No calls or messages are sent.', 'Koresha nimero y’igerageza iri hasi. Nta guhamagara cyangwa ubutumwa bwoherezwa.')
+        : restoringContact
+          ? t('Enter the same phone number and email you used for this order.', 'Andika nimero ya telefoni na imeyili wakoresheje kuri iyi komande.')
+          : t('Enter a phone number with its country code and an email for payment.', 'Andika nimero ya telefoni irimo indangagihugu na imeyili yo kwishyura.')}</Text>
+      <TextInput
+        ref={phoneInput}
+        accessibilityLabel={demo ? t('Demo phone number', 'Nimero y’igerageza') : t('Phone number', 'Nimero ya telefoni')}
+        autoComplete={demo ? 'off' : 'tel'}
+        keyboardType="phone-pad"
+        editable={!controlsLocked}
+        maxLength={24}
+        value={phone}
+        onChangeText={updatePhone}
+        placeholder={demo ? demoPhoneLabel : '+250 …'}
+        placeholderTextColor={colors.muted}
+        style={[styles.input, phoneInvalid && styles.invalidInput]}
+      />
+      {phoneInvalid && <Text accessibilityRole="alert" tone="red">{demo
+        ? t('Enter the demo phone number shown here.', 'Andika nimero y’igerageza yerekanwe hano.')
+        : t('Use a phone number with a country code, starting with +.', 'Andika nimero ifite indangagihugu, itangizwa na +.')}</Text>}
+      {demo ? (
+        <Button label={t('Use demo number', 'Koresha nimero y’igerageza')} variant="secondary" disabled={controlsLocked} onPress={() => updatePhone(demoPhoneLabel)} />
+      ) : (
+        <>
+          <TextInput
+            ref={emailInput}
+            accessibilityLabel={t('Email address', 'Aderesi ya imeyili')}
+            autoCapitalize="none"
+            autoComplete="email"
+            keyboardType="email-address"
+            editable={!controlsLocked}
+            maxLength={254}
+            value={email}
+            onChangeText={(value) => { setEmail(value); setEmailInvalid(false); }}
+            placeholder={t('Email address', 'Aderesi ya imeyili')}
+            placeholderTextColor={colors.muted}
+            style={[styles.input, emailInvalid && styles.invalidInput]}
+          />
+          {emailInvalid && <Text accessibilityRole="alert" tone="red">{t('Enter a valid email address.', 'Andika aderesi ya imeyili yemewe.')}</Text>}
+        </>
+      )}
+    </Card>
+  );
+
+  if (!checkoutAllowed) {
+    return (
+      <Screen safeBottom>
+        <Text variant="title" accessibilityRole="header">{t('Checkout', 'Kwishyura')}</Text>
+        <Text>{t('Open the Android or iOS app to place an order.', 'Fungura porogaramu ya Android cyangwa iOS kugira ngo utange komande.')}</Text>
+        <Button label={t('Browse menu', 'Reba ibiribwa')} onPress={() => router.replace('/(tabs)')} />
+      </Screen>
+    );
+  }
+
   if (!hydrated || (!journal && !restoreFailed)) {
     return <Screen safeBottom>{!draftStorageError && <Text>
       {t('Opening checkout…', 'Turimo gufungura aho kwishyurira…')}
     </Text>}</Screen>;
+  }
+
+  if (restoringContact && !restoreFailed) {
+    return (
+      <Screen safeBottom bottom={(
+        <View style={styles.stack}>
+          {problem && <Text tone="red" accessibilityRole="alert">{problem}</Text>}
+          <Button label={t('Resume checkout', 'Komeza kwishyura')} onPress={() => { void submit(); }}
+            busy={busy} disabled={draftSaving || !!draftStorageError} />
+        </View>
+      )}>
+        <Text variant="title" accessibilityRole="header">{t('Resume checkout', 'Komeza kwishyura')}</Text>
+        {contactCard}
+      </Screen>
+    );
   }
 
   if (restoreFailed || unfinished || cart.length === 0) {
@@ -215,30 +316,12 @@ export default function CheckoutScreen() {
         )}
       </Card>
 
-      <Card>
-        <Text variant="heading" accessibilityRole="header">{t('Guest contact', 'Nimero y’umushyitsi')}</Text>
-        <Text variant="small" tone="muted">{t('Use the demo number below. No calls or messages are sent.', 'Koresha nimero y’igerageza iri hasi. Nta guhamagara cyangwa ubutumwa bwoherezwa.')}</Text>
-        <TextInput
-          ref={phoneInput}
-          accessibilityLabel={t('Demo phone number', 'Nimero y’igerageza')}
-          autoComplete="off"
-          keyboardType="phone-pad"
-          editable={!controlsLocked}
-          maxLength={19}
-          value={phone}
-          onChangeText={updatePhone}
-          placeholder={demoPhoneLabel}
-          placeholderTextColor={colors.muted}
-          style={[styles.input, phoneInvalid && styles.invalidInput]}
-        />
-        {phoneInvalid && <Text accessibilityRole="alert" tone="red">{t('Enter the demo phone number shown here.', 'Andika nimero y’igerageza yerekanwe hano.')}</Text>}
-        <Button label={t('Use demo number', 'Koresha nimero y’igerageza')} variant="secondary" disabled={controlsLocked} onPress={() => updatePhone(demoPhoneLabel)} />
-      </Card>
+      {contactCard}
       </>}
 
       <Card>
         <Text variant="heading" accessibilityRole="header">{t('Order summary', 'Incamake ya komande')}</Text>
-        {quote && slot && <Text variant="small" tone="muted">{t('Pickup', 'Gufata komande')} · {slotLabel(slot, locale)}</Text>}
+        {quote && reviewedSlot && <Text variant="small" tone="muted">{t('Pickup', 'Gufata komande')} · {slotLabel(reviewedSlot, locale)}</Text>}
         {quote?.changes.map((change, index) => <Text key={index} tone="red">{changeLabel(change, locale, menu)}</Text>)}
         {(quote?.lines ?? cart).map((line) => (
           <View key={`${line.sku}:${line.modifierIds.join(',')}`} style={styles.row}>
@@ -264,7 +347,9 @@ export default function CheckoutScreen() {
         {quote && <Button label={t('Edit pickup or contact', 'Hindura igihe cyangwa nimero')} variant="secondary"
           disabled={controlsLocked} onPress={() => { setReview(null); setProblem(null); }} />}
         <Text variant="small" tone="muted">{quote
-          ? t('Confirm the shown items, total and time to open demo payment.', 'Emeza ibyo ubonye, igiteranyo n’igihe kugira ngo wishyure mu igerageza.')
+          ? demo
+            ? t('Confirm the shown items, total and time to open demo payment.', 'Emeza ibyo ubonye, igiteranyo n’igihe kugira ngo wishyure mu igerageza.')
+            : t('Confirm the items, total and pickup time to continue to payment.', 'Emeza ibiribwa, igiteranyo n’igihe cyo gufata komande kugira ngo wishyure.')
           : t('We’ll confirm the items, price and time before payment.', 'Tuzemeza ibiribwa, igiciro n’igihe mbere yo kwishyura.')}</Text>
       </Card>
     </Screen>

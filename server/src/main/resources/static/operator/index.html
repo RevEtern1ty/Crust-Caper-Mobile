@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#2B1827">
+    <meta name="referrer" content="no-referrer">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'">
+    <title>CrustCaper Kitchen &amp; Pickup</title>
+    <link rel="stylesheet" href="/operator/style.css">
+    <script type="module" src="/operator/app.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="frame header-inner">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>CrustCaper</span>
+        </div>
+        <span class="header-context">Kitchen &amp; pickup</span>
+      </div>
+    </header>
+
+    <main class="frame main-content">
+      <section class="sign-in" id="sign-in" aria-labelledby="sign-in-title">
+        <h1 id="sign-in-title" tabindex="-1">Staff sign in</h1>
+        <form id="login-form" method="post">
+          <label for="username">Username</label>
+          <input id="username" name="username" required maxlength="128" autocomplete="username" autocapitalize="none" spellcheck="false">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" required maxlength="256" autocomplete="current-password">
+          <p class="problem" id="login-problem" role="alert" hidden></p>
+          <button class="button button-primary" id="login-button" type="submit">Sign in</button>
+        </form>
+        <noscript><p class="problem">Enable JavaScript to sign in and manage orders.</p></noscript>
+      </section>
+
+      <section id="workstation" aria-labelledby="workstation-title" hidden>
+        <div class="queue-header">
+          <div>
+            <div class="session-label" id="session-label"></div>
+            <h1 id="workstation-title" tabindex="-1">Order queue</h1>
+            <p class="update-time" id="update-time" aria-live="polite">Loading paid orders…</p>
+          </div>
+          <div class="toolbar">
+            <button class="button button-secondary" id="payment-review-jump" type="button" hidden>Payment review</button>
+            <button class="button button-secondary" id="refresh-button" type="button">Refresh</button>
+            <button class="button button-quiet" id="logout-button" type="button">Sign out</button>
+          </div>
+        </div>
+
+        <p class="problem" id="queue-problem" role="alert" hidden></p>
+        <p class="empty-state" id="empty-state" hidden>No paid orders are waiting.</p>
+        <ul class="order-list" id="order-list" aria-label="Paid orders"></ul>
+
+        <section class="payment-review" id="payment-review" aria-labelledby="payment-review-title" hidden>
+          <div class="queue-header">
+            <div>
+              <h2 id="payment-review-title" tabindex="-1">Payment review</h2>
+              <p class="payment-review-help">Use the provider transaction ID to check and handle any refund in Flutterwave. This list shows up to 50 recent events, including any you have already handled.</p>
+            </div>
+            <button class="button button-secondary" id="payment-review-refresh" type="button">Refresh payment review</button>
+          </div>
+          <p class="problem" id="payment-review-problem" role="alert" hidden></p>
+          <p class="empty-state" id="payment-review-empty" role="status" hidden>No recent payment exceptions.</p>
+          <ul class="order-list" id="payment-review-list" aria-label="Payment exceptions"></ul>
+        </section>
+      </section>
+    </main>
+
+    <template id="order-template">
+      <li class="order-card">
+        <div class="order-header">
+          <h2 class="order-title"></h2>
+          <span class="order-status"></span>
+        </div>
+        <p class="pickup-window"></p>
+        <ul class="order-lines" aria-label="Items"></ul>
+        <div class="order-actions"></div>
+        <p class="problem order-problem" role="alert" hidden></p>
+      </li>
+    </template>
+    <template id="payment-exception-template">
+      <li class="order-card">
+        <h3 class="order-title payment-exception-reason"></h3>
+        <p class="pickup-window payment-exception-time"></p>
+        <dl class="payment-identifiers">
+          <dt>Order ID</dt><dd class="payment-exception-order"></dd>
+          <dt>Merchant reference</dt><dd class="payment-exception-reference"></dd>
+          <dt>Provider transaction ID</dt><dd class="payment-exception-transaction"></dd>
+        </dl>
+      </li>
+    </template>
+  </body>
+</html>

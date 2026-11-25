@@ -1,0 +1,76 @@
+name: Connected commerce CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  commerce:
+    name: PostgreSQL, API and connected checkout
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: crustcaper_dev
+          POSTGRES_USER: crustcaper
+          POSTGRES_PASSWORD: crustcaper-local
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U crustcaper -d crustcaper_dev"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      EXPO_NO_TELEMETRY: '1'
+      CRUSTCAPER_BUILD_PROFILE: local
+      CRUSTCAPER_API_BASE_URL: http://127.0.0.1:18080/api/v1
+      CRUSTCAPER_PORT: '18080'
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Test the transactional API and build the JAR
+        working-directory: server
+        run: bash ./gradlew --no-daemon test bootJar cyclonedxDirectBom
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build:connected-web
+      - name: Verify customer checkout and operator pickup
+        shell: bash
+        run: |
+          java -jar server/build/libs/crustcaper-api.jar --spring.profiles.active=local >"$RUNNER_TEMP/crustcaper-api.log" 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true; wait "$api_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:18080/actuator/health/readiness >/dev/null; then
+              npm run test:connected
+              exit
+            fi
+            kill -0 "$api_pid" || break
+            sleep 1
+          done
+          sed -n '1,100p' "$RUNNER_TEMP/crustcaper-api.log"
+          exit 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crustcaper-api-${{ github.sha }}
+          path: |
+            server/build/libs/crustcaper-api.jar
+            server/build/reports/crustcaper-api-sbom.json
+          if-no-files-found: error
+          retention-days: 14

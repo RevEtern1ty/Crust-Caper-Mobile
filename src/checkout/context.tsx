@@ -4,18 +4,19 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import type { PropsWithChildren } from 'react';
 import { AppState } from 'react-native';
 
-import type { CartLine, Order, Quote } from '../domain/types';
+import { DEMO_PHONE } from '../domain/demo-api';
+import { ApiError, type CartLine, type Order, type Quote } from '../domain/types';
 import { privateStorage } from '../state/private-storage';
 import { useShop } from '../state/shop';
-import { CheckoutController, CheckoutError, type CheckoutJournal } from './controller';
+import { CheckoutController, CheckoutError, type CheckoutContact, type CheckoutJournal } from './controller';
 
 type Context = {
   journal: CheckoutJournal | null;
   restoreFailed: boolean;
   busy: boolean;
   retryRestore: () => Promise<void>;
-  beginCheckout: (quote: Quote, cart: CartLine[]) => Promise<Order>;
-  resumeCheckout: (retryDeclined?: boolean) => Promise<Order>;
+  beginCheckout: (quote: Quote, cart: CartLine[], contact: CheckoutContact) => Promise<Order>;
+  resumeCheckout: (retryDeclined?: boolean, contact?: CheckoutContact) => Promise<Order>;
 };
 
 const CheckoutContext = createContext<Context | null>(null);
@@ -25,7 +26,7 @@ function fingerprint(cart: CartLine[]) {
 }
 
 export function CheckoutProvider({ children }: PropsWithChildren) {
-  const { api, cart, clearCart } = useShop();
+  const { api, demoApi, checkoutStorageKey, cart, clearCart } = useShop();
   const cartRef = useRef(cart);
   const clearCartRef = useRef(clearCart);
   const running = useRef(false);
@@ -41,16 +42,18 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
   const controller = useMemo(() => new CheckoutController({
     api,
     storage: privateStorage,
+    storageKey: checkoutStorageKey,
     newKey: randomUUID,
-    allowMissingDemoOrders: true,
-    listDemoOrderRefs: api.listDemoOrderRefs,
+    demoContact: demoApi ? { phone: DEMO_PHONE } : undefined,
+    allowMissingDemoOrders: !!demoApi,
+    listDemoOrderRefs: demoApi ? (limit) => demoApi.listDemoOrderRefs(limit) : undefined,
     onOrderCreated: async (expected) => {
       const current = cartRef.current;
       if (await fingerprint(current) === expected) {
         await clearCartRef.current(current);
       }
     },
-  }), [api]);
+  }), [api, checkoutStorageKey, demoApi]);
 
   useEffect(() => {
     let active = true;
@@ -91,8 +94,8 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
         setRestoreFailed(true);
       }
     },
-    beginCheckout: (quote, snapshot) => run(async () => controller.begin(quote, await fingerprint(snapshot))),
-    resumeCheckout: (retryDeclined) => run(() => controller.resume(retryDeclined)),
+    beginCheckout: (quote, snapshot, contact) => run(async () => controller.begin(quote, await fingerprint(snapshot), contact)),
+    resumeCheckout: (retryDeclined, contact) => run(() => controller.resume(retryDeclined, contact)),
   };
 
   return <CheckoutContext.Provider value={value}>{children}</CheckoutContext.Provider>;
@@ -119,9 +122,9 @@ const statusRefreshMs = 3000;
 const maxPolls = 8;
 
 export function useOrderStatus(orderId: string | null) {
-  const { api } = useShop();
+  const { api, mode } = useShop();
   const [known, setKnown] = useState<Order | null>(null);
-  const [failedId, setFailedId] = useState<string | null>(null);
+  const [failure, setFailure] = useState<{ orderId: string; error: unknown } | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const version = useRef(0);
 
@@ -134,11 +137,16 @@ export function useOrderStatus(orderId: string | null) {
       const order = await api.getOrder(orderId);
       if (request === version.current) {
         setKnown(order);
-        setFailedId(null);
+        setFailure(null);
       }
       return order;
-    } catch {
-      if (request === version.current) setFailedId(orderId);
+    } catch (error) {
+      if (request === version.current) {
+        setFailure({ orderId, error });
+        if (error instanceof ApiError && (error.code === 'unauthenticated' || error.code === 'not_found')) {
+          setKnown(null);
+        }
+      }
       return null;
     } finally {
       if (request === version.current) setLoadingId(null);
@@ -153,9 +161,15 @@ export function useOrderStatus(orderId: string | null) {
 
     async function poll(pollCycle: number, count: number) {
       const order = await refresh(count > 0);
-      if (pollCycle !== cycle || count >= maxPolls) return;
+      if (pollCycle !== cycle) return;
 
-      if (!order || order.paymentStatus === 'processing' || order.status === 'accepted' || order.status === 'preparing') {
+      const inKitchen = order?.status === 'accepted' || order?.status === 'preparing';
+      if (mode === 'connected' && inKitchen) {
+        timer = setTimeout(() => { void poll(pollCycle, 1); }, 5000);
+        return;
+      }
+
+      if (count < maxPolls && (!order || order.paymentStatus === 'processing' || inKitchen)) {
         timer = setTimeout(() => { void poll(pollCycle, count + 1); }, statusRefreshMs);
       }
     }
@@ -181,11 +195,12 @@ export function useOrderStatus(orderId: string | null) {
       stop();
       subscription.remove();
     };
-  }, [orderId, refresh]));
+  }, [mode, orderId, refresh]));
 
   return {
     order: known?.id === orderId ? known : null,
-    failed: failedId !== null && failedId === orderId,
+    failed: failure !== null && failure.orderId === orderId,
+    error: failure?.orderId === orderId ? failure.error : null,
     loading: loadingId !== null && loadingId === orderId,
     refresh,
   };

@@ -1,6 +1,12 @@
+const { createHash } = require('node:crypto');
+const { getConfig } = require('expo/config');
 const { getDefaultConfig } = require('expo/metro-config');
 
 const config = getDefaultConfig(__dirname);
+const { exp } = getConfig(__dirname, { isPublicConfig: true });
+// Web expo-constants embeds the manifest at transform time. Separate build profiles must never share it.
+const profileHash = createHash('sha256').update(JSON.stringify(exp.extra?.restaurant ?? null)).digest('hex');
+config.cacheVersion = [config.cacheVersion, profileHash].filter(Boolean).join(':');
 const decoder = require.resolve('./tooling/query-string-decoder.js');
 
 config.resolver.resolveRequest = (context, moduleName, platform) => {

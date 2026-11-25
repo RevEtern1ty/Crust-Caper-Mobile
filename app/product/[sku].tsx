@@ -8,10 +8,10 @@ import { copy, money } from '../../src/ui/format';
 import { menuPhoto } from '../../src/ui/menu-photos';
 
 function Details({ product, editing }: { product: Product; editing?: CartLine }) {
-  const { locale, cart, hydrated, addLine, editLine } = useShop();
+  const { locale, mode, fixturePhotos, cart, hydrated, addLine, editLine } = useShop();
   const router = useRouter();
   const [selected, setSelected] = useState(editing?.modifierIds ?? []);
-  const photo = menuPhoto(product.sku);
+  const photo = menuPhoto(product.sku, fixturePhotos, product.photoUrl);
   const validSelected = product.modifiers.filter(option => selected.includes(option.id));
   const unitPrice = product.price + validSelected.reduce((sum, option) => sum + option.price, 0);
   const line = { sku: product.sku, modifierIds: validSelected.map(option => option.id), quantity: 1, unitPrice };
@@ -45,10 +45,12 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
       <Card>
         <Text variant="label">{copy(locale, 'Ingredients', 'Ibigize ifunguro')}</Text>
         <Text>{product.ingredients.length ? product.ingredients.map(item => item[locale]).join(', ')
-          : copy(locale, 'Ingredient details are unavailable for this demo item.', 'Ibigize iri funguro ry’igerageza ntibiraboneka.')}</Text>
+          : copy(locale, 'Ingredient details are unavailable.', 'Ibigize iri funguro ntibiraboneka.')}</Text>
         <Text variant="label">{copy(locale, 'Allergens', 'Ibitera ubwivumbure bw’umubiri')}</Text>
         <Text>{product.allergens.length ? product.allergens.map(item => item[locale]).join(', ')
-          : copy(locale, 'None listed in the demo recipe.', 'Nta byanditswe mu ifunguro ry’igerageza.')}</Text>
+          : mode === 'demo'
+            ? copy(locale, 'None listed in the demo recipe.', 'Nta byanditswe mu ifunguro ry’igerageza.')
+            : copy(locale, 'Ask the restaurant about allergens.', 'Baza resitora ku bitera ubwivumbure bw’umubiri.')}</Text>
       </Card>
       {product.modifiers.length > 0 && <View style={styles.options}>
         <Text variant="heading" accessibilityRole="header">{copy(locale, 'Make it yours', 'Hitamo ibyo wongeramo')}</Text>

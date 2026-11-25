@@ -1,18 +1,19 @@
 import { router } from 'expo-router';
 import { useRef, useState } from 'react';
-import { Platform, Pressable, StyleSheet, View } from 'react-native';
+import { Linking, Platform, Pressable, StyleSheet, View } from 'react-native';
 
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../../src/checkout/context';
+import { CheckoutError } from '../../src/checkout/controller';
 import { checkoutError, changeLabel, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
 import type { DemoKitchenStatus, ReorderResult } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
 import { copy, money, slotLabel } from '../../src/ui/format';
 
-type Action = 'resume' | 'reorder' | 'kitchen';
+type Action = 'resume' | 'reorder' | 'kitchen' | 'receipt';
 
 export default function OrdersScreen() {
-  const { api, locale, menu, cart, hydrated, replaceCart } = useShop();
+  const { api, mode, demoApi, checkoutAllowed, locale, menu, cart, hydrated, replaceCart } = useShop();
   const { journal, restoreFailed, retryRestore, resumeCheckout, busy } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const latestId = journal?.orderIds[0] ?? null;
@@ -22,13 +23,13 @@ export default function OrdersScreen() {
   const [problem, setProblem] = useState<string | null>(null);
   const running = useRef(false);
   const orderId = choice?.latest === latestId ? choice.id : latestId;
-  const { order, loading, failed, refresh } = useOrderStatus(orderId);
+  const { order, loading, failed, error: statusError, refresh } = useOrderStatus(orderId);
   const t = (en: string, rw: string) => copy(locale, en, rw);
 
   const active = journal?.active;
   const ongoingCreate = active?.phase === 'creating';
   const activeOrder = active && active.phase !== 'creating' && active.orderId === orderId;
-  const canResume = activeOrder && !!order && order.status === 'awaiting_payment'
+  const canResume = checkoutAllowed && activeOrder && !!order && order.status === 'awaiting_payment'
     && (order.paymentStatus === 'unpaid' || order.paymentStatus === 'declined');
   const nextKitchen: DemoKitchenStatus | null = order?.status === 'accepted' ? 'preparing'
     : order?.status === 'preparing' ? 'ready' : order?.status === 'ready' ? 'collected' : null;
@@ -52,12 +53,21 @@ export default function OrdersScreen() {
   }
 
   function resume(retryDeclined = false) {
+    if (!checkoutAllowed) return;
     const shouldNavigate = guardNavigation();
     void run('resume', async () => {
-      const resumed = await resumeCheckout(retryDeclined);
-      if (resumed.paymentStatus === 'processing' && shouldNavigate()) {
-        router.push({ pathname: '/payment', params: { from: 'orders' } });
-      } else await refresh();
+      try {
+        const resumed = await resumeCheckout(retryDeclined);
+        if (resumed.paymentStatus === 'processing' && (mode === 'demo' || resumed.status === 'awaiting_payment') && shouldNavigate()) {
+          router.push({ pathname: '/payment', params: { from: 'orders' } });
+        } else await refresh();
+      } catch (error) {
+        if (error instanceof CheckoutError && error.code === 'contact_required') {
+          if (shouldNavigate()) router.push({ pathname: '/checkout', params: { resume: 'contact' } });
+          return;
+        }
+        throw error;
+      }
     });
   }
 
@@ -84,7 +94,7 @@ export default function OrdersScreen() {
         </Card>
       )}
       {!journal && !restoreFailed && <Text tone="muted">{t('Opening saved orders…', 'Turimo gufungura komande zabitswe…')}</Text>}
-      {activeOrder && !order && failed && (
+      {checkoutAllowed && activeOrder && !order && failed && (
         <Button
           label={t('Restore saved checkout', 'Ongera ufungure ubwishyu bwabitswe')}
           onPress={() => resume()} variant="secondary" busy={busy || action === 'resume'} disabled={!hydrated}
@@ -94,7 +104,7 @@ export default function OrdersScreen() {
         <Card>
           <Text variant="heading">{t('Finish your last checkout', 'Rangiza kwishyura komande ya nyuma')}</Text>
           <Text>{t('Continue with the same order request.', 'Komeza icyifuzo cya komande kimwe.')}</Text>
-          <Button label={t('Resume checkout', 'Komeza kwishyura')} onPress={() => resume()} busy={busy || action === 'resume'} disabled={!hydrated} />
+          {checkoutAllowed && <Button label={t('Resume checkout', 'Komeza kwishyura')} onPress={() => resume()} busy={busy || action === 'resume'} disabled={!hydrated} />}
         </Card>
       )}
 
@@ -133,22 +143,28 @@ export default function OrdersScreen() {
 
           {activeOrder && order.paymentStatus === 'processing' && (
             <Card>
-              <Text>{t('This payment is being checked. You can leave and come back here.', 'Ubu bwishyu buracyagenzurwa. Ushobora kugenda ukagaruka hano.')}</Text>
-              <Button
-                label={t('Open existing demo payment', 'Fungura ubwishyu bw’igerageza busanzwe')}
+              <Text>{mode === 'connected' && order.status === 'cancelled'
+                ? t('The pickup hold ended. We’re checking this payment.', 'Igihe cyabikiwe komande cyarangiye. Turacyagenzura ubu bwishyu.')
+                : t('This payment is being checked. You can leave and come back here.', 'Ubu bwishyu buracyagenzurwa. Ushobora kugenda ukagaruka hano.')}</Text>
+              {checkoutAllowed && (mode === 'demo' || order.status === 'awaiting_payment') && <Button
+                label={mode === 'demo' ? t('Open existing demo payment', 'Fungura ubwishyu bw’igerageza busanzwe') : t('Open payment', 'Fungura aho kwishyurira')}
                 onPress={() => resume()} variant="secondary" busy={busy || action === 'resume'} disabled={!hydrated}
-              />
+              />}
             </Card>
           )}
 
           {canResume && (
             <Button
-              label={order.paymentStatus === 'declined' ? t('Retry demo payment', 'Ongera ugerageze ubwishyu') : t('Continue to demo payment', 'Komeza ku bwishyu bw’igerageza')}
+              label={order.paymentStatus === 'declined'
+                ? t(mode === 'demo' ? 'Retry demo payment' : 'Retry payment', 'Ongera ugerageze ubwishyu')
+                : mode === 'demo' ? t('Continue to demo payment', 'Komeza ku bwishyu bw’igerageza')
+                  : t('Continue to payment', 'Komeza wishyure')}
               onPress={() => resume(order.paymentStatus === 'declined')} busy={busy || action === 'resume'} disabled={!hydrated}
             />
           )}
 
-          {activeOrder && active?.phase === 'paying' && !canResume && order.paymentStatus !== 'processing' && (
+          {checkoutAllowed && activeOrder && active?.phase === 'paying' && !canResume
+            && (order.paymentStatus !== 'processing' || (mode === 'connected' && order.status === 'cancelled')) && (
             <Button
               label={t('Restore saved checkout', 'Ongera ufungure ubwishyu bwabitswe')}
               onPress={() => resume()} variant="secondary" busy={busy || action === 'resume'} disabled={!hydrated}
@@ -170,8 +186,18 @@ export default function OrdersScreen() {
                 <Text style={styles.amount}>{money(line.quantity * line.unitPrice)}</Text>
               </View>
             ))}
-            {order.paymentStatus === 'paid' && (
+            {mode === 'demo' && order.paymentStatus === 'paid' && (
               <Text variant="small" tone="muted">{t('Fiscal receipt unavailable in the demo.', 'Inyemezabwishyu yemewe ntiboneka mu igerageza.')}</Text>
+            )}
+            {mode === 'connected' && order.receiptUrl && order.receiptStatus !== 'pending' && (
+              <Button label={t('Open receipt', 'Fungura inyemezabwishyu')} variant="secondary" busy={action === 'receipt'}
+                disabled={!!action} onPress={() => {
+                  const receiptUrl = order.receiptUrl;
+                  if (receiptUrl) void run('receipt', () => Linking.openURL(receiptUrl));
+                }} />
+            )}
+            {mode === 'connected' && order.paymentStatus === 'paid' && order.receiptStatus === 'pending' && (
+              <Text variant="small" tone="muted">{t('The receipt is pending.', 'Inyemezabwishyu iracyategerejwe.')}</Text>
             )}
             {order.paymentStatus === 'paid' || order.status === 'cancelled' ? (
               <Button label={t('Review reorder', 'Reba komande nshya isa n’iyi')} variant="secondary" busy={action === 'reorder'} disabled={!!action} onPress={() => {
@@ -201,7 +227,7 @@ export default function OrdersScreen() {
             </Card>
           )}
 
-          {nextKitchen && (
+          {demoApi && nextKitchen && (
             <Card style={styles.demoTools}>
               <Text variant="label">{t('Demo kitchen', 'Igikoni cy’igerageza')}</Text>
               <Button
@@ -210,7 +236,7 @@ export default function OrdersScreen() {
                     : t('Simulate pickup', 'Gerageza gufata komande')}
                 onPress={() => {
                   void run('kitchen', async () => {
-                    await api.setDemoOrderStatus(order.id, nextKitchen);
+                    await demoApi.setDemoOrderStatus(order.id, nextKitchen);
                     await refresh();
                   });
                 }}
@@ -221,12 +247,12 @@ export default function OrdersScreen() {
         </>
       )}
 
-      {(problem || failed) && <Text accessibilityRole="alert" tone="red">{problem ?? t('Unable to refresh the order. Try again.', 'Ntitwashoboye kuvugurura komande. Ongera ugerageze.')}</Text>}
+      {(problem || failed) && <Text accessibilityRole="alert" tone="red">{problem ?? checkoutError(statusError, locale)}</Text>}
       {orderId && <Button label={t('Refresh order status', 'Vugurura uko komande ihagaze')} onPress={() => { void refresh(); }} busy={loading} variant="secondary" />}
 
       {journal && journal.orderIds.length > 1 && (
         <Card>
-          <Text variant="heading">{t('Recent demo orders', 'Komande z’igerageza ziheruka')}</Text>
+          <Text variant="heading">{mode === 'demo' ? t('Recent demo orders', 'Komande z’igerageza ziheruka') : t('Recent orders', 'Komande ziheruka')}</Text>
           <View style={styles.history}>
             {journal.orderIds.map((id) => (
               <Pressable

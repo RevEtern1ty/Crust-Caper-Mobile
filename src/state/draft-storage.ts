@@ -39,9 +39,10 @@ export function readBrowserLocale(getShared: GetSharedStorage): Locale | null {
   return locale === 'en' || locale === 'rw' ? locale : null;
 }
 
-export function readBrowserDraft(tab: BrowserStorage, getShared: GetSharedStorage): Draft {
-  const tabDraft = tab.getItem(DRAFT_KEY);
-  const legacyDraft = tabDraft === null ? trySharedStorage(getShared, shared => shared.getItem(DRAFT_KEY)) : null;
+export function readBrowserDraft(tab: BrowserStorage, getShared: GetSharedStorage, key = DRAFT_KEY): Draft {
+  const tabDraft = tab.getItem(key);
+  const legacyDraft = key === DRAFT_KEY && tabDraft === null
+    ? trySharedStorage(getShared, shared => shared.getItem(DRAFT_KEY)) : null;
   const draft = readDraft(tabDraft ?? legacyDraft);
   const locale = readBrowserLocale(getShared);
   if (legacyDraft !== null) {
@@ -53,7 +54,7 @@ export function readBrowserDraft(tab: BrowserStorage, getShared: GetSharedStorag
   return { ...draft, locale: locale ?? draft.locale };
 }
 
-export function writeBrowserDraft(tab: BrowserStorage, getShared: GetSharedStorage, draft: Draft, localeChanged: boolean): void {
-  tab.setItem(DRAFT_KEY, JSON.stringify(draft));
+export function writeBrowserDraft(tab: BrowserStorage, getShared: GetSharedStorage, draft: Draft, localeChanged: boolean, key = DRAFT_KEY): void {
+  tab.setItem(key, JSON.stringify(draft));
   if (localeChanged) trySharedStorage(getShared, shared => shared.setItem(LOCALE_KEY, draft.locale));
 }
