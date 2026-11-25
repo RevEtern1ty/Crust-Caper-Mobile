@@ -1,32 +1,12 @@
 const assert = require('node:assert/strict');
 const { mkdir, readFile } = require('node:fs/promises');
-const { createServer } = require('node:http');
-const { extname, resolve, sep } = require('node:path');
+const { resolve } = require('node:path');
 const { after, before, test } = require('node:test');
 const { chromium } = require('playwright-core');
+const { createPreviewServer } = require('../tooling/preview-server.cjs');
 
 const root = resolve('dist');
-const mime = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.json': 'application/json',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.ttf': 'font/ttf',
-  '.ico': 'image/x-icon',
-};
-const server = createServer(async (request, response) => {
-  try {
-    const url = new URL(request.url, 'http://localhost');
-    const pathname = decodeURIComponent(url.pathname);
-    const file = resolve(root, extname(pathname) ? '.' + pathname : 'index.html');
-    if (!file.startsWith(root + sep)) return response.writeHead(404).end();
-    const data = await readFile(file);
-    response.writeHead(200, { 'Content-Type': mime[extname(file)] ?? 'application/octet-stream' }).end(data);
-  } catch {
-    response.writeHead(404).end();
-  }
-});
+const server = createPreviewServer(root);
 
 let browser;
 let base;
