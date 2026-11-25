@@ -7,6 +7,7 @@ import { CheckoutError } from '../../src/checkout/controller';
 import { checkoutError, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
 import { ReorderPanel } from '../../src/checkout/reorder-panel';
 import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
+import { PickupAlertPanel } from '../../src/checkout/pickup-alert';
 import { shareReceipt } from '../../src/checkout/receipt-sharing';
 import type { DemoKitchenStatus, ReorderResult } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
@@ -36,9 +37,10 @@ export default function OrdersScreen() {
       setChoice({ latest: latestId, id: linkedOrderId });
       setPreview(null);
       setProblem(null);
+      if (Platform.OS !== 'web') void refresh();
     }
     setRequestedOrderId(null);
-  }, [journal, latestId, linkedOrderId, requestedOrderId, setRequestedOrderId]);
+  }, [journal, latestId, linkedOrderId, refresh, requestedOrderId, setRequestedOrderId]);
 
   const active = journal?.active;
   const ongoingCreate = active?.phase === 'creating';
@@ -168,6 +170,8 @@ export default function OrdersScreen() {
               <Text variant="small" tone="muted">{t('Show this code at the pickup counter.', 'Erekana iyi kode aho bafatira komande.')}</Text>
             </Card>
           )}
+
+          <PickupAlertPanel key={order.id} order={order} />
 
           {activeOrder && order.paymentStatus === 'processing' && (
             <Card>

@@ -112,9 +112,19 @@ final class OperatorOrders {
         jdbc.sql("UPDATE orders SET status = ?, pickup_code = CASE WHEN ? THEN NULL ELSE pickup_code END WHERE id = ?")
                 .params(transition.to(), transition.collects(), id).update();
         recordEvent(actor, id, transition, "changed");
+        if (transition == Transition.READY) enqueuePickupAlerts(id);
         OrderView before = existing.order();
         return new Outcome(new OrderView(id, transition.to(), before.paymentStatus(), before.lines(),
                 before.pickupStartsAt(), before.pickupEndsAt()), false);
+    }
+
+    private void enqueuePickupAlerts(UUID orderId) {
+        jdbc.sql("""
+                UPDATE pickup_alerts
+                SET state = 'pending', queued_at = clock_timestamp(), next_attempt_at = clock_timestamp(),
+                    updated_at = clock_timestamp()
+                WHERE order_id = ? AND state = 'waiting' AND enabled AND encrypted_token IS NOT NULL
+                """).param(orderId).update();
     }
 
     private boolean acceptPickup(String storedCode, String presentedCode, Principal actor, UUID id) {

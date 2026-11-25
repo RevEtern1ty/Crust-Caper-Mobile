@@ -18,6 +18,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
@@ -176,6 +177,40 @@ class OperatorIntegrationTest {
     private String paymentReference(OrderFixture order) {
         return jdbc.sql("SELECT id FROM payment_attempts WHERE order_id = ?")
                 .param(UUID.fromString(order.orderId())).query(UUID.class).single().toString();
+    }
+
+    @Test
+    void readyTransitionQueuesConsentedPickupAlertsOnce() throws Exception {
+        String kitchen = login(newStaff(store, "kitchen"));
+        String pickup = login(newStaff(store, "pickup"));
+        OrderFixture order = newOrder(store, true);
+        UUID orderId = UUID.fromString(order.orderId());
+        UUID optedIn = UUID.randomUUID();
+        UUID revoked = UUID.randomUUID();
+        jdbc.sql("""
+                INSERT INTO pickup_alerts (id, order_id, guest_session_id, installation_id, locale,
+                    enabled, state, encrypted_token)
+                SELECT ?, id, guest_session_id, ?, 'en', true, 'waiting', ? FROM orders WHERE id = ?
+                """).params(optedIn, UUID.randomUUID(), new byte[64], orderId).update();
+        jdbc.sql("""
+                INSERT INTO pickup_alerts (id, order_id, guest_session_id, installation_id, locale,
+                    enabled, state)
+                SELECT ?, id, guest_session_id, ?, 'rw', false, 'cancelled' FROM orders WHERE id = ?
+                """).params(revoked, UUID.randomUUID(), orderId).update();
+
+        change(kitchen, order.orderId(), "preparing", null).andExpect(status().isOk());
+        change(pickup, order.orderId(), "ready", null).andExpect(status().isForbidden());
+        String stateQuery = "SELECT state FROM pickup_alerts WHERE id = ?";
+        String queuedQuery = "SELECT queued_at FROM pickup_alerts WHERE id = ?";
+        assertThat(jdbc.sql(stateQuery).param(optedIn).query(String.class).single()).isEqualTo("waiting");
+
+        change(kitchen, order.orderId(), "ready", null).andExpect(status().isOk());
+        OffsetDateTime queued = jdbc.sql(queuedQuery).param(optedIn).query(OffsetDateTime.class).single();
+        assertThat(queued).isNotNull();
+        assertThat(jdbc.sql(stateQuery).param(optedIn).query(String.class).single()).isEqualTo("pending");
+        assertThat(jdbc.sql(stateQuery).param(revoked).query(String.class).single()).isEqualTo("cancelled");
+        change(kitchen, order.orderId(), "ready", null).andExpect(status().isConflict());
+        assertThat(jdbc.sql(queuedQuery).param(optedIn).query(OffsetDateTime.class).single()).isEqualTo(queued);
     }
 
     @Test

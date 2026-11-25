@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { AppState, Platform, StyleSheet, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CheckoutProvider } from '../src/checkout/context';
+import { PickupAlertResponses } from '../src/checkout/pickup-alert';
 import { purgeExpiredReceiptFiles } from '../src/checkout/receipt-sharing';
 import { ShopProvider, useShop } from '../src/state/shop';
 import { Button, colors, Text } from '../src/ui/core';
@@ -85,6 +86,7 @@ export default function RootLayout() {
             <CheckoutProvider>
               <StatusBar style="light" />
               <Routes />
+              <PickupAlertResponses />
               <DraftStorageNotice />
             </CheckoutProvider>
           </ShopProvider>

@@ -27,11 +27,12 @@ async function capture(page, name) {
   await page.screenshot({ path: resolve(directory, name + '.png'), animations: 'disabled' });
 }
 
-async function send(path, { method = 'GET', token, data, key } = {}) {
+async function send(path, { method = 'GET', token, data, key, installationId } = {}) {
   const headers = {};
   if (token) headers.Authorization = 'Bearer ' + token;
   if (data) headers['Content-Type'] = 'application/json';
   if (key) headers['Idempotency-Key'] = key;
+  if (installationId) headers['X-Installation-Id'] = installationId;
   return fetch(api + path, {
     method, headers, body: data ? JSON.stringify(data) : undefined,
     redirect: 'error', signal: AbortSignal.timeout(10_000),
@@ -139,6 +140,19 @@ test('connected checkout, receipt, pickup, cross-device recovery and payment ret
   await button(page, 'Confirm local test payment').click();
   assert.equal((await (await settled).json()).paymentStatus, 'paid');
   await shown(page, 'Order accepted');
+
+  const alertPath = '/orders/' + order.id + '/pickup-alert';
+  const installationId = randomUUID();
+  assert.equal((await send(alertPath, { installationId })).status, 401);
+  assert.equal((await send(alertPath, { token: foreign.accessToken, installationId })).status, 404);
+  const alert = await send(alertPath, { token, installationId });
+  assert.equal(alert.status, 200);
+  assert.equal(alert.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await alert.json(), { available: false, enabled: false });
+  assert.equal((await send(alertPath, {
+    method: 'PUT', token, installationId, data: { token: 'ExpoPushToken[integration_only]', locale: 'en' },
+  })).status, 503);
+  assert.equal((await send(alertPath, { method: 'DELETE', token, installationId })).status, 204);
 
   const kitchen = await operator('demo-kitchen');
   const pickup = await operator('demo-pickup');

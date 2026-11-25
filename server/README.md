@@ -38,6 +38,8 @@ Production uses the real catalog loaded for the restaurant and individual operat
 
 The operator queue shows confirmed orders by store and role. The release procedure accounts for late or duplicate payment exceptions and fiscal receipt integration. [Release checks](../docs/runbooks/MOBILE_RELEASE.md)
 
+Optional pickup notifications use Expo. Set the provider and server credentials only for the environments where notifications are enabled. [Pickup notification configuration](docs/PICKUP_ALERTS.md)
+
 ### Single-host HTTPS staging
 
 The [HTTPS overlay](deploy/compose.https.yml) runs Caddy and the API on a Linux Docker host with Docker Compose 2.30 or newer. It publishes only TCP ports 80 and 443. Caddy redirects HTTP to HTTPS, renews the certificate for the staging hostname, and stores TLS state in the `edge_data` volume. Keep that volume across container updates. The [base Compose file](deploy/compose.yml) can also run alone with a loopback API port when the host already has HTTPS ingress.

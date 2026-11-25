@@ -19,6 +19,9 @@ const refreshToken = 'refresh_' + 'b'.repeat(40);
 const refreshExpiresAt = '2027-01-26T10:00:00Z';
 const session = { accessToken, expiresAt, refreshToken, refreshExpiresAt };
 const cartLine = { sku: 'double-smash', quantity: 1, unitPrice: 9200, modifierIds: [] };
+const pickupOrderId = 'ab83bbb6-fd3c-4fad-99c7-4538319add23';
+const installationId = '67295c19-0610-4210-94df-79d8161bb727';
+const pushConfig = { ...config, pushProjectId: '13015b68-c43c-481a-be41-1ff695c1a37b' };
 const order = {
   id: 'order-17',
   storeId: 'kigali',
@@ -48,7 +51,7 @@ function memory() {
   return { data, storage };
 }
 
-type Call = { url: string; method?: string; key: string | null; token: string | null; accept: string | null; body: unknown };
+type Call = { url: string; method?: string; key: string | null; token: string | null; accept: string | null; installationId: string | null; body: unknown };
 function transport(handler: (call: Call) => Response | Promise<Response>) {
   const calls: Call[] = [];
   const fetcher: typeof fetch = async (input, init) => {
@@ -59,6 +62,7 @@ function transport(handler: (call: Call) => Response | Promise<Response>) {
       key: headers.get('Idempotency-Key'),
       token: headers.get('Authorization'),
       accept: headers.get('Accept'),
+      installationId: headers.get('X-Installation-Id'),
       body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
     };
     assert.equal(init?.redirect, 'error');
@@ -68,6 +72,81 @@ function transport(handler: (call: Call) => Response | Promise<Response>) {
   };
   return { calls, fetcher };
 }
+
+test('pickup alert reads, opt-in and opt-out are bearer scoped and reuse a private installation after restart', async () => {
+  const { storage, data } = memory();
+  const fixtureToken = 'ExpoPushToken[test-fixture]';
+  let enabled = false;
+  let available = true;
+  let installations = 0;
+  const { fetcher, calls } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) {
+      assert.equal(call.installationId, null);
+      return Response.json(session, { status: 201 });
+    }
+    assert.equal(call.url, config.apiBaseUrl + `/orders/${pickupOrderId}/pickup-alert`);
+    assert.equal(call.token, 'Bearer ' + accessToken);
+    assert.equal(call.installationId, installationId);
+    assert.equal(call.key, null);
+    assert.equal(data.get(journalKey + '.installation'), installationId);
+    if (call.method === 'PUT') {
+      assert.deepEqual(call.body, { token: fixtureToken, locale: 'rw' });
+      enabled = true;
+    } else assert.equal(call.body, undefined);
+    if (call.method === 'DELETE') {
+      enabled = false;
+      return new Response(null, { status: 204 });
+    }
+    return Response.json({ enabled, available });
+  });
+  const options = {
+    config: pushConfig, storage, journalKey, fetcher, now,
+    newInstallationId: () => { installations++; return installationId; },
+  };
+  const first = createLiveApi(options).pickupAlerts!;
+  const reads = await Promise.all([first.get(pickupOrderId), first.get(pickupOrderId)]);
+  assert.deepEqual(reads, [{ enabled: false, available: true }, { enabled: false, available: true }]);
+  assert.deepEqual(await first.enable(pickupOrderId, fixtureToken, 'rw'), { enabled: true, available: true });
+  assert.ok([...data.values()].every(value => !value.includes(fixtureToken)));
+  available = false;
+  const restarted = createLiveApi(options).pickupAlerts!;
+  assert.deepEqual(await restarted.get(pickupOrderId), { enabled: true, available: false });
+  await restarted.disable(pickupOrderId);
+  assert.deepEqual(await restarted.get(pickupOrderId), { enabled: false, available: false });
+  assert.equal(installations, 1);
+  assert.deepEqual(calls.filter(call => call.installationId).map(call => call.method), ['GET', 'GET', 'PUT', 'GET', 'DELETE', 'GET']);
+});
+
+test('pickup alert is disabled outside configured native stage or production and rejects malformed inputs', async () => {
+  const { storage, data } = memory();
+  const { fetcher, calls } = transport(() => { throw new Error('unexpected request'); });
+  const options = { storage, journalKey, fetcher, now, newInstallationId: () => installationId };
+  assert.equal(createLiveApi({ ...options, config }).pickupAlerts, undefined);
+  assert.equal(createLiveApi({ ...options, config: { ...pushConfig, profile: 'local' } }).pickupAlerts, undefined);
+  assert.equal(createLiveApi({ ...options, config: pushConfig, newInstallationId: undefined }).pickupAlerts, undefined);
+
+  const alerts = createLiveApi({ ...options, config: pushConfig }).pickupAlerts!;
+  await assert.rejects(alerts.get('../orders'), { code: 'invalid_input' });
+  await assert.rejects(alerts.enable(pickupOrderId, 'unverified-token', 'en'), { code: 'invalid_input' });
+  data.set(journalKey + '.installation', 'corrupt');
+  await assert.rejects(alerts.get(pickupOrderId), { code: 'storage_unavailable' });
+  assert.equal(data.get(journalKey + '.installation'), 'corrupt');
+  assert.deepEqual(calls, []);
+});
+
+test('failed opt-in and opt-out never appear confirmed', async () => {
+  const { storage } = memory();
+  const { fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) return Response.json(session, { status: 201 });
+    if (call.method === 'PUT') return Response.json({ code: 'pickup_alert_unavailable' }, { status: 409 });
+    if (call.method === 'DELETE') return Response.json(null);
+    return Response.json({ enabled: 'false' });
+  });
+  const alerts = createLiveApi({ config: pushConfig, storage, journalKey, fetcher, now, newInstallationId: () => installationId }).pickupAlerts!;
+  await assert.rejects(alerts.enable(pickupOrderId, 'ExponentPushToken[test-fixture]', 'en'), { code: 'pickup_alert_unavailable' });
+  await assert.rejects(alerts.disable(pickupOrderId), { code: 'invalid_response' });
+  await assert.rejects(alerts.get(pickupOrderId), { code: 'invalid_response' });
+});
 
 test('connected requests share one durable guest identity and recover with the same key after restart', async () => {
   const { storage, data } = memory();

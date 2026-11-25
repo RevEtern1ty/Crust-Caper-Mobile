@@ -6,8 +6,10 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 import com.crustcaper.api.payment.PaymentGateway;
@@ -36,7 +38,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
-@SpringBootTest(properties = "crustcaper.order-access.provider=disabled")
+@SpringBootTest(properties = {"crustcaper.order-access.provider=disabled", "crustcaper.push.provider=disabled"})
 @AutoConfigureMockMvc
 @ActiveProfiles("local")
 class CommerceIntegrationTest {
@@ -389,6 +391,40 @@ class CommerceIntegrationTest {
             .andExpect(jsonPath("$.paymentAttempt").isEmpty());
         assertThat(jdbc.sql("SELECT count(*) FROM payment_attempts WHERE order_id = ?")
             .param(UUID.fromString(legacyOrder)).query(Long.class).single()).isZero();
+    }
+
+    @Test
+    void disabledPickupAlertsExposeExistingConsentAndLetTheGuestRevokeIt() throws Exception {
+        String owner = guest();
+        String quoteId = quote(owner).path("quoteId").asString();
+        String id = body(create(owner, quoteId, "alert").andExpect(status().isOk())).path("id").asString();
+        String attempt = beginPayment(owner, id, "alert-payment");
+        localResult(owner, id, attempt, "paid").andExpect(status().isOk());
+        UUID installation = UUID.randomUUID();
+        String path = orderPath(id) + "/pickup-alert";
+
+        api.perform(get(path).header(HttpHeaders.AUTHORIZATION, owner).header("X-Installation-Id", installation))
+            .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+            .andExpect(content().json("{\"enabled\":false,\"available\":false}"));
+        jdbc.sql("""
+            INSERT INTO pickup_alerts (id, order_id, guest_session_id, installation_id, locale, encrypted_token, enabled, state)
+            VALUES (?, ?, ?, ?, 'en', ?, true, 'waiting')
+            """).params(UUID.randomUUID(), UUID.fromString(id), sessions.authenticate(owner), installation, new byte[64]).update();
+        api.perform(get(path).header(HttpHeaders.AUTHORIZATION, owner).header("X-Installation-Id", installation))
+            .andExpect(status().isOk()).andExpect(content().json("{\"enabled\":true,\"available\":false}"));
+        api.perform(get(path).header(HttpHeaders.AUTHORIZATION, guest()).header("X-Installation-Id", installation))
+            .andExpect(status().isNotFound());
+        api.perform(put(path).header(HttpHeaders.AUTHORIZATION, owner).header("X-Installation-Id", installation)
+            .contentType(MediaType.APPLICATION_JSON).content("""
+                {"token":"ExpoPushToken[synthetic-enrollment-disabled]","locale":"en"}
+                """))
+            .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("service_unavailable"));
+        api.perform(delete(path).header(HttpHeaders.AUTHORIZATION, owner).header("X-Installation-Id", installation))
+            .andExpect(status().isNoContent()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"));
+        assertThat(jdbc.sql("""
+            SELECT count(*) FROM pickup_alerts
+            WHERE order_id = ? AND NOT enabled AND encrypted_token IS NULL AND state = 'cancelled'
+            """).param(UUID.fromString(id)).query(Long.class).single()).isOne();
     }
 
     private void setProductPrice(long amount) {

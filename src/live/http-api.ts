@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { hasSavedCheckout } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError } from '../domain/types';
-import type { ApiErrorCode, Order, PaymentAttempt, ShopApi, Storage } from '../domain/types';
+import type { ApiErrorCode, Locale, Order, PaymentAttempt, ShopApi, Storage } from '../domain/types';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import { menuResponse, orderAccessChallenge, orderAccessGrant, orderResponse, paymentResponse, quoteResponse, reorderResponse, sessionResponse } from './wire';
 
@@ -14,6 +14,7 @@ export type ConnectedConfig = {
   apiBaseUrl: string;
   storeId: string;
   pspHosts: string[];
+  pushProjectId?: string;
 };
 
 type Options = {
@@ -23,6 +24,7 @@ type Options = {
   fetcher?: Fetcher;
   now?: () => number;
   timeoutMs?: number;
+  newInstallationId?: () => string;
 };
 
 export interface LiveShopApi extends ShopApi {
@@ -31,7 +33,10 @@ export interface LiveShopApi extends ShopApi {
 
 const knownConflicts = new Set<string>([
   'quote_expired', 'quote_changed', 'slot_unavailable', 'conflict', 'reservation_expired', 'payment_pending',
+  'pickup_alert_unavailable',
 ]);
+const expoPushTokenPattern = /^(?:Expo|Exponent)PushToken\[[A-Za-z0-9_-]{1,128}\]$/;
+const pickupAlertStatus = z.object({ enabled: z.boolean(), available: z.boolean() });
 
 function invalidResponse(): never {
   throw new ApiError('invalid_response');
@@ -63,7 +68,7 @@ function errorCode(status: number, problem: unknown): ApiErrorCode {
 }
 
 export function createLiveApi({
-  config, storage, journalKey, fetcher = fetch, now = Date.now, timeoutMs = 15_000,
+  config, storage, journalKey, fetcher = fetch, now = Date.now, timeoutMs = 15_000, newInstallationId,
 }: Options): LiveShopApi {
   const base = new URL(config.apiBaseUrl);
   const endpoint = base.origin + '/api/v1';
@@ -72,6 +77,7 @@ export function createLiveApi({
   const orderPath = (id: string) => '/orders/' + encodeURIComponent(id);
   const receiptPath = (id: string) => orderPath(id) + '/receipt';
   let sessionPromise: Promise<Session> | null = null;
+  let installation: Promise<string> | null = null;
 
   const checkedPayment = (attempt: PaymentAttempt): PaymentAttempt => ({
     ...attempt,
@@ -89,21 +95,23 @@ export function createLiveApi({
   };
 
   async function request<T>({
-    path, schema, method = 'GET', token, key, body, pdf = false,
+    path, schema, method = 'GET', token, key, body, pdf = false, installationId,
   }: {
     path: string;
     schema: z.ZodType<T>;
-    method?: 'POST' | 'GET';
+    method?: 'POST' | 'GET' | 'PUT' | 'DELETE';
     token?: string;
     key?: string;
     body?: unknown;
     pdf?: boolean;
+    installationId?: string;
   }): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const headers: Record<string, string> = { Accept: (pdf ? PDF_MIME_TYPE : 'application/json') + ', application/problem+json' };
     if (token) headers.Authorization = 'Bearer ' + token;
     if (key) headers['Idempotency-Key'] = key;
+    if (installationId) headers['X-Installation-Id'] = installationId;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     try {
       const url = endpoint + path;
@@ -119,7 +127,8 @@ export function createLiveApi({
       if (response.redirected || (response.url && response.url !== url)) invalidResponse();
       if (pdf && !response.ok) throw new ApiError(errorCode(response.status, null));
       if (pdf && response.status !== 200) invalidResponse();
-      const payload: unknown = pdf ? await readReceiptPdf(response) : await response.json().catch(() => null);
+      if (method === 'DELETE' && response.ok && response.status !== 204) invalidResponse();
+      const payload: unknown = pdf ? await readReceiptPdf(response) : response.status === 204 ? null : await response.json().catch(() => null);
       if (!response.ok) throw new ApiError(errorCode(response.status, payload));
       const parsed = schema.safeParse(payload);
       if (!parsed.success) invalidResponse();
@@ -194,6 +203,26 @@ export function createLiveApi({
     }
   }
 
+  function pickupAlertPath(orderId: string) {
+    if (!paymentReturnOrderId(orderId)) throw new ApiError('invalid_input');
+    return orderPath(orderId) + '/pickup-alert';
+  }
+
+  function pickupInstallation(): Promise<string> {
+    installation ??= (async () => {
+      const key = journalKey + '.installation';
+      const saved = await storage.getItem(key);
+      const id = paymentReturnOrderId(saved ?? newInstallationId?.());
+      if (!id) throw new ApiError('storage_unavailable');
+      if (saved === null) await storage.setItem(key, id);
+      return id;
+    })().catch(() => {
+      installation = null;
+      throw new ApiError('storage_unavailable');
+    });
+    return installation;
+  }
+
   return {
     async getMenu() {
       const menu = await request({
@@ -248,6 +277,23 @@ export function createLiveApi({
       const path = '/order-access/challenges/' + encodeURIComponent(challengeId) + '/verify';
       return authorized({ path, method: 'POST', schema: orderAccessGrant, body: { code } });
     },
+    ...(config.profile !== 'local' && paymentReturnOrderId(config.pushProjectId) && newInstallationId ? {
+      pickupAlerts: {
+        async get(orderId: string) {
+          const path = pickupAlertPath(orderId);
+          return authorized({ path, schema: pickupAlertStatus, installationId: await pickupInstallation() });
+        },
+        async enable(orderId: string, token: string, locale: Locale) {
+          const path = pickupAlertPath(orderId);
+          if (!expoPushTokenPattern.test(token) || (locale !== 'en' && locale !== 'rw')) throw new ApiError('invalid_input');
+          return authorized({ path, method: 'PUT', schema: pickupAlertStatus, installationId: await pickupInstallation(), body: { token, locale } });
+        },
+        async disable(orderId: string) {
+          const path = pickupAlertPath(orderId);
+          await authorized({ path, method: 'DELETE', schema: z.null(), installationId: await pickupInstallation() });
+        },
+      },
+    } : {}),
     ...(config.profile === 'local' ? {
       async settleLocalTestPayment(orderId: string, attemptId: string, status: 'paid' | 'declined') {
         const path = '/local' + orderPath(orderId) + '/payments/' + encodeURIComponent(attemptId) + '/result';

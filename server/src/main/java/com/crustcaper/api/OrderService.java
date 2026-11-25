@@ -205,6 +205,27 @@ public class OrderService {
             .optional().orElseThrow(ApiFailure::notFound);
     }
 
+    record PickupAlertOrder(String status, String paymentStatus, boolean pickupOpen) {
+        boolean allowsEnrollment() {
+            return pickupOpen && paymentStatus.equals("paid") && (status.equals("accepted") || status.equals("preparing"));
+        }
+    }
+
+    PickupAlertOrder pickupAlertOrder(UUID guest, UUID id, boolean lock) {
+        // Evaluate the end of the pickup window after waiting for a concurrent kitchen or delivery lock.
+        return jdbc.sql("""
+            WITH visible_order AS MATERIALIZED (
+                SELECT status, payment_status, pickup_ends_at FROM orders WHERE id = ?
+            """ + VISIBLE_TO_GUEST + (lock ? " FOR UPDATE OF orders" : "") + """
+            )
+            SELECT status, payment_status, pickup_ends_at > clock_timestamp() AS pickup_open FROM visible_order
+            """)
+            .params(id, guest, guest)
+            .query((rs, row) -> new PickupAlertOrder(rs.getString("status"), rs.getString("payment_status"),
+                rs.getBoolean("pickup_open")))
+            .optional().orElseThrow(ApiFailure::notFound);
+    }
+
     public PaymentAttempt startPayment(UUID guest, UUID id, String key) {
         validateKey(key);
         PaymentStart start = Objects.requireNonNull(transactions.execute(tx -> preparePayment(guest, id, key)));

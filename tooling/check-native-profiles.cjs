@@ -11,6 +11,7 @@ const fixture = {
   CRUSTCAPER_ANDROID_PACKAGE: 'org.crustcaper.civerification',
   CRUSTCAPER_IOS_BUNDLE_ID: 'org.crustcaper.civerification',
 };
+const pushProjectId = '9afd8de1-0758-4bfe-9ccc-12589d6a62dc';
 
 function inspect(profile, overrides = {}, json = true) {
   const env = { ...inherited, EXPO_NO_TELEMETRY: '1', EXPO_NO_DOTENV: '1', ...fixture, CRUSTCAPER_BUILD_PROFILE: profile };
@@ -47,6 +48,10 @@ for (const profile of ['stage', 'production']) {
     pspHosts: [fixture.CRUSTCAPER_PSP_HOSTS],
   });
   const manifest = native.android.manifest.manifest;
+  const permissions = manifest['uses-permission'] ?? [];
+  assert.ok(permissions.some(permission => permission.$['android:name'] === 'android.permission.POST_NOTIFICATIONS'
+    && permission.$['tools:node'] === 'remove'));
+  assert.equal(native.ios.entitlements['aps-environment'], undefined);
   const application = manifest.application[0];
   assert.equal(application.$['android:allowBackup'], 'false');
   assert.equal(application.$['android:usesCleartextTraffic'], 'false');
@@ -67,7 +72,28 @@ for (const profile of ['stage', 'production']) {
     NSAllowsLocalNetworking: false,
   });
   console.log(`${profile} Android manifest and iOS entitlements match the connected configuration`);
+
+  const pushResult = inspect(profile, { CRUSTCAPER_PUSH_PROJECT_ID: pushProjectId });
+  assert.equal(pushResult.status, 0, pushResult.stderr);
+  const pushConfig = JSON.parse(pushResult.stdout);
+  assert.equal(pushConfig.extra.restaurant.pushProjectId, pushProjectId);
+  assert.equal(pushConfig.extra.eas.projectId, pushProjectId);
+  const pushNative = pushConfig._internal.modResults;
+  assert.equal(pushNative.ios.entitlements['aps-environment'], 'production');
+  const pushManifest = pushNative.android.manifest.manifest;
+  const pushPermissions = pushManifest['uses-permission'] ?? [];
+  assert.ok(!pushPermissions.some(permission => permission.$['android:name'] === 'android.permission.POST_NOTIFICATIONS'
+    && permission.$['tools:node'] === 'remove'));
+  const androidApp = pushManifest.application[0];
+  const defaultChannel = androidApp['meta-data']?.find(entry =>
+    entry.$['android:name'] === 'com.google.firebase.messaging.default_notification_channel_id');
+  assert.equal(defaultChannel?.$['android:value'], 'pickup-ready');
+  console.log(`${profile} Expo Push project, Android channel and APNs entitlement match the opt-in configuration`);
 }
+
+const demoResult = inspect('demo', { CRUSTCAPER_PUSH_PROJECT_ID: pushProjectId });
+assert.equal(demoResult.status, 0, demoResult.stderr);
+assert.deepEqual(JSON.parse(demoResult.stdout).extra.restaurant, { profile: 'demo' });
 
 const rejectedProductionConfigs = [
   [{ CRUSTCAPER_API_BASE_URL: undefined }, 'Set CRUSTCAPER_API_BASE_URL'],
@@ -79,6 +105,7 @@ const rejectedProductionConfigs = [
   [{ CRUSTCAPER_ANDROID_PACKAGE: undefined }, 'Set CRUSTCAPER_ANDROID_PACKAGE'],
   [{ CRUSTCAPER_ANDROID_PACKAGE: 'com.crustcaper.mobile.stage' }, 'Use a distinct, valid native application identifier'],
   [{ CRUSTCAPER_IOS_BUNDLE_ID: undefined }, 'Set CRUSTCAPER_IOS_BUNDLE_ID'],
+  [{ CRUSTCAPER_PUSH_PROJECT_ID: 'invalid' }, 'CRUSTCAPER_PUSH_PROJECT_ID must be a UUID'],
 ];
 for (const [overrides, cause] of rejectedProductionConfigs) {
   const result = inspect('production', overrides, false);

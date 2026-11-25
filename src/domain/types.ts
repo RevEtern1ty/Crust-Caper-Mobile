@@ -134,6 +134,7 @@ export type ApiErrorCode =
   | 'conflict'
   | 'reservation_expired'
   | 'payment_pending'
+  | 'pickup_alert_unavailable'
   | 'storage_unavailable'
   | 'unauthenticated'
   | 'network_unavailable'
@@ -151,6 +152,8 @@ export class ApiError extends Error {
   }
 }
 
+export type PickupAlertStatus = { enabled: boolean; available: boolean }
+
 export interface ShopApi {
   getMenu(): Promise<Menu>
   createQuote(input: QuoteInput): Promise<Quote>
@@ -162,6 +165,11 @@ export interface ShopApi {
   reorder(orderId: string): Promise<ReorderResult>
   requestOrderAccess?(input: OrderAccessRequest): Promise<{ challengeId: string }>
   verifyOrderAccess?(challengeId: string, code: string): Promise<{ orderId: string }>
+  pickupAlerts?: {
+    get(orderId: string): Promise<PickupAlertStatus>
+    enable(orderId: string, token: string, locale: Locale): Promise<PickupAlertStatus>
+    disable(orderId: string): Promise<void>
+  }
 }
 
 export type DemoPaymentResult = 'paid' | 'declined' | 'processing'

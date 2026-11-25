@@ -1,6 +1,11 @@
 import type { ConfigContext, ExpoConfig } from 'expo/config';
+import { createRunOncePlugin } from 'expo/config-plugins';
 
 const domainName = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const projectIdPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+
+// Expo Prebuild otherwise applies the installed notifications plugin automatically.
+const withoutPickupAlertEntitlement = createRunOncePlugin(config => config, 'expo-notifications');
 
 function required(value: string | undefined, name: string): string {
   if (!value?.trim()) throw new Error(`Set ${name} for this CrustCaper build profile.`);
@@ -18,8 +23,19 @@ function httpsOrigin(value: string, name: string): URL {
 
 export default ({ config }: ConfigContext): ExpoConfig => {
   const profile = process.env.CRUSTCAPER_BUILD_PROFILE ?? 'demo';
+  const pushProfile = profile === 'stage' || profile === 'production';
+  const pushProjectId = pushProfile ? process.env.CRUSTCAPER_PUSH_PROJECT_ID?.trim().toLowerCase() || undefined : undefined;
+  if (pushProjectId && !projectIdPattern.test(pushProjectId)) {
+    throw new Error('CRUSTCAPER_PUSH_PROJECT_ID must be a UUID for this build profile.');
+  }
+  const googleServicesFile = pushProjectId ? process.env.CRUSTCAPER_ANDROID_GOOGLE_SERVICES_FILE?.trim() : undefined;
+  const blockedPermissions = [
+    ...(config.android?.blockedPermissions ?? []),
+    'android.permission.RECEIVE_BOOT_COMPLETED',
+    ...(pushProjectId ? [] : ['android.permission.POST_NOTIFICATIONS']),
+  ];
   if (profile === 'demo') {
-    return { ...config, extra: { ...config.extra, restaurant: { profile } } };
+    return withoutPickupAlertEntitlement({ ...config, android: { ...config.android, blockedPermissions }, extra: { ...config.extra, restaurant: { profile } } });
   }
   if (profile !== 'local' && profile !== 'stage' && profile !== 'production') {
     throw new Error('Use demo, local, stage or production for CRUSTCAPER_BUILD_PROFILE.');
@@ -67,7 +83,8 @@ export default ({ config }: ConfigContext): ExpoConfig => {
           android: { ...plugin[1]?.android, usesCleartextTraffic: local },
         }] as typeof plugin
       : plugin);
-  return {
+  if (pushProjectId) plugins.push(['expo-notifications', { defaultChannel: 'pickup-ready', mode: 'production' }]);
+  const resolved: ExpoConfig = {
     ...config,
     name,
     scheme: production ? 'crustcaper' : `crustcaper-${profile}`,
@@ -84,6 +101,8 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     android: {
       ...config.android,
       package: androidPackage,
+      blockedPermissions,
+      ...(googleServicesFile ? { googleServicesFile } : {}),
       intentFilters: appLinkOrigin ? [{
         action: 'VIEW',
         autoVerify: true,
@@ -93,7 +112,9 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     },
     extra: {
       ...config.extra,
-      restaurant: { profile, apiBaseUrl: api.origin + '/api/v1', storeId, pspHosts },
+      ...(pushProjectId ? { eas: { ...config.extra?.eas, projectId: pushProjectId } } : {}),
+      restaurant: { profile, apiBaseUrl: api.origin + '/api/v1', storeId, pspHosts, pushProjectId },
     },
   };
+  return pushProjectId ? resolved : withoutPickupAlertEntitlement(resolved);
 };

@@ -8,6 +8,7 @@ import {
 import type { PropsWithChildren } from 'react';
 import { AppState, Platform } from 'react-native';
 import { CHECKOUT_JOURNAL_KEY } from '../checkout/controller';
+import { paymentReturnOrderId } from '../checkout/payment-return';
 import { lineKey } from '../domain/cart';
 import { createDemoApi } from '../domain/demo-api';
 import type { CartLine, DemoApi, Locale, Menu, ShopApi } from '../domain/types';
@@ -24,6 +25,8 @@ if (!settings || !['demo', 'local', 'stage', 'production'].includes(settings.pro
   throw new Error('CrustCaper runtime profile is missing.');
 }
 const connected = settings.profile !== 'demo' ? settings : null;
+const pushProjectId = connected && connected.profile !== 'local' && (Platform.OS === 'android' || Platform.OS === 'ios')
+  ? paymentReturnOrderId(connected.pushProjectId) : null;
 const runtimeScope = connected ? [
   connected.profile, new URL(connected.apiBaseUrl).hostname, new URL(connected.apiBaseUrl).port || '443', connected.storeId,
 ].join('.') : null;
@@ -46,6 +49,7 @@ const liveApi = connected ? createLiveApi({
   config: connected,
   storage: privateStorage,
   journalKey: checkoutStorageKey,
+  newInstallationId: pushProjectId ? randomUUID : undefined,
   // The React Native XHR-backed fetch does not enforce RequestInit.redirect.
   fetcher: Platform.OS === 'web' ? undefined : expoFetch,
 }) : null;
@@ -88,6 +92,7 @@ type Shop = Draft & {
   settleLocalTestPayment: LiveShopApi['settleLocalTestPayment'];
   checkoutStorageKey: string;
   checkoutAllowed: boolean;
+  pushProjectId: string | null;
   fixturePhotos: boolean;
   menu: Menu | null;
   status: MenuStatus;
@@ -202,6 +207,7 @@ export function ShopProvider({ children }: PropsWithChildren) {
       ...draft, api, demoApi, settleLocalTestPayment: liveApi?.settleLocalTestPayment,
       checkoutStorageKey, mode: connected ? 'connected' : 'demo',
       checkoutAllowed: !connected || connected.profile === 'local' || Platform.OS !== 'web',
+      pushProjectId,
       fixturePhotos: !connected || connected.profile === 'local',
       menu, status, refreshing, hydrated, draftSaving, draftStorageError, retryDraftStorage, total, count,
       setLocale, addLine, changeQuantity, editLine, replaceCart, clearCart, refreshMenu,

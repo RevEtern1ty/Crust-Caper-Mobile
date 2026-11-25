@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: CrustCaper Shared API
-  version: 0.5.0
+  version: 0.6.0
   description: Implemented HTTP contract for the Spring Boot commerce service.
 servers:
   - url: /api/v1
@@ -146,6 +146,58 @@ paths:
           content:
             application/pdf:
               schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+  /orders/{id}/pickup-alert:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+      - $ref: '#/components/parameters/PickupInstallationId'
+    get:
+      operationId: getPickupAlert
+      security: [{ guestOrAccount: [] }]
+      description: Returns the saved preference for this installation and order and whether the push provider is available. Visible to the original guest or a guest with a valid recovery grant.
+      responses:
+        '200': { $ref: '#/components/responses/PickupAlert' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+    put:
+      operationId: enablePickupAlert
+      security: [{ guestOrAccount: [] }]
+      description: Enables a ready notification for a paid order while it is accepted or preparing and its pickup window has not ended. Repeating the request for the same guest and installation updates its preference while enrollment stays open.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PickupAlertRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/PickupAlert' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '409':
+          description: Order state prevents enrollment or the tracked installation limit has been reached.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetails'
+                  - type: object
+                    properties:
+                      status: { const: 409 }
+                      code: { enum: [pickup_alert_unavailable, pickup_alert_limit] }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    delete:
+      operationId: disablePickupAlert
+      security: [{ guestOrAccount: [] }]
+      description: Revokes the preference and clears the saved Expo token for this guest, installation and order. The operation is idempotent and available when the push provider is disabled.
+      responses:
+        '204':
+          description: The preference is disabled.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+        '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
   /orders/{id}/reorder:
@@ -558,6 +610,15 @@ components:
       in: path
       required: true
       schema: { type: string }
+    PickupInstallationId:
+      name: X-Installation-Id
+      in: header
+      required: true
+      description: Stable identifier generated and stored by the native installation.
+      schema:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -565,6 +626,14 @@ components:
       description: Reuse the key with the same payload to recover the original operation.
       schema: { type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$' }
   responses:
+    PickupAlert:
+      description: Current notification preference for the guest, installation and order.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PickupAlert' }
     OperatorAvailability:
       description: Current restaurant and item availability. Changes to published values advance the version.
       headers:
@@ -674,6 +743,21 @@ components:
                   status: { const: 429 }
                   code: { const: rate_limited }
   schemas:
+    PickupAlert:
+      type: object
+      required: [available, enabled]
+      properties:
+        available: { type: boolean, description: The server is configured to send push notifications. }
+        enabled: { type: boolean }
+    PickupAlertRequest:
+      type: object
+      required: [token, locale]
+      properties:
+        token:
+          type: string
+          pattern: '^(Expo|Exponent)PushToken\[[A-Za-z0-9_-]{1,128}\]$'
+          writeOnly: true
+        locale: { type: string, enum: [en, rw] }
     OperatorAvailability:
       type: object
       required: [version, open, products]
