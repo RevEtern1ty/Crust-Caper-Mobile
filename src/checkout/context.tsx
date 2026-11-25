@@ -12,6 +12,8 @@ import { CheckoutController, CheckoutError, type CheckoutContact, type CheckoutJ
 
 type Context = {
   journal: CheckoutJournal | null;
+  paymentReturnOrder: string | null;
+  setPaymentReturnOrder: (orderId: string | null) => void;
   restoreFailed: boolean;
   busy: boolean;
   retryRestore: () => Promise<void>;
@@ -31,6 +33,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
   const clearCartRef = useRef(clearCart);
   const running = useRef(false);
   const [journal, setJournal] = useState<CheckoutJournal | null>(null);
+  const [paymentReturnOrder, setPaymentReturnOrder] = useState<string | null>(null);
   const [restoreFailed, setRestoreFailed] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -84,6 +87,8 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
 
   const value: Context = {
     journal,
+    paymentReturnOrder,
+    setPaymentReturnOrder,
     restoreFailed,
     busy,
     retryRestore: async () => {

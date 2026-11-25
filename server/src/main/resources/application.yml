@@ -34,5 +34,9 @@ management:
         readiness:
           include: readinessState,db
 crustcaper:
+  app-links:
+    ios-app-id: ${CRUSTCAPER_APP_LINK_IOS_APP_ID:}
+    android-package: ${CRUSTCAPER_APP_LINK_ANDROID_PACKAGE:}
+    android-fingerprints: ${CRUSTCAPER_APP_LINK_ANDROID_FINGERPRINTS:}
   payment:
     provider: ${CRUSTCAPER_PAYMENT_PROVIDER:flutterwave}

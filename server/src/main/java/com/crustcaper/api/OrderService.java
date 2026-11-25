@@ -33,7 +33,6 @@ public class OrderService {
     private static final Pattern KEY = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
     private static final Pattern CATALOG_ID = Pattern.compile("[A-Za-z0-9._:-]{1,100}");
     private static final Pattern PHONE = Pattern.compile("\\+[1-9][0-9]{7,14}");
-    private static final Pattern EMAIL = Pattern.compile("[^\\s@]+@[^\\s@]+\\.[^\\s@]+");
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final TypeReference<List<CartLine>> CART_LINES = new TypeReference<>() {};
     private static final String ORDER = "SELECT * FROM orders WHERE id = ?";
@@ -114,7 +113,7 @@ public class OrderService {
         String email = input.email() == null || input.email().isBlank() ? null : input.email().strip();
         if (!PHONE.matcher(phone).matches()
             || (email == null && !localPayments)
-            || (email != null && (email.length() > 254 || !EMAIL.matcher(email).matches()))) {
+            || (email != null && !PaymentGateway.supportsCustomerEmail(email))) {
             throw ApiFailure.invalid();
         }
 
@@ -204,10 +203,31 @@ public class OrderService {
                 .params(checkoutUrl, attempt.id()).update();
             return jdbc.sql("SELECT * FROM payment_attempts WHERE id = ?").param(attempt.id())
                 .query(OrderService::attemptRow).single().view();
-        } catch (PaymentGatewayException ignored) {
+        } catch (PaymentGatewayException error) {
+            if (error.kind() == PaymentGatewayException.Kind.INVALID_REQUEST) {
+                boolean expired = Objects.requireNonNull(transactions.execute(tx -> rejectUndispatchedPayment(guest, attempt)));
+                throw expired ? ApiFailure.conflict("reservation_expired") : ApiFailure.invalid();
+            }
             // The provider may have received the request. Keep this attempt for verification by reference.
             throw ApiFailure.unavailable();
         }
+    }
+
+    private boolean rejectUndispatchedPayment(UUID guest, Attempt attempt) {
+        StoredOrder order = owned(guest, attempt.orderId(), true);
+        boolean expired = !order.reservationExpiresAt().isAfter(databaseNow());
+        Attempt current = latest(order.id());
+        if (current == null || !current.id().equals(attempt.id()) || !order.paymentStatus().equals("processing")
+            || !order.status().equals("awaiting_payment")) return expired;
+        int closed = jdbc.sql("""
+            UPDATE payment_attempts SET status = 'declined'
+            WHERE id = ? AND status = 'processing' AND checkout_url IS NULL AND provider_transaction_id IS NULL
+            """).param(attempt.id()).update();
+        if (closed == 1) {
+            jdbc.sql("UPDATE orders SET status = 'cancelled', payment_status = 'declined' WHERE id = ?")
+                .param(order.id()).update();
+        }
+        return expired;
     }
 
     private PaymentStart preparePayment(UUID guest, UUID id, String key) {

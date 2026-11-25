@@ -1,10 +1,12 @@
 import { router } from 'expo-router';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Linking, Platform, Pressable, StyleSheet, View } from 'react-native';
 
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../../src/checkout/context';
 import { CheckoutError } from '../../src/checkout/controller';
-import { checkoutError, changeLabel, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
+import { checkoutError, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
+import { ReorderPanel } from '../../src/checkout/reorder-panel';
+import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
 import type { DemoKitchenStatus, ReorderResult } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
@@ -14,7 +16,7 @@ type Action = 'resume' | 'reorder' | 'kitchen' | 'receipt';
 
 export default function OrdersScreen() {
   const { api, mode, demoApi, checkoutAllowed, locale, menu, cart, hydrated, replaceCart } = useShop();
-  const { journal, restoreFailed, retryRestore, resumeCheckout, busy } = useCheckout();
+  const { journal, paymentReturnOrder, setPaymentReturnOrder, restoreFailed, retryRestore, resumeCheckout, busy } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const latestId = journal?.orderIds[0] ?? null;
   const [choice, setChoice] = useState<{ latest: string | null; id: string } | null>(null);
@@ -22,9 +24,20 @@ export default function OrdersScreen() {
   const [preview, setPreview] = useState<{ orderId: string; result: ReorderResult } | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const running = useRef(false);
-  const orderId = choice?.latest === latestId ? choice.id : latestId;
+  const linkedOrderId = savedPaymentReturnOrderId(paymentReturnOrder ?? undefined, journal?.orderIds ?? []);
+  const orderId = linkedOrderId ?? (choice?.latest === latestId ? choice.id : latestId);
   const { order, loading, failed, error: statusError, refresh } = useOrderStatus(orderId);
   const t = (en: string, rw: string) => copy(locale, en, rw);
+
+  useEffect(() => {
+    if (!journal || paymentReturnOrder === null) return;
+    if (linkedOrderId) {
+      setChoice({ latest: latestId, id: linkedOrderId });
+      setPreview(null);
+      setProblem(null);
+    }
+    setPaymentReturnOrder(null);
+  }, [journal, latestId, linkedOrderId, paymentReturnOrder, setPaymentReturnOrder]);
 
   const active = journal?.active;
   const ongoingCreate = active?.phase === 'creating';
@@ -209,22 +222,16 @@ export default function OrdersScreen() {
           </Card>
 
           {repeat && (
-            <Card>
-              <Text variant="heading">{t('Available items today', 'Ibiribwa biboneka uyu munsi')}</Text>
-              {repeat.lines.map((line) => <Text key={`${line.sku}:${line.modifierIds.join(',')}`}>{line.quantity} × {itemName(line.sku, locale, menu)} · {money(line.unitPrice * line.quantity)}</Text>)}
-              {repeat.changes.map((change, index) => <Text key={index} tone="red">{changeLabel(change, locale, menu)}</Text>)}
-              {!repeat.lines.length && <Text tone="muted">{t('None of these items are available.', 'Nta na kimwe muri ibi biribwa kiboneka.')}</Text>}
-              <Button
-                label={cart.length ? t('Replace cart with these items', 'Simbuza ibiri mu gatebo ibi biribwa') : t('Add these items to cart', 'Shyira ibi biribwa mu gatebo')}
-                onPress={() => {
-                  replaceCart(repeat.lines);
-                  setPreview(null);
-                  router.push('/cart');
-                }}
-                disabled={!repeat.lines.length || !hydrated}
-              />
-              <Button label={t('Cancel reorder', 'Hagarika gusubiramo komande')} variant="ghost" onPress={() => setPreview(null)} />
-            </Card>
+            <ReorderPanel
+              original={order.lines} offer={repeat} menu={menu} locale={locale}
+              replacesCart={cart.length > 0} disabled={!hydrated}
+              onConfirm={() => {
+                replaceCart(repeat.lines);
+                setPreview(null);
+                router.push('/cart');
+              }}
+              onCancel={() => setPreview(null)}
+            />
           )}
 
           {demoApi && nextKitchen && (

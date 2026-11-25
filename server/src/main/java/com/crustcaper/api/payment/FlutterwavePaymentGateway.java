@@ -29,7 +29,6 @@ final class FlutterwavePaymentGateway implements PaymentGateway {
     private static final Pattern REFERENCE = Pattern.compile("[A-Za-z0-9_-]{1,128}");
     private static final Pattern TRANSACTION_ID = Pattern.compile("[1-9][0-9]{0,18}");
     private static final Pattern CURRENCY = Pattern.compile("[A-Z]{3}");
-    private static final Pattern EMAIL = Pattern.compile("[^@\\s\\p{Cntrl}]+@[^@\\s\\p{Cntrl}]+\\.[^@\\s\\p{Cntrl}]+");
     private static final Pattern PHONE = Pattern.compile("\\+[1-9][0-9]{6,14}");
     private static final Pattern CHECKOUT_PATH = Pattern.compile("/v3/hosted/pay/[A-Za-z0-9_-]{1,256}");
     private static final Set<String> NOT_FOUND_MESSAGES = Set.of("transaction not found", "no transaction found");
@@ -120,7 +119,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway {
     private void validateRequest(PaymentRequest request) {
         if (request == null || !matches(REFERENCE, request.reference()) || !matches(REFERENCE, request.orderId())
                 || request.amount() <= 0 || request.amount() > MAX_CHARGE_RWF || !"RWF".equals(request.currency())
-                || request.email() == null || request.email().length() > 254 || !matches(EMAIL, request.email())
+                || !PaymentGateway.supportsCustomerEmail(request.email())
                 || request.expiresAt() == null || !request.expiresAt().isAfter(Instant.now(clock))
                 || (request.phone() != null && !request.phone().isBlank() && !matches(PHONE, request.phone()))) {
             throw new PaymentGatewayException(INVALID_REQUEST);

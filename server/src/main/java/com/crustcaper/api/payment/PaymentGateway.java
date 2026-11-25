@@ -6,11 +6,17 @@ import java.util.Optional;
 public interface PaymentGateway {
     long MAX_CHARGE_RWF = Integer.MAX_VALUE;
 
+    /** INVALID_REQUEST is reserved for a checkout rejected before any provider request is sent. */
     HostedPayment open(PaymentRequest request);
 
     VerifiedPayment verify(String transactionId);
 
     Optional<VerifiedPayment> verifyByReference(String reference);
+
+    static boolean supportsCustomerEmail(String email) {
+        return email != null && email.length() <= 254
+            && email.matches("[^@\\s\\p{Cntrl}]+@[^@\\s\\p{Cntrl}]+\\.[^@\\s\\p{Cntrl}]+");
+    }
 
     record PaymentRequest(String reference, String orderId, long amount, String currency,
                           String phone, String email, Instant expiresAt) {

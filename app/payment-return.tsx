@@ -1,11 +1,18 @@
-import { Redirect } from 'expo-router';
+import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import { useEffect } from 'react';
+import { useCallback } from 'react';
 import { Platform } from 'react-native';
+import { useCheckout } from '../src/checkout/context';
+import { paymentReturnOrderId } from '../src/checkout/payment-return';
 
 export default function PaymentReturn() {
-  useEffect(() => {
+  const { orderId } = useLocalSearchParams<{ orderId?: string | string[] }>();
+  const { setPaymentReturnOrder } = useCheckout();
+  const requestedOrder = paymentReturnOrderId(orderId);
+  useFocusEffect(useCallback(() => {
+    setPaymentReturnOrder(requestedOrder);
     if (Platform.OS === 'ios') void WebBrowser.dismissBrowser().catch(() => undefined);
-  }, []);
-  return <Redirect href="/(tabs)/orders" />;
+    router.replace('/(tabs)/orders');
+  }, [requestedOrder, setPaymentReturnOrder]));
+  return null;
 }

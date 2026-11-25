@@ -38,4 +38,38 @@ Production uses the real catalog loaded for the restaurant and individual operat
 
 The operator queue shows confirmed orders by store and role. The release procedure accounts for late or duplicate payment exceptions and fiscal receipt integration. [Release checks](../docs/runbooks/MOBILE_RELEASE.md)
 
-The [deployment Compose file](deploy/compose.yml) runs the API with a read-only root filesystem and loopback listener for a host HTTPS proxy. Set `CRUSTCAPER_API_IMAGE` to the selected image and `CRUSTCAPER_API_ENV_FILE` to the path of the separate environment file. Use a PostgreSQL connection with server certificate and hostname verification. Point the proxy at the configured loopback port and apply the traffic and webhook policies for the environment.
+### Single-host HTTPS staging
+
+The [HTTPS overlay](deploy/compose.https.yml) runs Caddy and the API on a Linux Docker host with Docker Compose 2.30 or newer. It publishes only TCP ports 80 and 443. Caddy redirects HTTP to HTTPS, renews the certificate for the staging hostname, and stores TLS state in the `edge_data` volume. Keep that volume across container updates. The [base Compose file](deploy/compose.yml) can also run alone with a loopback API port when the host already has HTTPS ingress.
+
+Set an A record for the staging hostname and allow TCP 80 and 443 through the host firewall. If the hostname also has an AAAA record, verify that IPv6 reaches the ingress as well before certificate issuance. Supply a dedicated private PostgreSQL database, its PEM CA certificate, Flutterwave Test credentials and the signed staging application identities. Use the same hostname for the native client's API and return origin. [Caddy HTTPS requirements](https://caddyserver.com/docs/automatic-https)
+
+Create `/etc/crustcaper/stage/compose.env` with the following deployment values. Set a verified image digest or a locally loaded, SHA-specific API image tag.
+
+| Variable | Staging value |
+| --- | --- |
+| `CRUSTCAPER_API_IMAGE` | Verified API image for the selected release SHA. |
+| `CRUSTCAPER_HTTPS_HOST` | Exact staging hostname, without a scheme or port. |
+| `CRUSTCAPER_HTTPS_BIND_IP` | Host listener IP. Use `127.0.0.1` with hostname `localhost` for a private local HTTPS rehearsal. |
+| `CRUSTCAPER_API_ENV_FILE` | Absolute path to the API environment file. |
+| `CRUSTCAPER_POSTGRES_CA_FILE` | Absolute path to the CA PEM file, readable by the API container's UID `10001`. |
+
+Store the API variables from the Deployment configuration section in a separate host file with mode `0600`. Use raw `KEY=value` lines without shell quoting. Set `SPRING_PROFILES_ACTIVE=stage`, `CRUSTCAPER_PAYMENT_PROVIDER=flutterwave`, and `CRUST_PAYMENT_RETURN_URL=https://<staging-host>/payment-return`. Set the JDBC URL to `jdbc:postgresql://<db-host>:5432/<db>?sslmode=verify-full&sslrootcert=/run/crustcaper/postgres-ca.crt`; the database hostname must match its certificate. Keep API secrets out of Compose interpolation values and use `config --quiet` for validation. [pgJDBC TLS configuration](https://jdbc.postgresql.org/documentation/ssl/)
+
+Configure `CRUSTCAPER_APP_LINK_IOS_APP_ID` with the signed Apple application identifier and `CRUSTCAPER_APP_LINK_ANDROID_PACKAGE` with the signed Android package. Supply the comma-separated, colon-delimited SHA-256 signing certificate fingerprints in `CRUSTCAPER_APP_LINK_ANDROID_FINGERPRINTS`. An unconfigured platform's association URL returns 404. [Connected release checks](../docs/runbooks/CONNECTED_RELEASE.md)
+
+From the candidate checkout on the staging host, run the same project name and files for validation, start and subsequent updates.
+
+```sh
+stage_compose() {
+  docker compose --env-file /etc/crustcaper/stage/compose.env \
+    --project-name crustcaper-stage \
+    -f server/deploy/compose.yml -f server/deploy/compose.https.yml "$@"
+}
+stage_compose config --quiet
+stage_compose run --rm --no-deps edge caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+stage_compose up -d --wait --wait-timeout 90
+stage_compose exec -T edge wget -qO- http://api:8080/actuator/health/readiness
+```
+
+Run the [connected release checks](../docs/runbooks/CONNECTED_RELEASE.md) against the deployed HTTPS hostname. The proxy exposes customer API and Flutterwave webhook, `/operator/index.html`, `/payment-return` and the two signing association URLs. Internal health probes stay inside the Docker network. HTTPS requests are capped at 64 KiB. Before allowing pilot traffic, configure log and availability monitoring, an approved request-rate policy and database backup/restore. Prepare a verified previous image reference. Roll back the container by restoring that reference and rerunning `up` only after confirming the previous image supports the current Flyway schema.

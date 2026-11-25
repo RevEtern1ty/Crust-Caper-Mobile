@@ -1,0 +1,51 @@
+{
+	admin off
+	persist_config off
+	skip_install_trust
+	log {
+		format filter {
+			wrap json
+			request delete
+		}
+	}
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_header 5s
+			read_body 15s
+			idle 60s
+		}
+	}
+}
+
+https://{$CRUSTCAPER_HTTPS_HOST} {
+	header {
+		-Server
+		Strict-Transport-Security "max-age=86400"
+		Referrer-Policy no-referrer
+		X-Content-Type-Options nosniff
+	}
+
+	@local path /api/v1/local /api/v1/local/*
+	@operatorHome path /operator /operator/
+	@publicRoutes path /api/v1 /api/v1/* /operator/* /payment-return /.well-known/apple-app-site-association /.well-known/assetlinks.json
+	route {
+		respond @local 404
+		redir @operatorHome /operator/index.html 308
+		handle @publicRoutes {
+			request_body {
+				max_size 64KiB
+			}
+			reverse_proxy api:8080 {
+				health_uri /actuator/health/readiness
+				health_interval 5s
+				health_timeout 3s
+				transport http {
+					dial_timeout 3s
+					response_header_timeout 30s
+				}
+			}
+		}
+		respond 404
+	}
+}

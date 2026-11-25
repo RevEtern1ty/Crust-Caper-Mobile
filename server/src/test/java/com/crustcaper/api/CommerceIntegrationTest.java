@@ -2,12 +2,18 @@ package com.crustcaper.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
+import com.crustcaper.api.payment.PaymentGateway;
 import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
+import com.crustcaper.api.payment.PaymentGatewayException;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
@@ -26,6 +32,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
@@ -43,6 +50,7 @@ class CommerceIntegrationTest {
     @Autowired ObjectMapper json;
     @Autowired GuestSessions sessions;
     @Autowired OrderService orders;
+    @MockitoSpyBean PaymentGateway gateway;
 
     private String store;
     private final List<UUID> guests = new ArrayList<>();
@@ -227,6 +235,66 @@ class CommerceIntegrationTest {
             .andExpect(jsonPath("$.pickupCode").isEmpty());
         assertThat(jdbc.sql("SELECT reason FROM payment_exceptions WHERE attempt_id = ?")
             .param(UUID.fromString(second)).query(String.class).single()).isEqualTo("unavailable_reservation");
+    }
+
+    @Test
+    void anUndispatchedPaymentClosesItsAttemptAndReleasesAnExpiredHold() throws Exception {
+        String owner = guest();
+        String quoteId = quote(owner).path("quoteId").asText();
+        String id = body(create(owner, quoteId, "order").andExpect(status().isOk())).path("id").asText();
+        doAnswer(invocation -> {
+            jdbc.sql("UPDATE orders SET reservation_expires_at = clock_timestamp() WHERE id = ?")
+                .param(UUID.fromString(id)).update();
+            throw new PaymentGatewayException(PaymentGatewayException.Kind.INVALID_REQUEST);
+        }).when(gateway).open(any());
+
+        api.perform(post(orderPath(id) + "/payments").header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "open"))
+            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("reservation_expired"));
+        String attempt = jdbc.sql("SELECT id FROM payment_attempts WHERE order_id = ? AND status = 'declined'")
+            .param(UUID.fromString(id)).query(UUID.class).single().toString();
+        api.perform(get(orderPath(id)).header(HttpHeaders.AUTHORIZATION, owner)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.status").value("cancelled")).andExpect(jsonPath("$.paymentStatus").value("declined"));
+        api.perform(post(orderPath(id) + "/payments").header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "open"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(attempt))
+            .andExpect(jsonPath("$.status").value("declined"));
+        verify(gateway).open(any());
+
+        String freshQuote = quote(owner).path("quoteId").asText();
+        create(owner, freshQuote, "new-order").andExpect(status().isOk());
+    }
+
+    @Test
+    void anUncertainGatewayFailureKeepsTheSamePaymentAttemptForReconciliation() throws Exception {
+        String owner = guest();
+        String quoteId = quote(owner).path("quoteId").asText();
+        String id = body(create(owner, quoteId, "order").andExpect(status().isOk())).path("id").asText();
+        doThrow(new PaymentGatewayException(PaymentGatewayException.Kind.UNAVAILABLE)).when(gateway).open(any());
+
+        api.perform(post(orderPath(id) + "/payments").header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "open"))
+            .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("service_unavailable"));
+        JsonNode saved = body(api.perform(get(orderPath(id)).header(HttpHeaders.AUTHORIZATION, owner))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.paymentStatus").value("processing")));
+        String attempt = saved.path("paymentAttempt").path("id").asText();
+        api.perform(post(orderPath(id) + "/payments").header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "open"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(attempt))
+            .andExpect(jsonPath("$.status").value("processing"));
+        api.perform(post(orderPath(id) + "/payments").header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "another"))
+            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("payment_pending"));
+        verify(gateway).open(any());
+    }
+
+    @Test
+    void rejectsEmailOutsideTheProviderContractBeforeReservingAnOrder() throws Exception {
+        String owner = guest();
+        String quoteId = quote(owner).path("quoteId").asText();
+        String controlCharacter = "customer" + (char) 127 + "@example.test";
+        api.perform(post(ROOT + "/orders").header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "order")
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(json.writeValueAsString(new ApiModels.OrderInput(quoteId, PHONE, controlCharacter))))
+            .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("invalid_input"));
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?")
+            .param(store).query(Long.class).single()).isZero();
+        create(owner, quoteId, "valid-order").andExpect(status().isOk());
     }
 
     @Test

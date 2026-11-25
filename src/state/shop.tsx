@@ -8,6 +8,7 @@ import {
 import type { PropsWithChildren } from 'react';
 import { AppState, Platform } from 'react-native';
 import { CHECKOUT_JOURNAL_KEY } from '../checkout/controller';
+import { lineKey } from '../domain/cart';
 import { createDemoApi } from '../domain/demo-api';
 import type { CartLine, DemoApi, Locale, Menu, ShopApi } from '../domain/types';
 import { createLiveApi, type ConnectedConfig, type LiveShopApi } from '../live/http-api';
@@ -15,6 +16,7 @@ import { MAX_QUANTITY, type Draft } from './draft-storage';
 import { privateStorage } from './private-storage';
 import { useShopDraft } from './use-shop-draft';
 
+export { lineKey } from '../domain/cart';
 export { MAX_QUANTITY } from './draft-storage';
 
 const settings = Constants.expoConfig?.extra?.restaurant as ConnectedConfig | { profile: 'demo' } | undefined;
@@ -77,10 +79,6 @@ function readMenu(raw: string | null): Menu | null {
   } catch {
     return null;
   }
-}
-
-export function lineKey(line: Pick<CartLine, 'sku' | 'modifierIds'>) {
-  return JSON.stringify([line.sku, [...line.modifierIds].sort()]);
 }
 
 type Shop = Draft & {

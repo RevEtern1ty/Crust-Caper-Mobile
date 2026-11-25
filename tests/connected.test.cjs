@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { randomUUID } = require('node:crypto');
 const { mkdir } = require('node:fs/promises');
 const { resolve } = require('node:path');
 const { test } = require('node:test');
@@ -42,7 +43,7 @@ async function operator(username) {
   return (await response.json()).accessToken;
 }
 
-test('connected checkout, server-authorized payment and role-scoped pickup', { timeout: 70_000 }, async t => {
+test('connected checkout, role-scoped pickup and return to the referenced saved order', { timeout: 70_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/, 'Run only against a local integration API');
   const server = createPreviewServer(dist);
   await new Promise((resolve, reject) => {
@@ -60,27 +61,34 @@ test('connected checkout, server-authorized payment and role-scoped pickup', { t
   const watch = (pattern, method = 'POST') => page.waitForResponse(response =>
     pattern.test(response.url()) && response.request().method() === method && response.ok());
   const opened = 'http://127.0.0.1:' + server.address().port;
-  await page.goto(opened);
-  await shown(page, 'Double Smash');
-  await page.evaluate(() => document.fonts.ready);
-  await capture(page, 'connected-menu');
-  await button(page, /^Double Smash,/).click();
-  await button(page, /^Add to cart/).click();
-  await button(page, /^View cart/).click();
-  await button(page, 'Choose pickup time').click();
-  await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { disabled: false }).nth(2).click();
-  await page.getByLabel('Phone number', { exact: true }).fill(contact.phone);
-  await page.getByLabel('Email address', { exact: true }).fill(contact.email);
-  await button(page, 'Review order').click();
-  await shown(page, 'Included tax');
-  const orderResponse = watch(/\/api\/v1\/orders$/);
-  const attemptResponse = watch(/\/api\/v1\/orders\/[^/]+\/payments$/);
-  await button(page, /^Confirm .*RWF/).click();
-  const order = await (await orderResponse).json();
-  const attempt = await (await attemptResponse).json();
+  async function openCheckout(screenshot) {
+    await page.goto(opened);
+    await shown(page, 'Double Smash');
+    if (screenshot) {
+      await page.evaluate(() => document.fonts.ready);
+      await capture(page, screenshot);
+    }
+    await button(page, /^Double Smash,/).click();
+    await button(page, /^Add to cart/).click();
+    await button(page, /^View cart/).click();
+    await button(page, 'Choose pickup time').click();
+    await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { disabled: false }).nth(2).click();
+    await page.getByLabel('Phone number', { exact: true }).fill(contact.phone);
+    await page.getByLabel('Email address', { exact: true }).fill(contact.email);
+    await button(page, 'Review order').click();
+    await shown(page, 'Included tax');
+    const orderResponse = watch(/\/api\/v1\/orders$/);
+    const attemptResponse = watch(/\/api\/v1\/orders\/[^/]+\/payments$/);
+    await button(page, /^Confirm .*RWF/).click();
+    const order = await (await orderResponse).json();
+    const attempt = await (await attemptResponse).json();
+    await shown(page, 'Checking payment');
+    return { order, attempt };
+  }
+
+  const { order, attempt } = await openCheckout('connected-menu');
   assert.equal(order.total, 9200);
   assert.equal(attempt.status, 'processing');
-  await shown(page, 'Checking payment');
   assert.equal(await button(page, 'Simulate successful payment').count(), 0);
 
   await page.reload();
@@ -124,5 +132,22 @@ test('connected checkout, server-authorized payment and role-scoped pickup', { t
   await page.reload();
   await shown(page, 'Picked up');
   assert.equal(await page.getByText('Pickup code', { exact: true }).count(), 0);
+
+  const { order: newerOrder } = await openCheckout();
+  const views = [];
+  page.on('request', request => {
+    if (request.method() === 'GET' && request.url().startsWith(api + '/orders/')) views.push(request.url());
+  });
+  await page.goto(`${opened}/payment-return?orderId=${order.id}&status=failed`);
+  await shown(page, 'Picked up');
+  await page.waitForURL(url => url.pathname === '/orders' && url.search === '');
+  assert.ok(views.includes(api + '/orders/' + order.id));
+
+  const unknown = randomUUID();
+  await page.goto(`${opened}/payment-return?orderId=${unknown}&status=successful`);
+  await shown(page, 'Checking payment');
+  await page.waitForURL(url => url.pathname === '/orders' && url.search === '');
+  assert.ok(views.includes(api + '/orders/' + newerOrder.id));
+  assert.ok(!views.includes(api + '/orders/' + unknown));
   assert.deepEqual(errors, []);
 });
