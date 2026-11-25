@@ -10,9 +10,10 @@ export default function SettingsScreen() {
   const isWeb = Platform.OS === 'web';
   return (
     <Screen safeBottom>
-      <Text variant="title" accessibilityRole="header">{copy(locale, 'Settings', 'Amagenamiterere')}</Text>
       <View role={isWeb ? 'group' : undefined} aria-labelledby={isWeb ? 'language-heading' : undefined} style={styles.languages}>
-        <Text nativeID={isWeb ? 'language-heading' : undefined} variant="heading">{copy(locale, 'Language', 'Ururimi')}</Text>
+        <Text nativeID={isWeb ? 'language-heading' : undefined} variant="heading" accessibilityRole="header">
+          {copy(locale, 'Language', 'Ururimi')}
+        </Text>
         {languages.map(language => {
           const selected = locale === language.id;
           return <Pressable key={language.id} accessibilityRole={isWeb ? 'button' : 'radio'}

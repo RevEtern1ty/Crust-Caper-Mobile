@@ -81,7 +81,7 @@ async function fillCart(page) {
   await button(page, /^View cart/).click();
 }
 
-async function reviewCheckout(page, validatePhone = false) {
+async function reviewCheckout(page, { validatePhone = false, withKeyboard = false } = {}) {
   await button(page, 'Choose pickup time').click();
   const slot = page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio').first();
   if (validatePhone) await slot.press('Space');
@@ -92,12 +92,14 @@ async function reviewCheckout(page, validatePhone = false) {
     await shown(page, 'Enter the demo phone number shown here.');
   }
   await button(page, 'Use demo number').click();
-  await button(page, 'Review order').click();
+  const review = button(page, 'Review order');
+  if (withKeyboard) await review.press('Enter');
+  else await review.click();
   await shown(page, 'Included tax');
 }
 
 async function confirmCheckout(page, validatePhone = false) {
-  await reviewCheckout(page, validatePhone);
+  await reviewCheckout(page, { validatePhone });
   await button(page, /^Confirm 9,200 RWF/).click();
   await button(page, 'Leave payment pending').click();
   await shown(page, /This payment is being checked/);
@@ -214,6 +216,7 @@ test('keyboard selection exposes its state and changing language updates the doc
   const kinyarwanda = button(page, 'Kinyarwanda');
   await kinyarwanda.press('Space');
   await shown(page, 'Amagenamiterere');
+  assert.equal(await page.getByText('Amagenamiterere', { exact: true }).filter({ visible: true }).count(), 1);
   await capture(page, '320-rw-settings');
   assert.equal(await kinyarwanda.getAttribute('aria-pressed'), 'true');
   assert.equal(await page.locator('html').getAttribute('lang'), 'rw');
@@ -244,17 +247,19 @@ async function capture(page, name) {
 test('checkout displays review above the fold before enabling confirmation on a short screen', async t => {
   const { page, errors } = await newPage(await newContext(t, 320, 640));
   await fillCart(page);
-  await reviewCheckout(page);
+  await reviewCheckout(page, { withKeyboard: true });
   const heading = page.getByText('Review your order', { exact: true });
   const visible = await heading.evaluate(element => {
     const rect = element.getBoundingClientRect();
     return rect.top >= 0 && rect.bottom < window.innerHeight;
   });
   assert.equal(visible, true, 'The review heading must be visible without scrolling past the form');
+  assert.equal(await heading.evaluate(element => element === document.activeElement), true);
   assert.equal(await page.getByLabel('Demo phone number').filter({ visible: true }).count(), 0);
   await capture(page, '320-en-order-review');
-  await button(page, 'Edit pickup or contact').click();
+  await button(page, 'Edit pickup or contact').press('Enter');
   await page.getByLabel('Demo phone number').waitFor({ state: 'visible' });
+  assert.equal(await page.getByText('Pickup order', { exact: true }).evaluate(element => element === document.activeElement), true);
   assert.match(await page.getByLabel('Demo phone number').inputValue(), /250 700/);
   assert.deepEqual(errors, []);
 });

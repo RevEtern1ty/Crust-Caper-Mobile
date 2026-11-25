@@ -1,6 +1,6 @@
 import { router, useFocusEffect } from 'expo-router';
-import { useCallback, useRef, useState } from 'react';
-import { Platform, Pressable, StyleSheet, TextInput, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Platform, Pressable, StyleSheet, type Text as NativeText, TextInput, View } from 'react-native';
 
 import { useCheckout, useRouteActionGuard } from '../src/checkout/context';
 import { checkoutError, changeLabel, itemName, itemOptions } from '../src/checkout/labels';
@@ -24,6 +24,8 @@ export default function CheckoutScreen() {
   const [problem, setProblem] = useState<string | null>(null);
   const checking = useRef(false);
   const phoneInput = useRef<TextInput>(null);
+  const stepHeading = useRef<NativeText>(null);
+  const previousStepWasReview = useRef(false);
   const slotButtons = useRef(new Map<string, View>());
   const t = (en: string, rw: string) => copy(locale, en, rw);
 
@@ -36,10 +38,18 @@ export default function CheckoutScreen() {
   const availableSlots = menu?.slots.filter((option) => option.available) ?? [];
   const noAvailableSlots = availableSlots.length === 0;
   const controlsLocked = requestingQuote || busy;
+  const reviewing = quote !== null;
 
   useFocusEffect(useCallback(() => {
     void refreshMenu();
   }, [refreshMenu]));
+
+  useEffect(() => {
+    if (Platform.OS === 'web' && previousStepWasReview.current !== reviewing) {
+      stepHeading.current?.focus();
+    }
+    previousStepWasReview.current = reviewing;
+  }, [reviewing]);
 
   function updatePhone(value: string) {
     setPhone(value);
@@ -151,7 +161,7 @@ export default function CheckoutScreen() {
       />
     )}>
       <View style={styles.stack}>
-        <Text variant="title" accessibilityRole="header">{quote
+        <Text ref={stepHeading} tabIndex={Platform.OS === 'web' ? -1 : undefined} variant="title" accessibilityRole="header">{quote
           ? t('Review your order', 'Reba komande yawe')
           : t('Pickup order', 'Komande yo gufata')}</Text>
         <Text tone="muted">{menu?.store.name[locale] ?? 'CrustCaper Kigali'}</Text>

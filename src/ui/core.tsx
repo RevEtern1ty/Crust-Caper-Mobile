@@ -1,10 +1,10 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
-import type { ComponentProps, PropsWithChildren, ReactNode } from 'react';
+import type { ComponentProps, ComponentPropsWithRef, PropsWithChildren, ReactNode } from 'react';
 import {
   ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, RefreshControl,
   ScrollView, StyleSheet, Text as NativeText, View,
 } from 'react-native';
-import type { StyleProp, TextProps, ViewStyle } from 'react-native';
+import type { StyleProp, ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export const colors = {
@@ -31,7 +31,7 @@ const type = StyleSheet.create({
 
 export function Text({
   variant = 'body', tone = 'ink', style, ...props
-}: TextProps & { variant?: keyof typeof type; tone?: keyof typeof colors }) {
+}: ComponentPropsWithRef<typeof NativeText> & { variant?: keyof typeof type; tone?: keyof typeof colors; tabIndex?: 0 | -1 }) {
   return <NativeText {...props} style={[type[variant], { color: colors[tone] }, style]} />;
 }
 
