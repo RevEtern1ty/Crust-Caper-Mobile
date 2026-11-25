@@ -58,8 +58,10 @@ async function newContext(t, width = 390, height = 844) {
 async function newPage(context, setClock = true) {
   const page = await context.newPage();
   const errors = [];
-  page.on('pageerror', error => errors.push(error.message));
-  page.on('console', item => { if (item.type() === 'error') errors.push(item.text()); });
+  page.on('pageerror', error => errors.push({ kind: 'page', message: error.message }));
+  page.on('console', item => {
+    if (item.type() === 'error') errors.push({ kind: 'console', message: item.text(), url: item.location().url });
+  });
   page.setDefaultTimeout(7500);
   if (setClock) await page.clock.setFixedTime(new Date('2026-06-15T10:02:00Z'));
   await page.goto(base);
@@ -506,8 +508,16 @@ test('offline demo keeps the same amount through cart, quote, payment and the pe
   await button(page, /^View cart/).click();
   await button(page, 'Add one Double Smash').click();
   await shown(page, '19,400 RWF');
+  const failedRequests = [];
+  page.on('requestfailed', request => failedRequests.push(request));
   await context.setOffline(true);
   try {
+    await page.evaluate(() => new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => reject(new Error('The uncached offline fixture unexpectedly loaded'));
+      image.onerror = resolve;
+      image.src = '/favicon.ico?offline-fixture';
+    }));
     await reviewCheckout(page);
     const confirm = button(page, /^Confirm 19,400 RWF/);
     await confirm.evaluate(element => { element.click(); element.click(); });
@@ -520,7 +530,16 @@ test('offline demo keeps the same amount through cart, quote, payment and the pe
     assert.equal(ledger.orders[0].attempts.length, 1);
     assert.equal(ledger.orders[0].order.total, 19400);
     assert.deepEqual(ledger.orders[0].order.lines, [{ sku: 'double-smash', modifierIds: ['extra-cheese'], quantity: 2, unitPrice: 9700 }]);
-    assert.deepEqual(errors, []);
+    // An uncached image or font can fail offline, but ordering must not need a network request.
+    const optionalAssetUrls = new Set(failedRequests.filter(request =>
+      new URL(request.url()).origin === base
+      && ['image', 'font'].includes(request.resourceType())
+      && request.failure()?.errorText === 'net::ERR_INTERNET_DISCONNECTED').map(request => request.url()));
+    assert.ok(optionalAssetUrls.has(`${base}/favicon.ico?offline-fixture`));
+    assert.deepEqual(failedRequests.filter(request => !optionalAssetUrls.has(request.url())).map(request => request.url()), []);
+    assert.deepEqual(errors.filter(error => error.kind !== 'console'
+      || error.message !== 'Failed to load resource: net::ERR_INTERNET_DISCONNECTED'
+      || !optionalAssetUrls.has(error.url)), []);
   } finally {
     await context.setOffline(false);
   }
