@@ -7,12 +7,12 @@ import { paymentReturnOrderId } from '../src/checkout/payment-return';
 
 export default function PaymentReturn() {
   const { orderId } = useLocalSearchParams<{ orderId?: string | string[] }>();
-  const { setPaymentReturnOrder } = useCheckout();
+  const { setRequestedOrderId } = useCheckout();
   const requestedOrder = paymentReturnOrderId(orderId);
   useFocusEffect(useCallback(() => {
-    setPaymentReturnOrder(requestedOrder);
+    setRequestedOrderId(requestedOrder);
     if (Platform.OS === 'ios') void WebBrowser.dismissBrowser().catch(() => undefined);
     router.replace('/(tabs)/orders');
-  }, [requestedOrder, setPaymentReturnOrder]));
+  }, [requestedOrder, setRequestedOrderId]));
   return null;
 }

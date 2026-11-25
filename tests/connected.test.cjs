@@ -3,6 +3,7 @@ const { randomUUID } = require('node:crypto');
 const { mkdir } = require('node:fs/promises');
 const { resolve } = require('node:path');
 const { test } = require('node:test');
+const { setTimeout: delay } = require('node:timers/promises');
 const { chromium } = require('playwright-core');
 const { createPreviewServer } = require('../tooling/preview-server.cjs');
 
@@ -25,10 +26,11 @@ async function capture(page, name) {
   await page.screenshot({ path: resolve(directory, name + '.png'), animations: 'disabled' });
 }
 
-async function send(path, { method = 'GET', token, data } = {}) {
+async function send(path, { method = 'GET', token, data, key } = {}) {
   const headers = {};
   if (token) headers.Authorization = 'Bearer ' + token;
   if (data) headers['Content-Type'] = 'application/json';
+  if (key) headers['Idempotency-Key'] = key;
   return fetch(api + path, {
     method, headers, body: data ? JSON.stringify(data) : undefined,
     redirect: 'error', signal: AbortSignal.timeout(10_000),
@@ -43,7 +45,7 @@ async function operator(username) {
   return (await response.json()).accessToken;
 }
 
-test('connected checkout, role-scoped pickup and return to the referenced saved order', { timeout: 70_000 }, async t => {
+test('connected checkout, pickup, cross-device recovery and payment return', { timeout: 70_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/, 'Run only against a local integration API');
   const server = createPreviewServer(dist);
   await new Promise((resolve, reject) => {
@@ -127,6 +129,43 @@ test('connected checkout, role-scoped pickup and return to the referenced saved 
   await capture(page, 'connected-ready');
   const { pickupCode } = await send('/orders/' + order.id, { token }).then(response => response.json());
   assert.match(pickupCode, /^[0-9]{6}$/);
+
+  const secondDevice = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  secondDevice.setDefaultTimeout(9000);
+  secondDevice.on('pageerror', error => errors.push(error.message));
+  await secondDevice.goto(opened + '/orders');
+  await shown(secondDevice, 'No orders yet');
+  await button(secondDevice, 'Find an order from another device').click();
+  await secondDevice.getByLabel('Order number', { exact: true }).fill('#' + order.id.slice(-8).toUpperCase());
+  await secondDevice.getByLabel('Phone number', { exact: true }).fill(contact.phone);
+  await button(secondDevice, 'Request verification code').click();
+  await shown(secondDevice, 'Verify your phone');
+  await capture(secondDevice, 'connected-order-recovery');
+  await secondDevice.getByLabel('Verification code', { exact: true }).fill('418263');
+  let recovery;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const result = secondDevice.waitForResponse(response =>
+      /\/api\/v1\/order-access\/challenges\/[^/]+\/verify$/.test(response.url()) && response.request().method() === 'POST');
+    await button(secondDevice, 'Verify and open order').click();
+    recovery = await result;
+    if (recovery.ok()) break;
+    assert.equal(recovery.status(), 404);
+    await delay(500);
+  }
+  assert.ok(recovery?.ok(), 'The local fixture must complete phone verification');
+  assert.deepEqual(await recovery.json(), { orderId: order.id });
+  await shown(secondDevice, 'Ready for pickup');
+  await shown(secondDevice, pickupCode);
+  const recoveredAuthorization = (await recovery.request().allHeaders()).authorization;
+  assert.ok(recoveredAuthorization?.startsWith('Bearer '));
+  const recoveredToken = recoveredAuthorization.slice(7);
+  assert.ok(recoveredToken !== token, 'The second device must retain its own guest identity');
+  const disallowedPayment = await send(`/orders/${order.id}/payments`, {
+    method: 'POST', token: recoveredToken, key: 'recovered-device-payment',
+  });
+  assert.equal(disallowedPayment.status, 404);
+  await secondDevice.close();
+
   assert.equal((await advance(pickup, 'collected', pickupCode === '000000' ? '999999' : '000000')).status, 409);
   assert.equal((await advance(pickup, 'collected', pickupCode)).status, 200);
   await page.reload();

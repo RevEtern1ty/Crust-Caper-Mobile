@@ -20,7 +20,7 @@ npm run build:connected-web
 npm run start:local-stack
 ```
 
-The customer app opens on port 47867 and the operator console on port 18080 under `/operator/index.html`. The test command `npm run test:connected` uses Chrome, creates a real local order, settles the synthetic payment through the local API, then checks kitchen authorization and pickup. The server keeps customer and operator session data separate.
+The customer app opens on port 47867 and the operator console on port 18080 under `/operator/index.html`. The test command `npm run test:connected` uses Chrome, creates a real local order, settles synthetic payment, checks kitchen and pickup authorization, and recovers the order from a fresh browser session. The local launcher enables the synthetic phone challenge. [Local recovery fixture](docs/ORDER_RECOVERY.md#локальная-проверка)
 
 ## Deployment configuration
 

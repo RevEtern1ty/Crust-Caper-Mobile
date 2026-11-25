@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: CrustCaper Shared API
-  version: 0.2.0
+  version: 0.3.0
   description: Implemented HTTP contract for the Spring Boot commerce service.
 servers:
   - url: /api/v1
@@ -168,6 +168,76 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /order-access/challenges:
+    post:
+      operationId: requestOrderAccessChallenge
+      security: [{ guestOrAccount: [] }]
+      description: Requests verification of the checkout phone for one saved order. Acknowledgement does not disclose whether the order and phone matched or an SMS was sent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderCode, phone]
+              properties:
+                orderCode: { type: string, pattern: '^#?[0-9A-Fa-f]{8}$' }
+                phone: { type: string, pattern: '^\+[1-9][0-9]{7,14}$', writeOnly: true }
+      responses:
+        '202':
+          description: Verification request acknowledged. Preserve the challenge ID on the requesting device for this flow.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challengeId]
+                properties:
+                  challengeId: { type: string, format: uuid }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /order-access/challenges/{challengeId}/verify:
+    post:
+      operationId: verifyOrderAccessChallenge
+      security: [{ guestOrAccount: [] }]
+      parameters:
+        - name: challengeId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, pattern: '^[0-9]{6}$', writeOnly: true }
+      responses:
+        '200':
+          description: This guest can read and reorder the verified order. Original checkout and payment rights remain with the order owner. Repeating a successful challenge as the same guest returns the same order ID.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [orderId]
+                properties:
+                  orderId: { type: string, format: uuid }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404':
+          description: Verification is unavailable or unsuccessful. Shares a response across missing, expired, foreign and rejected challenges.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/NotFoundProblem' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/sessions:
     post:

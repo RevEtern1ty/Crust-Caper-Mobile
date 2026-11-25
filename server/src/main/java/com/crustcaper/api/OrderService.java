@@ -171,7 +171,8 @@ public class OrderService {
     }
 
     public Order getOrder(UUID guest, UUID id) {
-        StoredOrder order = owned(guest, id, false);
+        StoredOrder order = visible(guest, id);
+        if (!order.owner().equals(guest)) return view(order, false);
         Attempt attempt = latest(id);
         if (attempt != null && attempt.status().equals("processing") && !localPayments
             && claimVerification(attempt.id())) {
@@ -186,7 +187,7 @@ public class OrderService {
     }
 
     public Reorder reorder(UUID guest, UUID id) {
-        StoredOrder order = owned(guest, id, false);
+        StoredOrder order = visible(guest, id);
         return Catalog.reconcile(order.lines(), catalog.products(order.storeId(), false));
     }
 
@@ -332,7 +333,7 @@ public class OrderService {
         return jdbc.sql("""
             UPDATE payment_attempts SET last_checked_at = now()
             WHERE id = ? AND status = 'processing'
-              AND (last_checked_at IS NULL OR last_checked_at < now() - interval '8 seconds')
+              AND (last_checked_at IS NULL OR last_checked_at < now() - interval '15 seconds')
             """).param(attempt).update() > 0;
     }
 
@@ -348,11 +349,25 @@ public class OrderService {
         return sql.query(this::orderRow).optional().orElseThrow(ApiFailure::notFound);
     }
 
+    private StoredOrder visible(UUID guest, UUID id) {
+        return jdbc.sql(ORDER + " " + """
+            AND (guest_session_id = ? OR EXISTS (
+                SELECT FROM order_read_grants g WHERE g.guest_session_id = ? AND g.order_id = orders.id
+            ))
+            """).params(id, guest, guest).query(this::orderRow).optional().orElseThrow(ApiFailure::notFound);
+    }
+
     private Order view(StoredOrder order) {
+        return view(order, true);
+    }
+
+    private Order view(StoredOrder order, boolean exposeCheckout) {
         Attempt attempt = latest(order.id());
+        PaymentAttempt visibleAttempt = attempt == null ? null
+            : exposeCheckout ? attempt.view() : new PaymentAttempt(attempt.id(), attempt.status(), null);
         return new Order(order.id(), order.storeId(), order.slotId(), order.lines(), order.total(), order.tax(),
             CURRENCY, order.paymentStatus(), statusAt(order, databaseNow()), order.pickupCode(), order.receiptStatus(),
-            order.receiptUrl(), attempt == null ? null : attempt.view(), order.createdAt(),
+            order.receiptUrl(), visibleAttempt, order.createdAt(),
             order.reservationExpiresAt(), order.startsAt(), order.endsAt());
     }
 

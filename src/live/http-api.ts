@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { hasSavedCheckout } from '../checkout/controller';
 import { ApiError } from '../domain/types';
 import type { ApiErrorCode, Order, PaymentAttempt, ShopApi, Storage } from '../domain/types';
-import { menuResponse, orderResponse, paymentResponse, quoteResponse, reorderResponse, sessionResponse } from './wire';
+import { menuResponse, orderAccessChallenge, orderAccessGrant, orderResponse, paymentResponse, quoteResponse, reorderResponse, sessionResponse } from './wire';
 
 type Session = z.infer<typeof sessionResponse>;
 type Fetcher = (url: string, options: RequestInit) => Promise<Pick<Response, 'ok' | 'status' | 'redirected' | 'url' | 'json'>>;
@@ -52,6 +52,7 @@ function errorCode(status: number, problem: unknown): ApiErrorCode {
   if (status === 400 || status === 422) return 'invalid_input';
   if (status === 401 || status === 403) return 'unauthenticated';
   if (status === 404) return 'not_found';
+  if (status === 429) return 'rate_limited';
   if (status === 409) {
     const code = z.object({ code: z.string() }).safeParse(problem);
     return code.success && knownConflicts.has(code.data.code) ? code.data.code as ApiErrorCode : 'conflict';
@@ -228,6 +229,13 @@ export function createLiveApi({
     },
     async reorder(orderId) {
       return authorized({ path: orderPath(orderId) + '/reorder', method: 'POST', schema: reorderResponse });
+    },
+    async requestOrderAccess(input) {
+      return authorized({ path: '/order-access/challenges', method: 'POST', schema: orderAccessChallenge, body: input });
+    },
+    async verifyOrderAccess(challengeId, code) {
+      const path = '/order-access/challenges/' + encodeURIComponent(challengeId) + '/verify';
+      return authorized({ path, method: 'POST', schema: orderAccessGrant, body: { code } });
     },
     ...(config.profile === 'local' ? {
       async settleLocalTestPayment(orderId: string, attemptId: string, status: 'paid' | 'declined') {

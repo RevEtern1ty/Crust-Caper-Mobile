@@ -1,4 +1,5 @@
 import { ApiError, type Order, type OrderInput, type Quote, type ShopApi } from '../domain/types';
+import { paymentReturnOrderId } from './payment-return';
 
 export const CHECKOUT_JOURNAL_KEY = 'crustcaper.checkout.v1';
 const maxRecentOrders = 10;
@@ -105,6 +106,21 @@ export class CheckoutController {
   async restore(): Promise<CheckoutJournal> {
     await this.load();
     return this.journal;
+  }
+
+  async rememberRecoveredOrder(orderId: string): Promise<void> {
+    if (!paymentReturnOrderId(orderId)) throw new ApiError('invalid_response');
+
+    await this.exclusive(async () => {
+      const { active, orderIds } = this.journal;
+      if (orderIds.includes(orderId)) return;
+
+      const retained = orderIds.slice(0, maxRecentOrders - 1);
+      if (active && active.phase !== 'creating' && !retained.includes(active.orderId)) {
+        retained[retained.length - 1] = active.orderId;
+      }
+      await this.save(active, [...retained, orderId]);
+    });
   }
 
   async begin(quote: Quote, cartFingerprint: string, contact = this.dependencies.demoContact): Promise<Order> {
@@ -288,7 +304,7 @@ export class CheckoutController {
     this.journal = next;
   }
 
-  private async exclusive(operation: () => Promise<Order>): Promise<Order> {
+  private async exclusive<Result>(operation: () => Promise<Result>): Promise<Result> {
     if (this.running) {
       throw new CheckoutError('active_checkout');
     }

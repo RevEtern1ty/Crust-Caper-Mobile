@@ -430,3 +430,47 @@ test('unauthorized connected recovery preserves the pending journal without post
   equal(f.createCalls.length, 1);
   equal(f.journal.get(f.merchantJournalKey), saved);
 });
+
+const recoveredOrderId = '1cf5ba6e-0584-45b5-bbc5-3a5ec90502c9';
+
+test('a proven order is appended once without replacing a pending checkout', async () => {
+  const f = fixture();
+  const active = { phase: 'creating', quoteId: 'old-quote', key: 'old-key', cartFingerprint: 'old-cart' };
+  f.restoreLegacyJournal({ version: 1, active, orderIds: ['earlier-order'] });
+
+  const restored = f.restart(false);
+  await restored.rememberRecoveredOrder(recoveredOrderId);
+  await restored.rememberRecoveredOrder(recoveredOrderId);
+  const coldStart = await f.restart(false).restore();
+
+  deepEqual(coldStart, { version: 1, active, orderIds: ['earlier-order', recoveredOrderId] });
+  deepEqual(f.orderCalls, []);
+  deepEqual(f.paymentCalls, []);
+});
+
+test('adding a recovered order at the history limit keeps the active payment reference', async () => {
+  const f = fixture();
+  const active = { phase: 'paying', orderId: 'active-order', key: 'payment-key' };
+  const previous = Array.from({ length: 9 }, (_, index) => `order-${index}`);
+  f.restoreLegacyJournal({ version: 1, active, orderIds: [...previous, active.orderId] });
+
+  await f.restart(false).rememberRecoveredOrder(recoveredOrderId);
+
+  deepEqual(await f.restart(false).restore(), {
+    version: 1, active, orderIds: [...previous.slice(0, 8), active.orderId, recoveredOrderId],
+  });
+});
+
+test('an invalid grant or a failed history write leaves the saved orders intact', async () => {
+  const f = fixture();
+  const saved = { version: 1, active: null, orderIds: ['earlier-order'] };
+  f.restoreLegacyJournal(saved);
+  const restored = f.restart(false);
+
+  await rejects(restored.rememberRecoveredOrder('not-an-order-id'), { code: 'invalid_response' });
+  f.blockJournal();
+  await rejects(restored.rememberRecoveredOrder(recoveredOrderId), /Journal write failed/);
+
+  deepEqual(restored.snapshot, saved);
+  deepEqual(f.savedJournal(), saved);
+});

@@ -123,6 +123,7 @@ export type Order = {
 export type QuoteInput = { storeId: string; slotId: string; lines: CartLine[] }
 export type OrderInput = { quoteId: string; phone: string; email?: string }
 export type ReorderResult = { lines: CartLine[]; changes: QuoteChange[] }
+export type OrderAccessRequest = { orderCode: string; phone: string }
 
 export type ApiErrorCode =
   | 'invalid_input'
@@ -138,6 +139,7 @@ export type ApiErrorCode =
   | 'network_unavailable'
   | 'invalid_response'
   | 'service_unavailable'
+  | 'rate_limited'
 
 export class ApiError extends Error {
   readonly code: ApiErrorCode
@@ -157,6 +159,8 @@ export interface ShopApi {
   startPayment(orderId: string, key: string): Promise<PaymentAttempt>
   getOrder(orderId: string): Promise<Order>
   reorder(orderId: string): Promise<ReorderResult>
+  requestOrderAccess?(input: OrderAccessRequest): Promise<{ challengeId: string }>
+  verifyOrderAccess?(challengeId: string, code: string): Promise<{ orderId: string }>
 }
 
 export type DemoPaymentResult = 'paid' | 'declined' | 'processing'

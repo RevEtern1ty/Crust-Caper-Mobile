@@ -72,6 +72,8 @@ async function main() {
       CRUSTCAPER_DB_USER: 'crustcaper',
       CRUSTCAPER_DB_PASSWORD: 'crustcaper-local',
       CRUSTCAPER_PAYMENT_PROVIDER: 'local',
+      CRUSTCAPER_ORDER_ACCESS_PROVIDER: 'local',
+      CRUSTCAPER_ORDER_ACCESS_NEGATIVE_DELAY: 'PT0S',
     },
   });
   let javaError;

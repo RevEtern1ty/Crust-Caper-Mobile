@@ -168,6 +168,41 @@ test('a transport response marked as redirected is rejected before reading its b
   await assert.rejects(() => api.getMenu(), { code: 'invalid_response' });
 });
 
+test('order phone verification uses the same guest without saving the contact or code', async () => {
+  const { data, storage } = memory();
+  const challengeId = '85e9eb23-9b52-4905-8c81-7d347d746db9';
+  const orderId = '1cf5ba6e-0584-45b5-bbc5-3a5ec90502c9';
+  const { calls, fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) return Response.json(session, { status: 201 });
+    if (call.url.endsWith('/order-access/challenges')) return Response.json({ challengeId }, { status: 202 });
+    assert.ok(call.url.endsWith(`/order-access/challenges/${challengeId}/verify`));
+    if (!call.body || !('code' in (call.body as { code?: string }))) assert.fail('Verification needs the submitted code');
+    return (call.body as { code: string }).code === '418263'
+      ? Response.json({ orderId }) : Response.json({ code: 'not_found' }, { status: 404 });
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  const contact = { orderCode: '502A8EF1', phone: '+250700000000' };
+
+  assert.deepEqual(await api.requestOrderAccess!(contact), { challengeId });
+  await assert.rejects(() => api.verifyOrderAccess!(challengeId, '111111'), { code: 'not_found' });
+  assert.deepEqual(await api.verifyOrderAccess!(challengeId, '418263'), { orderId });
+
+  const protectedCalls = calls.filter(call => call.url.includes('/order-access/'));
+  assert.deepEqual(protectedCalls.map(({ token }) => token), Array(3).fill('Bearer ' + accessToken));
+  assert.deepEqual(protectedCalls.map(({ body }) => body), [contact, { code: '111111' }, { code: '418263' }]);
+  assert.doesNotMatch(JSON.stringify([...data.values()]), /700000000|418263|502A8EF1/);
+});
+
+test('invalid challenge and grant identifiers do not pass wire validation', async () => {
+  const { storage } = memory();
+  const { fetcher } = transport(call => call.url.endsWith('/guest-sessions')
+    ? Response.json(session) : Response.json({ challengeId: 'unknown', orderId: 'not-a-uuid' }));
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+
+  await assert.rejects(() => api.requestOrderAccess!({ orderCode: '502A8EF1', phone: '+250700000000' }), { code: 'invalid_response' });
+  await assert.rejects(() => api.verifyOrderAccess!('85e9eb23-9b52-4905-8c81-7d347d746db9', '418263'), { code: 'invalid_response' });
+});
+
 test('checkout links and receipts permit only the configured secure destinations', async () => {
   const { storage } = memory();
   let checkoutUrl = 'https://checkout.example.test.payments-other.test/pay';

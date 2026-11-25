@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Platform, Pressable, StyleSheet, type Text as NativeText, TextInput, View } from 'react-native';
 
 import { useCheckout, useRouteActionGuard } from '../src/checkout/context';
+import { normalizePhone } from '../src/checkout/contact';
 import type { CheckoutContact } from '../src/checkout/controller';
 import { checkoutError, changeLabel, itemName, itemOptions } from '../src/checkout/labels';
 import { DEMO_PHONE } from '../src/domain/demo-api';
@@ -66,8 +67,8 @@ export default function CheckoutScreen() {
   }
 
   function readContact(): CheckoutContact | null {
-    const e164 = phone.replace(/[\s()-]/g, '');
-    if (demo ? e164 !== DEMO_PHONE : !/^\+[1-9][0-9]{7,14}$/.test(e164)) {
+    const e164 = normalizePhone(phone);
+    if (!e164 || (demo && e164 !== DEMO_PHONE)) {
       setPhoneInvalid(true);
       phoneInput.current?.focus();
       return null;

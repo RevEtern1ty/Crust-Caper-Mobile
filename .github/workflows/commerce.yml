@@ -50,7 +50,10 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build:connected-web
-      - name: Verify customer checkout and operator pickup
+      - name: Verify customer checkout, recovery and operator pickup
+        env:
+          CRUSTCAPER_ORDER_ACCESS_PROVIDER: local
+          CRUSTCAPER_ORDER_ACCESS_NEGATIVE_DELAY: PT0S
         shell: bash
         run: |
           java -jar server/build/libs/crustcaper-api.jar --spring.profiles.active=local >"$RUNNER_TEMP/crustcaper-api.log" 2>&1 &

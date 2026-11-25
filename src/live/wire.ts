@@ -101,3 +101,6 @@ export const sessionResponse = z.object({
   refreshToken: z.string().min(32).max(512).regex(/^[A-Za-z0-9_-]+$/),
   refreshExpiresAt: timestamp,
 });
+
+export const orderAccessChallenge = z.object({ challengeId: z.guid() });
+export const orderAccessGrant = z.object({ orderId: z.guid().refine((id) => id === id.toLowerCase()) });

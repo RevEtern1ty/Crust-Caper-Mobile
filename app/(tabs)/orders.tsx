@@ -16,7 +16,7 @@ type Action = 'resume' | 'reorder' | 'kitchen' | 'receipt';
 
 export default function OrdersScreen() {
   const { api, mode, demoApi, checkoutAllowed, locale, menu, cart, hydrated, replaceCart } = useShop();
-  const { journal, paymentReturnOrder, setPaymentReturnOrder, restoreFailed, retryRestore, resumeCheckout, busy } = useCheckout();
+  const { journal, requestedOrderId, setRequestedOrderId, restoreFailed, retryRestore, resumeCheckout, busy } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const latestId = journal?.orderIds[0] ?? null;
   const [choice, setChoice] = useState<{ latest: string | null; id: string } | null>(null);
@@ -24,20 +24,20 @@ export default function OrdersScreen() {
   const [preview, setPreview] = useState<{ orderId: string; result: ReorderResult } | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const running = useRef(false);
-  const linkedOrderId = savedPaymentReturnOrderId(paymentReturnOrder ?? undefined, journal?.orderIds ?? []);
+  const linkedOrderId = savedPaymentReturnOrderId(requestedOrderId ?? undefined, journal?.orderIds ?? []);
   const orderId = linkedOrderId ?? (choice?.latest === latestId ? choice.id : latestId);
   const { order, loading, failed, error: statusError, refresh } = useOrderStatus(orderId);
   const t = (en: string, rw: string) => copy(locale, en, rw);
 
   useEffect(() => {
-    if (!journal || paymentReturnOrder === null) return;
+    if (!journal || requestedOrderId === null) return;
     if (linkedOrderId) {
       setChoice({ latest: latestId, id: linkedOrderId });
       setPreview(null);
       setProblem(null);
     }
-    setPaymentReturnOrder(null);
-  }, [journal, latestId, linkedOrderId, paymentReturnOrder, setPaymentReturnOrder]);
+    setRequestedOrderId(null);
+  }, [journal, latestId, linkedOrderId, requestedOrderId, setRequestedOrderId]);
 
   const active = journal?.active;
   const ongoingCreate = active?.phase === 'creating';
@@ -128,6 +128,11 @@ export default function OrdersScreen() {
           <Text tone="muted">{t('Your pickup order and its status will appear here.', 'Komande yawe n’uko ihagaze bizagaragara hano.')}</Text>
           <Button label={t('Browse the menu', 'Reba ibiribwa')} onPress={() => router.navigate('/(tabs)')} />
         </Card>
+      )}
+
+      {mode === 'connected' && checkoutAllowed && api.requestOrderAccess && api.verifyOrderAccess && (
+        <Button label={t('Find an order from another device', 'Shaka komande yakozwe ku kindi gikoresho')} variant="secondary"
+          onPress={() => router.push({ pathname: '/order-recovery', params: { from: 'orders' } })} />
       )}
 
       {order && (

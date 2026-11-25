@@ -12,13 +12,14 @@ import { CheckoutController, CheckoutError, type CheckoutContact, type CheckoutJ
 
 type Context = {
   journal: CheckoutJournal | null;
-  paymentReturnOrder: string | null;
-  setPaymentReturnOrder: (orderId: string | null) => void;
+  requestedOrderId: string | null;
+  setRequestedOrderId: (orderId: string | null) => void;
   restoreFailed: boolean;
   busy: boolean;
   retryRestore: () => Promise<void>;
   beginCheckout: (quote: Quote, cart: CartLine[], contact: CheckoutContact) => Promise<Order>;
   resumeCheckout: (retryDeclined?: boolean, contact?: CheckoutContact) => Promise<Order>;
+  rememberRecoveredOrder: (orderId: string) => Promise<void>;
 };
 
 const CheckoutContext = createContext<Context | null>(null);
@@ -33,7 +34,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
   const clearCartRef = useRef(clearCart);
   const running = useRef(false);
   const [journal, setJournal] = useState<CheckoutJournal | null>(null);
-  const [paymentReturnOrder, setPaymentReturnOrder] = useState<string | null>(null);
+  const [requestedOrderId, setRequestedOrderId] = useState<string | null>(null);
   const [restoreFailed, setRestoreFailed] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -71,7 +72,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     return () => { active = false; };
   }, [controller]);
 
-  const run = useCallback(async (operation: () => Promise<Order>) => {
+  const run = useCallback(async <Result,>(operation: () => Promise<Result>) => {
     if (running.current) throw new CheckoutError('active_checkout');
 
     running.current = true;
@@ -87,8 +88,8 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
 
   const value: Context = {
     journal,
-    paymentReturnOrder,
-    setPaymentReturnOrder,
+    requestedOrderId,
+    setRequestedOrderId,
     restoreFailed,
     busy,
     retryRestore: async () => {
@@ -101,6 +102,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     },
     beginCheckout: (quote, snapshot, contact) => run(async () => controller.begin(quote, await fingerprint(snapshot), contact)),
     resumeCheckout: (retryDeclined, contact) => run(() => controller.resume(retryDeclined, contact)),
+    rememberRecoveredOrder: (orderId) => run(() => controller.rememberRecoveredOrder(orderId)),
   };
 
   return <CheckoutContext.Provider value={value}>{children}</CheckoutContext.Provider>;

@@ -36,7 +36,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
-@SpringBootTest
+@SpringBootTest(properties = "crustcaper.order-access.provider=disabled")
 @AutoConfigureMockMvc
 @ActiveProfiles("local")
 class CommerceIntegrationTest {
@@ -107,6 +107,17 @@ class CommerceIntegrationTest {
             .andExpect(status().isUnauthorized())
             .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
             .andExpect(jsonPath("$.code").value("unauthenticated"));
+    }
+
+    @Test
+    void orderAccessProviderDisabledReturnsUnavailableWithoutCreatingAChallenge() throws Exception {
+        String bearer = guest();
+        api.perform(post(ROOT + "/order-access/challenges").header(HttpHeaders.AUTHORIZATION, bearer)
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(json.writeValueAsString(new OrderAccessController.StartInput("A1B2C3D4", PHONE))))
+            .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("service_unavailable"));
+        assertThat(jdbc.sql("SELECT count(*) FROM order_access_challenges WHERE guest_session_id = ?")
+            .param(guests.getFirst()).query(Long.class).single()).isZero();
     }
 
     @Test
