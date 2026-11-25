@@ -23,6 +23,8 @@ export default function CheckoutScreen() {
   const [requestingQuote, setRequestingQuote] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const checking = useRef(false);
+  const phoneInput = useRef<TextInput>(null);
+  const slotButtons = useRef(new Map<string, View>());
   const t = (en: string, rw: string) => copy(locale, en, rw);
 
   const slot = menu?.slots.find((option) => option.id === selectedSlot && option.available);
@@ -31,7 +33,9 @@ export default function CheckoutScreen() {
   const quote = review && review.cartKey === cartKey && review.slotKey === slotKey ? review.quote : null;
   const unfinished = journal?.active && journal.active.phase !== 'tracking';
   const savedOrder = !!journal?.orderIds.length;
-  const noAvailableSlots = !menu?.slots.some((option) => option.available);
+  const availableSlots = menu?.slots.filter((option) => option.available) ?? [];
+  const noAvailableSlots = availableSlots.length === 0;
+  const controlsLocked = requestingQuote || busy;
 
   useFocusEffect(useCallback(() => {
     void refreshMenu();
@@ -42,10 +46,40 @@ export default function CheckoutScreen() {
     setPhoneInvalid(false);
   }
 
+  function chooseSlot(id: string) {
+    setSlot(id);
+    setReview(null);
+    setProblem(null);
+  }
+
+  function handleSlotKey(event: { key: string; preventDefault: () => void }, id: string) {
+    const current = availableSlots.findIndex((option) => option.id === id);
+    const last = availableSlots.length - 1;
+    if (controlsLocked || current < 0) return;
+
+    let next = current;
+    switch (event.key) {
+      case 'ArrowRight':
+      case 'ArrowDown': next = current === last ? 0 : current + 1; break;
+      case 'ArrowLeft':
+      case 'ArrowUp': next = current === 0 ? last : current - 1; break;
+      case 'Home': next = 0; break;
+      case 'End': next = last; break;
+      case ' ': break;
+      default: return;
+    }
+    event.preventDefault();
+    const nextId = availableSlots[next]?.id;
+    if (!nextId) return;
+    chooseSlot(nextId);
+    slotButtons.current.get(nextId)?.focus();
+  }
+
   async function submit() {
     if (checking.current || !menu || !slot || !cart.length || busy || !journal) return;
     if (phone.replace(/\s/g, '') !== DEMO_PHONE) {
       setPhoneInvalid(true);
+      phoneInput.current?.focus();
       return;
     }
 
@@ -56,7 +90,7 @@ export default function CheckoutScreen() {
     try {
       if (!quote) {
         const result = await api.createQuote({ storeId: menu.store.id, slotId: slot.id, lines: cart });
-        setReview({ quote: result, cartKey, slotKey });
+        if (shouldNavigate()) setReview({ quote: result, cartKey, slotKey });
         return;
       }
       const order = await beginCheckout(quote, cart);
@@ -101,51 +135,52 @@ export default function CheckoutScreen() {
   }
 
   return (
-    <Screen safeBottom bottom={(
+    <Screen key={quote ? 'review' : 'details'} safeBottom bottom={(
       <Button
         label={quote
-          ? t(`Confirm ${money(quote.total)} & continue`, `Emeza ${money(quote.total)} ukomeze`)
+          ? quote.lines.length
+            ? t(`Confirm ${money(quote.total)} & continue`, `Emeza ${money(quote.total)} ukomeze`)
+            : t('Edit cart', 'Hindura agatebo')
           : t('Review order', 'Reba komande')}
-        onPress={() => { void submit(); }}
-        busy={requestingQuote || busy}
-        disabled={!journal || !slot || (!!quote && quote.lines.length === 0)}
+        onPress={() => {
+          if (quote && !quote.lines.length) router.replace('/cart');
+          else void submit();
+        }}
+        busy={controlsLocked}
+        disabled={!journal || !slot}
       />
     )}>
       <View style={styles.stack}>
-        <Text variant="title" accessibilityRole="header">{t('Pickup order', 'Komande yo gufata')}</Text>
-        <Text tone="muted">{menu?.store.name[locale] ?? t('CrustCaper Kigali', 'CrustCaper Kigali')}</Text>
+        <Text variant="title" accessibilityRole="header">{quote
+          ? t('Review your order', 'Reba komande yawe')
+          : t('Pickup order', 'Komande yo gufata')}</Text>
+        <Text tone="muted">{menu?.store.name[locale] ?? 'CrustCaper Kigali'}</Text>
       </View>
 
+      {!quote && <>
       <Card>
         <Text variant="heading" accessibilityRole="header">{t('Pickup time', 'Igihe cyo gufata')}</Text>
         <View accessibilityRole="radiogroup" accessibilityLabel={t('Pickup time', 'Igihe cyo gufata')} style={styles.slotGroup}>
           {menu?.slots.map((option) => {
             const checked = option.id === slot?.id;
-            const disabled = !option.available || requestingQuote || busy;
-            const choose = () => {
-              if (disabled || checked) return;
-              setSlot(option.id);
-              setReview(null);
-              setProblem(null);
-            };
+            const disabled = !option.available || controlsLocked;
             const webKeyboard = Platform.OS === 'web' ? {
-              onKeyDown: (event: { key: string; preventDefault: () => void }) => {
-                if (event.key === ' ' && !disabled) {
-                  event.preventDefault();
-                  choose();
-                }
-              },
+              tabIndex: !disabled && option.id === (slot?.id ?? availableSlots[0]?.id) ? 0 as const : -1 as const,
+              onKeyDown: (event: { key: string; preventDefault: () => void }) => handleSlotKey(event, option.id),
             } : {};
-
             return (
               <Pressable
                 key={option.id}
+                ref={(element) => {
+                  if (element) slotButtons.current.set(option.id, element);
+                  else slotButtons.current.delete(option.id);
+                }}
                 accessibilityRole="radio"
                 accessibilityState={{ checked, disabled }}
                 aria-checked={checked}
                 aria-disabled={disabled}
                 disabled={disabled}
-                onPress={choose}
+                onPress={() => chooseSlot(option.id)}
                 {...webKeyboard}
                 style={({ pressed }) => [styles.slot, checked && styles.selected, (pressed || !option.available) && styles.dimmed]}
               >
@@ -169,10 +204,11 @@ export default function CheckoutScreen() {
         <Text variant="heading" accessibilityRole="header">{t('Guest contact', 'Nimero y’umushyitsi')}</Text>
         <Text variant="small" tone="muted">{t('Use the demo number below. No calls or messages are sent.', 'Koresha nimero y’igerageza iri hasi. Nta guhamagara cyangwa ubutumwa bwoherezwa.')}</Text>
         <TextInput
+          ref={phoneInput}
           accessibilityLabel={t('Demo phone number', 'Nimero y’igerageza')}
           autoComplete="off"
           keyboardType="phone-pad"
-          editable={!busy}
+          editable={!controlsLocked}
           maxLength={19}
           value={phone}
           onChangeText={updatePhone}
@@ -181,12 +217,14 @@ export default function CheckoutScreen() {
           style={[styles.input, phoneInvalid && styles.invalidInput]}
         />
         {phoneInvalid && <Text accessibilityRole="alert" tone="red">{t('Enter the demo phone number shown here.', 'Andika nimero y’igerageza yerekanwe hano.')}</Text>}
-        <Button label={t('Use demo number', 'Koresha nimero y’igerageza')} variant="secondary" disabled={busy} onPress={() => updatePhone(demoPhoneLabel)} />
+        <Button label={t('Use demo number', 'Koresha nimero y’igerageza')} variant="secondary" disabled={controlsLocked} onPress={() => updatePhone(demoPhoneLabel)} />
       </Card>
+      </>}
 
       <Card>
-        <Text variant="heading" accessibilityRole="header">{quote ? t('Review your order', 'Reba komande yawe') : t('Order summary', 'Incamake ya komande')}</Text>
+        <Text variant="heading" accessibilityRole="header">{t('Order summary', 'Incamake ya komande')}</Text>
         {quote && slot && <Text variant="small" tone="muted">{t('Pickup', 'Gufata komande')} · {slotLabel(slot, locale)}</Text>}
+        {quote?.changes.map((change, index) => <Text key={index} tone="red">{changeLabel(change, locale, menu)}</Text>)}
         {(quote?.lines ?? cart).map((line) => (
           <View key={`${line.sku}:${line.modifierIds.join(',')}`} style={styles.row}>
             <View style={styles.shrink}>
@@ -198,8 +236,6 @@ export default function CheckoutScreen() {
         ))}
         {quote && (
           <>
-            {quote.changes.map((change, index) => <Text key={index} tone="red">{changeLabel(change, locale, menu)}</Text>)}
-            {!quote.lines.length && <Button label={t('Edit cart', 'Hindura agatebo')} variant="secondary" onPress={() => router.replace('/cart')} />}
             <View style={styles.row}>
               <Text style={styles.shrink} tone="muted">{t('Included tax', 'Umusoro urimo')}</Text>
               <Text tone="muted">{money(quote.tax)}</Text>
@@ -210,6 +246,8 @@ export default function CheckoutScreen() {
           <Text variant="label" style={styles.shrink}>{quote ? t('Total', 'Igiteranyo') : t('Estimated total', 'Igiteranyo cy’agateganyo')}</Text>
           <Text variant="label">{money(quote?.total ?? total)}</Text>
         </View>
+        {quote && <Button label={t('Edit pickup or contact', 'Hindura igihe cyangwa nimero')} variant="secondary"
+          disabled={controlsLocked} onPress={() => { setReview(null); setProblem(null); }} />}
         <Text variant="small" tone="muted">{quote
           ? t('Confirm the shown items, total and time to open demo payment.', 'Emeza ibyo ubonye, igiteranyo n’igihe kugira ngo wishyure mu igerageza.')
           : t('We’ll confirm the items, price and time before payment.', 'Tuzemeza ibiribwa, igiciro n’igihe mbere yo kwishyura.')}</Text>

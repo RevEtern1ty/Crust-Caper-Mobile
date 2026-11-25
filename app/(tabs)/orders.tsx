@@ -1,6 +1,6 @@
 import { router } from 'expo-router';
 import { useRef, useState } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { Platform, Pressable, StyleSheet, View } from 'react-native';
 
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../../src/checkout/context';
 import { checkoutError, changeLabel, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
@@ -13,7 +13,7 @@ type Action = 'resume' | 'reorder' | 'kitchen';
 
 export default function OrdersScreen() {
   const { api, locale, menu, cart, hydrated, replaceCart } = useShop();
-  const { journal, restoreFailed, resumeCheckout, busy } = useCheckout();
+  const { journal, restoreFailed, retryRestore, resumeCheckout, busy } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const latestId = journal?.orderIds[0] ?? null;
   const [choice, setChoice] = useState<{ latest: string | null; id: string } | null>(null);
@@ -76,7 +76,13 @@ export default function OrdersScreen() {
         </Pressable>
       </View>
 
-      {restoreFailed && <Text tone="red" accessibilityRole="alert">{t('The saved order could not be opened.', 'Komande yabitswe ntishobora gufungurwa.')}</Text>}
+      {restoreFailed && (
+        <Card>
+          <Text tone="red" accessibilityRole="alert">{t('Saved orders could not be opened.', 'Komande zabitswe ntizashoboye gufungurwa.')}</Text>
+          <Button label={t('Try opening saved orders again', 'Ongera ugerageze gufungura komande zabitswe')}
+            variant="secondary" busy={busy} onPress={() => { void retryRestore(); }} />
+        </Card>
+      )}
       {!journal && !restoreFailed && <Text tone="muted">{t('Opening saved orders…', 'Turimo gufungura komande zabitswe…')}</Text>}
       {activeOrder && !order && failed && (
         <Button
@@ -161,7 +167,7 @@ export default function OrdersScreen() {
                   <Text>{line.quantity} × {itemName(line.sku, locale, menu)}</Text>
                   {line.modifierIds.length > 0 && <Text variant="small" tone="muted">{itemOptions(line, locale, menu)}</Text>}
                 </View>
-                <Text>{money(line.quantity * line.unitPrice)}</Text>
+                <Text style={styles.amount}>{money(line.quantity * line.unitPrice)}</Text>
               </View>
             ))}
             {order.paymentStatus === 'paid' && (
@@ -226,7 +232,8 @@ export default function OrdersScreen() {
               <Pressable
                 key={id}
                 accessibilityRole="button"
-                accessibilityState={{ selected: id === orderId }}
+                aria-pressed={Platform.OS === 'web' ? id === orderId : undefined}
+                accessibilityState={Platform.OS === 'web' ? undefined : { selected: id === orderId }}
                 onPress={() => {
                   setChoice({ latest: latestId, id });
                   setPreview(null);
@@ -260,7 +267,8 @@ const styles = StyleSheet.create({
   shrink: { flexShrink: 1 },
   pickupCode: { alignItems: 'center', backgroundColor: colors.mint, borderColor: colors.green },
   code: { fontSize: 39, lineHeight: 46, letterSpacing: 6, fontWeight: '900', textAlign: 'center' },
-  row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline', gap: 10 },
+  row: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'baseline', gap: 10 },
+  amount: { flexShrink: 1 },
   demoTools: { backgroundColor: colors.paper },
   history: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   historyItem: { minHeight: 48, justifyContent: 'center', paddingHorizontal: 12, borderRadius: 12, borderWidth: 1, borderColor: colors.border },

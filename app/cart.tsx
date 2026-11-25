@@ -6,9 +6,12 @@ import { copy, money } from '../src/ui/format';
 import { menuPhoto } from '../src/ui/menu-photos';
 
 export default function CartScreen() {
-  const { locale, menu, status, count, cart, setQuantity, total, refreshMenu, refreshing } = useShop();
+  const { locale, menu, status, count, cart, hydrated, setQuantity, total, refreshMenu, refreshing } = useShop();
   const router = useRouter();
   const checkoutReady = count > 0 && status === 'ready';
+  if (!hydrated) {
+    return <Screen safeBottom><Text accessibilityLiveRegion="polite">{copy(locale, 'Opening cart…', 'Turimo gufungura agatebo…')}</Text></Screen>;
+  }
   return (
     <Screen safeBottom bottom={count > 0 && <Button label={copy(locale, 'Choose pickup time', 'Hitamo igihe cyo kwakira')}
       disabled={!checkoutReady} onPress={() => router.push('/checkout')} />}>

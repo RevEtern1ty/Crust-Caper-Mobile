@@ -155,6 +155,7 @@ export type DemoPaymentResult = 'paid' | 'declined' | 'processing'
 export type DemoKitchenStatus = 'preparing' | 'ready' | 'collected'
 
 export interface DemoApi extends ShopApi {
+  listDemoOrderRefs(limit: number): Promise<{ orderId: string; key: string }[]>
   setDemoPaymentResult(orderId: string, attemptId: string, result: DemoPaymentResult): Promise<Order>
   setDemoOrderStatus(orderId: string, status: DemoKitchenStatus): Promise<Order>
 }

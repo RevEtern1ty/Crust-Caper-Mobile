@@ -263,3 +263,22 @@ test('late successful payment stays out of the kitchen and repeat recalculates c
   ])
   await rejects(fixture.api.getOrder('unknown-order'), { code: 'not_found' })
 })
+
+
+test('expired quotes are pruned without affecting committed order retries', async () => {
+  const f = setup();
+  const old = await f.quote();
+  const unused = await f.quote();
+  const input = { quoteId: old.id, phone: DEMO_PHONE };
+  const recorded = await f.api.createOrder(input, 'known-order');
+  f.advance(6);
+
+  const fresh = await f.quote();
+  const saved = f.snapshot();
+  ok(saved);
+  deepEqual(JSON.parse(saved).quotes.map(({ id }: { id: string }) => id), [fresh.id]);
+  equal((await f.restart().createOrder(input, 'known-order')).id, recorded.id);
+  await rejects(f.api.createOrder({ quoteId: unused.id, phone: DEMO_PHONE }, 'expired-order'), {
+    code: 'quote_expired',
+  });
+});

@@ -35,7 +35,7 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
       onPress={updateCart}
     />}>
       <Stack.Screen options={{ title: product.name[locale] }} />
-      {photo && <Image source={photo} style={styles.photo} accessible accessibilityLabel={product.name[locale]} />}
+      {photo && <Image source={photo} style={styles.photo} accessible={false} />}
       <View style={styles.intro}>
         <Text variant="title" accessibilityRole="header">{product.name[locale]}</Text>
         <Text tone="muted">{product.description[locale]}</Text>
@@ -44,7 +44,8 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
       </View>
       <Card>
         <Text variant="label">{copy(locale, 'Ingredients', 'Ibigize ifunguro')}</Text>
-        <Text>{product.ingredients.map(item => item[locale]).join(', ')}</Text>
+        <Text>{product.ingredients.length ? product.ingredients.map(item => item[locale]).join(', ')
+          : copy(locale, 'Ingredient details are unavailable for this demo item.', 'Ibigize iri funguro ry’igerageza ntibiraboneka.')}</Text>
         <Text variant="label">{copy(locale, 'Allergens', 'Ibitera ubwivumbure bw’umubiri')}</Text>
         <Text>{product.allergens.length ? product.allergens.map(item => item[locale]).join(', ')
           : copy(locale, 'None listed in the demo recipe.', 'Nta byanditswe mu ifunguro ry’igerageza.')}</Text>
@@ -55,13 +56,13 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
           const checked = selected.includes(option.id);
           return <Pressable key={option.id} accessibilityRole={Platform.OS === 'web' ? 'button' : 'checkbox'}
             aria-pressed={Platform.OS === 'web' ? checked : undefined}
-            accessibilityState={{ checked }} accessibilityLanguage={locale}
+            accessibilityState={Platform.OS === 'web' ? undefined : { checked }} accessibilityLanguage={locale}
             onPress={() => setSelected(current => current.includes(option.id)
               ? current.filter(id => id !== option.id) : [...current, option.id])}
             style={[styles.option, checked && styles.selected]}>
             <Icon name={checked ? 'checkbox' : 'square-outline'} color={colors.green} />
             <Text style={styles.optionLabel}>{option.name[locale]}</Text>
-            <Text variant="small">+{money(option.price)}</Text>
+            <Text variant="small" style={styles.optionPrice}>+{money(option.price)}</Text>
           </Pressable>;
         })}
       </View>}
@@ -76,12 +77,15 @@ export default function ProductScreen() {
   const router = useRouter();
   const product = menu?.products.find(item => item.sku === sku);
   const editing = line ? cart.find(item => lineKey(item) === line && item.sku === sku) : undefined;
+  const missingCartItem = !!line && !editing;
   if (product && (!line || editing)) return <Details key={`${sku}:${line ?? ''}`} product={product} editing={editing} />;
   return <Screen safeBottom>
-    {!hydrated || status === 'loading' ? <ActivityIndicator color={colors.plum} />
+    {!hydrated || status === 'loading' ? <ActivityIndicator color={colors.plum} accessibilityLabel={copy(locale, 'Loading item', 'Ifunguro ririmo gufunguka')} />
       : <Card>
-        <Text>{copy(locale, 'This item could not load.', 'Iri funguro ntiryabonetse.')}</Text>
-        <Button label={copy(locale, 'Back to menu', 'Subira ku ifunguro')} onPress={() => router.replace('/')} />
+        <Text accessibilityRole="alert">{missingCartItem ? copy(locale, 'This item is no longer in your cart.', 'Iri funguro ntirikiri mu gitebo cyawe.')
+          : copy(locale, 'This item could not load.', 'Iri funguro ntiryabonetse.')}</Text>
+        {missingCartItem ? <Button label={copy(locale, 'Back to cart', 'Subira ku gitebo')} onPress={() => router.replace('/cart')} />
+          : <Button label={copy(locale, 'Back to menu', 'Subira ku ifunguro')} onPress={() => router.replace('/')} />}
       </Card>}
   </Screen>;
 }
@@ -95,5 +99,6 @@ const styles = StyleSheet.create({
     padding: 12, flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: colors.white,
   },
   selected: { borderColor: colors.green, backgroundColor: colors.mint },
-  optionLabel: { flex: 1 },
+  optionLabel: { flex: 1, minWidth: 0 },
+  optionPrice: { flexShrink: 1, textAlign: 'right' },
 });

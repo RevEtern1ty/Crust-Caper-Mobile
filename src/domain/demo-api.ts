@@ -240,6 +240,8 @@ export function createDemoApi({
           expiresAt: new Date(Math.min(timestamp + QUOTE_LIFETIME, Date.parse(slot.startsAt))).toISOString(),
           changes,
         }
+        // Recorded orders retain the original quote ID for idempotent replays.
+        data.quotes = data.quotes.filter(({ expiresAt }) => Date.parse(expiresAt) > timestamp)
         data.quotes.push({ ...quote, pickupStartsAt: slot.startsAt, pickupEndsAt: slot.endsAt })
         return quote
       })
@@ -320,6 +322,13 @@ export function createDemoApi({
         expireReservation(order, timestamp)
         return order
       })
+    },
+
+    listDemoOrderRefs(limit) {
+      return withData(false, (data) => data.orders.slice(Math.max(0, data.orders.length - limit)).reverse().map((record) => ({
+        orderId: record.order.id,
+        key: record.attempts.at(-1)?.key ?? record.key,
+      })))
     },
 
     reorder(orderId) {

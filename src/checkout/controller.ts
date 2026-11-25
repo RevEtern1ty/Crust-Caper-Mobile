@@ -24,6 +24,7 @@ type Dependencies = {
   newKey: () => string;
   onOrderCreated: (cartFingerprint: string) => Promise<void>;
   allowMissingDemoOrders?: boolean;
+  listDemoOrderRefs?: (limit: number) => Promise<{ orderId: string; key: string }[]>;
 };
 
 export class CheckoutError extends Error {
@@ -82,6 +83,7 @@ export function canStartNewOrder(order: Order): boolean {
 export class CheckoutController {
   private journal = emptyJournal;
   private loaded = false;
+  private loading: Promise<void> | null = null;
   private running = false;
 
   constructor(private readonly dependencies: Dependencies) {}
@@ -213,14 +215,29 @@ export class CheckoutController {
     await this.save({ phase: 'tracking', orderId, key });
   }
 
-  private async load(): Promise<void> {
-    if (!this.loaded) {
-      const journal = parseJournal(await this.dependencies.storage.getItem(CHECKOUT_JOURNAL_KEY));
-      if (!this.loaded) {
-        this.journal = journal;
-        this.loaded = true;
-      }
+  private load(): Promise<void> {
+    if (this.loaded) return Promise.resolve();
+    this.loading ??= this.readJournal().finally(() => { this.loading = null; });
+    return this.loading;
+  }
+
+  private async readJournal(): Promise<void> {
+    const raw = await this.dependencies.storage.getItem(CHECKOUT_JOURNAL_KEY);
+    try {
+      this.journal = parseJournal(raw);
+    } catch (error) {
+      const listDemoOrderRefs = this.dependencies.listDemoOrderRefs;
+      if (!this.dependencies.allowMissingDemoOrders || !listDemoOrderRefs) throw error;
+
+      // A readable demo ledger can recover committed orders without clearing the cart.
+      const orders = await listDemoOrderRefs(maxRecentOrders);
+      const latest = orders[0];
+      await this.save(
+        latest ? { phase: 'tracking', orderId: latest.orderId, key: latest.key } : null,
+        orders.map(({ orderId }) => orderId),
+      );
     }
+    this.loaded = true;
   }
 
   private async save(active: Progress | null, orderIds = this.journal.orderIds): Promise<void> {

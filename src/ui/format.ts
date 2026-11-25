@@ -1,4 +1,4 @@
-import type { Locale, PickupSlot } from '../domain/types';
+import type { Locale, Menu, PickupSlot } from '../domain/types';
 
 export function copy(locale: Locale, en: string, rw: string) {
   return locale === 'en' ? en : rw;
@@ -9,6 +9,21 @@ export function money(value: number) {
 }
 
 const dateOptions = { timeZone: 'Africa/Kigali' } as const;
+
+export function nextPickupSlot(menu: Menu | null, now = Date.now()) {
+  if (!menu?.store.open || menu.orderingUnavailable) return undefined;
+
+  let next: PickupSlot | undefined;
+  let nextStart = Infinity;
+  for (const slot of menu.slots) {
+    const start = Date.parse(slot.startsAt);
+    if (slot.available && start > now && start < nextStart) {
+      next = slot;
+      nextStart = start;
+    }
+  }
+  return next;
+}
 
 export function slotLabel(slot: Pick<PickupSlot, 'startsAt' | 'endsAt'>, locale: Locale) {
   const lang = locale === 'en' ? 'en-GB' : 'rw-RW';

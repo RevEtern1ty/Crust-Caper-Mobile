@@ -8,11 +8,12 @@ import { AppState, Platform } from 'react-native';
 import { CHECKOUT_JOURNAL_KEY } from '../checkout/controller';
 import { createDemoApi } from '../domain/demo-api';
 import type { CartLine, Locale, Menu } from '../domain/types';
+import { DRAFT_KEY, MAX_QUANTITY, readBrowserDraft, readDraft, writeBrowserDraft, type Draft } from './draft-storage';
 import { privateStorage } from './private-storage';
 
-const DRAFT_KEY = 'crustcaper.draft.v1';
+export { MAX_QUANTITY } from './draft-storage';
+
 const MENU_KEY = 'crustcaper.menu.v1';
-export const MAX_QUANTITY = 9;
 const demoStorage = Platform.OS === 'web' ? {
   async getItem(key: string) {
     const saved = await privateStorage.getItem(key);
@@ -27,25 +28,7 @@ const demoStorage = Platform.OS === 'web' ? {
 } : AsyncStorage;
 const api = createDemoApi({ storage: demoStorage, newId: randomUUID });
 
-type Draft = { locale: Locale; cart: CartLine[] };
 type MenuStatus = 'loading' | 'ready' | 'stale' | 'unavailable';
-
-function readDraft(raw: string | null): Draft {
-  const fallback: Draft = { locale: 'en', cart: [] };
-  if (!raw) return fallback;
-  try {
-    const value = JSON.parse(raw) as Partial<Draft>;
-    const cart = Array.isArray(value.cart) ? value.cart.filter(line =>
-      line && typeof line.sku === 'string' && Array.isArray(line.modifierIds)
-      && line.modifierIds.every(id => typeof id === 'string')
-      && Number.isSafeInteger(line.quantity) && line.quantity > 0 && line.quantity <= MAX_QUANTITY
-      && Number.isSafeInteger(line.unitPrice) && line.unitPrice >= 0,
-    ) : [];
-    return { locale: value.locale === 'rw' ? 'rw' : 'en', cart };
-  } catch {
-    return fallback;
-  }
-}
 
 function readMenu(raw: string | null): Menu | null {
   if (!raw) return null;
@@ -129,11 +112,15 @@ export function ShopProvider({ children }: PropsWithChildren) {
 
   useEffect(() => {
     let active = true;
-    void AsyncStorage.multiGet([DRAFT_KEY, MENU_KEY]).then(entries => {
+    const storedDraft = Platform.OS === 'web'
+      ? Promise.resolve().then(() => readBrowserDraft(window.sessionStorage, () => window.localStorage))
+      : AsyncStorage.getItem(DRAFT_KEY).then(readDraft);
+    const storedMenu = AsyncStorage.getItem(MENU_KEY).catch(() => null);
+    void Promise.all([storedDraft.catch(() => readDraft(null)), storedMenu]).then(([savedDraft, rawMenu]) => {
       if (!active) return;
-      currentDraft.current = readDraft(entries[0]?.[1] ?? null);
-      setDraft(currentDraft.current);
-      const cached = readMenu(entries[1]?.[1] ?? null);
+      currentDraft.current = savedDraft;
+      setDraft(savedDraft);
+      const cached = readMenu(rawMenu);
       if (cached && !cachedMenu.current) {
         cachedMenu.current = cached;
         setMenu(cached);
@@ -158,7 +145,13 @@ export function ShopProvider({ children }: PropsWithChildren) {
     const next = update(previous);
     currentDraft.current = next;
     setDraft(next);
-    const write = writeQueue.current.then(() => AsyncStorage.setItem(DRAFT_KEY, JSON.stringify(next)));
+    const write = writeQueue.current.then(() => {
+      if (Platform.OS === 'web') {
+        writeBrowserDraft(window.sessionStorage, () => window.localStorage, next, previous.locale !== next.locale);
+        return;
+      }
+      return AsyncStorage.setItem(DRAFT_KEY, JSON.stringify(next));
+    });
     writeQueue.current = write.catch(() => undefined);
     if (!durable) return writeQueue.current;
     return write.catch(error => {

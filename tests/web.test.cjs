@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { readFile } = require('node:fs/promises');
+const { mkdir, readFile } = require('node:fs/promises');
 const { createServer } = require('node:http');
 const { extname, resolve, sep } = require('node:path');
 const { after, before, test } = require('node:test');
@@ -34,7 +34,8 @@ before(async () => {
   await readFile(resolve(root, 'index.html'));
   await new Promise(done => server.listen(0, '127.0.0.1', done));
   base = 'http://127.0.0.1:' + server.address().port;
-  browser = await chromium.launch({ channel: 'chrome' });
+  const executablePath = process.env.CRUST_CHROMIUM_EXECUTABLE;
+  browser = await chromium.launch(executablePath ? { executablePath } : { channel: 'chrome' });
 });
 after(async () => {
   try {
@@ -44,9 +45,9 @@ after(async () => {
   }
 });
 
-async function newContext(t, width = 390) {
+async function newContext(t, width = 390, height = 844) {
   const context = await browser.newContext({
-    viewport: { width, height: 844 },
+    viewport: { width, height },
     isMobile: true,
     hasTouch: true,
   });
@@ -108,7 +109,9 @@ function lastOrderId(page) {
 
 test('guest pickup survives reload, failed payment, retry and reorder', async t => {
   const { page, errors } = await newPage(await newContext(t));
+  await capture(page, '390-en-menu');
   await fillCart(page);
+  await capture(page, '390-en-cart');
   await button(page, 'Add one Double Smash').click();
   await shown(page, '18,400 RWF');
   await button(page, 'Remove one Double Smash').click();
@@ -116,12 +119,14 @@ test('guest pickup survives reload, failed payment, retry and reorder', async t 
   const orderId = await lastOrderId(page);
   await page.reload();
   await button(page, 'Open existing demo payment').click();
+  await capture(page, '390-en-payment');
   await button(page, 'Simulate payment decline').click();
   await button(page, 'Retry demo payment').click();
   await button(page, 'Simulate successful payment').click();
   await button(page, 'Simulate preparation').click();
   await button(page, 'Simulate ready for pickup').click();
   await shown(page, 'Pickup code');
+  await capture(page, '390-en-order-ready');
   await page.reload();
   await shown(page, 'Pickup code');
   assert.equal(await lastOrderId(page), orderId);
@@ -138,11 +143,24 @@ test('concurrent browser tabs can recover their own orders independently', async
   for (const { page } of [first, second]) {
     await page.bringToFront();
     await fillCart(page);
-    await reviewCheckout(page);
   }
+  await button(second.page, 'Add one Double Smash').click();
+  await shown(second.page, '18,400 RWF');
+  await first.page.bringToFront();
+  await first.page.reload();
+  await shown(first.page, '9,200 RWF');
+  assert.equal(await first.page.getByText('18,400 RWF', { exact: true }).filter({ visible: true }).count(), 0);
+  await reviewCheckout(first.page);
+  await second.page.bringToFront();
+  await second.page.reload();
+  await shown(second.page, '18,400 RWF');
+  await reviewCheckout(second.page);
+  await capture(second.page, '390-en-two-item-review');
   // Start both writes before switching foreground tabs to observe their results.
-  await Promise.all([first, second].map(({ page }) =>
-    button(page, /^Confirm 9,200 RWF/).dispatchEvent('click')));
+  await Promise.all([
+    button(first.page, /^Confirm 9,200 RWF/).dispatchEvent('click'),
+    button(second.page, /^Confirm 18,400 RWF/).dispatchEvent('click'),
+  ]);
   for (const { page } of [first, second]) {
     await page.bringToFront();
     await button(page, 'Leave payment pending').click();
@@ -196,14 +214,91 @@ test('keyboard selection exposes its state and changing language updates the doc
   const kinyarwanda = button(page, 'Kinyarwanda');
   await kinyarwanda.press('Space');
   await shown(page, 'Amagenamiterere');
+  await capture(page, '320-rw-settings');
   assert.equal(await kinyarwanda.getAttribute('aria-pressed'), 'true');
   assert.equal(await page.locator('html').getAttribute('lang'), 'rw');
   await page.goto(base);
   await shown(page, 'Ifunguro');
-  await button(page, 'Ibinyobwa').press('Space');
+  for (const name of ['Burgeri', 'Amafunguro', 'Ibyunganira', 'Ibinyobwa']) {
+    const bounds = await button(page, name).boundingBox();
+    assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 320 && bounds.height >= 48,
+      `${name} must fit the narrow screen with a touch-sized target`);
+  }
+  await capture(page, '320-rw-menu');
+  await button(page, 'Ibinyobwa').tap();
   await shown(page, 'Ikinyobwa kidasembuye');
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 320);
   await page.setViewportSize({ width: 430, height: 900 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 430);
+  assert.deepEqual(errors, []);
+});
+
+
+async function capture(page, name) {
+  const directory = process.env.CRUST_SCREENSHOT_DIR;
+  if (!directory) return;
+  await mkdir(directory, { recursive: true });
+  await page.screenshot({ path: resolve(directory, `${name}.png`), animations: 'disabled' });
+}
+
+test('checkout displays review above the fold before enabling confirmation on a short screen', async t => {
+  const { page, errors } = await newPage(await newContext(t, 320, 640));
+  await fillCart(page);
+  await reviewCheckout(page);
+  const heading = page.getByText('Review your order', { exact: true });
+  const visible = await heading.evaluate(element => {
+    const rect = element.getBoundingClientRect();
+    return rect.top >= 0 && rect.bottom < window.innerHeight;
+  });
+  assert.equal(visible, true, 'The review heading must be visible without scrolling past the form');
+  assert.equal(await page.getByLabel('Demo phone number').filter({ visible: true }).count(), 0);
+  await capture(page, '320-en-order-review');
+  await button(page, 'Edit pickup or contact').click();
+  await page.getByLabel('Demo phone number').waitFor({ state: 'visible' });
+  assert.match(await page.getByLabel('Demo phone number').inputValue(), /250 700/);
+  assert.deepEqual(errors, []);
+});
+
+test('pickup time can be selected with arrow keys without adding tab stops', async t => {
+  const { page, errors } = await newPage(await newContext(t));
+  await fillCart(page);
+  await button(page, 'Choose pickup time').click();
+  const radios = page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio');
+  const first = radios.first();
+  await first.press('ArrowDown');
+  const second = radios.nth(1);
+  assert.equal(await second.getAttribute('aria-checked'), 'true');
+  assert.equal(await second.evaluate(element => element === document.activeElement), true);
+  assert.equal(await first.getAttribute('tabindex'), '-1');
+  assert.deepEqual(errors, []);
+});
+
+
+test('expired review keeps the cart and requires a new quote', async t => {
+  const { page, errors } = await newPage(await newContext(t, 320, 640));
+  await fillCart(page);
+  await reviewCheckout(page);
+  await page.clock.setFixedTime(new Date('2026-06-15T10:09:00Z'));
+  await button(page, /^Confirm 9,200 RWF/).click();
+  await shown(page, 'Your quote changed or expired. Review the order again.');
+  assert.equal(await lastOrderId(page), undefined);
+  await page.goto(base + '/cart');
+  await shown(page, '9,200 RWF');
+  assert.deepEqual(errors, []);
+});
+
+test('damaged demo journal recovers its pending payment without a new order', async t => {
+  const { page, errors } = await newPage(await newContext(t));
+  await fillCart(page);
+  await confirmCheckout(page);
+  const orderId = await lastOrderId(page);
+  await page.evaluate(() => sessionStorage.setItem('crustcaper.checkout.v1', '{'));
+  await page.reload();
+  await shown(page, /This payment is being checked/);
+  assert.equal(await lastOrderId(page), orderId);
+  await button(page, 'Open existing demo payment').click();
+  await button(page, 'Simulate successful payment').click();
+  await shown(page, 'Paid');
+  assert.equal(await lastOrderId(page), orderId);
   assert.deepEqual(errors, []);
 });
