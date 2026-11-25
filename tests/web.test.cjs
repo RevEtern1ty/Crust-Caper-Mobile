@@ -244,6 +244,15 @@ async function capture(page, name) {
   await page.screenshot({ path: resolve(directory, `${name}.png`), animations: 'disabled' });
 }
 
+test('opening settings directly still provides a path back to the menu', async t => {
+  const context = await newContext(t, 320);
+  const page = await context.newPage();
+  await page.goto(base + '/settings');
+  await shown(page, 'Settings');
+  await page.getByRole('link', { name: 'Menu, back', exact: true }).click();
+  await shown(page, 'Double Smash');
+});
+
 test('checkout displays review above the fold before enabling confirmation on a short screen', async t => {
   const { page, errors } = await newPage(await newContext(t, 320, 640));
   await fillCart(page);

@@ -8,6 +8,8 @@ import { ShopProvider, useShop } from '../src/state/shop';
 import { colors } from '../src/ui/core';
 import { copy } from '../src/ui/format';
 
+export const unstable_settings = { anchor: '(tabs)' };
+
 function Routes() {
   const { locale } = useShop();
   useEffect(() => {
@@ -25,7 +27,7 @@ function Routes() {
       headerTitleStyle: { fontWeight: '800' },
       headerBackButtonDisplayMode: 'minimal',
     }}>
-      <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+      <Stack.Screen name="(tabs)" options={{ headerShown: false, title: copy(locale, 'Menu', 'Ifunguro') }} />
       <Stack.Screen name="product/[sku]" options={{ title: copy(locale, 'Menu item', 'Ifunguro') }} />
       <Stack.Screen name="cart" options={{ title: copy(locale, 'Your cart', 'Igitebo cyawe') }} />
       <Stack.Screen name="checkout" options={{ title: copy(locale, 'Checkout', 'Kwemeza komande') }} />
