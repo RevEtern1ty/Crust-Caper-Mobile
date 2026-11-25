@@ -63,6 +63,12 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .problem { font-weight: 680; color: var(--red); overflow-wrap: anywhere; }
 #queue-problem { margin-bottom: 1rem; }
 .queue-notice { margin-bottom: 1rem; border-left: .24rem solid var(--green); border-radius: .4rem; padding: .75rem 1rem; background: var(--mint); }
+.queue-stale { margin-bottom: 1rem; border-left: .24rem solid var(--red); border-radius: .4rem; padding: .75rem 1rem; background: var(--paper); color: var(--red); font-weight: 750; }
+.kitchen-signal { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .8rem 1rem; padding: .8rem 1rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: .85rem; background: var(--white); }
+.kitchen-signal[data-waiting="true"] { border-left: .28rem solid var(--mustard); }
+.kitchen-signal h2 { font-size: 1.13rem; }
+.kitchen-signal p { margin-top: .3rem; overflow-wrap: anywhere; }
+.kitchen-sound p { color: var(--muted); font-size: .87rem; }
 
 .order-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 24rem), 1fr)); gap: 1rem; align-items: start; list-style: none; margin: 0; padding: 0; }
 .order-card { min-width: 0; background: var(--white); border: 1px solid var(--border); border-radius: .9rem; padding: clamp(.9rem, 3vw, 1.3rem); }
@@ -72,6 +78,8 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .order-status[data-status="accepted"] { background: var(--mustard); }
 .order-status[data-status="ready"] { color: var(--green); background: var(--mint); }
 .pickup-window { margin-block: .38rem .9rem; color: var(--muted); font-size: .9rem; overflow-wrap: anywhere; }
+.kitchen-wait { margin-block: -.3rem .85rem; color: var(--muted); font-weight: 700; overflow-wrap: anywhere; }
+.kitchen-wait[data-overdue="true"] { color: var(--red); }
 .order-lines { list-style: none; padding: .55rem 0; margin: 0; border-block: 1px solid var(--border); }
 .order-line { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .65rem; padding-block: .35rem; }
 .quantity { color: var(--green); font-weight: 810; }

@@ -28,9 +28,10 @@ final class OperatorModels {
     record OrderLine(String sku, List<String> modifierIds, int quantity) { }
 
     record OrderView(UUID id, String status, String paymentStatus, List<OrderLine> lines,
-                     Instant pickupStartsAt, Instant pickupEndsAt) { }
+                     Instant pickupStartsAt, Instant pickupEndsAt,
+                     @JsonInclude(JsonInclude.Include.ALWAYS) Instant acceptedAt) { }
 
-    record Queue(List<OrderView> orders) { }
+    record Queue(List<OrderView> orders, Instant serverTime) { }
 
     record PaymentExceptionView(UUID orderId, UUID merchantReference, String providerTransactionId,
                                 String reason, Instant createdAt,

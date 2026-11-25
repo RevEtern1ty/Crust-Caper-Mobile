@@ -325,7 +325,10 @@ public class OrderService {
                 WHERE id = ?
                 """).params(payment.transactionId(), attemptId).update();
             if (acceptable) {
-                jdbc.sql("UPDATE orders SET status = 'accepted', payment_status = 'paid', pickup_code = ? WHERE id = ?")
+                jdbc.sql("""
+                        UPDATE orders SET status = 'accepted', payment_status = 'paid', pickup_code = ?,
+                            accepted_at = clock_timestamp() WHERE id = ?
+                        """)
                     .params(String.format(Locale.ROOT, "%06d", RANDOM.nextInt(1_000_000)), order.id()).update();
                 return;
             }

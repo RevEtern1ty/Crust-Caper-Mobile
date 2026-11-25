@@ -52,6 +52,17 @@
         </div>
 
         <p class="problem" id="queue-problem" role="alert" hidden></p>
+        <p class="queue-stale" id="queue-stale" role="status" hidden></p>
+        <section class="kitchen-signal" id="kitchen-signal" aria-labelledby="kitchen-signal-title" hidden>
+          <div>
+            <h2 id="kitchen-signal-title">New paid orders</h2>
+            <p id="kitchen-new-orders" role="status"></p>
+          </div>
+          <div class="kitchen-sound">
+            <button class="button button-secondary" id="kitchen-sound-toggle" type="button">Enable order sound</button>
+            <p id="kitchen-sound-status" role="status">Order sound is off.</p>
+          </div>
+        </section>
         <p class="queue-notice" id="queue-notice" role="status" tabindex="-1" hidden></p>
         <p class="empty-state" id="empty-state" hidden>No paid orders are waiting.</p>
         <ul class="order-list" id="order-list" aria-label="Paid orders"></ul>
@@ -123,6 +134,7 @@
           <span class="order-status"></span>
         </div>
         <p class="pickup-window"></p>
+        <p class="kitchen-wait" hidden><strong class="kitchen-overdue" hidden>Check this order</strong><span class="kitchen-age"></span></p>
         <ul class="order-lines" aria-label="Items"></ul>
         <div class="order-actions"></div>
         <p class="problem order-problem" role="alert" hidden></p>

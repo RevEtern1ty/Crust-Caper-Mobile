@@ -27,7 +27,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 @Service
 final class OperatorOrders {
     private static final Pattern PICKUP_CODE = Pattern.compile("[0-9]{6}");
-    private static final String ORDER_FIELDS = "id, status, payment_status, lines, pickup_starts_at, pickup_ends_at";
+    private static final String ORDER_FIELDS = "id, status, payment_status, lines, pickup_starts_at, pickup_ends_at, accepted_at";
     private static final String RESTAURANT_CANCELLED = "restaurant_cancelled";
     private static final int PAYMENT_REVIEW_LIMIT = 50;
     private final JdbcClient jdbc;
@@ -49,7 +49,7 @@ final class OperatorOrders {
                  WHERE store_id = ? AND payment_status = 'paid' AND status IN ('accepted', 'preparing', 'ready')
                  ORDER BY pickup_starts_at, id
                 """).param(actor.storeId()).query(this::orderRow).list();
-        return new Queue(active);
+        return new Queue(active, jdbc.sql("SELECT clock_timestamp()").query(OffsetDateTime.class).single().toInstant());
     }
 
     PaymentReview paymentReview(String authorization) {
@@ -125,7 +125,7 @@ final class OperatorOrders {
             cancelPickupAlerts(id);
             recordEvent(actor, id, existing.status(), "cancelled", "changed");
             return new OrderView(id, "cancelled", "refund_pending", existing.lines(),
-                    existing.pickupStartsAt(), existing.pickupEndsAt());
+                    existing.pickupStartsAt(), existing.pickupEndsAt(), existing.acceptedAt());
         }));
     }
 
@@ -182,7 +182,7 @@ final class OperatorOrders {
         if (transition == Transition.READY) enqueuePickupAlerts(id);
         OrderView before = existing.order();
         return new Outcome(new OrderView(id, transition.to(), before.paymentStatus(), before.lines(),
-                before.pickupStartsAt(), before.pickupEndsAt()), false);
+                before.pickupStartsAt(), before.pickupEndsAt(), before.acceptedAt()), false);
     }
 
     private void enqueuePickupAlerts(UUID orderId) {
@@ -231,9 +231,11 @@ final class OperatorOrders {
         } catch (JacksonException ignored) {
             throw new OperatorFailure(HttpStatus.SERVICE_UNAVAILABLE, "service_unavailable");
         }
+        OffsetDateTime acceptedAt = row.getObject("accepted_at", OffsetDateTime.class);
         return new OrderView(row.getObject("id", UUID.class), row.getString("status"), row.getString("payment_status"),
                 lines, row.getObject("pickup_starts_at", OffsetDateTime.class).toInstant(),
-                row.getObject("pickup_ends_at", OffsetDateTime.class).toInstant());
+                row.getObject("pickup_ends_at", OffsetDateTime.class).toInstant(),
+                acceptedAt == null ? null : acceptedAt.toInstant());
     }
 
     private static UUID orderId(String value) {

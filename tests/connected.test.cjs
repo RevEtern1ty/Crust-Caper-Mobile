@@ -340,7 +340,7 @@ test('payment review displays a verified refund only after the API confirms it',
         expiresAt: new Date(Date.now() + 60_000).toISOString() } });
     }
     if (path.endsWith('/sessions/current')) return route.fulfill({ status: 204, body: '' });
-    if (path.endsWith('/orders')) return route.fulfill({ json: { orders: [] } });
+    if (path.endsWith('/orders')) return route.fulfill({ json: { orders: [], serverTime: new Date().toISOString() } });
     if (path.endsWith('/receipts')) return route.fulfill({ json: [] });
     if (path.endsWith('/availability')) return route.fulfill({ json: { version: 'finance-fixture', open: true, products: [] } });
     if (path.endsWith('/payment-exceptions')) {
@@ -379,6 +379,194 @@ test('payment review displays a verified refund only after the API confirms it',
   await shown(page, 'Staff sign in');
   assert.equal(await page.getByText(/^Refund verified/).count(), 0);
   assert.deepEqual(errors, []);
+});
+
+test('a paid order appears on the kitchen screen within ten seconds and is acknowledged by preparation', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(9000);
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-kitchen');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  const initialQueue = page.waitForResponse(response =>
+    response.url() === api + '/operator/orders' && response.request().method() === 'GET' && response.ok());
+  await button(page, 'Sign in').click();
+  assert.ok(Number.isFinite(Date.parse((await (await initialQueue).json()).serverTime)));
+
+  const menu = await send('/stores/kigali/menu').then(response => response.json());
+  const product = menu.products.find(item => item.name.en === 'Double Smash' && item.available);
+  const slot = menu.slots.filter(item => item.available).at(-1);
+  assert.ok(product && slot, 'The local integration restaurant needs a free pickup slot and an available burger');
+  const { accessToken } = await send('/guest-sessions', { method: 'POST' }).then(response => response.json());
+  const quote = await send('/quotes', { method: 'POST', token: accessToken, data: {
+    storeId: 'kigali', slotId: slot.id, lines: [{ sku: product.sku, modifierIds: [], quantity: 1, unitPrice: product.price }],
+  } });
+  assert.equal(quote.status, 200);
+  const { quoteId } = await quote.json();
+  const placed = await send('/orders', { method: 'POST', token: accessToken, key: randomUUID(), data: { quoteId, ...contact } });
+  assert.equal(placed.status, 200);
+  const { id: orderId } = await placed.json();
+  const started = await send('/orders/' + orderId + '/payments', { method: 'POST', token: accessToken, key: randomUUID() });
+  assert.equal(started.status, 200);
+  const { id: attemptId } = await started.json();
+  const card = page.getByRole('list', { name: 'Paid orders' }).getByRole('listitem')
+    .filter({ has: page.getByRole('heading', { name: 'Order #' + orderId.slice(-8).toUpperCase(), exact: true }) });
+  assert.equal(await card.count(), 0);
+  const observed = page.waitForResponse(async response => {
+    if (response.url() !== api + '/operator/orders' || !response.ok()) return false;
+    return (await response.json()).orders.some(order => order.id === orderId);
+  });
+  const start = performance.now();
+  const settlement = await send('/local/orders/' + orderId + '/payments/' + attemptId + '/result', {
+    method: 'POST', token: accessToken, data: { status: 'paid' },
+  });
+  assert.equal(settlement.status, 200);
+  await card.getByText('New', { exact: true }).waitFor({ timeout: 10_000 });
+  const elapsed = Math.round(performance.now() - start);
+  assert.ok(elapsed <= 10_000, 'Payment request to visible kitchen card took ' + elapsed + ' ms');
+  const queue = await (await observed).json();
+  const admitted = queue.orders.find(order => order.id === orderId);
+  assert.ok(Number.isFinite(Date.parse(admitted.acceptedAt)));
+  assert.ok(Date.parse(admitted.acceptedAt) <= Date.parse(queue.serverTime));
+  await shown(page, 'New paid orders');
+  await capture(page, 'operator-new-paid-order');
+  t.diagnostic('Payment request to visible kitchen card: ' + elapsed + ' ms on loopback with a foreground Chrome tab');
+
+  const path = '/operator/orders/' + orderId + '/status';
+  const committed = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  await page.route(api + path, async route => {
+    const result = await route.fetch();
+    committed.resolve({ status: result.status(), order: await result.json() });
+    await release.promise;
+    await route.fulfill({ response: result });
+  });
+  try {
+    await button(card, 'Start preparing').click();
+    const accepted = await committed.promise;
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.order.status, 'preparing');
+    assert.equal(accepted.order.acceptedAt, admitted.acceptedAt);
+
+    const ready = await send(path, { method: 'POST', token: await operator('demo-kitchen'), data: { status: 'ready' } });
+    assert.equal(ready.status, 200);
+    await card.getByText('Ready for pickup', { exact: true }).waitFor();
+    await page.evaluate(shortId => {
+      const list = document.querySelector('#order-list');
+      window.kitchenStates = [];
+      new MutationObserver(() => {
+        const order = [...list.children].find(item => item.querySelector('.order-title')?.textContent === 'Order #' + shortId);
+        if (order) window.kitchenStates.push(order.querySelector('.order-status')?.textContent);
+      }).observe(list, { subtree: true, childList: true });
+    }, orderId.slice(-8).toUpperCase());
+    const refreshed = page.waitForResponse(response => response.url() === api + '/operator/orders' && response.ok());
+    release.resolve();
+    await refreshed;
+    await card.getByText('Ready for pickup', { exact: true }).waitFor();
+    assert.ok((await page.evaluate(() => window.kitchenStates)).every(state => state === 'Ready for pickup'));
+  } finally {
+    release.resolve();
+  }
+});
+
+test('kitchen sound follows a fresh paid queue, stops offline and clears after server acknowledgment', { timeout: 30_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+  await page.clock.install();
+  await page.addInitScript(() => {
+    window.orderSoundStarts = 0;
+    const parameter = () => ({ value: 0, setValueAtTime() {}, exponentialRampToValueAtTime() {}, linearRampToValueAtTime() {} });
+    window.AudioContext = class extends EventTarget {
+      state = 'suspended';
+      destination = {};
+      get currentTime() { return performance.now() / 1000; }
+      changeState(state) {
+        this.state = state;
+        this.dispatchEvent(new Event('statechange'));
+        return Promise.resolve();
+      }
+      resume() { return this.changeState('running'); }
+      suspend() { return this.changeState('suspended'); }
+      close() { return this.changeState('closed'); }
+      createOscillator() {
+        return { frequency: parameter(), connect() {}, stop() {}, disconnect() {}, addEventListener() {},
+          start() { window.orderSoundStarts++; } };
+      }
+      createGain() { return { gain: parameter(), connect() {}, disconnect() {} }; }
+    };
+  });
+  const order = {
+    id: 'b6be5c82-c61d-4b70-8f5a-43214cab6005', status: 'accepted', paymentStatus: 'paid',
+    acceptedAt: '2031-01-01T12:00:00Z', pickupStartsAt: '2031-01-01T12:10:00Z', pickupEndsAt: '2031-01-01T12:20:00Z',
+    lines: [{ sku: 'double-smash', modifierIds: [], quantity: 1 }],
+  };
+  let failReads = false;
+  let preparations = 0;
+  await page.route('**/api/v1/operator/**', async route => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith('/sessions')) {
+      return route.fulfill({ json: { accessToken: 'fixture-kitchen-session', role: 'kitchen', storeId: 'kigali',
+        expiresAt: new Date(Date.now() + 240_000).toISOString() } });
+    }
+    if (path.endsWith('/orders')) {
+      if (failReads) return route.fulfill({ status: 503, json: { code: 'service_unavailable' } });
+      return route.fulfill({ json: { orders: [order], serverTime: '2031-01-01T12:01:05Z' } });
+    }
+    if (path.endsWith('/orders/' + order.id + '/status') && request.method() === 'POST') {
+      preparations++;
+      order.status = 'preparing';
+      return route.fulfill({ json: order });
+    }
+    await route.abort();
+  });
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('fixture-kitchen');
+  await page.getByLabel('Password', { exact: true }).fill('fixture-only');
+  await button(page, 'Sign in').click();
+  await shown(page, '1 order awaiting preparation.');
+  await shown(page, 'Check this order');
+  const tones = () => page.evaluate(() => window.orderSoundStarts);
+  assert.equal(await tones(), 0);
+  await button(page, 'Enable order sound').click();
+  await button(page, 'Mute order sound').waitFor();
+  await page.waitForFunction(() => window.orderSoundStarts === 1);
+  for (let count = 0; count < 4; count++) {
+    const refreshed = page.waitForResponse(response => response.url() === api + '/operator/orders' && response.ok());
+    await page.clock.runFor(5_100);
+    await refreshed;
+  }
+  await page.waitForFunction(() => window.orderSoundStarts >= 2);
+  await capture(page, 'operator-unacknowledged-kitchen-order');
+
+  await page.context().setOffline(true);
+  await shown(page, 'You are offline. Reconnect to refresh the kitchen queue.');
+  assert.equal(await button(page, 'Start preparing').isDisabled(), true);
+  const offlineTones = await tones();
+  await page.clock.runFor(25_000);
+  assert.equal(await tones(), offlineTones);
+  assert.equal(preparations, 0);
+  await capture(page, 'operator-kitchen-offline');
+
+  failReads = true;
+  await page.context().setOffline(false);
+  await shown(page, 'The kitchen queue may be out of date. Refresh before starting an order.');
+  assert.equal(await button(page, 'Start preparing').isDisabled(), true);
+  failReads = false;
+  await button(page, 'Refresh').click();
+  await shown(page, '1 order awaiting preparation.');
+  await button(page, 'Start preparing').click();
+  await shown(page, 'Preparing');
+  assert.equal(preparations, 1);
+  await page.getByText('1 order awaiting preparation.', { exact: true }).waitFor({ state: 'hidden' });
+  const preparedTones = await tones();
+  await page.clock.runFor(25_000);
+  assert.equal(await tones(), preparedTones);
 });
 
 test('manager stop list and pause apply to new orders and preserve the paid kitchen queue', { timeout: 50_000 }, async t => {

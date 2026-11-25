@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: CrustCaper Shared API
-  version: 0.7.0
+  version: 0.8.0
   description: Implemented HTTP contract for the Spring Boot commerce service.
 servers:
   - url: /api/v1
@@ -356,15 +356,21 @@ paths:
       responses:
         '200':
           description: Paid orders ready for kitchen or pickup work in the session's assigned store.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema:
                 type: object
-                required: [orders]
+                required: [orders, serverTime]
                 properties:
                   orders:
                     type: array
                     items: { $ref: '#/components/schemas/OperatorOrder' }
+                  serverTime:
+                    $ref: '#/components/schemas/Timestamp'
+                    description: Database clock sampled after reading the queue. Used to calculate elapsed time without relying on the browser's wall clock.
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/orders/{id}/status:
@@ -825,7 +831,7 @@ components:
         recordedAt: { $ref: '#/components/schemas/Timestamp' }
     OperatorOrderDetails:
       type: object
-      required: [id, lines, pickupStartsAt, pickupEndsAt]
+      required: [id, lines, pickupStartsAt, pickupEndsAt, acceptedAt]
       properties:
         id: { type: string, format: uuid }
         lines:
@@ -839,6 +845,11 @@ components:
               quantity: { type: integer, minimum: 1 }
         pickupStartsAt: { $ref: '#/components/schemas/Timestamp' }
         pickupEndsAt: { $ref: '#/components/schemas/Timestamp' }
+        acceptedAt:
+          description: Time of the verified payment and accepted kitchen transition. Null for historical orders without this timestamp.
+          anyOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
     OperatorOrder:
       allOf:
         - $ref: '#/components/schemas/OperatorOrderDetails'

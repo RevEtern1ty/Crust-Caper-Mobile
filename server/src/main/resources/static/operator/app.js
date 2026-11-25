@@ -1,4 +1,5 @@
 import { mountAvailability } from './availability.js';
+import { createOrderSound } from './order-sound.js';
 
 const element = (id) => document.getElementById(id);
 const signIn = element('sign-in');
@@ -9,6 +10,11 @@ const workstation = element('workstation');
 const workstationTitle = element('workstation-title');
 const refreshButton = element('refresh-button');
 const queueProblem = element('queue-problem');
+const queueStale = element('queue-stale');
+const kitchenSignal = element('kitchen-signal');
+const kitchenNewOrders = element('kitchen-new-orders');
+const kitchenSoundToggle = element('kitchen-sound-toggle');
+const kitchenSoundStatus = element('kitchen-sound-status');
 const queueNotice = element('queue-notice');
 const updateTime = element('update-time');
 const orderList = element('order-list');
@@ -61,18 +67,32 @@ const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const providerId = /^[1-9][0-9]{0,18}$/;
 const receiptReference = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$/;
 const maxReceiptBytes = 1024 * 1024;
+const queuePollMs = 5000;
+const queueFreshMs = 12_000;
+const overdueMs = 60_000;
 const cards = new Map();
+const kitchenTransitions = new Set();
 
 let session = null;
 let orders = [];
 let receipts = [];
 let timer;
+let kitchenTimer;
 let refreshVersion = 0;
+let queueEpoch = 0;
+let queueSnapshot = null;
+let needsQueueRefresh = false;
+let pagePaused = false;
 let refreshing = false;
 let paymentReviewVersion = 0;
 let authVersion = 0;
 let cancellation = null;
 const availability = mountAvailability({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
+let kitchenSoundState = 'off';
+const orderSound = createOrderSound((state) => {
+  kitchenSoundState = state;
+  syncKitchenSignal();
+});
 
 class ApiError extends Error {
   constructor(status, code) {
@@ -146,6 +166,78 @@ function orderNumber(id) {
   return `#${id.slice(-8).toUpperCase()}`;
 }
 
+function staffKitchen(current) {
+  return current?.role === 'kitchen' || current?.role === 'manager';
+}
+
+function queueVisible() {
+  return !document.hidden && !pagePaused && navigator.onLine;
+}
+
+function queueFresh(now = performance.now()) {
+  return queueVisible() && !needsQueueRefresh && queueSnapshot !== null && now - queueSnapshot.receivedAt < queueFreshMs;
+}
+
+function changeText(target, value) {
+  if (target.textContent !== value) target.textContent = value;
+}
+
+function syncKitchenSignal() {
+  const now = performance.now();
+  const kitchen = staffKitchen(session);
+  const fresh = queueFresh(now);
+  const cached = queueSnapshot !== null;
+  const offline = !!session && !navigator.onLine;
+  const stale = !!session && !fresh && (cached || needsQueueRefresh);
+  changeText(queueStale, offline ? 'You are offline. Reconnect to refresh the kitchen queue.'
+    : 'The kitchen queue may be out of date. Refresh before starting an order.');
+  queueStale.hidden = !offline && !stale;
+  kitchenSignal.hidden = !kitchen;
+  let waiting = 0;
+  for (const { card, order } of cards.values()) {
+    const action = card.querySelector('[data-kitchen-action]');
+    if (action) action.disabled = !fresh || kitchenTransitions.has(order.id);
+    if (!kitchen || order.status !== 'accepted') continue;
+    waiting++;
+    const wait = card.querySelector('.kitchen-wait');
+    const acceptedAt = order.acceptedAt === null ? null : Date.parse(order.acceptedAt);
+    const server = queueSnapshot?.serverTime;
+    const elapsed = server == null || acceptedAt === null ? null : Math.max(0, server + now - queueSnapshot.receivedAt - acceptedAt);
+    const overdue = elapsed !== null && elapsed >= overdueMs;
+    wait.hidden = false;
+    wait.dataset.overdue = String(overdue);
+    wait.querySelector('.kitchen-overdue').hidden = !overdue;
+    changeText(wait.querySelector('.kitchen-age'), elapsed === null ? 'Awaiting preparation'
+      : `${overdue ? ' · ' : 'Awaiting preparation · '}${Math.floor(elapsed / 1000)} s`);
+  }
+
+  if (kitchen) {
+    kitchenSignal.dataset.waiting = String(waiting > 0);
+    changeText(kitchenNewOrders, waiting === 1 ? '1 order awaiting preparation.' : `${waiting} orders awaiting preparation.`);
+    changeText(kitchenSoundToggle, kitchenSoundState === 'on' ? 'Mute order sound' : 'Enable order sound');
+    kitchenSoundToggle.disabled = kitchenSoundState === 'starting';
+    changeText(kitchenSoundStatus, kitchenSoundState === 'on' ? (fresh ? 'Order sound is on.' : 'Order sound is paused until the queue is refreshed.')
+      : kitchenSoundState === 'failed' ? 'Order sound could not be started. Select Enable order sound to try again.' : 'Order sound is off.');
+  }
+  const active = session && session.expiresAt > Date.now();
+  void orderSound.update(active && kitchen && fresh && waiting > 0, now);
+}
+
+function invalidateQueue() {
+  queueEpoch++;
+  refreshVersion++;
+  refreshing = false;
+  needsQueueRefresh = true;
+  refreshButton.disabled = false;
+  syncKitchenSignal();
+}
+
+function recheckQueue() {
+  if (!session) return;
+  invalidateQueue();
+  if (queueVisible()) void refreshQueue(true);
+}
+
 function pickupWindow(start, end) {
   const startDate = new Date(start);
   const endDate = new Date(end);
@@ -159,6 +251,7 @@ function checkedOrder(order, completed = false) {
   if (!order || typeof order.id !== 'string' || !order.id || order.paymentStatus !== 'paid'
     || (!Object.hasOwn(statuses, order.status) && !(completed && order.status === 'collected'))
     || !Number.isFinite(Date.parse(order.pickupStartsAt)) || !Number.isFinite(Date.parse(order.pickupEndsAt))
+    || (order.acceptedAt != null && (typeof order.acceptedAt !== 'string' || !Number.isFinite(Date.parse(order.acceptedAt))))
     || !Array.isArray(order.lines) || !order.lines.every((line) => line && typeof line.sku === 'string'
       && Number.isInteger(line.quantity) && line.quantity > 0 && Array.isArray(line.modifierIds)
       && line.modifierIds.every((modifier) => typeof modifier === 'string'))) {
@@ -168,6 +261,7 @@ function checkedOrder(order, completed = false) {
     id: order.id,
     status: order.status,
     paymentStatus: order.paymentStatus,
+    acceptedAt: order.acceptedAt ?? null,
     pickupStartsAt: order.pickupStartsAt,
     pickupEndsAt: order.pickupEndsAt,
     lines: order.lines.map(({ sku, modifierIds, quantity }) => ({ sku, modifierIds, quantity })),
@@ -208,6 +302,7 @@ function addAction(card, order) {
 
   if (!isCollection) {
     button.type = 'button';
+    button.dataset.kitchenAction = 'true';
     button.addEventListener('click', () => { void submitTransition(order, action, button, problem); });
     container.append(button);
     return;
@@ -281,12 +376,13 @@ function renderOrders() {
       card.querySelector('.order-lines').append(...order.lines.map(renderedLine));
       addAction(card, order);
       addCancellation(card, order);
-      cards.set(order.id, { card, signature });
+      cards.set(order.id, { card, signature, order });
       current?.card.replaceWith(card);
     }
     if (orderList.children[index] !== card) orderList.insertBefore(card, orderList.children[index] ?? null);
   });
   emptyState.hidden = display.length !== 0;
+  syncKitchenSignal();
   if (cancellation && !cancellation.submitting && !isCurrentCancellation(cancellation)) {
     closeCancellation(`Order ${orderNumber(cancellation.id)} changed. Review the updated queue.`);
   }
@@ -488,12 +584,19 @@ async function attachReceipt(entry, card, form) {
 function closeSession(message = '') {
   authVersion++;
   refreshVersion++;
+  queueEpoch++;
   paymentReviewVersion++;
   clearInterval(timer);
+  clearInterval(kitchenTimer);
   session = null;
   closeCancellation('', false);
   showMessage(queueNotice);
   refreshing = false;
+  refreshButton.disabled = false;
+  queueSnapshot = null;
+  needsQueueRefresh = false;
+  kitchenTransitions.clear();
+  orderSound.mute();
   orders = [];
   cards.clear();
   orderList.replaceChildren();
@@ -526,7 +629,7 @@ function availableSession() {
 
 async function refreshQueue(force = false) {
   const current = availableSession();
-  if (!current || (refreshing && !force)) return;
+  if (!current || !queueVisible() || (refreshing && !force)) return;
 
   const version = ++refreshVersion;
   refreshing = true;
@@ -535,14 +638,24 @@ async function refreshQueue(force = false) {
     const data = await request('/orders', { token: current.accessToken });
     if (session !== current || refreshVersion !== version) return;
     if (!Array.isArray(data?.orders)) throw new ApiError(502, 'invalid_response');
+    const serverTime = data.serverTime === undefined ? null : Date.parse(data.serverTime);
+    if (serverTime !== null && (typeof data.serverTime !== 'string' || !Number.isFinite(serverTime))) {
+      throw new ApiError(502, 'invalid_response');
+    }
     orders = data.orders.map((order) => checkedOrder(order));
+    queueSnapshot = { serverTime, receivedAt: performance.now() };
+    needsQueueRefresh = false;
     renderOrders();
     showMessage(queueProblem);
-    updateTime.textContent = `Updated at ${timeFormat.format(new Date())} Kigali time`;
+    updateTime.textContent = `Updated at ${timeFormat.format(new Date(serverTime ?? Date.now()))} Kigali time`;
   } catch (error) {
     if (session !== current || refreshVersion !== version) return;
     if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
-    else showMessage(queueProblem, messageFor(error));
+    else {
+      needsQueueRefresh = true;
+      syncKitchenSignal();
+      showMessage(queueProblem, messageFor(error));
+    }
   } finally {
     if (session === current && refreshVersion === version) {
       refreshing = false;
@@ -610,6 +723,10 @@ async function refreshReceipts() {
 async function submitTransition(order, action, button, problem, input) {
   const current = availableSession();
   if (!current || button.disabled) return;
+  const kitchenAction = action.status !== 'collected';
+  const epoch = queueEpoch;
+  if (kitchenAction && (!staffKitchen(current) || !queueFresh() || kitchenTransitions.has(order.id)
+    || !orders.some((item) => item.id === order.id && item.status === order.status))) return;
 
   const body = { status: action.status };
   if (input) {
@@ -623,25 +740,31 @@ async function submitTransition(order, action, button, problem, input) {
     input.disabled = true;
   }
   button.disabled = true;
+  if (kitchenAction) kitchenTransitions.add(order.id);
   showMessage(problem);
   try {
     const data = await request(`/orders/${encodeURIComponent(order.id)}/status`, { method: 'POST', token: current.accessToken, body });
-    if (session !== current) return;
+    if (session !== current || (kitchenAction && queueEpoch !== epoch)) return;
     const updated = checkedOrder(data, true);
-    if (updated.id !== order.id) throw new ApiError(502, 'invalid_response');
+    if (updated.id !== order.id || updated.status !== action.status) throw new ApiError(502, 'invalid_response');
 
     if (input) input.value = '';
     orders = orders.flatMap((item) => {
-      if (item.id !== updated.id) return [item];
+      if (item.id !== updated.id || item.status !== order.status) return [item];
       return updated.status === 'collected' ? [] : [updated];
     });
     renderOrders();
     await refreshQueue(true);
   } catch (error) {
-    if (session !== current) return;
+    if (session !== current || (kitchenAction && queueEpoch !== epoch)) return;
     if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
     else {
       showMessage(problem, messageFor(error));
+      if (kitchenAction) {
+        needsQueueRefresh = true;
+        syncKitchenSignal();
+        await refreshQueue(true);
+      }
       if (input && error instanceof ApiError && error.code === 'pickup_code_mismatch') {
         input.value = '';
         input.disabled = false;
@@ -651,7 +774,14 @@ async function submitTransition(order, action, button, problem, input) {
     }
   } finally {
     if (session === current) {
-      button.disabled = false;
+      if (kitchenAction) {
+        kitchenTransitions.delete(order.id);
+        if (queueEpoch !== epoch && queueVisible()) {
+          needsQueueRefresh = true;
+          void refreshQueue(true);
+        }
+        syncKitchenSignal();
+      } else button.disabled = false;
       if (input) input.disabled = false;
     }
   }
@@ -754,7 +884,11 @@ loginForm.addEventListener('submit', async (event) => {
     fiscalReceipts.hidden = paymentReview.hidden;
     fiscalReceiptsJump.hidden = fiscalReceipts.hidden;
     workstationTitle.focus();
-    timer = setInterval(() => { if (!document.hidden) void refreshQueue(); }, 8000);
+    timer = setInterval(() => { void refreshQueue(); }, queuePollMs);
+    kitchenTimer = setInterval(() => {
+      if (availableSession()) syncKitchenSignal();
+    }, 1000);
+    syncKitchenSignal();
     void refreshQueue();
     if (data.role === 'manager') {
       void refreshPaymentReview();
@@ -773,6 +907,11 @@ loginForm.addEventListener('submit', async (event) => {
 });
 
 refreshButton.addEventListener('click', () => { void refreshQueue(); });
+kitchenSoundToggle.addEventListener('click', () => {
+  if (!staffKitchen(availableSession())) return;
+  if (kitchenSoundState === 'on') orderSound.mute();
+  else void orderSound.enable();
+});
 element('cancellation-form').addEventListener('submit', (event) => {
   event.preventDefault();
   void submitCancellation();
@@ -789,7 +928,25 @@ paymentReviewRefresh.addEventListener('click', () => { void refreshPaymentReview
 fiscalReceiptsJump.addEventListener('click', () => { element('fiscal-receipts-title').focus(); });
 fiscalReceiptsRefresh.addEventListener('click', () => { void refreshReceipts(); });
 fiscalReceiptsFilter.addEventListener('input', renderReceipts);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshQueue(); });
+document.addEventListener('visibilitychange', recheckQueue);
+document.addEventListener('freeze', () => {
+  pagePaused = true;
+  recheckQueue();
+});
+document.addEventListener('resume', () => {
+  pagePaused = false;
+  recheckQueue();
+});
+window.addEventListener('pagehide', () => {
+  pagePaused = true;
+  recheckQueue();
+});
+window.addEventListener('pageshow', () => {
+  pagePaused = false;
+  recheckQueue();
+});
+window.addEventListener('offline', recheckQueue);
+window.addEventListener('online', recheckQueue);
 element('logout-button').addEventListener('click', async () => {
   const current = session;
   if (!current) return;

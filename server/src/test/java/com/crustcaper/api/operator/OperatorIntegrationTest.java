@@ -18,6 +18,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HexFormat;
@@ -103,15 +104,75 @@ class OperatorIntegrationTest {
         JsonNode queue = body(api.perform(get(OPERATOR + "/orders").header(HttpHeaders.AUTHORIZATION, staffBearer))
                 .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store")));
 
+        assertThat(keys(queue)).containsExactlyInAnyOrder("orders", "serverTime");
         assertThat(queue.path("orders").size()).isEqualTo(1);
         JsonNode visible = queue.path("orders").get(0);
         assertThat(visible.path("id").asString("")).isEqualTo(accepted.orderId());
         assertThat(visible.path("status").asString("")).isEqualTo("accepted");
         assertThat(visible.path("paymentStatus").asString("")).isEqualTo("paid");
-        assertThat(keys(visible)).containsExactlyInAnyOrder("id", "status", "paymentStatus", "lines", "pickupStartsAt", "pickupEndsAt");
+        assertThat(keys(visible)).containsExactlyInAnyOrder("id", "status", "paymentStatus", "lines", "pickupStartsAt",
+                "pickupEndsAt", "acceptedAt");
+        assertThat(Instant.parse(queue.path("serverTime").asString()))
+                .isAfterOrEqualTo(Instant.parse(visible.path("acceptedAt").asString()));
         assertThat(keys(visible.path("lines").get(0))).containsExactlyInAnyOrder("sku", "modifierIds", "quantity");
         change(staffBearer, differentStore.orderId(), "preparing", null).andExpect(status().isNotFound());
         change(staffBearer, unpaid.orderId(), "preparing", null).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void kitchenAcceptanceUsesTheFirstSuccessfulCurrentSettlementTimeAndKeepsItThroughTransitions() throws Exception {
+        String manager = login(newStaff(store, "manager"));
+        OrderFixture order = newOrder(store, false);
+        UUID id = UUID.fromString(order.orderId());
+        jdbc.sql("UPDATE orders SET created_at = clock_timestamp() - interval '10 minutes' WHERE id = ?").param(id).update();
+
+        String oldAttempt = beginPayment(order.guestBearer(), order.orderId());
+        api.perform(post(API + "/local/orders/" + id + "/payments/" + oldAttempt + "/result")
+                .header(HttpHeaders.AUTHORIZATION, order.guestBearer()).contentType(MediaType.APPLICATION_JSON)
+                .content("{\"status\":\"declined\"}")).andExpect(status().isOk());
+        String primaryAttempt = body(api.perform(post(API + "/orders/" + id + "/payments")
+                .header(HttpHeaders.AUTHORIZATION, order.guestBearer()).header(IDEMPOTENCY, "second-payment"))
+                .andExpect(status().isOk())).path("id").asString();
+        VerifiedPayment superseded = new VerifiedPayment(oldAttempt, "synthetic-earlier-charge", 9700, "RWF", PaymentResult.PAID);
+        payments.settlePayment(superseded);
+        assertThat(jdbc.sql("SELECT accepted_at IS NULL FROM orders WHERE id = ?").param(id).query(Boolean.class).single()).isTrue();
+        JsonNode before = body(api.perform(get(OPERATOR + "/orders").header(HttpHeaders.AUTHORIZATION, manager))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.orders").isEmpty()));
+        Instant beforeSettlement = Instant.parse(before.path("serverTime").asString());
+
+        VerifiedPayment primary = new VerifiedPayment(primaryAttempt, "synthetic-current-charge", 9700, "RWF", PaymentResult.PAID);
+        payments.settlePayment(primary);
+        JsonNode after = body(api.perform(get(OPERATOR + "/orders").header(HttpHeaders.AUTHORIZATION, manager))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.orders[0].id").value(order.orderId())));
+        Instant accepted = Instant.parse(after.path("orders").get(0).path("acceptedAt").asString());
+        Instant afterSettlement = Instant.parse(after.path("serverTime").asString());
+        assertThat(accepted).isBetween(beforeSettlement, afterSettlement);
+        assertThat(jdbc.sql("SELECT accepted_at FROM orders WHERE id = ?").param(id)
+                .query(OffsetDateTime.class).single().toInstant()).isEqualTo(accepted);
+        api.perform(get(API + "/orders/" + id).header(HttpHeaders.AUTHORIZATION, order.guestBearer()))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.acceptedAt").doesNotHaveJsonPath());
+
+        payments.settlePayment(primary);
+        payments.settlePayment(superseded);
+        payments.settlePayment(new VerifiedPayment(primaryAttempt, "synthetic-duplicate-charge", 9700, "RWF", PaymentResult.PAID));
+        String acceptedAt = after.path("orders").get(0).path("acceptedAt").asString();
+        change(manager, order.orderId(), "preparing", null).andExpect(status().isOk()).andExpect(jsonPath("$.acceptedAt").value(acceptedAt));
+        change(manager, order.orderId(), "ready", null).andExpect(status().isOk()).andExpect(jsonPath("$.acceptedAt").value(acceptedAt));
+        cancel(manager, order.orderId()).andExpect(status().isOk()).andExpect(jsonPath("$.acceptedAt").value(acceptedAt));
+        cancel(manager, order.orderId()).andExpect(status().isOk()).andExpect(jsonPath("$.acceptedAt").value(acceptedAt));
+    }
+
+    @Test
+    void legacyAcceptedOrderRemainsVisibleWithNullTimeAndCanStillBeAcknowledged() throws Exception {
+        String kitchen = login(newStaff(store, "kitchen"));
+        OrderFixture legacy = newOrder(store, true);
+        jdbc.sql("UPDATE orders SET accepted_at = NULL WHERE id = ?").param(UUID.fromString(legacy.orderId())).update();
+
+        JsonNode queue = body(api.perform(get(OPERATOR + "/orders").header(HttpHeaders.AUTHORIZATION, kitchen))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.orders[0].id").value(legacy.orderId())));
+        assertThat(queue.path("orders").get(0).path("acceptedAt").isNull()).isTrue();
+        assertThat(body(change(kitchen, legacy.orderId(), "preparing", null).andExpect(status().isOk()))
+                .path("acceptedAt").isNull()).isTrue();
     }
 
     @Test
@@ -132,6 +193,8 @@ class OperatorIntegrationTest {
         jdbc.sql("UPDATE orders SET reservation_expires_at = now() - interval '1 second' WHERE id = ?")
                 .param(UUID.fromString(ownLate.orderId())).update();
         payments.settlePayment(new VerifiedPayment(lateReference, "synthetic-own-late", 9700, "RWF", PaymentResult.PAID));
+        assertThat(jdbc.sql("SELECT accepted_at IS NULL FROM orders WHERE id = ?")
+                .param(UUID.fromString(ownLate.orderId())).query(Boolean.class).single()).isTrue();
         payments.settlePayment(new VerifiedPayment(foreignReference, "synthetic-foreign-duplicate", 9700, "RWF", PaymentResult.PAID));
         jdbc.sql("UPDATE payment_exceptions SET created_at = now() - interval '5 minutes' WHERE attempt_id = ?")
                 .param(UUID.fromString(ownDuplicateReference)).update();
