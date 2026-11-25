@@ -537,6 +537,8 @@ test('offline demo keeps the same amount through cart, quote, payment and the pe
       && request.failure()?.errorText === 'net::ERR_INTERNET_DISCONNECTED').map(request => request.url()));
     assert.ok(optionalAssetUrls.has(`${base}/favicon.ico?offline-fixture`));
     assert.deepEqual(failedRequests.filter(request => !optionalAssetUrls.has(request.url())).map(request => request.url()), []);
+    // Chromium can fetch the browser tab icon without emitting a Playwright page request.
+    optionalAssetUrls.add(`${base}/favicon.ico`);
     assert.deepEqual(errors.filter(error => error.kind !== 'console'
       || error.message !== 'Failed to load resource: net::ERR_INTERNET_DISCONNECTED'
       || !optionalAssetUrls.has(error.url)), []);
