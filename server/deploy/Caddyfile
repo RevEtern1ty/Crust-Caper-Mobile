@@ -29,11 +29,22 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 	@local path /api/v1/local /api/v1/local/*
 	@operatorHome path /operator /operator/
 	@publicRoutes path /api/v1 /api/v1/* /operator/* /payment-return /.well-known/apple-app-site-association /.well-known/assetlinks.json
+	@receiptUpload {
+		method PUT
+		path_regexp ^/api/v1/operator/orders/[0-9a-fA-F-]{36}/receipt$
+	}
+	@otherRequests not {
+		method PUT
+		path_regexp ^/api/v1/operator/orders/[0-9a-fA-F-]{36}/receipt$
+	}
 	route {
 		respond @local 404
 		redir @operatorHome /operator/index.html 308
 		handle @publicRoutes {
-			request_body {
+			request_body @receiptUpload {
+				max_size 1MiB
+			}
+			request_body @otherRequests {
 				max_size 64KiB
 			}
 			reverse_proxy api:8080 {

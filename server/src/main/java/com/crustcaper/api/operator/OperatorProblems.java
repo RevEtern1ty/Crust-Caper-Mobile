@@ -9,7 +9,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
-@RestControllerAdvice(assignableTypes = OperatorController.class)
+@RestControllerAdvice(assignableTypes = {OperatorController.class, OperatorRefundController.class})
 final class OperatorProblems {
     @ExceptionHandler(OperatorFailure.class)
     ResponseEntity<Problem> problem(OperatorFailure failure) {

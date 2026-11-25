@@ -15,7 +15,7 @@ import org.springframework.core.env.Profiles;
 class PaymentGatewayConfiguration {
     @Bean
     @ConditionalOnProperty(name = "crustcaper.payment.provider", havingValue = "flutterwave")
-    PaymentGateway flutterwaveGateway(ObjectMapper mapper, Environment environment) {
+    FlutterwavePaymentGateway flutterwaveGateway(ObjectMapper mapper, Environment environment) {
         String secret = System.getenv("FLUTTERWAVE_SECRET_KEY");
         boolean stage = environment.acceptsProfiles(Profiles.of("stage"));
         if (stage && environment.acceptsProfiles(Profiles.of("prod", "production"))) {

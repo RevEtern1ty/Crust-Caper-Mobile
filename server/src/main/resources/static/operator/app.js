@@ -18,6 +18,14 @@ const paymentReviewProblem = element('payment-review-problem');
 const paymentReviewEmpty = element('payment-review-empty');
 const paymentReviewList = element('payment-review-list');
 const paymentExceptionTemplate = element('payment-exception-template');
+const fiscalReceipts = element('fiscal-receipts');
+const fiscalReceiptsJump = element('fiscal-receipts-jump');
+const fiscalReceiptsRefresh = element('fiscal-receipts-refresh');
+const fiscalReceiptsFilter = element('fiscal-receipts-filter');
+const fiscalReceiptsProblem = element('fiscal-receipts-problem');
+const fiscalReceiptsEmpty = element('fiscal-receipts-empty');
+const fiscalReceiptsList = element('fiscal-receipts-list');
+const fiscalReceiptTemplate = element('fiscal-receipt-template');
 
 const roles = {
   kitchen: { name: 'Kitchen', heading: 'Kitchen queue' },
@@ -38,10 +46,16 @@ const actions = {
 const dayFormat = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kigali', day: 'numeric', month: 'short' });
 const timeFormat = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kigali', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 const reviewTimeFormat = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kigali', dateStyle: 'medium', timeStyle: 'short' });
+const integerFormat = new Intl.NumberFormat('en-GB');
+const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const providerId = /^[1-9][0-9]{0,18}$/;
+const receiptReference = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$/;
+const maxReceiptBytes = 1024 * 1024;
 const cards = new Map();
 
 let session = null;
 let orders = [];
+let receipts = [];
 let timer;
 let refreshVersion = 0;
 let refreshing = false;
@@ -55,18 +69,23 @@ class ApiError extends Error {
   }
 }
 
-async function request(path, { method = 'GET', token, body } = {}) {
+async function request(path, { method = 'GET', token, body, receipt, timeoutMs = 12_000 } = {}) {
   const headers = { Accept: 'application/json, application/problem+json' };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (receipt) {
+    headers['Content-Type'] = 'application/pdf';
+    headers['X-Receipt-Reference'] = receipt.reference;
+    headers['X-Receipt-Total-RWF'] = receipt.total;
+  }
 
   const abort = new AbortController();
-  const deadline = setTimeout(() => abort.abort(), 12_000);
+  const deadline = setTimeout(() => abort.abort(), timeoutMs);
   try {
     const response = await fetch(`/api/v1/operator${path}`, {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: receipt?.file ?? (body === undefined ? undefined : JSON.stringify(body)),
       cache: 'no-store',
       credentials: 'omit',
       redirect: 'error',
@@ -88,6 +107,14 @@ function showMessage(target, message = '') {
 function messageFor(error) {
   if (!(error instanceof ApiError)) return 'The server could not be reached. Try again.';
   if (error.code === 'pickup_code_mismatch') return 'The pickup code did not match. Ask the guest for the code shown in their order.';
+  if (error.code === 'refund_unconfirmed') return 'Flutterwave did not confirm a completed full refund for this payment.';
+  if (error.code === 'refund_already_recorded') return 'This payment already has a recorded refund. Refresh payment review.';
+  if (error.code === 'refund_verification_unavailable') return 'Refund verification is temporarily unavailable.';
+  if (error.code === 'receipt_already_issued') return 'A receipt is already attached to this order. Refresh fiscal receipts.';
+  if (error.code === 'receipt_reference_in_use') return 'This receipt reference is already attached to another order.';
+  if (error.code === 'receipt_total_mismatch') return 'The total printed on the receipt must match the paid order.';
+  if (error.status === 413) return 'Choose a PDF file up to 1 MB.';
+  if (error.status === 415) return 'Choose a PDF file issued by the EBM.';
   if (error.code === 'invalid_transition' || error.status === 404 || error.status === 409) {
     return 'This order has changed. Refresh the queue before trying again.';
   }
@@ -243,7 +270,149 @@ function renderedPaymentException(entry) {
   card.querySelector('.payment-exception-order').textContent = entry.orderId;
   card.querySelector('.payment-exception-reference').textContent = entry.merchantReference;
   card.querySelector('.payment-exception-transaction').textContent = entry.providerTransactionId;
+  if (entry.refund != null) {
+    const refund = entry.refund;
+    if (typeof refund.providerRefundId !== 'string' || !providerId.test(refund.providerRefundId)
+      || !Number.isSafeInteger(refund.amount) || refund.amount <= 0 || refund.currency !== 'RWF') {
+      throw new ApiError(502, 'invalid_response');
+    }
+    showMessage(card.querySelector('.fiscal-result'),
+      `Refund verified · ${integerFormat.format(refund.amount)} RWF · #${refund.providerRefundId}`);
+  } else if (uuid.test(entry.merchantReference) && providerId.test(entry.providerTransactionId)) {
+    const form = card.querySelector('.refund-form');
+    form.hidden = false;
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void verifyRefund(entry, card, form);
+    });
+  }
   return card;
+}
+
+async function verifyRefund(entry, card, form) {
+  const current = availableSession();
+  const submit = form.querySelector('button');
+  if (current?.role !== 'manager' || submit.disabled) return;
+  const input = form.elements.namedItem('refundId');
+  const refundId = input.value.trim();
+  if (!providerId.test(refundId)) return;
+  const problem = form.querySelector('.manager-problem');
+  submit.disabled = true;
+  input.disabled = true;
+  showMessage(problem);
+  try {
+    const data = await request(`/payment-exceptions/${entry.merchantReference}/${entry.providerTransactionId}/refund`, {
+      method: 'POST', token: current.accessToken, body: { providerRefundId: refundId }, timeoutMs: 28_000,
+    });
+    if (session !== current) return;
+    if (data?.providerRefundId !== refundId) throw new ApiError(502, 'invalid_response');
+    const updated = renderedPaymentException({ ...entry, refund: data });
+    card.replaceWith(updated);
+    const status = updated.querySelector('.fiscal-result');
+    status.tabIndex = -1;
+    status.focus();
+  } catch (error) {
+    if (session !== current) return;
+    if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
+    else showMessage(problem, messageFor(error));
+  } finally {
+    if (session === current) {
+      submit.disabled = false;
+      input.disabled = false;
+    }
+  }
+}
+
+function checkedReceipt(entry) {
+  if (!entry || typeof entry.orderId !== 'string' || !uuid.test(entry.orderId) || entry.currency !== 'RWF'
+    || !Number.isSafeInteger(entry.total) || entry.total <= 0
+    || !['pending', 'issued', 'corrected'].includes(entry.receiptStatus)
+    || (entry.receiptReference != null && (typeof entry.receiptReference !== 'string'
+      || !receiptReference.test(entry.receiptReference)))) {
+    throw new ApiError(502, 'invalid_response');
+  }
+  return entry;
+}
+
+function renderedReceipt(entry) {
+  const card = fiscalReceiptTemplate.content.firstElementChild.cloneNode(true);
+  card.querySelector('.order-title').textContent = `Order #${entry.orderId.slice(-8).toUpperCase()}`;
+  const badge = card.querySelector('.order-status');
+  badge.dataset.status = entry.receiptStatus === 'pending' ? 'accepted' : 'ready';
+  badge.textContent = entry.receiptStatus === 'pending' ? 'Awaiting receipt'
+    : entry.receiptStatus === 'corrected' ? 'Corrected' : 'Attached';
+  card.querySelector('.receipt-total').textContent = `Paid total ${integerFormat.format(entry.total)} RWF`;
+  if (entry.receiptStatus === 'pending') {
+    const form = card.querySelector('.receipt-form');
+    form.hidden = false;
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void attachReceipt(entry, card, form);
+    });
+  } else if (entry.receiptReference) {
+    showMessage(card.querySelector('.fiscal-result'), `EBM reference ${entry.receiptReference}`);
+  }
+  return card;
+}
+
+function renderReceipts() {
+  const orderCode = fiscalReceiptsFilter.value.trim().replace(/^#/, '').toLowerCase();
+  const visible = receipts.filter((entry) => entry.orderId.slice(-8).includes(orderCode));
+  fiscalReceiptsList.replaceChildren(...visible.map(renderedReceipt));
+  showMessage(fiscalReceiptsEmpty, visible.length ? ''
+    : orderCode ? 'No matching order in this list.' : 'No paid orders for fiscal receipts.');
+}
+
+async function attachReceipt(entry, card, form) {
+  const current = availableSession();
+  const submit = form.querySelector('button');
+  if (current?.role !== 'manager' || submit.disabled) return;
+  const reference = form.elements.namedItem('reference').value.trim();
+  const total = form.elements.namedItem('total').value.trim();
+  const file = form.elements.namedItem('document').files[0];
+  const problem = form.querySelector('.manager-problem');
+  if (!receiptReference.test(reference)) {
+    showMessage(problem, 'Enter the receipt reference printed by the EBM.');
+    return;
+  }
+  if (!/^[1-9][0-9]{0,9}$/.test(total) || Number(total) !== entry.total) {
+    showMessage(problem, 'The total printed on the receipt must match the paid order.');
+    return;
+  }
+  if (!file || (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf'))
+    || file.size === 0 || file.size > maxReceiptBytes) {
+    showMessage(problem, 'Choose a PDF file up to 1 MB.');
+    return;
+  }
+
+  const inputs = form.querySelectorAll('input');
+  inputs.forEach((input) => { input.disabled = true; });
+  submit.disabled = true;
+  showMessage(problem);
+  try {
+    const data = checkedReceipt(await request(`/orders/${entry.orderId}/receipt`, {
+      method: 'PUT', token: current.accessToken, receipt: { file, reference, total }, timeoutMs: 25_000,
+    }));
+    if (session !== current) return;
+    if (data.orderId !== entry.orderId || data.receiptStatus !== 'issued' || data.receiptReference !== reference) {
+      throw new ApiError(502, 'invalid_response');
+    }
+    receipts = receipts.map((item) => item.orderId === data.orderId ? data : item);
+    const updated = renderedReceipt(data);
+    card.replaceWith(updated);
+    const status = updated.querySelector('.fiscal-result');
+    status.tabIndex = -1;
+    status.focus();
+  } catch (error) {
+    if (session !== current) return;
+    if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
+    else showMessage(problem, messageFor(error));
+  } finally {
+    if (session === current) {
+      submit.disabled = false;
+      inputs.forEach((input) => { input.disabled = false; });
+    }
+  }
 }
 
 function closeSession(message = '') {
@@ -261,6 +430,14 @@ function closeSession(message = '') {
   paymentReviewRefresh.disabled = false;
   showMessage(paymentReviewProblem);
   showMessage(paymentReviewEmpty);
+  receipts = [];
+  fiscalReceipts.hidden = true;
+  fiscalReceiptsJump.hidden = true;
+  fiscalReceiptsFilter.value = '';
+  fiscalReceiptsList.replaceChildren();
+  fiscalReceiptsRefresh.disabled = false;
+  showMessage(fiscalReceiptsProblem);
+  showMessage(fiscalReceiptsEmpty);
   workstation.hidden = true;
   signIn.hidden = false;
   loginForm.reset();
@@ -324,6 +501,33 @@ async function refreshPaymentReview() {
     }
   } finally {
     if (session === current) paymentReviewRefresh.disabled = false;
+  }
+}
+
+async function refreshReceipts() {
+  const current = availableSession();
+  if (current?.role !== 'manager' || fiscalReceiptsRefresh.disabled) return;
+
+  fiscalReceiptsRefresh.disabled = true;
+  showMessage(fiscalReceiptsProblem);
+  showMessage(fiscalReceiptsEmpty, receipts.length ? '' : 'Loading fiscal receipts…');
+  try {
+    const data = await request('/receipts', { token: current.accessToken });
+    if (session !== current) return;
+    if (!Array.isArray(data) || data.length > 100) throw new ApiError(502, 'invalid_response');
+    receipts = data.map(checkedReceipt);
+    renderReceipts();
+  } catch (error) {
+    if (session !== current) return;
+    if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
+    else {
+      receipts = [];
+      fiscalReceiptsList.replaceChildren();
+      showMessage(fiscalReceiptsEmpty);
+      showMessage(fiscalReceiptsProblem, messageFor(error));
+    }
+  } finally {
+    if (session === current) fiscalReceiptsRefresh.disabled = false;
   }
 }
 
@@ -408,10 +612,15 @@ loginForm.addEventListener('submit', async (event) => {
     workstation.hidden = false;
     paymentReview.hidden = data.role !== 'manager';
     paymentReviewJump.hidden = paymentReview.hidden;
+    fiscalReceipts.hidden = paymentReview.hidden;
+    fiscalReceiptsJump.hidden = fiscalReceipts.hidden;
     workstationTitle.focus();
     timer = setInterval(() => { if (!document.hidden) void refreshQueue(); }, 8000);
     void refreshQueue();
-    if (data.role === 'manager') void refreshPaymentReview();
+    if (data.role === 'manager') {
+      void refreshPaymentReview();
+      void refreshReceipts();
+    }
   } catch (error) {
     if (authVersion !== version) return;
     showMessage(loginProblem, error instanceof ApiError && error.status === 401
@@ -426,6 +635,9 @@ loginForm.addEventListener('submit', async (event) => {
 refreshButton.addEventListener('click', () => { void refreshQueue(); });
 paymentReviewJump.addEventListener('click', () => { element('payment-review-title').focus(); });
 paymentReviewRefresh.addEventListener('click', () => { void refreshPaymentReview(); });
+fiscalReceiptsJump.addEventListener('click', () => { element('fiscal-receipts-title').focus(); });
+fiscalReceiptsRefresh.addEventListener('click', () => { void refreshReceipts(); });
+fiscalReceiptsFilter.addEventListener('input', renderReceipts);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshQueue(); });
 element('logout-button').addEventListener('click', async () => {
   const current = session;

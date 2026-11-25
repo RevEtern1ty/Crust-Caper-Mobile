@@ -36,6 +36,11 @@ public class OrderService {
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final TypeReference<List<CartLine>> CART_LINES = new TypeReference<>() {};
     private static final String ORDER = "SELECT * FROM orders WHERE id = ?";
+    private static final String VISIBLE_TO_GUEST = """
+        AND (orders.guest_session_id = ? OR EXISTS (
+            SELECT FROM order_read_grants g WHERE g.guest_session_id = ? AND g.order_id = orders.id
+        ))
+        """;
     private static final String LATEST_ATTEMPT = """
         SELECT * FROM payment_attempts WHERE order_id = ? ORDER BY sequence DESC LIMIT 1
         """;
@@ -189,6 +194,15 @@ public class OrderService {
     public Reorder reorder(UUID guest, UUID id) {
         StoredOrder order = visible(guest, id);
         return Catalog.reconcile(order.lines(), catalog.products(order.storeId(), false));
+    }
+
+    byte[] receiptDocument(UUID guest, UUID id) {
+        return jdbc.sql("""
+            SELECT f.document FROM fiscal_receipts f JOIN orders ON orders.id = f.order_id
+            WHERE orders.id = ? AND orders.receipt_status = 'issued'
+            """ + VISIBLE_TO_GUEST)
+            .params(id, guest, guest).query((rs, row) -> rs.getBytes("document"))
+            .optional().orElseThrow(ApiFailure::notFound);
     }
 
     public PaymentAttempt startPayment(UUID guest, UUID id, String key) {
@@ -350,11 +364,8 @@ public class OrderService {
     }
 
     private StoredOrder visible(UUID guest, UUID id) {
-        return jdbc.sql(ORDER + " " + """
-            AND (guest_session_id = ? OR EXISTS (
-                SELECT FROM order_read_grants g WHERE g.guest_session_id = ? AND g.order_id = orders.id
-            ))
-            """).params(id, guest, guest).query(this::orderRow).optional().orElseThrow(ApiFailure::notFound);
+        return jdbc.sql(ORDER + " " + VISIBLE_TO_GUEST)
+            .params(id, guest, guest).query(this::orderRow).optional().orElseThrow(ApiFailure::notFound);
     }
 
     private Order view(StoredOrder order) {

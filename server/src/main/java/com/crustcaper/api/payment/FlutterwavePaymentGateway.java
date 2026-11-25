@@ -13,6 +13,7 @@ import tools.jackson.databind.node.ObjectNode;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.math.BigDecimal;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.time.Clock;
@@ -22,7 +23,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
-final class FlutterwavePaymentGateway implements PaymentGateway {
+final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory {
     static final URI API_ORIGIN = URI.create("https://api.flutterwave.com");
 
     private static final int MAX_RESPONSE_BYTES = 128 * 1024;
@@ -116,6 +117,73 @@ final class FlutterwavePaymentGateway implements PaymentGateway {
         return Optional.of(verification);
     }
 
+    @Override
+    public Optional<ConfirmedRefund> confirm(RefundRequest expected) {
+        if (expected == null || !RefundDirectory.validId(expected.refundId()) || !RefundDirectory.validId(expected.transactionId())
+                || !"RWF".equals(expected.currency()) || expected.amount() <= 0 || expected.amount() > MAX_CHARGE_RWF) {
+            throw new PaymentGatewayException(INVALID_REQUEST);
+        }
+        Optional<JsonNode> details = refundResponse("/v3/refunds/" + expected.refundId());
+        if (details.isEmpty()) {
+            return Optional.empty();
+        }
+        // V3 refund detail is an unwrapped object and does not document a currency field.
+        JsonNode detail = details.orElseThrow();
+        String refundReference = detail.path("flw_ref").asString("");
+        if (!matchesRefund(detail, expected) || !matches(REFERENCE, refundReference)) {
+            return Optional.empty();
+        }
+
+        Optional<JsonNode> listings = refundResponse("/v3/refunds?currency=RWF&flw_ref=" + refundReference);
+        if (listings.isEmpty()) {
+            return Optional.empty();
+        }
+        JsonNode list = listings.orElseThrow();
+        JsonNode data = list.path("data");
+        if (!"success".equals(list.path("status").asString("")) || !data.isArray()) {
+            return Optional.empty();
+        }
+        String refundStatus = detail.path("status").asString("");
+        // Corroborate the same final refund in the provider's RWF-filtered directory.
+        int matchingEntries = 0;
+        for (JsonNode entry : data) {
+            if (expected.refundId().equals(providerId(entry.path("id")))) {
+                if (!matchesRefund(entry, expected) || !refundReference.equals(entry.path("flw_ref").asString(""))
+                        || !refundStatus.equals(entry.path("status").asString(""))) {
+                    return Optional.empty();
+                }
+                matchingEntries++;
+            }
+        }
+        return matchingEntries == 1 ? Optional.of(new ConfirmedRefund(expected.refundId(), expected.transactionId(),
+                expected.amount(), expected.currency(), refundStatus)) : Optional.empty();
+    }
+
+    private Optional<JsonNode> refundResponse(String path) {
+        Response response = request(path, null);
+        if (response.status() == 400 || response.status() == 404) {
+            return Optional.empty();
+        }
+        if (response.status() != 200) {
+            throw new PaymentGatewayException(UNAVAILABLE);
+        }
+        return Optional.of(readResponse(response.body()));
+    }
+
+    private static boolean matchesRefund(JsonNode refund, RefundRequest expected) {
+        JsonNode currency = refund.path("currency");
+        JsonNode amount = refund.path("amount_refunded");
+        return expected.refundId().equals(providerId(refund.path("id")))
+                && expected.transactionId().equals(providerId(refund.path("transaction_id")))
+                && FINAL_STATUSES.contains(refund.path("status").asString(""))
+                && (currency.isMissingNode() || expected.currency().equals(currency.asString("")))
+                && amount.isNumber() && amount.decimalValue().compareTo(BigDecimal.valueOf(expected.amount())) == 0;
+    }
+
+    private static String providerId(JsonNode id) {
+        return id.isIntegralNumber() || id.isString() ? id.asString("") : null;
+    }
+
     private void validateRequest(PaymentRequest request) {
         if (request == null || !matches(REFERENCE, request.reference()) || !matches(REFERENCE, request.orderId())
                 || request.amount() <= 0 || request.amount() > MAX_CHARGE_RWF || !"RWF".equals(request.currency())
@@ -201,8 +269,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway {
     }
 
     private static VerifiedPayment paymentFrom(JsonNode data) {
-        JsonNode rawId = data.path("id");
-        String id = rawId.isIntegralNumber() || rawId.isString() ? rawId.asString("") : null;
+        String id = providerId(data.path("id"));
         String reference = requiredText(data.path("tx_ref"));
         String currency = requiredText(data.path("currency"));
         JsonNode amount = data.path("amount");

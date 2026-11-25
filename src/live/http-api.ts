@@ -1,11 +1,13 @@
 import { z } from 'zod';
 import { hasSavedCheckout } from '../checkout/controller';
+import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError } from '../domain/types';
 import type { ApiErrorCode, Order, PaymentAttempt, ShopApi, Storage } from '../domain/types';
+import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import { menuResponse, orderAccessChallenge, orderAccessGrant, orderResponse, paymentResponse, quoteResponse, reorderResponse, sessionResponse } from './wire';
 
 type Session = z.infer<typeof sessionResponse>;
-type Fetcher = (url: string, options: RequestInit) => Promise<Pick<Response, 'ok' | 'status' | 'redirected' | 'url' | 'json'>>;
+type Fetcher = (url: string, options: RequestInit) => Promise<Pick<Response, 'ok' | 'status' | 'redirected' | 'url' | 'json' | 'headers' | 'body'>>;
 
 export type ConnectedConfig = {
   profile: 'local' | 'stage' | 'production';
@@ -67,6 +69,8 @@ export function createLiveApi({
   const endpoint = base.origin + '/api/v1';
   const sessionKey = journalKey + '.guest';
   const hosts = new Set(config.pspHosts);
+  const orderPath = (id: string) => '/orders/' + encodeURIComponent(id);
+  const receiptPath = (id: string) => orderPath(id) + '/receipt';
   let sessionPromise: Promise<Session> | null = null;
 
   const checkedPayment = (attempt: PaymentAttempt): PaymentAttempt => ({
@@ -78,13 +82,14 @@ export function createLiveApi({
     if (order.storeId !== config.storeId || (id !== undefined && order.id !== id)) invalidResponse();
     return {
       ...order,
-      receiptUrl: safeHttps(order.receiptUrl, url => url.origin === base.origin),
+      receiptUrl: order.receiptStatus !== 'pending' && paymentReturnOrderId(order.id)
+        && order.receiptUrl === '/api/v1' + receiptPath(order.id) ? order.receiptUrl : null,
       paymentAttempt: order.paymentAttempt ? checkedPayment(order.paymentAttempt) : null,
     };
   };
 
   async function request<T>({
-    path, schema, method = 'GET', token, key, body,
+    path, schema, method = 'GET', token, key, body, pdf = false,
   }: {
     path: string;
     schema: z.ZodType<T>;
@@ -92,10 +97,11 @@ export function createLiveApi({
     token?: string;
     key?: string;
     body?: unknown;
+    pdf?: boolean;
   }): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    const headers: Record<string, string> = { Accept: 'application/json, application/problem+json' };
+    const headers: Record<string, string> = { Accept: (pdf ? PDF_MIME_TYPE : 'application/json') + ', application/problem+json' };
     if (token) headers.Authorization = 'Bearer ' + token;
     if (key) headers['Idempotency-Key'] = key;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -111,12 +117,15 @@ export function createLiveApi({
         signal: controller.signal,
       });
       if (response.redirected || (response.url && response.url !== url)) invalidResponse();
-      const payload: unknown = await response.json().catch(() => null);
+      if (pdf && !response.ok) throw new ApiError(errorCode(response.status, null));
+      if (pdf && response.status !== 200) invalidResponse();
+      const payload: unknown = pdf ? await readReceiptPdf(response) : await response.json().catch(() => null);
       if (!response.ok) throw new ApiError(errorCode(response.status, payload));
       const parsed = schema.safeParse(payload);
       if (!parsed.success) invalidResponse();
       return parsed.data;
     } catch (error) {
+      controller.abort();
       if (error instanceof ApiError) throw error;
       throw new ApiError('network_unavailable');
     } finally {
@@ -185,8 +194,6 @@ export function createLiveApi({
     }
   }
 
-  const orderPath = (id: string) => '/orders/' + encodeURIComponent(id);
-
   return {
     async getMenu() {
       const menu = await request({
@@ -226,6 +233,10 @@ export function createLiveApi({
     },
     async getOrder(orderId) {
       return checkedOrder(await authorized({ path: orderPath(orderId), schema: orderResponse }), orderId);
+    },
+    async getReceiptPdf(orderId) {
+      if (!paymentReturnOrderId(orderId)) throw new ApiError('invalid_input');
+      return authorized({ path: receiptPath(orderId), schema: z.instanceof(Uint8Array), pdf: true });
     },
     async reorder(orderId) {
       return authorized({ path: orderPath(orderId) + '/reorder', method: 'POST', schema: reorderResponse });

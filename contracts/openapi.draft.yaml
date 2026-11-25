@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: CrustCaper Shared API
-  version: 0.3.0
+  version: 0.4.0
   description: Implemented HTTP contract for the Spring Boot commerce service.
 servers:
   - url: /api/v1
@@ -129,6 +129,25 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /orders/{id}/receipt:
+    get:
+      operationId: downloadFiscalReceipt
+      security: [{ guestOrAccount: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: The attached original PDF from the seller's EBM. Available to the order owner and an authorized recovery guest.
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string }
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
   /orders/{id}/reorder:
     parameters:
       - $ref: '#/components/parameters/OrderId'
@@ -339,6 +358,57 @@ paths:
                       code: { enum: [invalid_transition, pickup_code_mismatch] }
         '429': { $ref: '#/components/responses/OperatorRateLimited' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/receipts:
+    get:
+      operationId: listOperatorReceipts
+      security: [{ operatorBearer: [] }]
+      responses:
+        '200':
+          description: Up to 100 paid orders for the manager's store, starting with orders awaiting a receipt.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items: { $ref: '#/components/schemas/OperatorReceipt' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+  /operator/orders/{id}/receipt:
+    put:
+      operationId: attachFiscalReceipt
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - name: X-Receipt-Reference
+          in: header
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$' }
+        - name: X-Receipt-Total-RWF
+          in: header
+          required: true
+          schema: { type: integer, minimum: 1 }
+      requestBody:
+        required: true
+        content:
+          application/pdf:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: Original receipt attached. An exact replay returns the existing attachment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorReceipt' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '409':
+          description: The receipt amount differs from the order, another receipt is attached, or the EBM reference is already in use.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '413': { description: The PDF exceeds 1 MiB. }
+        '415': { description: The request must contain a PDF. }
   /operator/payment-exceptions:
     get:
       operationId: listOperatorPaymentExceptions
@@ -356,6 +426,48 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/payment-exceptions/{merchantReference}/{providerTransactionId}/refund:
+    post:
+      operationId: verifyOperatorRefund
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: merchantReference
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: providerTransactionId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[1-9][0-9]{0,18}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [providerRefundId]
+              properties:
+                providerRefundId: { type: string, pattern: '^[1-9][0-9]{0,18}$' }
+      responses:
+        '200':
+          description: Full refund verified and recorded for the existing payment exception. A repeat returns the same record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VerifiedRefund' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { description: No payment exception with these identifiers is accessible to this manager. }
+        '409':
+          description: The provider has not confirmed the requested full refund, or a different refund is already recorded.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '503':
+          description: The provider refund verification service is unavailable.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
   /webhooks/flutterwave:
     post:
       operationId: receiveFlutterwaveEvent
@@ -383,7 +495,7 @@ components:
     guestOrAccount:
       type: http
       scheme: bearer
-      description: Opaque guest bearer credential. Every order and payment action verifies ownership.
+      description: Opaque guest bearer credential. The server verifies order access for each operation.
     operatorBearer:
       type: http
       scheme: bearer
@@ -506,6 +618,25 @@ components:
                   status: { const: 429 }
                   code: { const: rate_limited }
   schemas:
+    OperatorReceipt:
+      type: object
+      required: [orderId, status, total, currency, receiptStatus]
+      properties:
+        orderId: { type: string, format: uuid }
+        status: { type: string }
+        total: { $ref: '#/components/schemas/Amount' }
+        currency: { type: string, const: RWF }
+        receiptStatus: { type: string, enum: [pending, issued, corrected] }
+        receiptReference: { type: ['string', 'null'] }
+    VerifiedRefund:
+      type: object
+      required: [providerRefundId, refundStatus, amount, currency, recordedAt]
+      properties:
+        providerRefundId: { type: string, pattern: '^[1-9][0-9]{0,18}$' }
+        refundStatus: { type: string }
+        amount: { $ref: '#/components/schemas/Amount' }
+        currency: { type: string, const: RWF }
+        recordedAt: { $ref: '#/components/schemas/Timestamp' }
     OperatorOrder:
       type: object
       required: [id, status, paymentStatus, lines, pickupStartsAt, pickupEndsAt]
@@ -540,6 +671,7 @@ components:
               orderId: { type: string, format: uuid }
               merchantReference: { type: string, format: uuid, description: Merchant payment reference sent as tx_ref. }
               providerTransactionId: { type: string }
+              refund: { $ref: '#/components/schemas/VerifiedRefund' }
               reason: { type: string, enum: [duplicate_transaction, unavailable_reservation, superseded_attempt] }
               createdAt: { $ref: '#/components/schemas/Timestamp' }
     ProblemDetails:
@@ -705,7 +837,7 @@ components:
         paymentStatus: { type: string, enum: [unpaid, processing, paid, declined, refund_pending, refunded] }
         pickupCode: { type: ['string', 'null'] }
         receiptStatus: { type: string, enum: [pending, issued, corrected] }
-        receiptUrl: { type: ['string', 'null'], format: uri }
+        receiptUrl: { type: ['string', 'null'], format: uri-reference }
         paymentAttempt:
           anyOf:
             - $ref: '#/components/schemas/PaymentAttempt'

@@ -56,17 +56,20 @@ final class OperatorOrders {
             throw OperatorFailure.forbidden();
         }
         List<PaymentExceptionView> entries = jdbc.sql("""
-                SELECT o.id AS order_id, pe.attempt_id, pe.provider_transaction_id, pe.reason, pe.created_at
+                SELECT o.id AS order_id, pe.attempt_id, pe.provider_transaction_id, pe.reason, pe.created_at,
+                    vr.provider_refund_id, vr.refund_status, vr.amount, vr.currency, vr.recorded_at
                 FROM payment_exceptions pe
                 JOIN payment_attempts pa ON pa.id = pe.attempt_id
                 JOIN orders o ON o.id = pa.order_id
+                LEFT JOIN verified_refunds vr ON vr.attempt_id = pe.attempt_id AND vr.provider_transaction_id = pe.provider_transaction_id
                 WHERE o.store_id = ?
                 ORDER BY pe.created_at DESC, pe.attempt_id DESC, pe.provider_transaction_id DESC
                 LIMIT ?
                 """).params(actor.storeId(), PAYMENT_REVIEW_LIMIT)
                 .query((row, number) -> new PaymentExceptionView(row.getObject("order_id", UUID.class),
                         row.getObject("attempt_id", UUID.class), row.getString("provider_transaction_id"),
-                        row.getString("reason"), row.getObject("created_at", OffsetDateTime.class).toInstant()))
+                        row.getString("reason"), row.getObject("created_at", OffsetDateTime.class).toInstant(),
+                        row.getString("provider_refund_id") == null ? null : OperatorRefunds.refundRow(row)))
                 .list();
         return new PaymentReview(entries);
     }

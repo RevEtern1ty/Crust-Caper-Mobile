@@ -1,9 +1,10 @@
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useState } from 'react';
-import { Platform, StyleSheet, View } from 'react-native';
+import { AppState, Platform, StyleSheet, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CheckoutProvider } from '../src/checkout/context';
+import { purgeExpiredReceiptFiles } from '../src/checkout/receipt-sharing';
 import { ShopProvider, useShop } from '../src/state/shop';
 import { Button, colors, Text } from '../src/ui/core';
 import { copy } from '../src/ui/format';
@@ -69,6 +70,13 @@ function DraftStorageNotice() {
 }
 
 export default function RootLayout() {
+  useEffect(() => {
+    purgeExpiredReceiptFiles();
+    const handle = AppState.addEventListener('change', (state) => {
+      if (state === 'active') purgeExpiredReceiptFiles();
+    });
+    return () => handle.remove();
+  }, []);
   return (
     <View style={styles.backdrop}>
       <View style={styles.frame}>

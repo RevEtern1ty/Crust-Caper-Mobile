@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import type { Storage } from '../domain/types';
 import { createLiveApi, type ConnectedConfig } from './http-api';
+import { MAX_RECEIPT_BYTES, PDF_MIME_TYPE } from './receipt';
 
 const config: ConnectedConfig = {
   profile: 'stage',
@@ -47,7 +48,7 @@ function memory() {
   return { data, storage };
 }
 
-type Call = { url: string; method?: string; key: string | null; token: string | null; body: unknown };
+type Call = { url: string; method?: string; key: string | null; token: string | null; accept: string | null; body: unknown };
 function transport(handler: (call: Call) => Response | Promise<Response>) {
   const calls: Call[] = [];
   const fetcher: typeof fetch = async (input, init) => {
@@ -57,6 +58,7 @@ function transport(handler: (call: Call) => Response | Promise<Response>) {
       method: init?.method,
       key: headers.get('Idempotency-Key'),
       token: headers.get('Authorization'),
+      accept: headers.get('Accept'),
       body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
     };
     assert.equal(init?.redirect, 'error');
@@ -161,6 +163,7 @@ test('a transport response marked as redirected is rejected before reading its b
       assert.equal(options.redirect, 'error');
       return {
         ok: true, status: 200, url, redirected: true,
+        headers: new Headers(), body: null,
         async json() { assert.fail('Redirected response bodies must not be read'); },
       };
     },
@@ -224,6 +227,75 @@ test('checkout links and receipts permit only the configured secure destinations
   }
   checkoutUrl = 'https://checkout.example.test/pay';
   assert.equal((await api.getOrder(order.id)).paymentAttempt?.checkoutUrl, checkoutUrl);
+});
+
+const receiptOrderId = '1cf5ba6e-0584-45b5-bbc5-3a5ec90502c9';
+const authorizedReceiptPath = '/api/v1/orders/' + receiptOrderId + '/receipt';
+const receiptFixture = new TextEncoder().encode('%PDF-1.4\n% test receipt\n%%EOF\n');
+
+test('a receipt indicator accepts only the exact relative path for the issued order', async () => {
+  const { storage } = memory();
+  let receiptUrl = authorizedReceiptPath;
+  let receiptStatus = 'issued';
+  const { fetcher } = transport(call => call.url.endsWith('/guest-sessions') ? Response.json(session)
+    : Response.json({ ...order, id: receiptOrderId, receiptStatus, receiptUrl }));
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  assert.equal((await api.getOrder(receiptOrderId)).receiptUrl, authorizedReceiptPath);
+
+  for (const path of [authorizedReceiptPath + '?source=receipt', '/api/v1/orders/' + order.id + '/receipt', config.apiBaseUrl + '/orders/' + receiptOrderId + '/receipt']) {
+    receiptUrl = path;
+    assert.equal((await api.getOrder(receiptOrderId)).receiptUrl, null);
+  }
+  receiptStatus = 'pending';
+  receiptUrl = authorizedReceiptPath;
+  assert.equal((await api.getOrder(receiptOrderId)).receiptUrl, null);
+});
+
+test('the customer receipt uses an authenticated fixed GET without putting credentials in the URL', async () => {
+  const { storage, data } = memory();
+  const { calls, fetcher } = transport(call => call.url.endsWith('/guest-sessions') ? Response.json(session)
+    : new Response(receiptFixture, { headers: { 'Content-Type': PDF_MIME_TYPE, 'Content-Length': String(receiptFixture.length) } }));
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  await assert.rejects(() => api.getReceiptPdf!('malformed-order-id'), { code: 'invalid_input' });
+  assert.equal(calls.length, 0);
+  assert.deepEqual(await api.getReceiptPdf!(receiptOrderId), receiptFixture);
+  const request = calls.at(-1);
+  assert.equal(request?.url, new URL(authorizedReceiptPath, config.apiBaseUrl).href);
+  assert.equal(request?.method, 'GET');
+  assert.equal(request?.token, 'Bearer ' + accessToken);
+  assert.match(request?.accept ?? '', /^application\/pdf/);
+  assert.equal(request?.body, undefined);
+  assert.doesNotMatch(JSON.stringify([...data.values()]), /%PDF|test receipt/);
+});
+
+test('the receipt reader rejects unexpected media, partial content, truncation and oversized streams', async () => {
+  const { storage } = memory();
+  let response = () => new Response(receiptFixture, { headers: { 'Content-Type': PDF_MIME_TYPE } });
+  const { fetcher } = transport(call => call.url.endsWith('/guest-sessions') ? Response.json(session) : response());
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  const pdfHeaders = { 'Content-Type': PDF_MIME_TYPE };
+
+  const rejectPdf = () => assert.rejects(() => api.getReceiptPdf!(receiptOrderId), { code: 'invalid_response' });
+  response = () => new Response(receiptFixture, { headers: { 'Content-Type': 'text/html' } });
+  await rejectPdf();
+  response = () => new Response(receiptFixture, { status: 206, headers: pdfHeaders });
+  await rejectPdf();
+  response = () => new Response('%PDF-1.4\nTruncated receipt', { headers: pdfHeaders });
+  await rejectPdf();
+  response = () => new Response(receiptFixture, { headers: { ...pdfHeaders, 'Content-Length': String(receiptFixture.length + 1) } });
+  await rejectPdf();
+  response = () => new Response(receiptFixture, { headers: { ...pdfHeaders, 'Content-Length': String(MAX_RECEIPT_BYTES + 1) } });
+  await rejectPdf();
+  response = () => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(MAX_RECEIPT_BYTES));
+      controller.enqueue(new Uint8Array(1));
+      controller.close();
+    },
+  }), { headers: pdfHeaders });
+  await rejectPdf();
+  response = () => new Response('missing receipt', { status: 404 });
+  await assert.rejects(() => api.getReceiptPdf!(receiptOrderId), { code: 'not_found' });
 });
 
 test('server quote with changed money, currency or store fails closed', async () => {

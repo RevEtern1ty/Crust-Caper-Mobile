@@ -1,12 +1,13 @@
 import { router } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import { Linking, Platform, Pressable, StyleSheet, View } from 'react-native';
+import { Platform, Pressable, StyleSheet, View } from 'react-native';
 
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../../src/checkout/context';
 import { CheckoutError } from '../../src/checkout/controller';
 import { checkoutError, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
 import { ReorderPanel } from '../../src/checkout/reorder-panel';
 import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
+import { shareReceipt } from '../../src/checkout/receipt-sharing';
 import type { DemoKitchenStatus, ReorderResult } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
@@ -81,6 +82,15 @@ export default function OrdersScreen() {
         }
         throw error;
       }
+    });
+  }
+
+  function openReceipt(id: string) {
+    const shouldOpen = guardNavigation();
+    void run('receipt', async () => {
+      if (!api.getReceiptPdf) return;
+      const pdf = await api.getReceiptPdf(id);
+      if (shouldOpen()) await shareReceipt(pdf, `receipt-${id.slice(-8)}.pdf`, t('Receipt', 'Inyemezabwishyu'));
     });
   }
 
@@ -190,7 +200,9 @@ export default function OrdersScreen() {
           )}
 
           {(order.paymentStatus === 'refund_pending' || order.paymentStatus === 'refunded') && (
-            <Card><Text>{t('The pickup hold ended. Check with the pickup team if you need help with the refund.', 'Igihe cyabikiwe komande cyarangiye. Baza aho bafatira komande niba ukeneye ubufasha bwo gusubizwa amafaranga.')}</Text></Card>
+            <Card><Text>{order.paymentStatus === 'refunded'
+              ? t('Your refund has been confirmed. Contact the pickup team if you need help.', 'Gusubizwa amafaranga byemejwe. Saba ubufasha itsinda ritanga komande niba ubukeneye.')
+              : t('Your refund is being checked. Refresh this order later for an update.', 'Gusubizwa amafaranga biracyagenzurwa. Vugurura iyi komande nyuma urebe uko bihagaze.')}</Text></Card>
           )}
 
           <Card>
@@ -207,12 +219,9 @@ export default function OrdersScreen() {
             {mode === 'demo' && order.paymentStatus === 'paid' && (
               <Text variant="small" tone="muted">{t('Fiscal receipt unavailable in the demo.', 'Inyemezabwishyu yemewe ntiboneka mu igerageza.')}</Text>
             )}
-            {mode === 'connected' && order.receiptUrl && order.receiptStatus !== 'pending' && (
-              <Button label={t('Open receipt', 'Fungura inyemezabwishyu')} variant="secondary" busy={action === 'receipt'}
-                disabled={!!action} onPress={() => {
-                  const receiptUrl = order.receiptUrl;
-                  if (receiptUrl) void run('receipt', () => Linking.openURL(receiptUrl));
-                }} />
+            {mode === 'connected' && api.getReceiptPdf && order.receiptUrl && order.receiptStatus !== 'pending' && (
+              <Button label={Platform.OS === 'web' ? t('Download receipt', 'Kuramo inyemezabwishyu') : t('Share receipt', 'Sangiza inyemezabwishyu')}
+                variant="secondary" busy={action === 'receipt'} disabled={!!action} onPress={() => openReceipt(order.id)} />
             )}
             {mode === 'connected' && order.paymentStatus === 'paid' && order.receiptStatus === 'pending' && (
               <Text variant="small" tone="muted">{t('The receipt is pending.', 'Inyemezabwishyu iracyategerejwe.')}</Text>

@@ -158,6 +158,7 @@ export interface ShopApi {
   recoverOrder?(key: string): Promise<Order | null>
   startPayment(orderId: string, key: string): Promise<PaymentAttempt>
   getOrder(orderId: string): Promise<Order>
+  getReceiptPdf?(orderId: string): Promise<Uint8Array>
   reorder(orderId: string): Promise<ReorderResult>
   requestOrderAccess?(input: OrderAccessRequest): Promise<{ challengeId: string }>
   verifyOrderAccess?(challengeId: string, code: string): Promise<{ orderId: string }>

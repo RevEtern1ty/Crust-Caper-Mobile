@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { Buffer } = require('node:buffer');
 const { randomUUID } = require('node:crypto');
 const { mkdir } = require('node:fs/promises');
 const { resolve } = require('node:path');
@@ -45,7 +46,38 @@ async function operator(username) {
   return (await response.json()).accessToken;
 }
 
-test('connected checkout, pickup, cross-device recovery and payment return', { timeout: 70_000 }, async t => {
+function testReceipt() {
+  const text = 'BT /F1 15 Tf 36 72 Td (CrustCaper synthetic test document) Tj ET';
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 120] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${text.length} >>\nstream\n${text}\nendstream`,
+  ];
+  let pdf = '%PDF-1.7\n';
+  const offsets = objects.map((value, index) => {
+    const offset = pdf.length;
+    pdf += `${index + 1} 0 obj\n${value}\nendobj\n`;
+    return String(offset).padStart(10, '0') + ' 00000 n \n';
+  });
+  const xref = pdf.length;
+  pdf += `xref\n0 6\n0000000000 65535 f \n${offsets.join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(pdf, 'ascii');
+}
+
+async function downloadedReceipt(page) {
+  const download = page.waitForEvent('download');
+  await button(page, 'Download receipt').click();
+  const file = await download;
+  assert.match(file.suggestedFilename(), /\.pdf$/i);
+  const stream = await file.createReadStream();
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+test('connected checkout, receipt, pickup, cross-device recovery and payment return', { timeout: 70_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/, 'Run only against a local integration API');
   const server = createPreviewServer(dist);
   await new Promise((resolve, reject) => {
@@ -110,6 +142,7 @@ test('connected checkout, pickup, cross-device recovery and payment return', { t
 
   const kitchen = await operator('demo-kitchen');
   const pickup = await operator('demo-pickup');
+  assert.equal((await send('/operator/receipts', { token: kitchen })).status, 403);
   const queue = await send('/operator/orders', { token: kitchen });
   assert.equal(queue.status, 200);
   const visible = (await queue.json()).orders.find(item => item.id === order.id);
@@ -129,6 +162,38 @@ test('connected checkout, pickup, cross-device recovery and payment return', { t
   await capture(page, 'connected-ready');
   const { pickupCode } = await send('/orders/' + order.id, { token }).then(response => response.json());
   assert.match(pickupCode, /^[0-9]{6}$/);
+
+  const manager = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  manager.setDefaultTimeout(9000);
+  manager.on('pageerror', error => errors.push(error.message));
+  await manager.goto(new URL('/operator/index.html', api).href);
+  await manager.getByLabel('Username', { exact: true }).fill('demo-manager');
+  await manager.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(manager, 'Sign in').click();
+  await button(manager, 'Fiscal receipts').click();
+  const shortId = order.id.slice(-8).toUpperCase();
+  const reference = `FIXTURE-${shortId}`;
+  await manager.getByLabel('Filter by order number').fill(shortId);
+  const receiptCard = manager.getByRole('list', { name: 'Orders for fiscal receipts' }).getByRole('listitem')
+    .filter({ has: manager.getByRole('heading', { name: `Order #${shortId}`, exact: true }) });
+  const pdf = testReceipt();
+  await receiptCard.getByLabel('EBM receipt reference').fill(reference);
+  await receiptCard.getByLabel('Total printed on receipt (RWF)').fill(String(order.total));
+  await receiptCard.getByLabel('EBM receipt PDF').setInputFiles({
+    name: 'synthetic-ebm-fixture.pdf', mimeType: 'application/pdf', buffer: pdf,
+  });
+  const attached = manager.waitForResponse(response =>
+    response.request().method() === 'PUT' && response.url() === api + `/operator/orders/${order.id}/receipt`);
+  await receiptCard.getByRole('button', { name: 'Attach receipt' }).click();
+  assert.equal((await attached).status(), 200);
+  await receiptCard.getByText(`EBM reference ${reference}`, { exact: true }).waitFor();
+  await capture(manager, 'connected-fiscal-receipt');
+  await manager.close();
+
+  assert.equal((await send(`/orders/${order.id}/receipt`)).status, 401);
+  assert.equal((await send(`/orders/${order.id}/receipt`, { token: foreign.accessToken })).status, 404);
+  await button(page, 'Refresh order status').click();
+  assert.ok((await downloadedReceipt(page)).equals(pdf));
 
   const secondDevice = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   secondDevice.setDefaultTimeout(9000);
@@ -164,6 +229,7 @@ test('connected checkout, pickup, cross-device recovery and payment return', { t
     method: 'POST', token: recoveredToken, key: 'recovered-device-payment',
   });
   assert.equal(disallowedPayment.status, 404);
+  assert.ok((await downloadedReceipt(secondDevice)).equals(pdf));
   await secondDevice.close();
 
   assert.equal((await advance(pickup, 'collected', pickupCode === '000000' ? '999999' : '000000')).status, 409);
@@ -188,5 +254,71 @@ test('connected checkout, pickup, cross-device recovery and payment return', { t
   await page.waitForURL(url => url.pathname === '/orders' && url.search === '');
   assert.ok(views.includes(api + '/orders/' + newerOrder.id));
   assert.ok(!views.includes(api + '/orders/' + unknown));
+  assert.deepEqual(errors, []);
+});
+
+test('payment review displays a verified refund only after the API confirms it', { timeout: 30_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const payment = {
+    orderId: '84e40bb7-09b4-4a87-9027-f51487fcaf66', merchantReference: '98fd88b0-01a4-4df4-97fd-e61d7c8aa7c5',
+    providerTransactionId: '1011001', reason: 'unavailable_reservation', createdAt: '2026-01-01T12:00:00Z',
+  };
+  const refund = {
+    providerRefundId: '2022002', refundStatus: 'completed-momo', amount: 9200, currency: 'RWF',
+    recordedAt: '2026-01-01T12:20:00Z',
+  };
+  let recorded = false;
+  const requested = [];
+  await page.route('**/api/v1/operator/**', async route => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith('/sessions')) {
+      return route.fulfill({ json: { accessToken: 'fixture-session', role: 'manager', storeId: 'kigali',
+        expiresAt: new Date(Date.now() + 60_000).toISOString() } });
+    }
+    if (path.endsWith('/sessions/current')) return route.fulfill({ status: 204, body: '' });
+    if (path.endsWith('/orders')) return route.fulfill({ json: { orders: [] } });
+    if (path.endsWith('/receipts')) return route.fulfill({ json: [] });
+    if (path.endsWith('/payment-exceptions')) {
+      return route.fulfill({ json: { exceptions: [recorded ? { ...payment, refund } : payment] } });
+    }
+    if (path.endsWith(`/payment-exceptions/${payment.merchantReference}/${payment.providerTransactionId}/refund`)) {
+      requested.push(request.postDataJSON().providerRefundId);
+      assert.equal(request.method(), 'POST');
+      if (requested.at(-1) === refund.providerRefundId) {
+        recorded = true;
+        return route.fulfill({ json: refund });
+      }
+      return route.fulfill({ status: 409, json: { code: 'refund_unconfirmed' } });
+    }
+    await route.abort();
+  });
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('fixture-manager');
+  await page.getByLabel('Password', { exact: true }).fill('fixture-only');
+  await button(page, 'Sign in').click();
+  await button(page, 'Payment review').click();
+  await page.getByLabel('Provider refund ID').fill('2022001');
+  await button(page, 'Verify refund').click();
+  await shown(page, 'Flutterwave did not confirm a completed full refund for this payment.');
+  assert.equal(await page.getByText(/^Refund verified/).count(), 0);
+  await page.getByLabel('Provider refund ID').fill(refund.providerRefundId);
+  await button(page, 'Verify refund').click();
+  await shown(page, 'Refund verified · 9,200 RWF · #2022002');
+  await button(page, 'Refresh payment review').click();
+  await shown(page, 'Refund verified · 9,200 RWF · #2022002');
+  assert.equal(await button(page, 'Verify refund').count(), 0);
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 320);
+  assert.deepEqual(requested, ['2022001', '2022002']);
+  await capture(page, 'operator-refund-review');
+  await button(page, 'Sign out').click();
+  await shown(page, 'Staff sign in');
+  assert.equal(await page.getByText(/^Refund verified/).count(), 0);
   assert.deepEqual(errors, []);
 });

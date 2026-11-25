@@ -44,6 +44,7 @@
           </div>
           <div class="toolbar">
             <button class="button button-secondary" id="payment-review-jump" type="button" hidden>Payment review</button>
+            <button class="button button-secondary" id="fiscal-receipts-jump" type="button" hidden>Fiscal receipts</button>
             <button class="button button-secondary" id="refresh-button" type="button">Refresh</button>
             <button class="button button-quiet" id="logout-button" type="button">Sign out</button>
           </div>
@@ -57,13 +58,30 @@
           <div class="queue-header">
             <div>
               <h2 id="payment-review-title" tabindex="-1">Payment review</h2>
-              <p class="payment-review-help">Use the provider transaction ID to check and handle any refund in Flutterwave. This list shows up to 50 recent events, including any you have already handled.</p>
+              <p class="payment-review-help">Process the refund in Flutterwave using the provider transaction ID. Enter the refund ID here to verify and record the result.</p>
             </div>
             <button class="button button-secondary" id="payment-review-refresh" type="button">Refresh payment review</button>
           </div>
           <p class="problem" id="payment-review-problem" role="alert" hidden></p>
           <p class="empty-state" id="payment-review-empty" role="status" hidden>No recent payment exceptions.</p>
           <ul class="order-list" id="payment-review-list" aria-label="Payment exceptions"></ul>
+        </section>
+
+        <section class="payment-review" id="fiscal-receipts" aria-labelledby="fiscal-receipts-title" hidden>
+          <div class="queue-header">
+            <div>
+              <h2 id="fiscal-receipts-title" tabindex="-1">Fiscal receipts</h2>
+              <p class="payment-review-help">Attach the original PDF issued by the restaurant’s EBM. The customer can download it from the order.</p>
+            </div>
+            <button class="button button-secondary" id="fiscal-receipts-refresh" type="button">Refresh fiscal receipts</button>
+          </div>
+          <div class="receipt-search">
+            <label for="fiscal-receipts-filter">Filter by order number</label>
+            <input id="fiscal-receipts-filter" type="search" maxlength="9" autocomplete="off" spellcheck="false" placeholder="#1A2B3C4D">
+          </div>
+          <p class="problem" id="fiscal-receipts-problem" role="alert" hidden></p>
+          <p class="empty-state" id="fiscal-receipts-empty" role="status" hidden>No paid orders for fiscal receipts.</p>
+          <ul class="order-list" id="fiscal-receipts-list" aria-label="Orders for fiscal receipts"></ul>
         </section>
       </section>
     </main>
@@ -89,6 +107,37 @@
           <dt>Merchant reference</dt><dd class="payment-exception-reference"></dd>
           <dt>Provider transaction ID</dt><dd class="payment-exception-transaction"></dd>
         </dl>
+        <p class="fiscal-result" role="status" hidden></p>
+        <form class="manager-form refund-form" method="post" hidden>
+          <label>Provider refund ID
+            <input name="refundId" inputmode="numeric" pattern="[1-9][0-9]{0,18}" maxlength="19" autocomplete="off" required>
+          </label>
+          <button class="button button-primary" type="submit">Verify refund</button>
+          <p class="problem manager-problem" role="alert" hidden></p>
+        </form>
+      </li>
+    </template>
+    <template id="fiscal-receipt-template">
+      <li class="order-card">
+        <div class="order-header">
+          <h3 class="order-title"></h3>
+          <span class="order-status"></span>
+        </div>
+        <p class="pickup-window receipt-total"></p>
+        <p class="fiscal-result" role="status" hidden></p>
+        <form class="manager-form receipt-form" method="post" hidden>
+          <label>EBM receipt reference
+            <input name="reference" maxlength="80" autocomplete="off" spellcheck="false" required>
+          </label>
+          <label>Total printed on receipt (RWF)
+            <input name="total" inputmode="numeric" pattern="[1-9][0-9]{0,9}" maxlength="10" autocomplete="off" required>
+          </label>
+          <label>EBM receipt PDF
+            <input name="document" type="file" accept="application/pdf,.pdf" required>
+          </label>
+          <button class="button button-primary" type="submit">Attach receipt</button>
+          <p class="problem manager-problem" role="alert" hidden></p>
+        </form>
       </li>
     </template>
   </body>

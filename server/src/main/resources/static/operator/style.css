@@ -89,3 +89,9 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .payment-identifiers { margin: 0; }
 .payment-identifiers dt { margin-top: .65rem; color: var(--muted); font-size: .85rem; font-weight: 700; }
 .payment-identifiers dd { margin: .12rem 0 0; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+.receipt-search { display: grid; gap: .4rem; max-width: 23rem; margin-bottom: 1rem; }
+.manager-form { display: grid; gap: .8rem; margin-top: .9rem; }
+.manager-form label { display: grid; gap: .35rem; min-width: 0; }
+.manager-form input[type="file"] { max-width: 100%; }
+.manager-form .manager-problem { margin: 0; font-size: .9rem; }
+.fiscal-result { margin-top: .9rem; padding: .65rem .8rem; background: var(--mint); color: var(--green); border-radius: .55rem; font-weight: 710; overflow-wrap: anywhere; }
