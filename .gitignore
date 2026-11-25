@@ -1,0 +1,16 @@
+node_modules/
+.expo/
+dist/
+dist-android/
+dist-ios/
+android/
+ios/
+coverage/
+.env*.local
+*.keystore
+*.mobileprovision
+*.p12
+*.pem
+*.log
+.env
+.env.*

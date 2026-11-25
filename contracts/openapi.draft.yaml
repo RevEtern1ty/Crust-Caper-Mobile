@@ -1,0 +1,340 @@
+openapi: 3.1.0
+info:
+  title: CrustCaper Mobile API Discussion Draft
+  version: 0.1.0
+  description: Proposed wire shapes for the routes in the Mobile and Web plans.
+servers:
+  - url: /api/v1
+paths:
+  /stores/{id}/menu:
+    get:
+      operationId: getMenu
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: channel
+          in: query
+          schema: { type: string, const: mobile }
+        - name: locale
+          in: query
+          schema: { type: string, enum: [en, rw] }
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+      responses:
+        '200':
+          description: Versioned public menu, catalog and pickup availability.
+          headers:
+            ETag:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Menu' }
+        '304':
+          description: Cached representation is current.
+        '404': { $ref: '#/components/responses/StoreUnavailable' }
+  /quotes:
+    post:
+      operationId: createQuote
+      security: [{ guestOrAccount: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteRequest' }
+      responses:
+        '200':
+          description: Current total and changes requiring client acknowledgement.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /orders:
+    post:
+      operationId: createOrder
+      security: [{ guestOrAccount: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quoteId, phone]
+              properties:
+                quoteId: { type: string }
+                phone: { type: string, description: Order contact. }
+      responses:
+        '200': { $ref: '#/components/responses/Order' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /orders/{id}:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    get:
+      operationId: getOrder
+      security: [{ guestOrAccount: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Order' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+  /orders/{id}/payments:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    post:
+      operationId: startPayment
+      security: [{ guestOrAccount: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Stable payment attempt with a hosted PSP checkout URL while it is open.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentAttempt' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '409': { $ref: '#/components/responses/Conflict' }
+components:
+  securitySchemes:
+    guestOrAccount:
+      type: http
+      scheme: bearer
+      description: Proposed session transport. Backend verifies ownership for every order and payment action.
+  parameters:
+    OrderId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Reuse the key with the same payload to recover the original operation.
+      schema: { type: string, minLength: 1, maxLength: 128 }
+  responses:
+    Order:
+      description: Order snapshot with independently updated kitchen, payment and fiscal states.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Order' }
+    InvalidInput:
+      description: The operation requires valid parameters, contact or idempotency key.
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/ProblemDetails'
+              - type: object
+                properties:
+                  status: { const: 400 }
+                  code: { const: invalid_input }
+    Unauthenticated:
+      description: The client needs a valid guest or account session.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/ProblemDetails'
+              - type: object
+                properties:
+                  status: { const: 401 }
+                  code: { const: unauthenticated }
+    StoreUnavailable:
+      description: The store is unavailable.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/NotFoundProblem' }
+    OrderUnavailable:
+      description: The order is unavailable to the current session. Use the same response for missing and inaccessible orders.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/NotFoundProblem' }
+    Conflict:
+      description: Price or availability changed, the quote or reservation expired, or an operation conflicts with current state.
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/ProblemDetails'
+              - type: object
+                properties:
+                  status: { const: 409 }
+                  code:
+                    enum: [quote_expired, quote_changed, slot_unavailable, conflict, reservation_expired, payment_pending]
+  schemas:
+    ProblemDetails:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: Stable URI identifying the problem type. The agreed URI registry belongs to the API.
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string, description: Optional safe description for the user. }
+        instance: { type: string, format: uri-reference, description: Optional opaque occurrence identifier. }
+        code: { type: string, description: CrustCaper extension for mapping a known problem type to a client code. }
+    NotFoundProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status: { const: 404 }
+            code: { const: not_found }
+    Amount:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+      description: Whole RWF units, bounded to values exactly representable by the mobile client.
+    Timestamp: { type: string, format: date-time }
+    Localized:
+      type: object
+      required: [en, rw]
+      properties:
+        en: { type: string }
+        rw: { type: string }
+    Modifier:
+      type: object
+      required: [id, name, price]
+      properties:
+        id: { type: string }
+        name: { $ref: '#/components/schemas/Localized' }
+        price: { $ref: '#/components/schemas/Amount' }
+    Product:
+      type: object
+      required: [sku, name, description, ingredients, allergens, category, price, available, modifiers]
+      properties:
+        sku: { type: string }
+        name: { $ref: '#/components/schemas/Localized' }
+        description: { $ref: '#/components/schemas/Localized' }
+        ingredients: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+        allergens: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+        category: { type: string, enum: [burgers, combos, sides, drinks] }
+        price: { $ref: '#/components/schemas/Amount' }
+        available: { type: boolean }
+        modifiers: { type: array, items: { $ref: '#/components/schemas/Modifier' } }
+        photoUrl: { type: string, format: uri }
+    Store:
+      type: object
+      required: [id, name, area, open, hours]
+      properties:
+        id: { type: string }
+        name: { $ref: '#/components/schemas/Localized' }
+        area: { $ref: '#/components/schemas/Localized' }
+        open: { type: boolean }
+        hours: { $ref: '#/components/schemas/Localized' }
+        supportUrl: { type: string, format: uri }
+        directionsUrl: { type: string, format: uri }
+    Slot:
+      type: object
+      required: [id, startsAt, endsAt, available]
+      properties:
+        id: { type: string }
+        startsAt: { $ref: '#/components/schemas/Timestamp' }
+        endsAt: { $ref: '#/components/schemas/Timestamp' }
+        available: { type: boolean }
+    Menu:
+      type: object
+      required: [version, updatedAt, store, products, slots]
+      properties:
+        version: { type: string }
+        updatedAt: { $ref: '#/components/schemas/Timestamp' }
+        store: { $ref: '#/components/schemas/Store' }
+        products: { type: array, items: { $ref: '#/components/schemas/Product' } }
+        slots: { type: array, items: { $ref: '#/components/schemas/Slot' } }
+    CartLine:
+      type: object
+      required: [sku, modifierIds, quantity, unitPrice]
+      properties:
+        sku: { type: string }
+        modifierIds:
+          type: array
+          uniqueItems: true
+          items: { type: string }
+        quantity: { type: integer, minimum: 1 }
+        unitPrice:
+          $ref: '#/components/schemas/Amount'
+          description: Client estimate in a quote request. Recalculated by the server.
+    QuoteRequest:
+      type: object
+      required: [storeId, slotId, lines]
+      properties:
+        storeId: { type: string }
+        slotId: { type: string }
+        lines: { type: array, minItems: 1, items: { $ref: '#/components/schemas/CartLine' } }
+    QuoteChange:
+      type: object
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [price, unavailable, slot] }
+        sku: { type: string }
+        previousPrice: { $ref: '#/components/schemas/Amount' }
+        currentPrice: { $ref: '#/components/schemas/Amount' }
+    Quote:
+      type: object
+      required: [quoteId, storeId, slotId, lines, subtotal, tax, total, currency, expiresAt, changes]
+      properties:
+        quoteId: { type: string }
+        storeId: { type: string }
+        slotId: { type: string }
+        lines: { type: array, items: { $ref: '#/components/schemas/CartLine' } }
+        subtotal: { $ref: '#/components/schemas/Amount' }
+        tax: { $ref: '#/components/schemas/Amount' }
+        total: { $ref: '#/components/schemas/Amount' }
+        currency: { type: string, const: RWF }
+        expiresAt: { $ref: '#/components/schemas/Timestamp' }
+        changes: { type: array, items: { $ref: '#/components/schemas/QuoteChange' } }
+    PaymentAttempt:
+      type: object
+      required: [id, status, checkoutUrl]
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [processing, paid, declined] }
+        checkoutUrl: { type: ['string', 'null'], format: uri }
+    Order:
+      type: object
+      required: [id, storeId, slotId, lines, total, tax, currency, paymentStatus, status, pickupCode,
+        receiptStatus, receiptUrl, paymentAttempt, createdAt, reservationExpiresAt, pickupStartsAt, pickupEndsAt]
+      properties:
+        id: { type: string }
+        storeId: { type: string }
+        slotId: { type: string }
+        lines: { type: array, items: { $ref: '#/components/schemas/CartLine' } }
+        total: { $ref: '#/components/schemas/Amount' }
+        tax: { $ref: '#/components/schemas/Amount' }
+        currency: { type: string, const: RWF }
+        status: { type: string, enum: [awaiting_payment, accepted, preparing, ready, collected, cancelled] }
+        paymentStatus: { type: string, enum: [unpaid, processing, paid, declined, refund_pending, refunded] }
+        pickupCode: { type: ['string', 'null'] }
+        receiptStatus: { type: string, enum: [pending, issued, corrected] }
+        receiptUrl: { type: ['string', 'null'], format: uri }
+        paymentAttempt:
+          anyOf:
+            - $ref: '#/components/schemas/PaymentAttempt'
+            - type: 'null'
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+        reservationExpiresAt: { $ref: '#/components/schemas/Timestamp' }
+        pickupStartsAt: { $ref: '#/components/schemas/Timestamp' }
+        pickupEndsAt: { $ref: '#/components/schemas/Timestamp' }
