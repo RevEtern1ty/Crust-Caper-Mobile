@@ -95,7 +95,8 @@ final class OperatorRefunds {
     private EligibleException findException(Principal actor, UUID attemptId, String transactionId, boolean lock) {
         return jdbc.sql("""
                 SELECT o.id, o.total,
-                    (pe.reason = 'unavailable_reservation' AND o.status = 'cancelled' AND o.payment_status = 'refund_pending'
+                    (pe.reason IN ('unavailable_reservation', 'restaurant_cancelled')
+                        AND o.status = 'cancelled' AND o.payment_status = 'refund_pending'
                         AND pa.provider_transaction_id IS NOT DISTINCT FROM pe.provider_transaction_id
                         AND NOT EXISTS (SELECT FROM payment_attempts later WHERE later.order_id = o.id AND later.sequence > pa.sequence))
                     AS clears_order_payment

@@ -58,6 +58,7 @@ class OperatorRefundIntegrationTest {
     private static final String LATE_REFUND = "7654431";
     private static final String DUPLICATE_REFUND = "7654432";
     private static final String SUPERSEDED_REFUND = "7654433";
+    private static final String CANCELLATION_REFUND = "7654434";
 
     @Autowired MockMvc api;
     @Autowired JdbcClient jdbc;
@@ -137,6 +138,40 @@ class OperatorRefundIntegrationTest {
                 .andExpect(jsonPath("$.orders[0].id").value(order.id().toString()));
         assertThat(jdbc.sql("SELECT count(*) FROM verified_refunds WHERE store_id = ? AND NOT cleared_order_payment")
                 .param(store).query(Long.class).single()).isEqualTo(2);
+    }
+
+    @Test
+    void managerCancellationClosesOnlyAfterTheOriginalPaidChargeIsRefunded() throws Exception {
+        OrderFixture order = newOrder(false);
+        settle(order.attemptId(), PAID_TRANSACTION);
+        String manager = login(staff(store, "manager"));
+
+        api.perform(post(OPERATOR + "/orders/{id}/cancel", order.id()).header(HttpHeaders.AUTHORIZATION, manager))
+                .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.status").value("cancelled"))
+                .andExpect(jsonPath("$.paymentStatus").value("refund_pending"));
+        assertThat(jdbc.sql("SELECT reason FROM payment_exceptions WHERE attempt_id = ? AND provider_transaction_id = ?")
+                .params(order.attemptId(), PAID_TRANSACTION).query(String.class).single()).isEqualTo("restaurant_cancelled");
+        verifyNoInteractions(directory);
+
+        settle(order.attemptId(), DUPLICATE_TRANSACTION);
+        RefundRequest duplicate = confirm(DUPLICATE_REFUND, DUPLICATE_TRANSACTION);
+        RefundRequest original = confirm(CANCELLATION_REFUND, PAID_TRANSACTION);
+        record(manager, order.attemptId(), DUPLICATE_TRANSACTION, DUPLICATE_REFUND).andExpect(status().isOk());
+        assertThat(orderState(order.id())).isEqualTo("cancelled:refund_pending");
+
+        record(manager, order.attemptId(), PAID_TRANSACTION, CANCELLATION_REFUND).andExpect(status().isOk())
+                .andExpect(jsonPath("$.providerRefundId").value(CANCELLATION_REFUND));
+        assertThat(orderState(order.id())).isEqualTo("cancelled:refunded");
+        api.perform(post(OPERATOR + "/orders/{id}/cancel", order.id()).header(HttpHeaders.AUTHORIZATION, manager))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.status").value("cancelled"))
+                .andExpect(jsonPath("$.paymentStatus").value("refunded"));
+        assertThat(jdbc.sql("""
+                SELECT provider_refund_id FROM verified_refunds WHERE attempt_id = ? AND cleared_order_payment
+                """).param(order.attemptId()).query(String.class).single()).isEqualTo(CANCELLATION_REFUND);
+        verify(directory).confirm(duplicate);
+        verify(directory).confirm(original);
+        verifyNoMoreInteractions(directory);
     }
 
     @Test

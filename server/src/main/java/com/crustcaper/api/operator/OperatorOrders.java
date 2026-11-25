@@ -16,6 +16,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.springframework.http.HttpStatus;
@@ -27,6 +28,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 final class OperatorOrders {
     private static final Pattern PICKUP_CODE = Pattern.compile("[0-9]{6}");
     private static final String ORDER_FIELDS = "id, status, payment_status, lines, pickup_starts_at, pickup_ends_at";
+    private static final String RESTAURANT_CANCELLED = "restaurant_cancelled";
     private static final int PAYMENT_REVIEW_LIMIT = 50;
     private final JdbcClient jdbc;
     private final OperatorSessions sessions;
@@ -90,6 +92,71 @@ final class OperatorOrders {
         return result.order();
     }
 
+    OrderView cancel(String authorization, String rawId) {
+        return Objects.requireNonNull(transactions.execute(tx -> {
+            Principal actor = sessions.requirePrincipal(authorization, true);
+            if (!actor.role().equals("manager")) throw OperatorFailure.forbidden();
+            UUID id = orderId(rawId);
+            OrderView existing = jdbc.sql("SELECT " + ORDER_FIELDS + " FROM orders WHERE id = ? AND store_id = ? FOR UPDATE")
+                    .params(id, actor.storeId()).query(this::orderRow).optional().orElseThrow(OperatorFailure::notFound);
+            if (existing.status().equals("cancelled")
+                    && (existing.paymentStatus().equals("refund_pending") || existing.paymentStatus().equals("refunded"))) {
+                PaidReference primary = currentPaidReference(id);
+                if (primary != null && RESTAURANT_CANCELLED.equals(primary.exceptionReason())) return existing;
+                throw OperatorFailure.conflict("invalid_transition");
+            }
+            if (!existing.paymentStatus().equals("paid") || !cancellableStatus(existing.status())) {
+                throw OperatorFailure.conflict("invalid_transition");
+            }
+
+            PaidReference primary = currentPaidReference(id);
+            if (primary == null || primary.exceptionReason() != null) {
+                throw OperatorFailure.conflict("payment_reference_unavailable");
+            }
+            int recorded = jdbc.sql("""
+                    INSERT INTO payment_exceptions (attempt_id, provider_transaction_id, reason, created_at)
+                    VALUES (?, ?, ?, clock_timestamp()) ON CONFLICT (attempt_id, provider_transaction_id) DO NOTHING
+                    """).params(primary.attemptId(), primary.transactionId(), RESTAURANT_CANCELLED).update();
+            if (recorded != 1) throw OperatorFailure.conflict("payment_reference_unavailable");
+
+            jdbc.sql("""
+                    UPDATE orders SET status = 'cancelled', payment_status = 'refund_pending', pickup_code = NULL WHERE id = ?
+                    """).param(id).update();
+            cancelPickupAlerts(id);
+            recordEvent(actor, id, existing.status(), "cancelled", "changed");
+            return new OrderView(id, "cancelled", "refund_pending", existing.lines(),
+                    existing.pickupStartsAt(), existing.pickupEndsAt());
+        }));
+    }
+
+    private static boolean cancellableStatus(String status) {
+        return status.equals("accepted") || status.equals("preparing") || status.equals("ready");
+    }
+
+    private PaidReference currentPaidReference(UUID orderId) {
+        // Settlement also locks the order before the attempt. Older paid attempts must already be classified as superseded.
+        return jdbc.sql("""
+                SELECT primary_attempt.id, primary_attempt.provider_transaction_id, primary_exception.reason
+                FROM payment_attempts primary_attempt
+                LEFT JOIN payment_exceptions primary_exception ON primary_exception.attempt_id = primary_attempt.id
+                    AND primary_exception.provider_transaction_id = primary_attempt.provider_transaction_id
+                WHERE primary_attempt.order_id = ? AND primary_attempt.status = 'paid'
+                    AND NULLIF(btrim(primary_attempt.provider_transaction_id), '') IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT FROM payment_attempts other
+                        LEFT JOIN payment_exceptions explained ON explained.attempt_id = other.id
+                            AND explained.provider_transaction_id = other.provider_transaction_id
+                        WHERE other.order_id = primary_attempt.order_id AND other.id <> primary_attempt.id
+                            AND (other.sequence >= primary_attempt.sequence OR
+                                (other.status = 'paid' AND explained.reason IS DISTINCT FROM 'superseded_attempt'))
+                    )
+                FOR UPDATE OF primary_attempt
+                """).param(orderId)
+                .query((row, number) -> new PaidReference(row.getObject("id", UUID.class),
+                        row.getString("provider_transaction_id"), row.getString("reason")))
+                .optional().orElse(null);
+    }
+
     private Outcome changeLocked(String authorization, UUID id, Transition transition, String pickupCode) {
         Principal actor = sessions.requirePrincipal(authorization, true);
         if (!actor.role().equals(transition.role()) && !actor.role().equals("manager")) {
@@ -105,13 +172,13 @@ final class OperatorOrders {
             throw OperatorFailure.conflict("invalid_transition");
         }
         if (transition.collects() && !acceptPickup(existing.pickupCode(), pickupCode, actor, id)) {
-            recordEvent(actor, id, transition, "pickup_code_mismatch");
+            recordEvent(actor, id, transition.from(), transition.to(), "pickup_code_mismatch");
             return new Outcome(null, true);
         }
 
         jdbc.sql("UPDATE orders SET status = ?, pickup_code = CASE WHEN ? THEN NULL ELSE pickup_code END WHERE id = ?")
                 .params(transition.to(), transition.collects(), id).update();
-        recordEvent(actor, id, transition, "changed");
+        recordEvent(actor, id, transition.from(), transition.to(), "changed");
         if (transition == Transition.READY) enqueuePickupAlerts(id);
         OrderView before = existing.order();
         return new Outcome(new OrderView(id, transition.to(), before.paymentStatus(), before.lines(),
@@ -124,6 +191,16 @@ final class OperatorOrders {
                 SET state = 'pending', queued_at = clock_timestamp(), next_attempt_at = clock_timestamp(),
                     updated_at = clock_timestamp()
                 WHERE order_id = ? AND state = 'waiting' AND enabled AND encrypted_token IS NOT NULL
+                """).param(orderId).update();
+    }
+
+    private void cancelPickupAlerts(UUID orderId) {
+        // A sending claim that has reached Expo holds the order lock. An accepted ticket can only be reconciled.
+        jdbc.sql("""
+                UPDATE pickup_alerts SET state = 'cancelled', enabled = false, encrypted_token = NULL,
+                    expo_ticket_id = NULL, next_attempt_at = NULL, lease_id = NULL, lease_until = NULL,
+                    updated_at = clock_timestamp()
+                WHERE order_id = ? AND state IN ('waiting', 'pending', 'sending')
                 """).param(orderId).update();
     }
 
@@ -140,11 +217,11 @@ final class OperatorOrders {
                 presentedCode.getBytes(StandardCharsets.US_ASCII));
     }
 
-    private void recordEvent(Principal actor, UUID id, Transition transition, String outcome) {
+    private void recordEvent(Principal actor, UUID id, String previousStatus, String requestedStatus, String outcome) {
         jdbc.sql("""
                 INSERT INTO operator_order_events (order_id, store_id, operator_id, operator_role,
                     previous_status, requested_status, outcome) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """).params(id, actor.storeId(), actor.id(), actor.role(), transition.from(), transition.to(), outcome).update();
+                """).params(id, actor.storeId(), actor.id(), actor.role(), previousStatus, requestedStatus, outcome).update();
     }
 
     private OrderView orderRow(ResultSet row, int number) throws SQLException {
@@ -171,6 +248,8 @@ final class OperatorOrders {
     }
 
     private record ProfiledOrder(OrderView order, String pickupCode) { }
+
+    private record PaidReference(UUID attemptId, String transactionId, String exceptionReason) { }
 
     private record Outcome(OrderView order, boolean rejected) { }
 

@@ -47,6 +47,8 @@ label { font-weight: 700; }
 .button-secondary { background: var(--white); }
 .button-secondary:hover:not(:disabled), .button-quiet:hover:not(:disabled) { background: var(--paper); }
 .button-quiet { background: transparent; border-color: transparent; color: var(--muted); }
+.button-danger { border-color: var(--red); color: var(--white); background: var(--red); }
+.button-danger:hover:not(:disabled) { background: #822a25; }
 .button:disabled { opacity: .55; cursor: default; }
 input { width: 100%; color: var(--ink); background: var(--white); }
 input[aria-invalid="true"] { border-color: var(--red); }
@@ -60,6 +62,7 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .empty-state { padding: 1.2rem; border: 1px dashed var(--border); border-radius: .85rem; color: var(--muted); }
 .problem { font-weight: 680; color: var(--red); overflow-wrap: anywhere; }
 #queue-problem { margin-bottom: 1rem; }
+.queue-notice { margin-bottom: 1rem; border-left: .24rem solid var(--green); border-radius: .4rem; padding: .75rem 1rem; background: var(--mint); }
 
 .order-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 24rem), 1fr)); gap: 1rem; align-items: start; list-style: none; margin: 0; padding: 0; }
 .order-card { min-width: 0; background: var(--white); border: 1px solid var(--border); border-radius: .9rem; padding: clamp(.9rem, 3vw, 1.3rem); }
@@ -75,12 +78,21 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .name { font-weight: 720; overflow-wrap: anywhere; }
 .modifiers { display: block; margin-top: .13rem; color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
 .order-actions:not(:empty) { margin-top: .95rem; }
+.order-actions { display: grid; gap: .6rem; }
 .order-actions > .button { width: 100%; }
+.cancel-order { color: var(--red); }
 .pickup-form { display: flex; flex-wrap: wrap; gap: .55rem; align-items: flex-end; }
 .pickup-form > div { flex: 1 1 8rem; min-width: 0; }
 .pickup-form input { display: block; margin-top: .3rem; }
 .pickup-form button { flex: 1 0 8rem; }
 .order-problem { margin-top: .75rem; font-size: .9rem; }
+
+.cancellation-dialog { width: min(30rem, calc(100% - 24px)); max-height: calc(100dvh - 24px); border: 1px solid var(--border); border-radius: 1rem; padding: clamp(12px, 5vw, 24px); background: var(--white); color: var(--ink); overflow-wrap: anywhere; }
+.cancellation-dialog::backdrop { background: rgb(36 22 32 / 65%); }
+.cancellation-dialog h2 { font-size: 1.2rem; line-height: 1.15; }
+.cancellation-dialog p { margin-top: .75rem; }
+.cancellation-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+.cancellation-actions > .button { flex: 1 1 10rem; padding: 10px 12px; }
 
 .payment-review { margin-top: 2.6rem; padding-top: 1.6rem; border-top: 1px solid var(--border); }
 .payment-review .queue-header > div { flex: 1 1 28rem; }

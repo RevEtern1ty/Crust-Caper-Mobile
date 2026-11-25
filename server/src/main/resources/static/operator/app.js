@@ -9,10 +9,17 @@ const workstation = element('workstation');
 const workstationTitle = element('workstation-title');
 const refreshButton = element('refresh-button');
 const queueProblem = element('queue-problem');
+const queueNotice = element('queue-notice');
 const updateTime = element('update-time');
 const orderList = element('order-list');
 const emptyState = element('empty-state');
 const orderTemplate = element('order-template');
+const cancellationDialog = element('cancellation-dialog');
+const cancellationTitle = element('cancellation-title');
+const cancellationProblem = element('cancellation-problem');
+const cancellationProgress = element('cancellation-progress');
+const keepOrderButton = element('keep-order');
+const confirmCancellationButton = element('confirm-cancellation');
 const paymentReview = element('payment-review');
 const paymentReviewJump = element('payment-review-jump');
 const paymentReviewRefresh = element('payment-review-refresh');
@@ -37,6 +44,7 @@ const roles = {
 const statuses = { accepted: 'New', preparing: 'Preparing', ready: 'Ready for pickup' };
 const paymentReasons = {
   duplicate_transaction: 'Duplicate payment',
+  restaurant_cancelled: 'Restaurant cancelled',
   unavailable_reservation: 'Payment after reservation ended',
   superseded_attempt: 'Payment from a replaced attempt',
 };
@@ -61,7 +69,9 @@ let receipts = [];
 let timer;
 let refreshVersion = 0;
 let refreshing = false;
+let paymentReviewVersion = 0;
 let authVersion = 0;
+let cancellation = null;
 const availability = mountAvailability({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
 
 class ApiError extends Error {
@@ -111,6 +121,7 @@ function messageFor(error) {
   if (!(error instanceof ApiError)) return 'The server could not be reached. Try again.';
   if (error.code === 'pickup_code_mismatch') return 'The pickup code did not match. Ask the guest for the code shown in their order.';
   if (error.code === 'refund_unconfirmed') return 'Flutterwave did not confirm a completed full refund for this payment.';
+  if (error.code === 'payment_reference_unavailable') return 'The paid transaction could not be identified. Check Payment review before cancelling this order.';
   if (error.code === 'refund_already_recorded') return 'This payment already has a recorded refund. Refresh payment review.';
   if (error.code === 'refund_verification_unavailable') return 'Refund verification is temporarily unavailable.';
   if (error.code === 'receipt_already_issued') return 'A receipt is already attached to this order. Refresh fiscal receipts.';
@@ -129,6 +140,10 @@ function messageFor(error) {
 
 function label(value) {
   return value.replace(/[_-]+/g, ' ').replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
+}
+
+function orderNumber(id) {
+  return `#${id.slice(-8).toUpperCase()}`;
 }
 
 function pickupWindow(start, end) {
@@ -230,6 +245,18 @@ function addAction(card, order) {
   container.append(form);
 }
 
+function addCancellation(card, order) {
+  if (session.role !== 'manager' || !uuid.test(order.id)) return;
+
+  const button = document.createElement('button');
+  button.className = 'button button-secondary cancel-order';
+  button.type = 'button';
+  button.textContent = 'Cancel order';
+  button.setAttribute('aria-haspopup', 'dialog');
+  button.addEventListener('click', () => openCancellation(order.id));
+  card.querySelector('.order-actions').append(button);
+}
+
 function renderOrders() {
   const display = [...orders].sort((left, right) => Date.parse(left.pickupStartsAt) - Date.parse(right.pickupStartsAt)
     || left.id.localeCompare(right.id));
@@ -246,19 +273,59 @@ function renderOrders() {
     let card = current?.card;
     if (current?.signature !== signature) {
       card = orderTemplate.content.firstElementChild.cloneNode(true);
-      card.querySelector('.order-title').textContent = `Order #${order.id.slice(-8).toUpperCase()}`;
+      card.querySelector('.order-title').textContent = `Order ${orderNumber(order.id)}`;
       const badge = card.querySelector('.order-status');
       badge.dataset.status = order.status;
       badge.textContent = statuses[order.status];
       card.querySelector('.pickup-window').textContent = pickupWindow(order.pickupStartsAt, order.pickupEndsAt);
       card.querySelector('.order-lines').append(...order.lines.map(renderedLine));
       addAction(card, order);
+      addCancellation(card, order);
       cards.set(order.id, { card, signature });
       current?.card.replaceWith(card);
     }
     if (orderList.children[index] !== card) orderList.insertBefore(card, orderList.children[index] ?? null);
   });
   emptyState.hidden = display.length !== 0;
+  if (cancellation && !cancellation.submitting && !isCurrentCancellation(cancellation)) {
+    closeCancellation(`Order ${orderNumber(cancellation.id)} changed. Review the updated queue.`);
+  }
+}
+
+function isCurrentCancellation(selection) {
+  return session === selection.session && orders.some((order) => order.id === selection.id && order.status === selection.status);
+}
+
+function openCancellation(id) {
+  const current = availableSession();
+  const order = orders.find((item) => item.id === id);
+  if (current?.role !== 'manager' || !order || !uuid.test(id) || cancellation) return;
+
+  cancellation = { session: current, id, status: order.status, submitting: false };
+  cancellationTitle.textContent = `Cancel order ${orderNumber(id)}?`;
+  showMessage(queueNotice);
+  showMessage(cancellationProblem);
+  showMessage(cancellationProgress);
+  keepOrderButton.disabled = false;
+  confirmCancellationButton.disabled = false;
+  cancellationDialog.showModal();
+  keepOrderButton.focus();
+}
+
+function closeCancellation(message = '', restoreFocus = true) {
+  const closed = cancellation;
+  cancellation = null;
+  if (cancellationDialog.open) cancellationDialog.close();
+  cancellationTitle.textContent = '';
+  showMessage(cancellationProblem);
+  showMessage(cancellationProgress);
+  if (!restoreFocus || !closed) return;
+  if (message) {
+    showMessage(queueNotice, message);
+    queueNotice.focus();
+  } else {
+    (cards.get(closed.id)?.card.querySelector('.cancel-order') ?? workstationTitle).focus();
+  }
 }
 
 function renderedPaymentException(entry) {
@@ -421,8 +488,11 @@ async function attachReceipt(entry, card, form) {
 function closeSession(message = '') {
   authVersion++;
   refreshVersion++;
+  paymentReviewVersion++;
   clearInterval(timer);
   session = null;
+  closeCancellation('', false);
+  showMessage(queueNotice);
   refreshing = false;
   orders = [];
   cards.clear();
@@ -481,21 +551,23 @@ async function refreshQueue(force = false) {
   }
 }
 
-async function refreshPaymentReview() {
+async function refreshPaymentReview(force = false) {
   const current = availableSession();
-  if (current?.role !== 'manager' || paymentReviewRefresh.disabled) return;
+  if (current?.role !== 'manager' || (paymentReviewRefresh.disabled && !force)) return;
 
+  const version = ++paymentReviewVersion;
   paymentReviewRefresh.disabled = true;
   showMessage(paymentReviewProblem);
   showMessage(paymentReviewEmpty, paymentReviewList.childElementCount ? '' : 'Loading payment exceptions…');
   try {
     const data = await request('/payment-exceptions', { token: current.accessToken });
-    if (session !== current) return;
+    if (session !== current || paymentReviewVersion !== version) return;
     if (!Array.isArray(data?.exceptions) || data.exceptions.length > 50) throw new ApiError(502, 'invalid_response');
     paymentReviewList.replaceChildren(...data.exceptions.map(renderedPaymentException));
     showMessage(paymentReviewEmpty, data.exceptions.length ? '' : 'No recent payment exceptions.');
+    return data.exceptions;
   } catch (error) {
-    if (session !== current) return;
+    if (session !== current || paymentReviewVersion !== version) return;
     if (error instanceof ApiError && error.status === 401) {
       closeSession('Your staff session expired. Sign in again.');
     } else {
@@ -504,7 +576,7 @@ async function refreshPaymentReview() {
       showMessage(paymentReviewProblem, messageFor(error));
     }
   } finally {
-    if (session === current) paymentReviewRefresh.disabled = false;
+    if (session === current && paymentReviewVersion === version) paymentReviewRefresh.disabled = false;
   }
 }
 
@@ -585,6 +657,69 @@ async function submitTransition(order, action, button, problem, input) {
   }
 }
 
+async function submitCancellation() {
+  const current = availableSession();
+  const selection = cancellation;
+  if (current?.role !== 'manager' || !selection || selection.submitting) return;
+  const number = orderNumber(selection.id);
+  if (!isCurrentCancellation(selection)) {
+    closeCancellation(`Order ${number} changed. Review the updated queue.`);
+    return;
+  }
+
+  selection.submitting = true;
+  keepOrderButton.disabled = true;
+  confirmCancellationButton.disabled = true;
+  showMessage(cancellationProblem);
+  showMessage(cancellationProgress, 'Cancelling order…');
+  cancellationProgress.focus();
+
+  let cancelledOrder;
+  let failure;
+  try {
+    const data = await request(`/orders/${encodeURIComponent(selection.id)}/cancel`, { method: 'POST', token: current.accessToken });
+    if (data?.id !== selection.id || data.status !== 'cancelled' || !['refund_pending', 'refunded'].includes(data.paymentStatus)) {
+      throw new ApiError(502, 'invalid_response');
+    }
+    cancelledOrder = data;
+  } catch (error) {
+    failure = error;
+  }
+  if (session !== current || cancellation !== selection) return;
+  if (failure instanceof ApiError && failure.status === 401) {
+    closeSession('Your staff session expired. Sign in again.');
+    return;
+  }
+
+  const uncertain = !cancelledOrder && (!(failure instanceof ApiError) || failure.status >= 500);
+  let exceptions;
+  if (cancelledOrder || uncertain || (failure instanceof ApiError && [404, 409].includes(failure.status))) {
+    showMessage(cancellationProgress, 'Checking the order and payment review…');
+    [, exceptions] = await Promise.all([refreshQueue(true), refreshPaymentReview(true)]);
+  }
+  if (session !== current || cancellation !== selection) return;
+
+  const recorded = exceptions?.find((entry) => entry.orderId === selection.id && entry.reason === 'restaurant_cancelled');
+  if (cancelledOrder || recorded) {
+    orders = orders.filter((order) => order.id !== selection.id);
+    renderOrders();
+    const refund = cancelledOrder?.paymentStatus === 'refunded' || recorded?.refund
+      ? 'The refund is recorded in Payment review.' : 'Complete the refund and record it in Payment review.';
+    closeCancellation(`Order ${number} was cancelled. ${refund}`);
+  } else if (uncertain) {
+    closeCancellation(`Cancellation of order ${number} could not be confirmed. Check the updated queue and Payment review before trying again.`);
+  } else if (!isCurrentCancellation(selection)) {
+    closeCancellation(`Order ${number} changed. Review the updated queue and Payment review.`);
+  } else {
+    selection.submitting = false;
+    showMessage(cancellationProgress);
+    showMessage(cancellationProblem, messageFor(failure));
+    keepOrderButton.disabled = false;
+    confirmCancellationButton.disabled = false;
+    cancellationProblem.focus();
+  }
+}
+
 loginForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (loginButton.disabled) return;
@@ -638,6 +773,17 @@ loginForm.addEventListener('submit', async (event) => {
 });
 
 refreshButton.addEventListener('click', () => { void refreshQueue(); });
+element('cancellation-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  void submitCancellation();
+});
+keepOrderButton.addEventListener('click', () => {
+  if (!cancellation?.submitting) closeCancellation();
+});
+cancellationDialog.addEventListener('cancel', (event) => {
+  event.preventDefault();
+  if (!cancellation?.submitting) closeCancellation();
+});
 paymentReviewJump.addEventListener('click', () => { element('payment-review-title').focus(); });
 paymentReviewRefresh.addEventListener('click', () => { void refreshPaymentReview(); });
 fiscalReceiptsJump.addEventListener('click', () => { element('fiscal-receipts-title').focus(); });

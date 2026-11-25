@@ -214,6 +214,187 @@ class OperatorIntegrationTest {
     }
 
     @Test
+    void managerCancellationReleasesCapacityAndSurvivesPrimaryAndDuplicateSettlementReplays() throws Exception {
+        Staff manager = newStaff(store, "manager");
+        String managerBearer = login(manager);
+        jdbc.sql("UPDATE pickup_slots SET capacity = 1 WHERE store_id = ?").param(store).update();
+        OrderFixture paid = newOrder(store, true);
+        UUID id = UUID.fromString(paid.orderId());
+        UUID attempt = UUID.fromString(paymentReference(paid));
+        String primary = "local-" + attempt;
+        String guest = newGuest();
+        quote(guest, store).andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("slot_unavailable"));
+
+        for (String state : List.of("waiting", "pending", "sending", "receipt_pending")) {
+            jdbc.sql("""
+                    INSERT INTO pickup_alerts (id, order_id, guest_session_id, installation_id, locale, enabled, state,
+                        encrypted_token, queued_at, next_attempt_at, lease_id, lease_until, expo_ticket_id)
+                    SELECT ?, id, guest_session_id, ?, 'en', true, ?, ?, now(), now(), ?, now() + interval '1 minute', ?
+                    FROM orders WHERE id = ?
+                    """).params(UUID.randomUUID(), UUID.randomUUID(), state, new byte[64], UUID.randomUUID(),
+                            state.equals("receipt_pending") ? "accepted-ticket" : null, id).update();
+        }
+
+        cancel(managerBearer, paid.orderId()).andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.id").value(paid.orderId())).andExpect(jsonPath("$.status").value("cancelled"))
+                .andExpect(jsonPath("$.paymentStatus").value("refund_pending"));
+        quote(guest, store).andExpect(status().isOk());
+        api.perform(get(OPERATOR + "/orders").header(HttpHeaders.AUTHORIZATION, managerBearer))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.orders").isEmpty());
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM pickup_alerts WHERE order_id = ? AND state = 'cancelled'
+                    AND NOT enabled AND encrypted_token IS NULL AND lease_id IS NULL AND lease_until IS NULL
+                    AND expo_ticket_id IS NULL AND next_attempt_at IS NULL
+                """).param(id).query(Long.class).single()).isEqualTo(3);
+        assertThat(jdbc.sql("SELECT state FROM pickup_alerts WHERE order_id = ? AND expo_ticket_id = 'accepted-ticket'")
+                .param(id).query(String.class).single()).isEqualTo("receipt_pending");
+
+        payments.settlePayment(new VerifiedPayment(attempt.toString(), primary, 9700, "RWF", PaymentResult.PAID));
+        payments.settlePayment(new VerifiedPayment(attempt.toString(), "synthetic-after-cancel", 9700, "RWF", PaymentResult.PAID));
+        cancel(managerBearer, paid.orderId()).andExpect(status().isOk())
+                .andExpect(jsonPath("$.paymentStatus").value("refund_pending"));
+        api.perform(get(API + "/orders/" + id).header(HttpHeaders.AUTHORIZATION, paid.guestBearer()))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.status").value("cancelled"))
+                .andExpect(jsonPath("$.paymentStatus").value("refund_pending")).andExpect(jsonPath("$.pickupCode").doesNotExist());
+        assertThat(jdbc.sql("""
+                SELECT status || ':' || provider_transaction_id FROM payment_attempts WHERE id = ?
+                """).param(attempt).query(String.class).single()).isEqualTo("paid:" + primary);
+        assertThat(jdbc.sql("""
+                SELECT provider_transaction_id || ':' || reason FROM payment_exceptions WHERE attempt_id = ?
+                """).param(attempt).query(String.class).list())
+                .containsExactlyInAnyOrder(primary + ":restaurant_cancelled", "synthetic-after-cancel:duplicate_transaction");
+        assertThat(jdbc.sql("""
+                SELECT operator_id::text || ':' || previous_status FROM operator_order_events
+                WHERE order_id = ? AND requested_status = 'cancelled'
+                """).param(id).query(String.class).single()).isEqualTo(manager.id() + ":accepted");
+    }
+
+    @Test
+    void cancellationRequiresTheSameStoreManagerAndAnUncollectedPaidOrder() throws Exception {
+        String manager = login(newStaff(store, "manager"));
+        String kitchen = login(newStaff(store, "kitchen"));
+        String pickup = login(newStaff(store, "pickup"));
+        String otherStore = newStore();
+        OrderFixture paid = newOrder(store, true);
+        OrderFixture unpaid = newOrder(store, false);
+        OrderFixture foreignPaid = newOrder(otherStore, true);
+
+        api.perform(post(OPERATOR + "/orders/" + paid.orderId() + "/cancel")).andExpect(status().isUnauthorized());
+        cancel(paid.guestBearer(), paid.orderId()).andExpect(status().isUnauthorized());
+        cancel(kitchen, paid.orderId()).andExpect(status().isForbidden());
+        cancel(pickup, paid.orderId()).andExpect(status().isForbidden());
+        cancel(manager, foreignPaid.orderId()).andExpect(status().isNotFound());
+        cancel(manager, unpaid.orderId()).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("invalid_transition"));
+
+        String lateAttempt = beginPayment(unpaid.guestBearer(), unpaid.orderId());
+        jdbc.sql("UPDATE orders SET reservation_expires_at = now() - interval '1 second' WHERE id = ?")
+                .param(UUID.fromString(unpaid.orderId())).update();
+        payments.settlePayment(new VerifiedPayment(lateAttempt, "synthetic-late-before-cancel", 9700, "RWF", PaymentResult.PAID));
+        cancel(manager, unpaid.orderId()).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("invalid_transition"));
+        assertThat(jdbc.sql("SELECT reason FROM payment_exceptions WHERE attempt_id = ?")
+                .param(UUID.fromString(lateAttempt)).query(String.class).single()).isEqualTo("unavailable_reservation");
+
+        change(kitchen, paid.orderId(), "preparing", null).andExpect(status().isOk());
+        change(kitchen, paid.orderId(), "ready", null).andExpect(status().isOk());
+        change(pickup, paid.orderId(), "collected", paid.code()).andExpect(status().isOk());
+        cancel(manager, paid.orderId()).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("invalid_transition"));
+    }
+
+    @Test
+    void unavailableOrAmbiguousPrimaryPaymentFailsClosed() throws Exception {
+        String manager = login(newStaff(store, "manager"));
+        OrderFixture paid = newOrder(store, true);
+        UUID id = UUID.fromString(paid.orderId());
+        UUID primary = UUID.fromString(paymentReference(paid));
+        String primaryTransaction = "local-" + primary;
+        jdbc.sql("UPDATE payment_attempts SET provider_transaction_id = NULL WHERE id = ?").param(primary).update();
+        cancel(manager, paid.orderId()).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("payment_reference_unavailable"));
+        jdbc.sql("UPDATE payment_attempts SET provider_transaction_id = ? WHERE id = ?")
+                .params(primaryTransaction, primary).update();
+
+        UUID older = UUID.randomUUID();
+        String olderTransaction = "synthetic-earlier-paid";
+        jdbc.sql("""
+                INSERT INTO payment_attempts (id, order_id, sequence, request_key, status, provider_transaction_id)
+                    OVERRIDING SYSTEM VALUE VALUES (?, ?, 0, 'earlier-payment', 'paid', ?)
+                """).params(older, id, olderTransaction).update();
+        cancel(manager, paid.orderId()).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("payment_reference_unavailable"));
+        assertThat(jdbc.sql("SELECT count(*) FROM payment_exceptions WHERE attempt_id IN (?, ?)")
+                .params(primary, older).query(Long.class).single()).isZero();
+        jdbc.sql("""
+                INSERT INTO payment_exceptions (attempt_id, provider_transaction_id, reason, created_at)
+                VALUES (?, ?, 'superseded_attempt', now()), (?, ?, 'unavailable_reservation', now())
+                """).params(older, olderTransaction, primary, primaryTransaction).update();
+        cancel(manager, paid.orderId()).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("payment_reference_unavailable"));
+        assertThat(jdbc.sql("SELECT status || ':' || payment_status FROM orders WHERE id = ?")
+                .param(id).query(String.class).single()).isEqualTo("accepted:paid");
+        assertThat(jdbc.sql("SELECT count(*) FROM operator_order_events WHERE order_id = ?")
+                .param(id).query(Long.class).single()).isZero();
+
+        jdbc.sql("DELETE FROM payment_exceptions WHERE attempt_id = ?").param(primary).update();
+        cancel(manager, paid.orderId()).andExpect(status().isOk()).andExpect(jsonPath("$.paymentStatus").value("refund_pending"));
+        assertThat(jdbc.sql("SELECT reason FROM payment_exceptions WHERE attempt_id = ?")
+                .param(older).query(String.class).single()).isEqualTo("superseded_attempt");
+        assertThat(jdbc.sql("SELECT reason FROM payment_exceptions WHERE attempt_id = ?")
+                .param(primary).query(String.class).single()).isEqualTo("restaurant_cancelled");
+    }
+
+    @Test
+    void concurrentCancellationAndCollectionHaveOnlyOneWinner() throws Exception {
+        String manager = login(newStaff(store, "manager"));
+        String kitchen = login(newStaff(store, "kitchen"));
+        String pickup = login(newStaff(store, "pickup"));
+        OrderFixture paid = newOrder(store, true);
+        UUID id = UUID.fromString(paid.orderId());
+        UUID attemptId = UUID.fromString(paymentReference(paid));
+        change(kitchen, paid.orderId(), "preparing", null).andExpect(status().isOk());
+        change(kitchen, paid.orderId(), "ready", null).andExpect(status().isOk());
+        var waiting = new CountDownLatch(2);
+        var start = new CountDownLatch(1);
+        int cancelled;
+        int collected;
+        try (var threads = Executors.newFixedThreadPool(2)) {
+            var cancel = threads.submit(() -> {
+                waiting.countDown();
+                if (!start.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("Cancellation start barrier timed out");
+                return cancel(manager, paid.orderId()).andReturn().getResponse().getStatus();
+            });
+            var collect = threads.submit(() -> collectAfterBarrier(waiting, start, pickup, paid));
+            assertThat(waiting.await(10, TimeUnit.SECONDS)).isTrue();
+            start.countDown();
+            cancelled = cancel.get(10, TimeUnit.SECONDS);
+            collected = collect.get(10, TimeUnit.SECONDS);
+        }
+        String saved = jdbc.sql("SELECT status || ':' || payment_status FROM orders WHERE id = ?")
+                .param(id).query(String.class).single();
+        String audited = jdbc.sql("""
+                SELECT requested_status FROM operator_order_events
+                WHERE order_id = ? AND requested_status IN ('collected', 'cancelled')
+                """).param(id).query(String.class).single();
+        List<String> exceptions = jdbc.sql("SELECT reason FROM payment_exceptions WHERE attempt_id = ?")
+                .param(attemptId).query(String.class).list();
+        if (cancelled == 200) {
+            assertThat(collected).isEqualTo(404);
+            assertThat(saved).isEqualTo("cancelled:refund_pending");
+            assertThat(audited).isEqualTo("cancelled");
+            assertThat(exceptions).containsExactly("restaurant_cancelled");
+        } else {
+            assertThat(cancelled).isEqualTo(409);
+            assertThat(collected).isEqualTo(200);
+            assertThat(saved).isEqualTo("collected:paid");
+            assertThat(audited).isEqualTo("collected");
+            assertThat(exceptions).isEmpty();
+        }
+    }
+
+    @Test
     void transitionsAreRoleBoundAndConcurrentHandoffChangesTheOrderOnce() throws Exception {
         Staff kitchen = newStaff(store, "kitchen");
         Staff pickup = newStaff(store, "pickup");
@@ -536,6 +717,10 @@ class OperatorIntegrationTest {
         }
         return api.perform(post(OPERATOR + "/orders/" + orderId + "/status").header(HttpHeaders.AUTHORIZATION, bearer)
                 .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(input)));
+    }
+
+    private ResultActions cancel(String bearer, String orderId) throws Exception {
+        return api.perform(post(OPERATOR + "/orders/" + orderId + "/cancel").header(HttpHeaders.AUTHORIZATION, bearer));
     }
 
     private int collectAfterBarrier(CountDownLatch waiting, CountDownLatch start, String bearer, OrderFixture order) throws Exception {

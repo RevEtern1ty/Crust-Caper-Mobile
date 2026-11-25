@@ -78,7 +78,7 @@ async function downloadedReceipt(page) {
   return Buffer.concat(chunks);
 }
 
-test('connected checkout, receipt, pickup, cross-device recovery and payment return', { timeout: 70_000 }, async t => {
+test('connected checkout, receipt, pickup, recovery, payment return and restaurant cancellation', { timeout: 70_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/, 'Run only against a local integration API');
   const server = createPreviewServer(dist);
   await new Promise((resolve, reject) => {
@@ -202,7 +202,6 @@ test('connected checkout, receipt, pickup, cross-device recovery and payment ret
   assert.equal((await attached).status(), 200);
   await receiptCard.getByText(`EBM reference ${reference}`, { exact: true }).waitFor();
   await capture(manager, 'connected-fiscal-receipt');
-  await manager.close();
 
   assert.equal((await send(`/orders/${order.id}/receipt`)).status, 401);
   assert.equal((await send(`/orders/${order.id}/receipt`, { token: foreign.accessToken })).status, 404);
@@ -268,6 +267,50 @@ test('connected checkout, receipt, pickup, cross-device recovery and payment ret
   await page.waitForURL(url => url.pathname === '/orders' && url.search === '');
   assert.ok(views.includes(api + '/orders/' + newerOrder.id));
   assert.ok(!views.includes(api + '/orders/' + unknown));
+
+  await button(page, 'Open payment').click();
+  await button(page, 'Confirm local test payment').click();
+  await shown(page, 'Order accepted');
+  await manager.setViewportSize({ width: 320, height: 844 });
+  await button(manager, 'Refresh').click();
+  const cancelledShortId = newerOrder.id.slice(-8).toUpperCase();
+  const paidCard = manager.getByRole('list', { name: 'Paid orders' }).getByRole('listitem')
+    .filter({ has: manager.getByRole('heading', { name: `Order #${cancelledShortId}`, exact: true }) });
+  const modal = manager.getByRole('dialog', { name: `Cancel order #${cancelledShortId}?` });
+  const cancelPath = `/operator/orders/${newerOrder.id}/cancel`;
+  const dispatched = [];
+  await manager.route(api + cancelPath, async route => {
+    const upstream = await route.fetch();
+    dispatched.push({ method: route.request().method(), status: upstream.status(), body: await upstream.json() });
+    // Lose the first browser response after the real database transaction commits.
+    await route.abort('connectionreset');
+  });
+  await button(paidCard, 'Cancel order').click();
+  await button(modal, 'Keep order').waitFor();
+  assert.equal(await button(modal, 'Keep order').evaluate(element => element === document.activeElement), true);
+  await capture(manager, 'operator-cancel-confirm-320');
+  await button(modal, 'Keep order').click();
+  await modal.waitFor({ state: 'hidden' });
+  assert.deepEqual(dispatched, []);
+  await button(paidCard, 'Cancel order').click();
+  await button(modal, 'Confirm cancellation').click();
+  await shown(manager, new RegExp('^Order #' + cancelledShortId + ' was cancelled\\.'));
+  await paidCard.waitFor({ state: 'detached' });
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].method, 'POST');
+  assert.equal(dispatched[0].status, 200);
+  assert.equal(dispatched[0].body.status, 'cancelled');
+  assert.equal(dispatched[0].body.paymentStatus, 'refund_pending');
+  await button(manager, 'Payment review').click();
+  const exception = manager.getByRole('list', { name: 'Payment exceptions' }).getByRole('listitem')
+    .filter({ hasText: newerOrder.id });
+  await exception.getByRole('heading', { name: 'Restaurant cancelled' }).waitFor();
+
+  await button(page, 'Refresh order status').click();
+  await shown(page, 'Order cancelled');
+  await shown(page, 'Refund pending');
+  assert.equal(await page.getByText('Pickup code', { exact: true }).count(), 0);
+  await capture(page, 'connected-restaurant-cancelled');
   assert.deepEqual(errors, []);
 });
 

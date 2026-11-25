@@ -100,4 +100,10 @@ final class OperatorController {
                                      @PathVariable String id, @RequestBody StatusInput input) {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.change(authorization, id, input));
     }
+
+    @PostMapping("/orders/{id}/cancel")
+    ResponseEntity<OrderView> cancel(@RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+                                     @PathVariable String id) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.cancel(authorization, id));
+    }
 }

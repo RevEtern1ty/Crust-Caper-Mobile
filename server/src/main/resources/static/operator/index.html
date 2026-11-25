@@ -52,6 +52,7 @@
         </div>
 
         <p class="problem" id="queue-problem" role="alert" hidden></p>
+        <p class="queue-notice" id="queue-notice" role="status" tabindex="-1" hidden></p>
         <p class="empty-state" id="empty-state" hidden>No paid orders are waiting.</p>
         <ul class="order-list" id="order-list" aria-label="Paid orders"></ul>
 
@@ -103,6 +104,17 @@
         </section>
       </section>
     </main>
+
+    <dialog class="cancellation-dialog" id="cancellation-dialog" aria-labelledby="cancellation-title" aria-describedby="cancellation-description">
+      <h2 id="cancellation-title"></h2>
+      <p id="cancellation-description">Complete the refund in Flutterwave and record it in Payment review.</p>
+      <p id="cancellation-progress" role="status" tabindex="-1" hidden></p>
+      <p class="problem" id="cancellation-problem" role="alert" tabindex="-1" hidden></p>
+      <form class="cancellation-actions" id="cancellation-form" method="post">
+        <button class="button button-secondary" id="keep-order" type="button" autofocus>Keep order</button>
+        <button class="button button-danger" id="confirm-cancellation" type="submit">Confirm cancellation</button>
+      </form>
+    </dialog>
 
     <template id="order-template">
       <li class="order-card">

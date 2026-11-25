@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: CrustCaper Shared API
-  version: 0.6.0
+  version: 0.7.0
   description: Implemented HTTP contract for the Spring Boot commerce service.
 servers:
   - url: /api/v1
@@ -473,6 +473,37 @@ paths:
                 items: { $ref: '#/components/schemas/OperatorReceipt' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
+  /operator/orders/{id}/cancel:
+    post:
+      operationId: cancelPaidOrder
+      description: A manager can cancel an accepted, preparing or ready paid order in the assigned store. The original payment is added to Payment review. Repeating a restaurant cancellation returns the current cancellation and refund status.
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Cancelled order with the current refund status.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorCancelledOrder' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '409':
+          description: The order cannot transition to cancelled, or its original verified transaction cannot be identified.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetails'
+                  - type: object
+                    properties:
+                      status: { const: 409 }
+                      code: { enum: [invalid_transition, payment_reference_unavailable] }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/orders/{id}/receipt:
     put:
       operationId: attachFiscalReceipt
@@ -792,13 +823,11 @@ components:
         amount: { $ref: '#/components/schemas/Amount' }
         currency: { type: string, const: RWF }
         recordedAt: { $ref: '#/components/schemas/Timestamp' }
-    OperatorOrder:
+    OperatorOrderDetails:
       type: object
-      required: [id, status, paymentStatus, lines, pickupStartsAt, pickupEndsAt]
+      required: [id, lines, pickupStartsAt, pickupEndsAt]
       properties:
         id: { type: string, format: uuid }
-        status: { type: string, enum: [accepted, preparing, ready, collected] }
-        paymentStatus: { type: string, const: paid }
         lines:
           type: array
           items:
@@ -810,6 +839,22 @@ components:
               quantity: { type: integer, minimum: 1 }
         pickupStartsAt: { $ref: '#/components/schemas/Timestamp' }
         pickupEndsAt: { $ref: '#/components/schemas/Timestamp' }
+    OperatorOrder:
+      allOf:
+        - $ref: '#/components/schemas/OperatorOrderDetails'
+        - type: object
+          required: [status, paymentStatus]
+          properties:
+            status: { type: string, enum: [accepted, preparing, ready, collected] }
+            paymentStatus: { type: string, const: paid }
+    OperatorCancelledOrder:
+      allOf:
+        - $ref: '#/components/schemas/OperatorOrderDetails'
+        - type: object
+          required: [status, paymentStatus]
+          properties:
+            status: { type: string, const: cancelled }
+            paymentStatus: { type: string, enum: [refund_pending, refunded] }
     OperatorPaymentReview:
       type: object
       additionalProperties: false
@@ -827,7 +872,7 @@ components:
               merchantReference: { type: string, format: uuid, description: Merchant payment reference sent as tx_ref. }
               providerTransactionId: { type: string }
               refund: { $ref: '#/components/schemas/VerifiedRefund' }
-              reason: { type: string, enum: [duplicate_transaction, unavailable_reservation, superseded_attempt] }
+              reason: { type: string, enum: [duplicate_transaction, unavailable_reservation, superseded_attempt, restaurant_cancelled] }
               createdAt: { $ref: '#/components/schemas/Timestamp' }
     ProblemDetails:
       type: object
