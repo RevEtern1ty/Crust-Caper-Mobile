@@ -41,6 +41,8 @@ jobs:
 
       - run: npm ci
       - run: npm run check
+      - name: Verify stage and production native configuration
+        run: node tooling/check-native-profiles.cjs
       - run: npm run build:web
       - name: Verify checkout and reachable screens in Chrome
         run: npm run test:web
@@ -80,12 +82,25 @@ jobs:
           retention-days: 14
 
   android-demo:
-    name: Compile Android demo APK
+    name: Compile Android ${{ matrix.artifact }} APK
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: demo
+            artifact: demo
+          - profile: stage
+            artifact: connected-ci
     env:
       EXPO_NO_TELEMETRY: 1
+      CRUSTCAPER_BUILD_PROFILE: ${{ matrix.profile }}
+      CRUSTCAPER_API_BASE_URL: https://api-stage.crustcaper.invalid/api/v1
+      CRUSTCAPER_STORE_ID: ci-test-store
+      CRUSTCAPER_PSP_HOSTS: checkout.crustcaper.invalid
+      CRUSTCAPER_APP_LINK_ORIGIN: https://stage.crustcaper.invalid
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
         with:
@@ -96,19 +111,19 @@ jobs:
           package-manager-cache: false
       - run: npm ci
       - run: npx expo prebuild --platform android --no-install
-      - name: Build demo with bundled JS and debug signing
+      - name: Build with bundled JS and debug signing
         working-directory: android
         run: |
           export JAVA_HOME="$JAVA_HOME_17_X64"
           bash ./gradlew --no-daemon --max-workers=2 ':app:assembleRelease' \
             '-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8' \
             '-PreactNativeArchitectures=arm64-v8a,x86_64'
-      - name: Verify the demo APK identity, permissions, signature and bundled JS
+      - name: Verify the APK identity, permissions, signature, embedded settings and bundled JS
         shell: bash
         run: |
           apk=android/app/build/outputs/apk/release/app-release.apk
           tools="$ANDROID_HOME/build-tools/36.0.0"
-          expected_package=$(node -p 'require("./app.json").expo.android.package')
+          expected_package="com.crustcaper.mobile.$CRUSTCAPER_BUILD_PROFILE"
           expected_min_sdk=$(node -p 'require("./app.json").expo.plugins.find(plugin => Array.isArray(plugin) && plugin[0] === "expo-build-properties")[1].android.minSdkVersion')
           signer=$("$tools/apksigner" verify --print-certs "$apk")
           printf '%s\n' "$signer"
@@ -128,6 +143,29 @@ jobs:
           done
           manifest_tree=$("$tools/aapt" dump xmltree "$apk" AndroidManifest.xml)
           grep -Eq 'android:allowBackup\(0x[0-9a-f]+\)=\(type 0x12\)0x0$' <<< "$manifest_tree"
+          if [ "$CRUSTCAPER_BUILD_PROFILE" = stage ]; then
+            grep -Eq 'android:usesCleartextTraffic\(0x[0-9a-f]+\)=\(type 0x12\)0x0$' <<< "$manifest_tree"
+            grep -Eq 'android:autoVerify\(0x[0-9a-f]+\)=\(type 0x12\)0xffffffff$' <<< "$manifest_tree"
+            app_link_host=$(node -p 'new URL(process.env.CRUSTCAPER_APP_LINK_ORIGIN).host')
+            grep -Fq "=\"$app_link_host\"" <<< "$manifest_tree"
+            grep -Fq '="/payment-return"' <<< "$manifest_tree"
+          fi
+          unzip -p "$apk" assets/app.config > "$RUNNER_TEMP/crustcaper-app.config"
+          node - "$RUNNER_TEMP/crustcaper-app.config" "$expected_package" <<'NODE'
+          const assert = require('node:assert/strict');
+          const { readFileSync } = require('node:fs');
+          const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          const profile = process.env.CRUSTCAPER_BUILD_PROFILE;
+          assert.equal(config.android.package, process.argv[3]);
+          assert.equal(config.scheme, `crustcaper-${profile}`);
+          const expected = profile === 'demo' ? { profile } : {
+            profile,
+            apiBaseUrl: process.env.CRUSTCAPER_API_BASE_URL,
+            storeId: process.env.CRUSTCAPER_STORE_ID,
+            pspHosts: [process.env.CRUSTCAPER_PSP_HOSTS],
+          };
+          assert.deepEqual(config.extra.restaurant, expected);
+          NODE
           bundle_size=$(unzip -p "$apk" assets/index.android.bundle | wc -c)
           test "$bundle_size" -gt 0
           printf '%s\n' "$architectures"
@@ -136,7 +174,7 @@ jobs:
           sha256sum "$apk"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mobile-android-demo-${{ github.sha }}
+          name: mobile-android-${{ matrix.artifact }}-${{ github.sha }}
           path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 14

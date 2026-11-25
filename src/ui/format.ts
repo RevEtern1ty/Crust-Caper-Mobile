@@ -9,6 +9,21 @@ export function money(value: number) {
 }
 
 const dateOptions = { timeZone: 'Africa/Kigali' } as const;
+const shortDateOptions = { ...dateOptions, day: 'numeric', month: 'short' } as const;
+const timeOptions = { ...dateOptions, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' } as const;
+const englishDate = new Intl.DateTimeFormat('en-GB', shortDateOptions);
+const englishDateTime = new Intl.DateTimeFormat('en-GB', { ...shortDateOptions, ...timeOptions });
+const pickupTime = new Intl.DateTimeFormat('en-GB', timeOptions);
+const numericDate = new Intl.DateTimeFormat('en-GB', { ...dateOptions, day: 'numeric', month: 'numeric' });
+// Some native and browser engines omit rw. These month labels are from Unicode CLDR 49.
+const rwMonths = ['Mut.', 'Gas.', 'Wer.', 'Mat.', 'Gic.', 'Kam.', 'Nya.', 'Kan.', 'Nze.', 'Ukw.', 'Ugu.', 'Uku.'];
+
+function kinyarwandaDate(value: Date) {
+  const parts = numericDate.formatToParts(value);
+  const month = parts.find(part => part.type === 'month')?.value;
+  const day = parts.find(part => part.type === 'day')?.value;
+  return `${rwMonths[Number(month) - 1]} ${day}`;
+}
 
 export function nextPickupSlot(menu: Menu | null, now = Date.now()) {
   if (!menu?.store.open || menu.orderingUnavailable) return undefined;
@@ -26,15 +41,12 @@ export function nextPickupSlot(menu: Menu | null, now = Date.now()) {
 }
 
 export function slotLabel(slot: Pick<PickupSlot, 'startsAt' | 'endsAt'>, locale: Locale) {
-  const lang = locale === 'en' ? 'en-GB' : 'rw-RW';
   const start = new Date(slot.startsAt);
-  const date = new Intl.DateTimeFormat(lang, { ...dateOptions, day: 'numeric', month: 'short' });
-  const time = new Intl.DateTimeFormat(lang, { ...dateOptions, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-  return `${date.format(start)} · ${time.format(start)}–${time.format(new Date(slot.endsAt))}`;
+  const date = locale === 'rw' ? kinyarwandaDate(start) : englishDate.format(start);
+  return `${date} · ${pickupTime.format(start)}–${pickupTime.format(new Date(slot.endsAt))}`;
 }
 
 export function kigaliTime(timestamp: string, locale: Locale) {
-  return new Intl.DateTimeFormat(locale === 'en' ? 'en-GB' : 'rw-RW', {
-    ...dateOptions, day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  }).format(new Date(timestamp));
+  const date = new Date(timestamp);
+  return locale === 'rw' ? `${kinyarwandaDate(date)} ${pickupTime.format(date)}` : englishDateTime.format(date);
 }

@@ -45,6 +45,7 @@
           <div class="toolbar">
             <button class="button button-secondary" id="payment-review-jump" type="button" hidden>Payment review</button>
             <button class="button button-secondary" id="fiscal-receipts-jump" type="button" hidden>Fiscal receipts</button>
+            <button class="button button-secondary" id="availability-jump" type="button" hidden>Menu availability</button>
             <button class="button button-secondary" id="refresh-button" type="button">Refresh</button>
             <button class="button button-quiet" id="logout-button" type="button">Sign out</button>
           </div>
@@ -82,6 +83,23 @@
           <p class="problem" id="fiscal-receipts-problem" role="alert" hidden></p>
           <p class="empty-state" id="fiscal-receipts-empty" role="status" hidden>No paid orders for fiscal receipts.</p>
           <ul class="order-list" id="fiscal-receipts-list" aria-label="Orders for fiscal receipts"></ul>
+        </section>
+
+        <section class="payment-review" id="availability" aria-labelledby="availability-title" hidden>
+          <div class="queue-header">
+            <div>
+              <h2 id="availability-title" tabindex="-1">Menu availability</h2>
+              <p class="payment-review-help">Change which items can be ordered and whether the restaurant accepts new orders.</p>
+            </div>
+            <button class="button button-secondary" id="availability-refresh" type="button">Refresh availability</button>
+          </div>
+          <div class="order-card availability-store" id="availability-store" hidden>
+            <p class="order-title" id="availability-store-status"></p>
+            <button class="button button-secondary" id="availability-store-toggle" type="button"></button>
+          </div>
+          <p class="problem" id="availability-problem" role="alert" hidden></p>
+          <p class="availability-note" id="availability-note" role="status" hidden></p>
+          <ul class="order-list" id="availability-list" aria-label="Item availability"></ul>
         </section>
       </section>
     </main>
@@ -138,6 +156,15 @@
           <button class="button button-primary" type="submit">Attach receipt</button>
           <p class="problem manager-problem" role="alert" hidden></p>
         </form>
+      </li>
+    </template>
+    <template id="availability-template">
+      <li class="order-card availability-item">
+        <div class="order-header">
+          <h3 class="order-title"></h3>
+          <span class="order-status"></span>
+        </div>
+        <button class="button button-secondary" type="button"></button>
       </li>
     </template>
   </body>

@@ -95,3 +95,7 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .manager-form input[type="file"] { max-width: 100%; }
 .manager-form .manager-problem { margin: 0; font-size: .9rem; }
 .fiscal-result { margin-top: .9rem; padding: .65rem .8rem; background: var(--mint); color: var(--green); border-radius: .55rem; font-weight: 710; overflow-wrap: anywhere; }
+.availability-store { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .55rem 1rem; margin-bottom: 1rem; }
+.availability-store .button { flex: 0 1 auto; }
+.availability-item { display: grid; gap: .75rem; }
+.availability-note { color: var(--green); font-weight: 720; margin-bottom: .85rem; }

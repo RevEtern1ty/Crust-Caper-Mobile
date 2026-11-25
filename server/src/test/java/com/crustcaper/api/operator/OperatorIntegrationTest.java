@@ -1,8 +1,10 @@
 package com.crustcaper.api.operator;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
@@ -30,6 +32,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.dao.DataAccessException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -65,6 +68,7 @@ class OperatorIntegrationTest {
     @AfterEach
     void removeOnlyOperatorFixtures() {
         for (String fixtureStore : stores) {
+            jdbc.sql("DELETE FROM operator_availability_events WHERE store_id = ?").param(fixtureStore).update();
             jdbc.sql("DELETE FROM operator_order_events WHERE store_id = ?").param(fixtureStore).update();
             jdbc.sql("DELETE FROM operator_sessions WHERE operator_id IN (SELECT id FROM operator_accounts WHERE store_id = ?)")
                     .param(fixtureStore).update();
@@ -265,6 +269,151 @@ class OperatorIntegrationTest {
         api.perform(get(OPERATOR + "/orders").header(HttpHeaders.AUTHORIZATION, current)).andExpect(status().isUnauthorized());
     }
 
+    @Test
+    void availabilityIsManagerOnlyStoreScopedAndAuditsOnlyActualChanges() throws Exception {
+        Staff manager = newStaff(store, "manager");
+        String bearer = login(manager);
+        String staff = login(newStaff(store, "kitchen"));
+        String otherStore = newStore();
+        String otherManager = login(newStaff(otherStore, "manager"));
+        api.perform(get(OPERATOR + "/availability")).andExpect(status().isUnauthorized());
+        api.perform(get(OPERATOR + "/availability").header(HttpHeaders.AUTHORIZATION, newGuest()))
+            .andExpect(status().isUnauthorized());
+        api.perform(get(OPERATOR + "/availability").header(HttpHeaders.AUTHORIZATION, staff))
+            .andExpect(status().isForbidden());
+        updateAvailability(staff, "{}").andExpect(status().isForbidden());
+
+        JsonNode initial = availability(bearer);
+        String version = initial.path("version").asString();
+        assertThat(initial.path("open").asBoolean()).isTrue();
+        assertThat(initial.path("products").path(0).path("name").path("en").asString()).isEqualTo("Double Smash");
+        for (String invalid : List.of(
+            "{\"expectedVersion\":\"%s\",\"open\":true,\"sku\":\"double-smash\",\"available\":false}",
+            "{\"expectedVersion\":\"%s\",\"open\":false,\"open\":true}",
+            "{\"expectedVersion\":\"%s\",\"open\":null}",
+            "{\"expectedVersion\":\"%s\",\"available\":true,\"other\":\"double-smash\"}"
+        )) {
+            updateAvailability(bearer, invalid.formatted(version)).andExpect(status().isBadRequest());
+        }
+        updateAvailability(bearer, productChange(version, "missing", false)).andExpect(status().isNotFound());
+        updateAvailability(bearer, storeChange(version, true)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.version").value(version));
+        assertThat(auditCount(store)).isZero();
+
+        String etag = api.perform(get(API + "/stores/" + store + "/menu")).andExpect(status().isOk())
+            .andReturn().getResponse().getHeader(HttpHeaders.ETAG);
+        JsonNode changed = body(updateAvailability(bearer, productChange(version, "double-smash", false))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.products[0].available").value(false)));
+        String newVersion = changed.path("version").asString();
+        assertThat(newVersion).isNotEqualTo(version);
+        api.perform(get(API + "/stores/" + store + "/menu").header(HttpHeaders.IF_NONE_MATCH, etag))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.version").value(newVersion))
+            .andExpect(jsonPath("$.products[0].available").value(false));
+        assertThat(availability(otherManager).path("products").path(0).path("available").asBoolean()).isTrue();
+        updateAvailability(bearer, productChange(version, "double-smash", false)).andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("catalog_version_conflict"));
+        updateAvailability(bearer, productChange(newVersion, "double-smash", false)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.version").value(newVersion));
+        assertThat(auditCount(store)).isEqualTo(1);
+        jdbc.sql("UPDATE operator_accounts SET username = ? WHERE id = ?")
+            .params("renamed-" + manager.id(), manager.id()).update();
+        assertThat(jdbc.sql("""
+            SELECT operator_id::text || ':' || operator_username || ':' || action || ':' || sku || ':' || previous_value || ':' || new_value
+            FROM operator_availability_events WHERE store_id = ?
+            """).param(store).query(String.class).single())
+            .isEqualTo(manager.id() + ":" + manager.username() + ":product_available:double-smash:true:false");
+        assertThatThrownBy(() -> jdbc.sql("UPDATE operator_availability_events SET new_value = true WHERE store_id = ?")
+            .param(store).update()).isInstanceOf(DataAccessException.class);
+    }
+
+    @Test
+    void closureAndStopListInvalidateUncommittedCheckoutButPreserveAnExistingReservationAndPayment() throws Exception {
+        String bearer = login(newStaff(store, "manager"));
+        OrderFixture booked = newOrder(store, false);
+        String browsingGuest = newGuest();
+        String quoteBeforeClosure = body(quote(browsingGuest, store).andExpect(status().isOk())).path("quoteId").asString();
+        String current = availability(bearer).path("version").asString();
+        String closed = body(updateAvailability(bearer, storeChange(current, false)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.open").value(false))).path("version").asString();
+
+        api.perform(get(API + "/stores/" + store + "/menu")).andExpect(status().isOk())
+            .andExpect(jsonPath("$.version").value(closed)).andExpect(jsonPath("$.store.open").value(false))
+            .andExpect(jsonPath("$.slots[0].available").value(false));
+        createOrder(browsingGuest, quoteBeforeClosure, "prior-quote").andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("slot_unavailable"));
+        quote(browsingGuest, store).andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("slot_unavailable"));
+
+        String attempt = beginPayment(booked.guestBearer(), booked.orderId());
+        api.perform(post(API + "/local/orders/" + booked.orderId() + "/payments/" + attempt + "/result")
+            .header(HttpHeaders.AUTHORIZATION, booked.guestBearer()).contentType(MediaType.APPLICATION_JSON)
+            .content("{\"status\":\"paid\"}")).andExpect(status().isOk())
+            .andExpect(jsonPath("$.status").value("accepted")).andExpect(jsonPath("$.paymentStatus").value("paid"));
+
+        String reopened = body(updateAvailability(bearer, storeChange(closed, true)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.open").value(true))).path("version").asString();
+        String quoteBeforeStop = body(quote(browsingGuest, store).andExpect(status().isOk())).path("quoteId").asString();
+        updateAvailability(bearer, productChange(reopened, "double-smash", false)).andExpect(status().isOk());
+        createOrder(browsingGuest, quoteBeforeStop, "product-stopped").andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("quote_changed"));
+        quote(browsingGuest, store).andExpect(status().isOk()).andExpect(jsonPath("$.lines").isEmpty())
+            .andExpect(jsonPath("$.changes[0].kind").value("unavailable"))
+            .andExpect(jsonPath("$.changes[0].sku").value("double-smash"));
+
+        api.perform(get(OPERATOR + "/orders").header(HttpHeaders.AUTHORIZATION, bearer)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.orders[0].id").value(booked.orderId()))
+            .andExpect(jsonPath("$.orders[0].paymentStatus").value("paid"));
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?")
+            .param(store).query(Long.class).single()).isEqualTo(1);
+        assertThat(auditCount(store)).isEqualTo(3);
+    }
+
+    @Test
+    void concurrentAvailabilityEditsWithOneCatalogVersionCannotOverwriteEachOther() throws Exception {
+        String first = login(newStaff(store, "manager"));
+        String second = login(newStaff(store, "manager"));
+        String version = availability(first).path("version").asString();
+        var start = new CountDownLatch(1);
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            var close = pool.submit(() -> {
+                if (!start.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Test barrier timed out");
+                return updateAvailability(first, storeChange(version, false)).andReturn().getResponse().getStatus();
+            });
+            var stop = pool.submit(() -> {
+                if (!start.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Test barrier timed out");
+                return updateAvailability(second, productChange(version, "double-smash", false)).andReturn().getResponse().getStatus();
+            });
+            start.countDown();
+            assertThat(List.of(close.get(5, TimeUnit.SECONDS), stop.get(5, TimeUnit.SECONDS)))
+                .containsExactlyInAnyOrder(200, 409);
+        }
+        JsonNode result = availability(first);
+        assertThat(result.path("open").asBoolean()).isNotEqualTo(result.path("products").path(0).path("available").asBoolean());
+        assertThat(auditCount(store)).isEqualTo(1);
+    }
+
+    private JsonNode availability(String bearer) throws Exception {
+        return body(api.perform(get(OPERATOR + "/availability").header(HttpHeaders.AUTHORIZATION, bearer))
+            .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store")));
+    }
+
+    private ResultActions updateAvailability(String bearer, String payload) throws Exception {
+        return api.perform(patch(OPERATOR + "/availability").header(HttpHeaders.AUTHORIZATION, bearer)
+            .contentType(MediaType.APPLICATION_JSON).content(payload));
+    }
+
+    private long auditCount(String location) {
+        return jdbc.sql("SELECT count(*) FROM operator_availability_events WHERE store_id = ?")
+            .param(location).query(Long.class).single();
+    }
+
+    private String storeChange(String version, boolean open) {
+        return json.writeValueAsString(Map.of("expectedVersion", version, "open", open));
+    }
+
+    private String productChange(String version, String sku, boolean available) {
+        return json.writeValueAsString(Map.of("expectedVersion", version, "sku", sku, "available", available));
+    }
+
     private String newStore() {
         String id = "operator-it-" + UUID.randomUUID();
         stores.add(id);
@@ -304,17 +453,9 @@ class OperatorIntegrationTest {
     }
 
     private OrderFixture newOrder(String storeId, boolean paid) throws Exception {
-        String token = body(api.perform(post(API + "/guest-sessions")).andExpect(status().isOk())).path("accessToken").asString("");
-        guests.add(jdbc.sql("SELECT guest_session_id FROM guest_access_tokens WHERE token_hash = ?")
-                .param(sha256(token)).query(UUID.class).single());
-        String bearer = "Bearer " + token;
-        String quoteId = body(api.perform(post(API + "/quotes").header(HttpHeaders.AUTHORIZATION, bearer)
-                .contentType(MediaType.APPLICATION_JSON).content("""
-                    {"storeId":"%s","slotId":"%s","lines":[{"sku":"double-smash","modifierIds":["extra-cheese"],"quantity":1,"unitPrice":9700}]}
-                    """.formatted(storeId, SLOT))).andExpect(status().isOk())).path("quoteId").asString("");
-        String orderId = body(api.perform(post(API + "/orders").header(HttpHeaders.AUTHORIZATION, bearer)
-                .header(IDEMPOTENCY, "fixture-order").contentType(MediaType.APPLICATION_JSON)
-                .content(json.writeValueAsString(Map.of("quoteId", quoteId, "phone", "+250700000000", "email", "guest@example.test"))))
+        String bearer = newGuest();
+        String quoteId = body(quote(bearer, storeId).andExpect(status().isOk())).path("quoteId").asString("");
+        String orderId = body(createOrder(bearer, quoteId, "fixture-order")
                 .andExpect(status().isOk())).path("id").asString("");
         if (!paid) {
             return new OrderFixture(orderId, bearer, null);
@@ -325,6 +466,26 @@ class OperatorIntegrationTest {
                 .andExpect(status().isOk())).path("pickupCode").asString("");
         assertThat(code).matches("[0-9]{6}");
         return new OrderFixture(orderId, bearer, code);
+    }
+
+    private String newGuest() throws Exception {
+        String token = body(api.perform(post(API + "/guest-sessions")).andExpect(status().isOk())).path("accessToken").asString("");
+        guests.add(jdbc.sql("SELECT guest_session_id FROM guest_access_tokens WHERE token_hash = ?")
+                .param(sha256(token)).query(UUID.class).single());
+        return "Bearer " + token;
+    }
+
+    private ResultActions quote(String bearer, String storeId) throws Exception {
+        return api.perform(post(API + "/quotes").header(HttpHeaders.AUTHORIZATION, bearer)
+                .contentType(MediaType.APPLICATION_JSON).content("""
+                    {"storeId":"%s","slotId":"%s","lines":[{"sku":"double-smash","modifierIds":["extra-cheese"],"quantity":1,"unitPrice":9700}]}
+                    """.formatted(storeId, SLOT)));
+    }
+
+    private ResultActions createOrder(String bearer, String quoteId, String key) throws Exception {
+        return api.perform(post(API + "/orders").header(HttpHeaders.AUTHORIZATION, bearer)
+                .header(IDEMPOTENCY, key).contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsString(Map.of("quoteId", quoteId, "phone", "+250700000000", "email", "guest@example.test"))));
     }
 
     private String beginPayment(String bearer, String orderId) throws Exception {

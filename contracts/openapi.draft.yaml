@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: CrustCaper Shared API
-  version: 0.4.0
+  version: 0.5.0
   description: Implemented HTTP contract for the Spring Boot commerce service.
 servers:
   - url: /api/v1
@@ -358,6 +358,54 @@ paths:
                       code: { enum: [invalid_transition, pickup_code_mismatch] }
         '429': { $ref: '#/components/responses/OperatorRateLimited' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/availability:
+    get:
+      operationId: getMenuAvailability
+      security: [{ operatorBearer: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OperatorAvailability' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+    patch:
+      operationId: setMenuAvailability
+      description: Modify the manager's own restaurant or one of its items, using the current version. The request body is limited to 2 KiB.
+      security: [{ operatorBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  additionalProperties: false
+                  required: [expectedVersion, open]
+                  properties:
+                    expectedVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    open: { type: boolean }
+                - type: object
+                  additionalProperties: false
+                  required: [expectedVersion, sku, available]
+                  properties:
+                    expectedVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    sku: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    available: { type: boolean }
+      responses:
+        '200': { $ref: '#/components/responses/OperatorAvailability' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { description: No item with this SKU exists in the assigned restaurant. }
+        '415': { description: The request body must be sent as application/json. }
+        '409':
+          description: The caller must reload the current menu before changing availability.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetails'
+                  - properties:
+                      status: { const: 409 }
+                      code: { const: catalog_version_conflict }
   /operator/receipts:
     get:
       operationId: listOperatorReceipts
@@ -517,6 +565,14 @@ components:
       description: Reuse the key with the same payload to recover the original operation.
       schema: { type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$' }
   responses:
+    OperatorAvailability:
+      description: Current restaurant and item availability. Changes to published values advance the version.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/OperatorAvailability' }
     GuestSession:
       description: Opaque guest credentials and expirations. Keep both tokens in protected client storage.
       headers:
@@ -618,6 +674,21 @@ components:
                   status: { const: 429 }
                   code: { const: rate_limited }
   schemas:
+    OperatorAvailability:
+      type: object
+      required: [version, open, products]
+      properties:
+        version: { type: string }
+        open: { type: boolean }
+        products:
+          type: array
+          items:
+            type: object
+            required: [sku, name, available]
+            properties:
+              sku: { type: string }
+              name: { $ref: '#/components/schemas/Localized' }
+              available: { type: boolean }
     OperatorReceipt:
       type: object
       required: [orderId, status, total, currency, receiptStatus]

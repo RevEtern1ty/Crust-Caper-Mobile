@@ -1,3 +1,5 @@
+import { mountAvailability } from './availability.js';
+
 const element = (id) => document.getElementById(id);
 const signIn = element('sign-in');
 const loginForm = element('login-form');
@@ -60,6 +62,7 @@ let timer;
 let refreshVersion = 0;
 let refreshing = false;
 let authVersion = 0;
+const availability = mountAvailability({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
 
 class ApiError extends Error {
   constructor(status, code) {
@@ -438,6 +441,7 @@ function closeSession(message = '') {
   fiscalReceiptsRefresh.disabled = false;
   showMessage(fiscalReceiptsProblem);
   showMessage(fiscalReceiptsEmpty);
+  availability.reset();
   workstation.hidden = true;
   signIn.hidden = false;
   loginForm.reset();
@@ -620,6 +624,7 @@ loginForm.addEventListener('submit', async (event) => {
     if (data.role === 'manager') {
       void refreshPaymentReview();
       void refreshReceipts();
+      availability.show();
     }
   } catch (error) {
     if (authVersion !== version) return;

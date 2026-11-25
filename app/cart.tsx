@@ -1,5 +1,7 @@
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { useCallback } from 'react';
 import { Image, Pressable, StyleSheet, View } from 'react-native';
+import { cartLineUnavailable } from '../src/checkout/cart-review';
 import { lineKey, MAX_QUANTITY, useShop } from '../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../src/ui/core';
 import { copy, money } from '../src/ui/format';
@@ -8,7 +10,17 @@ import { menuPhoto } from '../src/ui/menu-photos';
 export default function CartScreen() {
   const { locale, fixturePhotos, checkoutAllowed, menu, status, count, cart, hydrated, draftSaving, draftStorageError, changeQuantity, total, refreshMenu, refreshing } = useShop();
   const router = useRouter();
-  const checkoutReady = checkoutAllowed && count > 0 && status === 'ready' && !draftSaving && !draftStorageError;
+  const items = cart.map(line => {
+    const product = menu?.products.find(item => item.sku === line.sku);
+    return { line, product, unavailable: status === 'ready' ? cartLineUnavailable(line, product) : null };
+  });
+  const closed = status === 'ready' && menu?.store.open === false;
+  const needsEdit = items.some(({ unavailable }) => unavailable !== null);
+  const checkoutReady = checkoutAllowed && count > 0 && status === 'ready' && !closed && !needsEdit && !draftSaving && !draftStorageError;
+
+  useFocusEffect(useCallback(() => {
+    void refreshMenu();
+  }, [refreshMenu]));
   if (!hydrated) {
     return <Screen safeBottom>{!draftStorageError && <Text accessibilityLiveRegion="polite">
       {copy(locale, 'Opening cart…', 'Turimo gufungura agatebo…')}
@@ -23,19 +35,26 @@ export default function CartScreen() {
         <Text variant="heading">{copy(locale, 'Your cart is empty', 'Igitebo cyawe kirimo ubusa')}</Text>
         <Button label={copy(locale, 'Browse the menu', 'Reba amafunguro')} onPress={() => router.replace('/')} />
       </Card>}
-      {cart.map(line => {
+      {count > 0 && closed && <Card>
+        <Text accessibilityRole="alert" tone="red">{copy(locale, 'Pickup orders are closed right now. You can still edit your cart.', 'Kwakira komande zo gufata byafunzwe ubu. Uracyashobora guhindura agatebo kawe.')}</Text>
+        <Button label={copy(locale, 'Refresh menu', 'Vugurura amafunguro')} variant="secondary"
+          busy={refreshing} onPress={() => { void refreshMenu(); }} />
+      </Card>}
+      {items.map(({ line, product, unavailable }) => {
         const key = lineKey(line);
-        const product = menu?.products.find(item => item.sku === line.sku);
         const photo = menuPhoto(line.sku, fixturePhotos, product?.photoUrl);
         const name = product?.name[locale] ?? line.sku;
-        const options = product?.modifiers.filter(option => line.modifierIds.includes(option.id)) ?? [];
+        const options = line.modifierIds.map(id => product?.modifiers.find(option => option.id === id)?.name[locale] ?? id);
+        const addingDisabled = line.quantity >= MAX_QUANTITY || unavailable !== null;
         return <Card key={key}>
           <View style={styles.product}>
             {photo && <Image source={photo} style={styles.thumb} accessible={false} />}
             <View style={styles.productCopy}>
               <Text variant="heading">{name}</Text>
-              {options.length > 0 && <Text variant="small" tone="muted">{options.map(option => option.name[locale]).join(' · ')}</Text>}
-              {product && !product.available && <Text variant="small" tone="red">{copy(locale, 'Sold out', 'Byashize')}</Text>}
+              {options.length > 0 && <Text variant="small" tone="muted">{options.join(' · ')}</Text>}
+              {unavailable && <Text variant="small" tone="red">{unavailable === 'item'
+                ? copy(locale, 'Unavailable. Remove this item to continue.', 'Ntiboneka. Kuramo iri funguro kugira ngo ukomeze.')
+                : copy(locale, 'Some options are unavailable. Edit or remove this item.', 'Bimwe mu byo wahisemo ntibiboneka. Hindura iri funguro cyangwa urikuremo.')}</Text>}
             </View>
           </View>
           <View style={styles.itemBar}>
@@ -46,15 +65,15 @@ export default function CartScreen() {
               </Pressable>
               <Text variant="label" accessibilityLiveRegion="polite">{line.quantity}</Text>
               <Pressable accessibilityRole="button" accessibilityLabel={copy(locale, `Add one ${name}`, `Ongeramo imwe muri ${name}`)}
-                accessibilityState={{ disabled: line.quantity >= MAX_QUANTITY }}
-                disabled={line.quantity >= MAX_QUANTITY} style={[styles.quantityButton, line.quantity >= MAX_QUANTITY && styles.disabled]}
+                accessibilityState={{ disabled: addingDisabled }}
+                disabled={addingDisabled} style={[styles.quantityButton, addingDisabled && styles.disabled]}
                 onPress={() => changeQuantity(key, 1)}>
                 <Icon name="add" size={20} />
               </Pressable>
             </View>
             <Text variant="label">{money(line.unitPrice * line.quantity)}</Text>
           </View>
-          {product && (product.modifiers.length > 0 || line.modifierIds.length > 0) && <Pressable accessibilityRole="button" style={styles.edit} onPress={() =>
+          {product?.available && (product.modifiers.length > 0 || line.modifierIds.length > 0) && <Pressable accessibilityRole="button" style={styles.edit} onPress={() =>
             router.push({ pathname: '/product/[sku]', params: { sku: line.sku, line: key } })}>
             <Text variant="label" tone="green">{copy(locale, 'Edit options', 'Hindura ibyo wahisemo')}</Text>
           </Pressable>}

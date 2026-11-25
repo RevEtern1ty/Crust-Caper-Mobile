@@ -2,6 +2,7 @@ import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Platform, Pressable, StyleSheet, type Text as NativeText, TextInput, View } from 'react-native';
 
+import { reviewCheckoutCart } from '../src/checkout/cart-review';
 import { useCheckout, useRouteActionGuard } from '../src/checkout/context';
 import { normalizePhone } from '../src/checkout/contact';
 import type { CheckoutContact } from '../src/checkout/controller';
@@ -16,7 +17,7 @@ const demoPhoneLabel = '+250 700 000 000';
 
 export default function CheckoutScreen() {
   const { resume } = useLocalSearchParams<{ resume?: string }>();
-  const { api, mode, checkoutAllowed, locale, menu, cart, total, hydrated, draftSaving, draftStorageError, refreshing, refreshMenu } = useShop();
+  const { api, mode, checkoutAllowed, locale, menu, status, cart, total, hydrated, draftSaving, draftStorageError, refreshing, refreshMenu } = useShop();
   const { beginCheckout, resumeCheckout, journal, busy, restoreFailed } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const [selectedSlot, setSlot] = useState('');
@@ -26,7 +27,7 @@ export default function CheckoutScreen() {
   const [emailInvalid, setEmailInvalid] = useState(false);
   const [review, setReview] = useState<{ quote: Quote; cartKey: string; slotKey: string } | null>(null);
   const [requestingQuote, setRequestingQuote] = useState(false);
-  const [problem, setProblem] = useState<string | null>(null);
+  const [problem, setProblem] = useState<{ message: string; canEditCart: boolean } | null>(null);
   const checking = useRef(false);
   const phoneInput = useRef<TextInput>(null);
   const emailInput = useRef<TextInput>(null);
@@ -35,15 +36,19 @@ export default function CheckoutScreen() {
   const slotButtons = useRef(new Map<string, View>());
   const t = (en: string, rw: string) => copy(locale, en, rw);
 
-  const slot = menu?.slots.find((option) => option.id === selectedSlot && option.available);
+  const closed = status === 'ready' && menu?.store.open === false;
+  const availableSlots = closed ? [] : menu?.slots.filter((option) => option.available) ?? [];
+  const slot = availableSlots.find((option) => option.id === selectedSlot);
   const slotKey = slot ? JSON.stringify([slot.id, slot.startsAt, slot.endsAt]) : '';
   const cartKey = JSON.stringify(cart);
   const quote = review && review.cartKey === cartKey && review.slotKey === slotKey ? review.quote : null;
+  const quotedCart = quote ? reviewCheckoutCart(cart, quote) : null;
+  const requiresCartEdit = quotedCart?.requiresCartEdit ?? false;
+  const reviewedLines = quotedCart?.available ?? cart.map((current) => ({ current, previous: current }));
   const unfinished = journal?.active && journal.active.phase !== 'tracking';
   const demo = mode === 'demo';
   const restoringContact = !demo && journal?.active?.phase === 'creating' && resume === 'contact';
   const savedOrder = !!journal?.orderIds.length;
-  const availableSlots = menu?.slots.filter((option) => option.available) ?? [];
   const noAvailableSlots = availableSlots.length === 0;
   const controlsLocked = requestingQuote || busy;
   const reviewing = quote !== null;
@@ -115,7 +120,7 @@ export default function CheckoutScreen() {
 
   async function submit() {
     if (!checkoutAllowed || checking.current || busy || !journal || draftSaving || draftStorageError) return;
-    if (!restoringContact && (!menu || !slot || !cart.length)) return;
+    if (!restoringContact && (!menu || !slot || !cart.length || requiresCartEdit)) return;
     const contact = readContact();
     if (!contact) return;
 
@@ -135,7 +140,8 @@ export default function CheckoutScreen() {
         if (shouldNavigate()) setReview({ quote: result, cartKey, slotKey });
       }
     } catch (error) {
-      setProblem(checkoutError(error, locale));
+      const canEditCart = error instanceof ApiError && ['quote_changed', 'slot_unavailable'].includes(error.code);
+      setProblem({ message: checkoutError(error, locale), canEditCart });
       if (error instanceof ApiError && ['quote_expired', 'quote_changed', 'slot_unavailable', 'reservation_expired'].includes(error.code)) {
         setReview(null);
         if (error.code === 'slot_unavailable' || error.code === 'reservation_expired') setSlot('');
@@ -145,6 +151,10 @@ export default function CheckoutScreen() {
       checking.current = false;
       setRequestingQuote(false);
     }
+  }
+
+  function editCart() {
+    router.dismissTo('/cart');
   }
 
   const contactCard = (
@@ -215,7 +225,7 @@ export default function CheckoutScreen() {
     return (
       <Screen safeBottom bottom={(
         <View style={styles.stack}>
-          {problem && <Text tone="red" accessibilityRole="alert">{problem}</Text>}
+          {problem && <Text tone="red" accessibilityRole="alert">{problem.message}</Text>}
           <Button label={t('Resume checkout', 'Komeza kwishyura')} onPress={() => { void submit(); }}
             busy={busy} disabled={draftSaving || !!draftStorageError} />
         </View>
@@ -238,7 +248,7 @@ export default function CheckoutScreen() {
               ? t('An order is waiting to be restored.', 'Hari komande itegereje kongera gufungurwa.')
               : savedOrder ? t('Your latest order is in Orders.', 'Komande yawe ya nyuma iri muri Komande.')
                 : t('Your cart is empty.', 'Agatebo kawe karimo ubusa.')}</Text>
-          {problem && <Text tone="red" accessibilityRole="alert">{problem}</Text>}
+          {problem && <Text tone="red" accessibilityRole="alert">{problem.message}</Text>}
           <Button
             label={viewOrders ? t('Go to Orders', 'Jya muri Komande') : t('Browse menu', 'Reba ibiribwa')}
             onPress={() => router.replace(viewOrders ? '/(tabs)/orders' : '/(tabs)')}
@@ -251,20 +261,18 @@ export default function CheckoutScreen() {
   return (
     <Screen key={quote ? 'review' : 'details'} safeBottom bottom={(
       <View style={styles.stack}>
-        {problem && <Text tone="red" accessibilityRole="alert">{problem}</Text>}
-        <Button
-          label={quote
-            ? quote.lines.length
-              ? t(`Confirm ${money(quote.total)} & continue`, `Emeza ${money(quote.total)} ukomeze`)
-              : t('Edit cart', 'Hindura agatebo')
-            : t('Review order', 'Reba komande')}
-          onPress={() => {
-            if (quote && !quote.lines.length) router.replace('/cart');
-            else void submit();
-          }}
-          busy={controlsLocked}
-          disabled={!journal || !slot || draftSaving || !!draftStorageError}
-        />
+        {problem && !(closed && problem.canEditCart) && <Text tone="red" accessibilityRole="alert">{problem.message}</Text>}
+        {requiresCartEdit || closed ? (
+          <Button label={t('Edit cart', 'Hindura agatebo')} onPress={editCart} disabled={controlsLocked} />
+        ) : (
+          <>
+            <Button label={quote ? t(`Confirm ${money(quote.total)} & continue`, `Emeza ${money(quote.total)} ukomeze`)
+              : t('Review order', 'Reba komande')} onPress={() => { void submit(); }} busy={controlsLocked}
+              disabled={!journal || !slot || draftSaving || !!draftStorageError} />
+            {problem?.canEditCart && <Button label={t('Edit cart', 'Hindura agatebo')} variant="secondary"
+              onPress={editCart} disabled={controlsLocked} />}
+          </>
+        )}
       </View>
     )}>
       <View style={styles.stack}>
@@ -278,7 +286,7 @@ export default function CheckoutScreen() {
       <Card>
         <Text variant="heading" accessibilityRole="header">{t('Pickup time', 'Igihe cyo gufata')}</Text>
         <View accessibilityRole="radiogroup" accessibilityLabel={t('Pickup time', 'Igihe cyo gufata')} style={styles.slotGroup}>
-          {menu?.slots.map((option) => {
+          {!closed && menu?.slots.map((option) => {
             const checked = option.id === slot?.id;
             const disabled = !option.available || controlsLocked;
             const webKeyboard = Platform.OS === 'web' ? {
@@ -309,7 +317,9 @@ export default function CheckoutScreen() {
         </View>
         {noAvailableSlots && (
           <>
-            <Text tone="muted">{refreshing
+            <Text tone={closed ? 'red' : 'muted'} accessibilityRole={closed ? 'alert' : undefined}>{closed
+              ? t('Pickup orders are closed right now. You can still edit your cart.', 'Kwakira komande zo gufata byafunzwe ubu. Uracyashobora guhindura agatebo kawe.')
+              : refreshing
               ? t('Checking pickup times…', 'Turimo kugenzura ibihe byo gufata…')
               : t('No pickup times are available right now.', 'Nta gihe cyo gufata komande kiboneka ubu.')}</Text>
             <Button label={t('Refresh pickup times', 'Vugurura ibihe byo gufata')} variant="secondary" busy={refreshing} onPress={() => { void refreshMenu(); }} />
@@ -317,18 +327,33 @@ export default function CheckoutScreen() {
         )}
       </Card>
 
-      {contactCard}
+      {!closed && contactCard}
       </>}
 
       <Card>
         <Text variant="heading" accessibilityRole="header">{t('Order summary', 'Incamake ya komande')}</Text>
         {quote && reviewedSlot && <Text variant="small" tone="muted">{t('Pickup', 'Gufata komande')} · {slotLabel(reviewedSlot, locale)}</Text>}
-        {quote?.changes.map((change, index) => <Text key={index} tone="red">{changeLabel(change, locale, menu)}</Text>)}
-        {(quote?.lines ?? cart).map((line) => (
+        {quote?.changes.filter(({ kind }) => kind === 'slot').map((change, index) => <Text key={index} tone="red">{changeLabel(change, locale, menu)}</Text>)}
+        {requiresCartEdit && <Text tone="red" accessibilityRole="alert">
+          {t('Your cart cannot be filled as selected. Edit it to continue.', 'Ibyo wahisemo mu gatebo ntibiboneka uko biri. Hindura agatebo kugira ngo ukomeze.')}
+        </Text>}
+        {quotedCart?.removed.map((line) => (
+          <View key={`${line.sku}:${line.modifierIds.join(',')}`} style={styles.stack}>
+            <Text tone="red">{line.quantity} × {itemName(line.sku, locale, menu)} · {t('Unavailable', 'Ntiboneka')}</Text>
+            {line.modifierIds.length > 0 && <Text variant="small" tone="muted">{itemOptions(line, locale, menu)}</Text>}
+          </View>
+        ))}
+        {reviewedLines.map(({ current: line, previous }) => (
           <View key={`${line.sku}:${line.modifierIds.join(',')}`} style={styles.row}>
             <View style={styles.shrink}>
               <Text>{line.quantity} × {itemName(line.sku, locale, menu)}</Text>
               {line.modifierIds.length > 0 && <Text variant="small" tone="muted">{itemOptions(line, locale, menu)}</Text>}
+              {previous && previous.unitPrice !== line.unitPrice && <Text variant="small" tone="red">
+                {t('Price per item', 'Igiciro kuri kimwe')} · {money(previous.unitPrice)} → {money(line.unitPrice)}
+              </Text>}
+              {previous && previous.quantity !== line.quantity && <Text variant="small" tone="red">
+                {t('Quantity', 'Umubare')} · {previous.quantity} → {line.quantity}
+              </Text>}
             </View>
             <Text style={styles.amount}>{money(line.quantity * line.unitPrice)}</Text>
           </View>
@@ -345,13 +370,15 @@ export default function CheckoutScreen() {
           <Text variant="label" style={styles.shrink}>{quote ? t('Total', 'Igiteranyo') : t('Estimated total', 'Igiteranyo cy’agateganyo')}</Text>
           <Text variant="label" style={styles.amount}>{money(quote?.total ?? total)}</Text>
         </View>
-        {quote && <Button label={t('Edit pickup or contact', 'Hindura igihe cyangwa nimero')} variant="secondary"
+        {quote && !requiresCartEdit && <Button label={t('Edit pickup or contact', 'Hindura igihe cyangwa nimero')} variant="secondary"
           disabled={controlsLocked} onPress={() => { setReview(null); setProblem(null); }} />}
-        <Text variant="small" tone="muted">{quote
+        {quote && !requiresCartEdit && <Button label={t('Edit cart', 'Hindura agatebo')} variant="ghost"
+          disabled={controlsLocked} onPress={editCart} />}
+        {!requiresCartEdit && !closed && <Text variant="small" tone="muted">{quote
           ? demo
             ? t('Confirm the shown items, total and time to open demo payment.', 'Emeza ibyo ubonye, igiteranyo n’igihe kugira ngo wishyure mu igerageza.')
             : t('Confirm the items, total and pickup time to continue to payment.', 'Emeza ibiribwa, igiteranyo n’igihe cyo gufata komande kugira ngo wishyure.')
-          : t('We’ll confirm the items, price and time before payment.', 'Tuzemeza ibiribwa, igiciro n’igihe mbere yo kwishyura.')}</Text>
+          : t('We’ll confirm the items, price and time before payment.', 'Tuzemeza ibiribwa, igiciro n’igihe mbere yo kwishyura.')}</Text>}
       </Card>
     </Screen>
   );

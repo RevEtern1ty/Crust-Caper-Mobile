@@ -285,6 +285,7 @@ test('payment review displays a verified refund only after the API confirms it',
     if (path.endsWith('/sessions/current')) return route.fulfill({ status: 204, body: '' });
     if (path.endsWith('/orders')) return route.fulfill({ json: { orders: [] } });
     if (path.endsWith('/receipts')) return route.fulfill({ json: [] });
+    if (path.endsWith('/availability')) return route.fulfill({ json: { version: 'finance-fixture', open: true, products: [] } });
     if (path.endsWith('/payment-exceptions')) {
       return route.fulfill({ json: { exceptions: [recorded ? { ...payment, refund } : payment] } });
     }
@@ -320,5 +321,101 @@ test('payment review displays a verified refund only after the API confirms it',
   await button(page, 'Sign out').click();
   await shown(page, 'Staff sign in');
   assert.equal(await page.getByText(/^Refund verified/).count(), 0);
+  assert.deepEqual(errors, []);
+});
+
+test('manager stop list and pause apply to new orders and preserve the paid kitchen queue', { timeout: 50_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const staff = await operator('demo-manager');
+  const kitchen = await operator('demo-kitchen');
+  const availabilityPath = '/operator/availability';
+  assert.equal((await send(availabilityPath, { token: kitchen })).status, 403);
+  const original = await send(availabilityPath, { token: staff }).then(response => response.json());
+  const initialItem = original.products.find(item => item.name.en === 'Double Smash');
+  assert.ok(original.open && initialItem?.available, 'Integration restaurant must start open with Double Smash available');
+
+  const snapshot = () => send(availabilityPath, { token: staff }).then(response => response.json());
+  const change = (version, update) => send(availabilityPath, { method: 'PATCH', token: staff,
+    data: { expectedVersion: version, ...update } });
+  t.after(async () => {
+    let current = await snapshot();
+    if (current.open !== original.open) {
+      const restored = await change(current.version, { open: original.open });
+      assert.ok(restored.ok, 'Restore the integration store after this test');
+      current = await restored.json();
+    }
+    if (current.products.find(item => item.sku === initialItem.sku)?.available !== initialItem.available) {
+      const restored = await change(current.version, { sku: initialItem.sku, available: initialItem.available });
+      assert.ok(restored.ok, 'Restore the integration product after this test');
+    }
+  });
+
+  const menuUrl = '/stores/kigali/menu';
+  const menu = await send(menuUrl).then(response => response.json());
+  const slotId = menu.slots.filter(slot => slot.available).at(4).id;
+  const product = menu.products.find(item => item.sku === initialItem.sku);
+  const purchase = { storeId: 'kigali', slotId, lines: [{ sku: initialItem.sku, modifierIds: [], quantity: 1, unitPrice: product.price }] };
+  const { accessToken } = await send('/guest-sessions', { method: 'POST' }).then(response => response.json());
+  const quote = () => send('/quotes', { token: accessToken, method: 'POST', data: purchase });
+  const create = (quoteId) => send('/orders', { token: accessToken, method: 'POST', key: randomUUID(), data: { quoteId, ...contact } });
+  const { quoteId } = await quote().then(response => response.json());
+  const placed = await create(quoteId).then(response => response.json());
+  const payment = await send(`/orders/${placed.id}/payments`, { token: accessToken, method: 'POST', key: randomUUID() })
+    .then(response => response.json());
+  const settled = await send(`/local/orders/${placed.id}/payments/${payment.id}/result`, {
+    token: accessToken, method: 'POST', data: { status: 'paid' },
+  });
+  assert.ok(settled.ok);
+  const staleQuote = await quote().then(response => response.json());
+
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-manager');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(page, 'Sign in').click();
+  await button(page, 'Menu availability').click();
+  await button(page, 'Put on stop list: Double Smash').click();
+  await shown(page, 'Double Smash is on the stop list.');
+  const stoppedMenu = await send(menuUrl).then(response => response.json());
+  assert.notEqual(stoppedMenu.version, menu.version);
+  assert.equal(stoppedMenu.products.find(item => item.sku === initialItem.sku).available, false);
+  const rejected = await create(staleQuote.quoteId);
+  assert.equal(rejected.status, 409);
+  assert.equal((await rejected.json()).code, 'quote_changed');
+
+  const current = await snapshot();
+  const paused = await change(current.version, { open: false });
+  assert.ok(paused.ok, 'A second manager may pause new orders');
+  await button(page, 'Pause new orders').click();
+  await shown(page, 'Availability changed. Refresh the menu and review it before trying again.');
+  assert.ok(await button(page, 'Pause new orders').isDisabled());
+  await button(page, 'Refresh availability').click();
+  await shown(page, 'New orders paused');
+  const closedQuote = await quote();
+  assert.equal(closedQuote.status, 409);
+  assert.equal((await closedQuote.json()).code, 'slot_unavailable');
+  const queue = await send('/operator/orders', { token: kitchen }).then(response => response.json());
+  assert.ok(queue.orders.some(order => order.id === placed.id && order.status === 'accepted' && order.paymentStatus === 'paid'));
+  for (const width of [320, 390, 430]) {
+    await page.setViewportSize({ width, height: 844 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+    await shown(page, 'New orders paused');
+  }
+  await page.setViewportSize({ width: 320, height: 844 });
+  await page.getByRole('heading', { name: 'Menu availability' }).scrollIntoViewIfNeeded();
+  await capture(page, 'operator-menu-availability');
+
+  await button(page, 'Accept new orders').click();
+  await shown(page, 'The restaurant is accepting new orders.');
+  await button(page, 'Resume item: Double Smash').click();
+  await shown(page, 'Double Smash is available.');
+  const reopened = await send(menuUrl).then(response => response.json());
+  assert.equal(reopened.store.open, true);
+  assert.equal(reopened.products.find(item => item.sku === initialItem.sku).available, true);
   assert.deepEqual(errors, []);
 });

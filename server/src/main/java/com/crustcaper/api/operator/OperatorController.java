@@ -7,15 +7,18 @@ import com.crustcaper.api.operator.OperatorModels.Queue;
 import com.crustcaper.api.operator.OperatorModels.Session;
 import com.crustcaper.api.operator.OperatorModels.StatusInput;
 import com.crustcaper.api.operator.OperatorReceipts.ReceiptOrder;
+import com.crustcaper.api.operator.OperatorCatalogAvailability.Snapshot;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.List;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -29,11 +32,14 @@ final class OperatorController {
     private final OperatorSessions sessions;
     private final OperatorOrders orders;
     private final OperatorReceipts receipts;
+    private final OperatorCatalogAvailability availability;
 
-    OperatorController(OperatorSessions sessions, OperatorOrders orders, OperatorReceipts receipts) {
+    OperatorController(OperatorSessions sessions, OperatorOrders orders, OperatorReceipts receipts,
+                       OperatorCatalogAvailability availability) {
         this.sessions = sessions;
         this.orders = orders;
         this.receipts = receipts;
+        this.availability = availability;
     }
 
     @PostMapping("/sessions")
@@ -56,6 +62,19 @@ final class OperatorController {
     ResponseEntity<PaymentReview> paymentReview(
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.paymentReview(authorization));
+    }
+
+    @GetMapping("/availability")
+    ResponseEntity<Snapshot> availability(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(availability.get(authorization));
+    }
+
+    @PatchMapping(value = "/availability", consumes = MediaType.APPLICATION_JSON_VALUE)
+    ResponseEntity<Snapshot> changeAvailability(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+            HttpServletRequest request) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(availability.change(authorization, request));
     }
 
     @GetMapping("/receipts")
