@@ -11,6 +11,8 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 import jakarta.servlet.ServletInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -19,6 +21,12 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.encryption.AccessPermission;
+import org.apache.pdfbox.pdmodel.encryption.StandardProtectionPolicy;
+import org.apache.pdfbox.pdfwriter.compress.CompressParameters;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -47,7 +55,8 @@ class FiscalReceiptIntegrationTest {
     private static final String REF = "X-Receipt-Reference";
     private static final String TOTAL = "X-Receipt-Total-RWF";
     private static final String KEY = "Idempotency-Key";
-    private static final byte[] PDF = "%PDF-1.7\nSynthetic marker fixture\n%%EOF\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] PDF = pdf("Synthetic receipt", CompressParameters.NO_COMPRESSION);
+    private static final byte[] MARKER_ONLY = "%PDF-1.7\nNot a PDF page tree\n%%EOF\n".getBytes(StandardCharsets.US_ASCII);
 
     @Autowired MockMvc api;
     @Autowired JdbcClient jdbc;
@@ -229,7 +238,7 @@ class FiscalReceiptIntegrationTest {
         upload(another.bearer(), first.id(), "EbM-abc/007", "9200", PDF).andExpect(status().isOk());
         upload(another.bearer(), first.id(), "EbM-abc/007", "9201", PDF).andExpect(status().isConflict())
             .andExpect(jsonPath("$.code").value("receipt_total_mismatch"));
-        byte[] replacement = "%PDF-1.4\nDifferent synthetic file\n%%EOF\n".getBytes(StandardCharsets.US_ASCII);
+        byte[] replacement = pdf("Different synthetic receipt", CompressParameters.NO_COMPRESSION);
         upload(another.bearer(), first.id(), "EbM-abc/007", "9200", replacement).andExpect(status().isConflict())
             .andExpect(jsonPath("$.code").value("receipt_already_issued"));
         upload(another.bearer(), second.id(), "EBM-ABC/007", "9200", PDF).andExpect(status().isConflict())
@@ -297,7 +306,8 @@ class FiscalReceiptIntegrationTest {
             .andExpect(status().isUnsupportedMediaType()).andExpect(jsonPath("$.code").value("unsupported_media_type"));
         upload(manager.bearer(), order.id(), "../unsafe", "9200", PDF).andExpect(status().isBadRequest());
         upload(manager.bearer(), order.id(), "RECEIPT-7", "9200",
-            "%PDF-1.7\nTruncated".getBytes(StandardCharsets.US_ASCII)).andExpect(status().isBadRequest());
+            "%PDF-1.7\nTruncated".getBytes(StandardCharsets.US_ASCII)).andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.code").value("invalid_receipt_pdf"));
         upload(manager.bearer(), order.id(), "RECEIPT-7", "9200", new byte[ReceiptPdf.LIMIT + 1])
             .andExpect(status().is(413)).andExpect(jsonPath("$.code").value("receipt_too_large"));
 
@@ -315,6 +325,74 @@ class FiscalReceiptIntegrationTest {
             .param(order.id()).query(String.class).single()).isEqualTo("pending");
         assertThat(jdbc.sql("SELECT count(*) FROM fiscal_receipts WHERE order_id = ?")
             .param(order.id()).query(Long.class).single()).isZero();
+    }
+
+    @Test
+    void rejectsAMarkerOnlyReceiptBeforeAnImmutableIssue() throws Exception {
+        Manager manager = staff(store, "manager");
+        Order order = order(store, true);
+        upload(manager.bearer(), order.id(), "EBM-PDF", "9200", MARKER_ONLY)
+            .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("invalid_receipt_pdf"));
+        assertThat(jdbc.sql("SELECT receipt_status FROM orders WHERE id = ?")
+            .param(order.id()).query(String.class).single()).isEqualTo("pending");
+        assertThat(jdbc.sql("SELECT count(*) FROM fiscal_receipts WHERE order_id = ?")
+            .param(order.id()).query(Long.class).single()).isZero();
+
+        upload(manager.bearer(), order.id(), "EBM-PDF", "9200", PDF).andExpect(status().isOk());
+        api.perform(get(receiptPath(order.id())).header(HttpHeaders.AUTHORIZATION, order.owner().bearer()))
+            .andExpect(status().isOk()).andExpect(content().bytes(PDF));
+    }
+
+    @Test
+    void rejectsMissingPagesAndEncryptionAndPreservesAReceiptWithAnXrefStream() throws Exception {
+        Manager manager = staff(store, "manager");
+        Order order = order(store, true);
+        try (var empty = new PDDocument(); var encrypted = new PDDocument()) {
+            encrypted.addPage(new PDPage(PDRectangle.A6));
+            encrypted.protect(new StandardProtectionPolicy("synthetic-owner", "", new AccessPermission()));
+            for (byte[] file : List.of(savePdf(empty, CompressParameters.NO_COMPRESSION),
+                savePdf(encrypted, CompressParameters.NO_COMPRESSION))) {
+                upload(manager.bearer(), order.id(), "EBM-STREAM", "9200", file).andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.code").value("invalid_receipt_pdf"));
+            }
+        }
+        byte[] compressed = pdf("Compressed synthetic receipt", CompressParameters.DEFAULT_COMPRESSION);
+        assertThat(new String(compressed, StandardCharsets.ISO_8859_1)).contains("/Type /XRef");
+        upload(manager.bearer(), order.id(), "EBM-STREAM", "9200", compressed).andExpect(status().isOk());
+        api.perform(get(receiptPath(order.id())).header(HttpHeaders.AUTHORIZATION, order.owner().bearer()))
+            .andExpect(status().isOk()).andExpect(content().bytes(compressed));
+    }
+
+    @Test
+    void preservesIdenticalRetriesOfReceiptsIssuedByThePreviousRelease() throws Exception {
+        Manager manager = staff(store, "manager");
+        Order order = order(store, true);
+        jdbc.sql("""
+            INSERT INTO fiscal_receipts(order_id, store_id, reference, total_rwf, document, attached_by)
+            VALUES (?, ?, 'EBM-LEGACY', 9200, ?, ?)
+            """).params(order.id(), store, MARKER_ONLY, manager.id()).update();
+        jdbc.sql("UPDATE orders SET receipt_status = 'issued', receipt_url = ? WHERE id = ?")
+            .params(receiptPath(order.id()), order.id()).update();
+
+        upload(manager.bearer(), order.id(), "EBM-LEGACY", "9200", MARKER_ONLY).andExpect(status().isOk());
+        api.perform(get(receiptPath(order.id())).header(HttpHeaders.AUTHORIZATION, order.owner().bearer()))
+            .andExpect(status().isOk()).andExpect(content().bytes(MARKER_ONLY));
+    }
+
+    private static byte[] pdf(String title, CompressParameters compression) {
+        try (var document = new PDDocument()) {
+            document.addPage(new PDPage(PDRectangle.A6));
+            document.getDocumentInformation().setTitle(title);
+            return savePdf(document, compression);
+        } catch (IOException failure) {
+            throw new AssertionError("Could not generate the synthetic PDF", failure);
+        }
+    }
+
+    private static byte[] savePdf(PDDocument document, CompressParameters compression) throws IOException {
+        var bytes = new ByteArrayOutputStream();
+        document.save(bytes, compression);
+        return bytes.toByteArray();
     }
 
     private String store() {

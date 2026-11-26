@@ -3,6 +3,14 @@ package com.crustcaper.api.operator;
 import jakarta.servlet.http.HttpServletRequest;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.stream.IntStream;
+import org.apache.pdfbox.cos.COSArray;
+import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.cos.COSNumber;
+import org.apache.pdfbox.io.RandomAccessReadBuffer;
+import org.apache.pdfbox.pdfparser.PDFParser;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPageTree;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -28,8 +36,36 @@ final class ReceiptPdf {
             throw OperatorFailure.invalid();
         }
         if (body.length > LIMIT) throw tooLarge();
-        if ((declared >= 0 && body.length != declared) || !hasPdfMarkers(body)) throw OperatorFailure.invalid();
+        if (declared >= 0 && body.length != declared) throw OperatorFailure.invalid();
+        if (!hasPdfMarkers(body)) throw invalidPdf();
         return body;
+    }
+
+    static boolean usable(byte[] body) {
+        try (var source = new RandomAccessReadBuffer(body);
+             var document = new PDFParser(source).parse(false)) {
+            return !document.isEncrypted() && hasUsablePage(document);
+        } catch (IOException | RuntimeException | StackOverflowError ignored) {
+            // Parser errors can include details from the uploaded file.
+            return false;
+        }
+    }
+
+    private static boolean hasUsablePage(PDDocument document) {
+        var catalog = document.getDocumentCatalog().getCOSObject();
+        var tree = catalog.getCOSDictionary(COSName.PAGES);
+        if (!COSName.CATALOG.equals(catalog.getCOSName(COSName.TYPE))
+            || tree == null || !COSName.PAGES.equals(tree.getCOSName(COSName.TYPE))) return false;
+        for (var page : document.getPages()) {
+            if (PDPageTree.getInheritableAttribute(page.getCOSObject(), COSName.MEDIA_BOX) instanceof COSArray box
+                && box.size() == 4 && IntStream.range(0, 4).allMatch(index -> box.getObject(index) instanceof COSNumber)) {
+                var dimensions = page.getMediaBox();
+                float width = dimensions.getWidth();
+                float height = dimensions.getHeight();
+                if (Float.isFinite(width) && width > 0 && Float.isFinite(height) && height > 0) return true;
+            }
+        }
+        return false;
     }
 
     private static boolean pdfContentType(String raw) {
@@ -68,5 +104,9 @@ final class ReceiptPdf {
 
     private static OperatorFailure tooLarge() {
         return new OperatorFailure(HttpStatus.CONTENT_TOO_LARGE, "receipt_too_large");
+    }
+
+    static OperatorFailure invalidPdf() {
+        return new OperatorFailure(HttpStatus.BAD_REQUEST, "invalid_receipt_pdf");
     }
 }

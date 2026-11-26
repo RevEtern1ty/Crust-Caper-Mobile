@@ -70,15 +70,17 @@ final class OperatorReceipts {
     ReceiptOrder attach(String authorization, String id, String reference, String total, byte[] document) {
         UUID orderId = orderId(id);
         Metadata metadata = metadata(reference, total);
+        boolean usable = ReceiptPdf.usable(document);
         return Objects.requireNonNull(transactions.execute(tx -> {
             Principal actor = manager(authorization, true);
             UploadableOrder order = uploadable(actor.storeId(), orderId, true);
             verifyTotal(order, metadata);
-            return attachLocked(actor, order, metadata, document);
+            return attachLocked(actor, order, metadata, document, usable);
         }));
     }
 
-    private ReceiptOrder attachLocked(Principal actor, UploadableOrder order, Metadata metadata, byte[] document) {
+    private ReceiptOrder attachLocked(Principal actor, UploadableOrder order, Metadata metadata, byte[] document,
+                                      boolean usable) {
         UUID orderId = order.view().orderId();
         Attached existing = jdbc.sql("""
             SELECT reference, total_rwf, document = ? AS matches_document FROM fiscal_receipts WHERE order_id = ?
@@ -90,6 +92,8 @@ final class OperatorReceipts {
         if (existing != null || !order.view().receiptStatus().equals("pending") || order.receiptUrl() != null) {
             throw OperatorFailure.conflict("receipt_already_issued");
         }
+        // Keep identical retries for previously issued bytes and validate every new attachment.
+        if (!usable) throw ReceiptPdf.invalidPdf();
         int inserted = jdbc.sql("""
             INSERT INTO fiscal_receipts (order_id, store_id, reference, total_rwf, document, attached_by)
             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
