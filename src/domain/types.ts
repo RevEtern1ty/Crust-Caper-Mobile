@@ -127,6 +127,11 @@ export type QuoteInput = { storeId: string; slotId: string; lines: CartLine[] }
 export type OrderInput = { quoteId: string; phone: string; email?: string }
 export type ReorderResult = { lines: CartLine[]; changes: QuoteChange[] }
 export type OrderAccessRequest = { orderCode: string; phone: string }
+export type PendingCheckoutIntent = { quoteId: string; key: string }
+export type PendingCheckoutRecovery =
+  | { state: 'waiting'; retryAt: string }
+  | { state: 'not_placed' }
+  | { state: 'verify'; challengeId: string }
 
 export type ApiErrorCode =
   | 'invalid_input'
@@ -168,6 +173,8 @@ export interface ShopApi {
   reorder(orderId: string): Promise<ReorderResult>
   requestOrderAccess?(input: OrderAccessRequest): Promise<{ challengeId: string }>
   verifyOrderAccess?(challengeId: string, code: string): Promise<{ orderId: string }>
+  requestPendingCheckoutRecovery?(intent: PendingCheckoutIntent, phone: string): Promise<PendingCheckoutRecovery>
+  verifyPendingCheckoutRecovery?(intent: PendingCheckoutIntent, challengeId: string, code: string): Promise<Order>
   pickupAlerts?: {
     get(orderId: string): Promise<PickupAlertStatus>
     enable(orderId: string, token: string, locale: Locale): Promise<PickupAlertStatus>

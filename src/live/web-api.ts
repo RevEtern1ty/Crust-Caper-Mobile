@@ -1,11 +1,11 @@
 import { z } from 'zod';
 import { hasSavedCheckout, parseJournal } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
-import { ApiError, type Order, type PaymentAttempt, type Storage } from '../domain/types';
+import { ApiError, type Order, type PaymentAttempt, type PendingCheckoutIntent, type Storage } from '../domain/types';
 import { errorCode, invalidResponse, safeHttps, type ConnectedConfig, type LiveShopApi } from './http-api';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import {
-  menuResponse, orderAccessChallenge, orderAccessGrant, paymentResponse, quoteResponse, reorderResponse,
+  menuResponse, orderAccessChallenge, orderAccessGrant, paymentResponse, pendingCheckoutRecovery, quoteResponse, reorderResponse,
   webOrderResponse, webSessionResponse,
 } from './wire';
 
@@ -37,6 +37,13 @@ type Request<T> = {
 const contextId = z.string().refine(value => paymentReturnOrderId(value) !== null);
 const verifiedContext = z.object({ sessionId: contextId, orderIds: z.array(contextId).max(10), owned: z.boolean() });
 const quotedContext = z.object({ quoteId: z.string(), sessionId: contextId });
+const checkoutRecoveryContext = z.object({ quoteId: z.string(), key: z.string(), sessionId: contextId, owned: z.boolean() });
+const storedCheckoutRecovery = z.discriminatedUnion('state', [
+  checkoutRecoveryContext.extend({ state: z.literal('pending') }),
+  checkoutRecoveryContext.extend({ state: z.literal('not_placed') }),
+  checkoutRecoveryContext.extend({ state: z.literal('verify'), challengeId: contextId }),
+  checkoutRecoveryContext.extend({ state: z.literal('confirmed'), challengeId: contextId, orderId: contextId }),
+]);
 const sessionPath = '/web/session';
 const cookieLock = 'crustcaper-web-session-v1';
 
@@ -53,6 +60,7 @@ export function createWebLiveApi({
   const contextKey = journalKey + '.context';
   const quoteKey = journalKey + '.quote';
   const recoveryKey = journalKey + '.verified';
+  const checkoutRecoveryKey = journalKey + '.pending-recovery';
   const endKey = journalKey + '.end-cookie';
   const hosts = new Set(config.pspHosts);
   const orderPath = (id: string) => {
@@ -83,13 +91,23 @@ export function createWebLiveApi({
     return raw;
   }
 
-  async function savedRecovery() {
-    const raw = await read(recoveryKey);
+  async function readRecord<T>(key: string, schema: z.ZodType<T>): Promise<T | null> {
+    const raw = await read(key);
     if (raw === null) return null;
     try {
-      return verifiedContext.parse(JSON.parse(raw));
+      return schema.parse(JSON.parse(raw));
     } catch {
       throw new ApiError('storage_unavailable');
+    }
+  }
+
+  const savedRecovery = () => readRecord(recoveryKey, verifiedContext);
+  const savedCheckoutRecovery = () => readRecord(checkoutRecoveryKey, storedCheckoutRecovery);
+
+  async function requirePendingIntent({ quoteId, key }: PendingCheckoutIntent) {
+    const { active } = parseJournal(await read(journalKey));
+    if (active?.phase !== 'creating' || active.quoteId !== quoteId || active.key !== key) {
+      throw new ApiError('unauthenticated');
     }
   }
 
@@ -174,7 +192,19 @@ export function createWebLiveApi({
   function forQuote() {
     return withCookieLock(async () => {
       const saved = await savedContext();
-      if (hasSavedCheckout(await read(journalKey))) {
+      const journal = await read(journalKey);
+      if (hasSavedCheckout(journal)) {
+        const recovered = await savedCheckoutRecovery();
+        if (recovered && recovered.sessionId !== saved) {
+          const { active } = parseJournal(journal);
+          // A fresh checkout can follow a resolved intent even if earlier order IDs remain in the journal.
+          const resolved = (active === null && recovered.state === 'not_placed')
+            || (active?.phase === 'tracking' && recovered.state === 'confirmed' && active.orderId === recovered.orderId);
+          if (resolved && await currentCookieContext() === recovered.sessionId && await read(journalKey) === journal) {
+            await save(contextKey, recovered.sessionId);
+            return recovered.sessionId;
+          }
+        }
         if (saved) return saved;
         throw new ApiError('unauthenticated');
       }
@@ -200,27 +230,45 @@ export function createWebLiveApi({
 
   async function contextForQuote(quoteId: string) {
     const sessionId = await savedContext();
-    const raw = await read(quoteKey);
-    let binding: z.infer<typeof quotedContext> | null;
-    try {
-      binding = raw === null ? null : quotedContext.parse(JSON.parse(raw));
-    } catch {
-      throw new ApiError('storage_unavailable');
-    }
+    const binding = await readRecord(quoteKey, quotedContext);
     if (!sessionId || binding?.quoteId !== quoteId || binding.sessionId !== sessionId) throw new ApiError('unauthenticated');
     return sessionId;
+  }
+
+  async function checkoutOrderCall<T>(id: string, options: Request<T>): Promise<T> {
+    try {
+      return await primaryCall(options);
+    } catch (error) {
+      if (!(error instanceof ApiError && ['unauthenticated', 'not_found'].includes(error.code))) throw error;
+      const recovered = await savedCheckoutRecovery();
+      if (recovered?.state !== 'confirmed' || recovered.orderId !== id) throw error;
+      return privateCall(options, recovered.sessionId);
+    }
   }
 
   function readOrder<T>(id: string, options: Request<T>) {
     return withWork(async () => {
       try {
-        return { payload: await primaryCall(options), alternateContext: false };
+        return { payload: await checkoutOrderCall(id, options), alternateContext: false };
       } catch (error) {
         if (!(error instanceof ApiError && ['unauthenticated', 'not_found'].includes(error.code))) throw error;
         const recovered = await savedRecovery();
         if (!recovered?.orderIds.includes(id)) throw error;
         return { payload: await privateCall(options, recovered.sessionId), alternateContext: true };
       }
+    });
+  }
+
+  function pendingRecoveryContext(intent: PendingCheckoutIntent) {
+    return withCookieLock(async () => {
+      await requirePendingIntent(intent);
+      const earlier = await savedCheckoutRecovery();
+      const current = await currentCookieContext();
+      const sessionId = current ?? await bootstrapCookie();
+      const owned = !current || (earlier?.sessionId === sessionId && earlier.owned);
+      const scope = { quoteId: intent.quoteId, key: intent.key, sessionId, owned };
+      if (!current) await save(checkoutRecoveryKey, JSON.stringify({ ...scope, state: 'pending' }));
+      return scope;
     });
   }
 
@@ -252,13 +300,15 @@ export function createWebLiveApi({
           const saved = await savedContext();
           const recovered = await savedRecovery();
           const owned = recovered?.owned ? recovered.sessionId : null;
-          const current = saved || owned ? await currentCookieContext() : null;
+          const checkoutRecovery = await savedCheckoutRecovery();
+          const checkoutOwned = checkoutRecovery?.owned ? checkoutRecovery.sessionId : null;
+          const current = saved || owned || checkoutOwned ? await currentCookieContext() : null;
           // The alternate cookie may already have belonged to another tab when recovery started.
-          if (current && (current === saved || current === owned)) {
+          if (current && (current === saved || current === owned || current === checkoutOwned)) {
             await request({ path: sessionPath, method: 'DELETE', schema: z.null() }, true, current);
           }
           challenge = null;
-          for (const key of [journalKey, quoteKey, recoveryKey, contextKey, endKey]) {
+          for (const key of [journalKey, quoteKey, recoveryKey, checkoutRecoveryKey, contextKey, endKey]) {
             await storageCall(() => storage.removeItem(key));
           }
         });
@@ -319,7 +369,7 @@ export function createWebLiveApi({
       });
     },
     startPayment(orderId, key) {
-      return withWork(async () => checkedPayment(await primaryCall({
+      return withWork(async () => checkedPayment(await checkoutOrderCall(orderId, {
         path: orderPath(orderId) + '/payments', method: 'POST', schema: paymentResponse, key,
       })));
     },
@@ -332,7 +382,39 @@ export function createWebLiveApi({
       return result.payload;
     },
     reorder(orderId) {
-      return withWork(() => primaryCall({ path: orderPath(orderId) + '/reorder', method: 'POST', schema: reorderResponse }));
+      return withWork(() => checkoutOrderCall(orderId, {
+        path: orderPath(orderId) + '/reorder', method: 'POST', schema: reorderResponse,
+      }));
+    },
+    requestPendingCheckoutRecovery(intent, phone) {
+      return withWork(async () => {
+        const scope = await pendingRecoveryContext(intent);
+        const response = await privateCall({
+          path: '/checkout-recovery', method: 'POST', schema: pendingCheckoutRecovery,
+          body: { quoteId: scope.quoteId, key: scope.key, phone },
+        }, scope.sessionId);
+        await requirePendingIntent(intent);
+        if (response.state !== 'waiting') await save(checkoutRecoveryKey, JSON.stringify({ ...scope, ...response }));
+        return response;
+      });
+    },
+    verifyPendingCheckoutRecovery(intent, challengeId, code) {
+      return withWork(async () => {
+        await requirePendingIntent(intent);
+        const scope = await savedCheckoutRecovery();
+        if ((scope?.state !== 'verify' && scope?.state !== 'confirmed') || scope.challengeId !== challengeId
+          || scope.quoteId !== intent.quoteId || scope.key !== intent.key) throw new ApiError('unauthenticated');
+        const grant = await privateCall({
+          path: '/order-access/challenges/' + encodeURIComponent(challengeId) + '/verify',
+          method: 'POST', schema: orderAccessGrant, body: { code },
+        }, scope.sessionId);
+        const payload = await privateCall({ path: orderPath(grant.orderId), schema: webOrderResponse }, scope.sessionId);
+        const order = checkedOrder(payload, grant.orderId);
+        if (order.recoveryReadOnly || (scope.state === 'confirmed' && scope.orderId !== order.id)) invalidResponse();
+        await requirePendingIntent(intent);
+        await save(checkoutRecoveryKey, JSON.stringify({ ...scope, state: 'confirmed', orderId: order.id }));
+        return order;
+      });
     },
     requestOrderAccess(input) {
       return withWork(async () => {

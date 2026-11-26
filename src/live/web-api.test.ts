@@ -31,6 +31,11 @@ const order = {
 const pendingJournal = JSON.stringify({
   version: 1, active: { phase: 'paying', orderId, key: 'pay-key' }, orderIds: [orderId],
 });
+const checkoutIntent = { quoteId: 'quote-1', key: 'create-key' };
+const pendingCreation = {
+  version: 1, active: { phase: 'creating', ...checkoutIntent, cartFingerprint: 'hash' }, orderIds: [unknownOrderId],
+};
+const phone = '+250780000001';
 
 function memory(entries: [string, string][] = []) {
   const saved = new Map(entries);
@@ -240,4 +245,77 @@ test('phone recovery can create a separate read context for an expired pending c
   await api.endGuestSession();
   assert.equal(saved.size, 0);
   assert.equal(transport.calls.find(call => call.method === 'DELETE')?.context, first);
+});
+
+test('Web checkout verification persists an exact order grant and never replays creation under the replacement cookie', async () => {
+  const { storage, saved } = memory([
+    [journalKey + '.context', first], [journalKey + '.quote', JSON.stringify({ quoteId: checkoutIntent.quoteId, sessionId: first })],
+    [journalKey, JSON.stringify(pendingCreation)],
+  ]);
+  let loseRequestResponse = true;
+  let loseVerifyResponse = true;
+  const transport = fixture(second, ({ path, body }) => {
+    if (path === '/web/checkout-recovery') {
+      assert.deepEqual(body, { ...checkoutIntent, phone });
+      if (loseRequestResponse) {
+        loseRequestResponse = false;
+        throw new TypeError('Committed recovery request response was lost');
+      }
+      return Response.json({ state: 'verify', challengeId });
+    }
+    if (path === '/web/order-access/challenges/' + challengeId + '/verify') {
+      assert.deepEqual(body, { code: '010101' });
+      if (loseVerifyResponse) {
+        loseVerifyResponse = false;
+        throw new TypeError('Committed verification response was lost');
+      }
+      return Response.json({ orderId });
+    }
+    if (path === '/web/orders/' + orderId) return Response.json(order);
+    if (path === '/web/orders/' + orderId + '/payments') return Response.json(attempt);
+    return new Response(null, { status: 404 });
+  });
+  const restart = () => createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+  await assert.rejects(restart().requestPendingCheckoutRecovery!(checkoutIntent, phone), { code: 'network_unavailable' });
+  assert.deepEqual(await restart().requestPendingCheckoutRecovery!(checkoutIntent, phone), { state: 'verify', challengeId });
+  assert.equal(saved.get(journalKey + '.context'), first);
+  await assert.rejects(restart().verifyPendingCheckoutRecovery!(checkoutIntent, unknownOrderId, '010101'), { code: 'unauthenticated' });
+  await assert.rejects(restart().verifyPendingCheckoutRecovery!(checkoutIntent, challengeId, '010101'), { code: 'network_unavailable' });
+  assert.equal((await restart().verifyPendingCheckoutRecovery!(checkoutIntent, challengeId, '010101')).id, orderId);
+  assert.deepEqual(await restart().getOrder(orderId).then(order => order.paymentAttempt?.checkoutUrl), attempt.checkoutUrl);
+  assert.deepEqual(await restart().startPayment(orderId, 'payment-key'), attempt);
+  await assert.rejects(restart().getOrder(unknownOrderId), { code: 'unauthenticated' });
+  await assert.rejects(restart().createOrder({ quoteId: checkoutIntent.quoteId, phone }, checkoutIntent.key), { code: 'unauthenticated' });
+  assert.equal(transport.calls.some(call => call.path === '/web/orders' && call.context === second), false);
+  assert.equal(transport.calls.some(call => call.path.includes(unknownOrderId) && call.context === second), false);
+  assert.equal([...saved.values()].some(item => item.includes(phone) || item.includes('"010101"')), false);
+});
+
+test('only a definitive unplaced proof allows a new quote after clearing an intent with history', async () => {
+  const { storage, saved } = memory([
+    [journalKey + '.context', first], [journalKey + '.quote', JSON.stringify({ quoteId: checkoutIntent.quoteId, sessionId: first })],
+    [journalKey, JSON.stringify(pendingCreation)],
+  ]);
+  let state = 'waiting';
+  const transport = fixture(second, ({ path }) => {
+    assert.equal(path, '/web/checkout-recovery');
+    return state === 'forbidden' ? new Response(null, { status: 403 })
+      : Response.json(state === 'waiting' ? { state, retryAt: expiresAt } : { state });
+  });
+  const api = createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+  assert.deepEqual(await api.requestPendingCheckoutRecovery!(checkoutIntent, phone), { state: 'waiting', retryAt: expiresAt });
+  await assert.rejects(api.createQuote(quoteInput), { code: 'unauthenticated' });
+  state = 'forbidden';
+  await assert.rejects(api.requestPendingCheckoutRecovery!(checkoutIntent, phone));
+  assert.equal(saved.get(journalKey + '.pending-recovery'), undefined);
+  assert.deepEqual(JSON.parse(saved.get(journalKey)!), pendingCreation);
+  state = 'not_placed';
+  assert.deepEqual(await api.requestPendingCheckoutRecovery!(checkoutIntent, phone), { state: 'not_placed' });
+  // Quote requests remain bound until the controller has durably retired the exact saved intent.
+  await assert.rejects(api.createQuote(quoteInput), { code: 'unauthenticated' });
+  saved.set(journalKey, JSON.stringify({ ...pendingCreation, active: null }));
+  assert.equal((await api.createQuote(quoteInput)).id, 'quote-2');
+  assert.deepEqual(JSON.parse(saved.get(journalKey)!).orderIds, [unknownOrderId]);
+  await assert.rejects(api.createOrder({ quoteId: checkoutIntent.quoteId, phone }, checkoutIntent.key), { code: 'unauthenticated' });
+  assert.equal(transport.calls.some(call => call.path === '/web/orders'), false);
 });

@@ -527,6 +527,102 @@ test('unauthorized connected recovery preserves the pending journal without post
 });
 
 const recoveredOrderId = '1cf5ba6e-0584-45b5-bbc5-3a5ec90502c9';
+const pendingChallenge = 'ffb6ca2e-3b67-48d6-9098-81b673c87144';
+
+test('pending checkout recovery survives reload and a failed adoption write, then leaves payment to the buyer', async () => {
+  const f = fixture();
+  const quote = await f.quote();
+  const original = await f.api.createOrder({ quoteId: quote.id, phone: DEMO_PHONE }, 'initial');
+  const active = { phase: 'creating', quoteId: quote.id, key: 'initial', cartFingerprint: 'saved-cart' } as const;
+  let durable = JSON.stringify({ version: 1, active, orderIds: ['earlier-order'] });
+  let failWrite = false;
+  let payment: Awaited<ReturnType<typeof f.api.startPayment>> | null = null;
+  const sentKeys: string[] = [];
+  const restart = () => new CheckoutController({
+    storage: {
+      async getItem() { return durable; },
+      async setItem(_name, value) {
+        if (failWrite) throw new Error('Journal write failed');
+        durable = value;
+      },
+    },
+    api: {
+      ...f.api,
+      createOrder: async () => { throw new Error('Recovery must not create another order'); },
+      requestPendingCheckoutRecovery: async (intent, phone) => {
+        equal(intent.key, active.key);
+        equal(phone, connectedContact.phone);
+        return { state: 'verify', challengeId: pendingChallenge };
+      },
+      verifyPendingCheckoutRecovery: async (intent, challengeId, code) => {
+        equal(intent.quoteId, active.quoteId);
+        equal(challengeId, pendingChallenge);
+        equal(code, '010101');
+        return { ...original, id: recoveredOrderId };
+      },
+      getOrder: async id => {
+        equal(id, recoveredOrderId);
+        return { ...(await f.api.getOrder(original.id)), id: recoveredOrderId };
+      },
+      startPayment: async (id, key) => {
+        equal(id, recoveredOrderId);
+        sentKeys.push(key);
+        payment = await f.api.startPayment(original.id, key);
+        return payment;
+      },
+    },
+    newKey: () => 'saved-payment-key',
+    async onOrderCreated(hash) { f.cartClears.push(hash); },
+  });
+
+  deepEqual(await restart().requestPendingOrderRecovery(connectedContact.phone), {
+    state: 'verify', challengeId: pendingChallenge,
+  });
+  const expected = { ...active, recoveryChallengeId: pendingChallenge };
+  deepEqual((await restart().restore()).active, expected);
+  failWrite = true;
+  await rejects(restart().confirmPendingOrderRecovery(pendingChallenge, '010101'), /Journal write failed/);
+  deepEqual((await restart().restore()).active, expected);
+  failWrite = false;
+  equal((await restart().confirmPendingOrderRecovery(pendingChallenge, '010101')).id, recoveredOrderId);
+  const saved = await restart().restore();
+  deepEqual(saved.orderIds, [recoveredOrderId, 'earlier-order']);
+  equal(saved.active?.phase, 'paying');
+  deepEqual(sentKeys, []);
+  deepEqual(f.cartClears, []);
+  equal(durable.includes(connectedContact.phone) || durable.includes('010101'), false);
+  equal((await restart().resume()).paymentStatus, 'processing');
+  ok(payment);
+  deepEqual(sentKeys, ['saved-payment-key']);
+  deepEqual(f.cartClears, ['saved-cart']);
+});
+
+test('waiting leaves the creating journal in place and not_placed retires only the pending checkout', async () => {
+  const f = fixture();
+  const active = { phase: 'creating', quoteId: 'saved-quote', key: 'saved-key', cartFingerprint: 'saved-cart' };
+  const saved = { version: 1, active, orderIds: ['earlier-order'] };
+  let durable = JSON.stringify(saved);
+  let resolved = false;
+  const controller = new CheckoutController({
+    storage: {
+      async getItem() { return durable; },
+      async setItem(_name, value) { durable = value; },
+    },
+    api: {
+      ...f.api,
+      requestPendingCheckoutRecovery: async () => resolved ? { state: 'not_placed' }
+        : { state: 'waiting', retryAt: '2026-11-25T10:10:00Z' },
+    },
+    newKey: () => 'new-key',
+    async onOrderCreated(hash) { f.cartClears.push(hash); },
+  });
+  equal((await controller.requestPendingOrderRecovery(connectedContact.phone)).state, 'waiting');
+  deepEqual(JSON.parse(durable), saved);
+  resolved = true;
+  equal((await controller.requestPendingOrderRecovery(connectedContact.phone)).state, 'not_placed');
+  deepEqual(JSON.parse(durable), { ...saved, active: null });
+  deepEqual(f.cartClears, []);
+});
 
 test('a proven order is appended once without replacing a pending checkout', async () => {
   const f = fixture();

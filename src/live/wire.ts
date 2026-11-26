@@ -112,3 +112,8 @@ export const webOrderResponse = orderResponse.safeExtend({ recoveryReadOnly: z.l
 
 export const orderAccessChallenge = z.object({ challengeId: z.guid() });
 export const orderAccessGrant = z.object({ orderId: z.guid().refine((id) => id === id.toLowerCase()) });
+export const pendingCheckoutRecovery = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('waiting'), retryAt: timestamp }),
+  z.object({ state: z.literal('not_placed') }),
+  z.object({ state: z.literal('verify'), challengeId: z.guid() }),
+]);

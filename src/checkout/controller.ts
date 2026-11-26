@@ -1,4 +1,4 @@
-import { ApiError, type Order, type OrderInput, type Quote, type ShopApi } from '../domain/types';
+import { ApiError, type Order, type OrderInput, type PendingCheckoutRecovery, type Quote, type ShopApi } from '../domain/types';
 import { paymentReturnOrderId } from './payment-return';
 import { hasInconsistentPayment, isExpiredUnpaidHold } from './pickup-hold';
 
@@ -6,7 +6,7 @@ export const CHECKOUT_JOURNAL_KEY = 'crustcaper.checkout.v1';
 const maxRecentOrders = 10;
 
 type Progress =
-  | { phase: 'creating'; quoteId: string; key: string; cartFingerprint: string }
+  | { phase: 'creating'; quoteId: string; key: string; cartFingerprint: string; recoveryChallengeId?: string }
   | { phase: 'paying'; orderId: string; key: string; cartFingerprint?: string }
   | { phase: 'tracking'; orderId: string; key: string };
 
@@ -24,7 +24,8 @@ export type GuestSessionLifecycle = {
 };
 
 type Dependencies = {
-  api: Pick<ShopApi, 'createOrder' | 'getOrder' | 'startPayment' | 'recoverOrder'>;
+  api: Pick<ShopApi, 'createOrder' | 'getOrder' | 'startPayment' | 'recoverOrder'
+    | 'requestPendingCheckoutRecovery' | 'verifyPendingCheckoutRecovery'>;
   storage: {
     getItem: (key: string) => Promise<string | null>;
     setItem: (key: string, value: string) => Promise<void>;
@@ -66,6 +67,9 @@ export function parseJournal(raw: string | null): CheckoutJournal {
       return { version: 1, active, orderIds: stored.orderIds };
     }
     if (active?.phase === 'creating' && isText(active.quoteId) && isText(active.key) && isText(active.cartFingerprint)) {
+      if (active.recoveryChallengeId !== undefined && !paymentReturnOrderId(active.recoveryChallengeId)) {
+        throw new CheckoutError('invalid_journal');
+      }
       return { version: 1, active, orderIds: stored.orderIds };
     }
     if (active && (active.phase === 'paying' || active.phase === 'tracking')
@@ -138,6 +142,40 @@ export class CheckoutController {
         retained[retained.length - 1] = active.orderId;
       }
       await this.save(active, [...retained, orderId]);
+    });
+  }
+
+  async requestPendingOrderRecovery(phone: string): Promise<PendingCheckoutRecovery> {
+    return this.exclusive(async () => {
+      const { active } = this.journal;
+      if (active?.phase !== 'creating') throw new CheckoutError('missing_checkout');
+      const request = this.dependencies.api.requestPendingCheckoutRecovery;
+      if (!request) throw new ApiError('service_unavailable');
+
+      const result = await request(active, phone);
+      if (result.state === 'not_placed') await this.save(null);
+      if (result.state === 'verify') await this.save({ ...active, recoveryChallengeId: result.challengeId });
+      return result;
+    });
+  }
+
+  async confirmPendingOrderRecovery(challengeId: string, code: string): Promise<Order> {
+    return this.exclusive(async () => {
+      const { active } = this.journal;
+      if (active?.phase !== 'creating' || active.recoveryChallengeId !== challengeId) {
+        throw new CheckoutError('missing_checkout');
+      }
+      const verify = this.dependencies.api.verifyPendingCheckoutRecovery;
+      if (!verify) throw new ApiError('service_unavailable');
+
+      const order = await verify(active, challengeId, code);
+      if (!paymentReturnOrderId(order.id) || order.recoveryReadOnly) throw new ApiError('invalid_response');
+      if (canStartNewOrder(order)) {
+        await this.save({ phase: 'tracking', orderId: order.id, key: this.dependencies.newKey() }, this.recentOrderIds(order.id));
+      } else {
+        await this.saveCreatedOrder(active, order);
+      }
+      return order;
     });
   }
 
@@ -274,12 +312,20 @@ export class CheckoutController {
     return this.continueOrder(intent, order);
   }
 
-  private async continueOrder(intent: Extract<Progress, { phase: 'creating' }>, order: Order): Promise<Order> {
-    const orderIds = [order.id, ...this.journal.orderIds.filter((id) => id !== order.id)].slice(0, maxRecentOrders);
+  private async saveCreatedOrder(intent: Extract<Progress, { phase: 'creating' }>, order: Order) {
     const payment = {
       phase: 'paying', orderId: order.id, key: this.dependencies.newKey(), cartFingerprint: intent.cartFingerprint,
     } as const;
-    await this.save(payment, orderIds);
+    await this.save(payment, this.recentOrderIds(order.id));
+    return payment;
+  }
+
+  private recentOrderIds(orderId: string) {
+    return [orderId, ...this.journal.orderIds.filter((id) => id !== orderId)].slice(0, maxRecentOrders);
+  }
+
+  private async continueOrder(intent: Extract<Progress, { phase: 'creating' }>, order: Order): Promise<Order> {
+    const payment = await this.saveCreatedOrder(intent, order);
     if (order.status === 'cancelled' || order.paymentStatus !== 'unpaid' || hasInconsistentPayment(order)) {
       await this.finishPayment(payment, order);
       return order;

@@ -5,7 +5,7 @@ import type { PropsWithChildren } from 'react';
 import { AppState } from 'react-native';
 
 import { DEMO_PHONE } from '../domain/demo-api';
-import { ApiError, type CartLine, type Order, type Quote } from '../domain/types';
+import { ApiError, type CartLine, type Order, type PendingCheckoutRecovery, type Quote } from '../domain/types';
 import { privateStorage } from '../state/private-storage';
 import { useShop } from '../state/shop';
 import { CheckoutController, CheckoutError, type CheckoutContact, type CheckoutJournal } from './controller';
@@ -26,6 +26,9 @@ type Context = {
   resumeCheckout: (retryDeclined?: boolean, contact?: CheckoutContact) => Promise<Order>;
   finishExpiredHold: (order: Order) => Promise<void>;
   rememberRecoveredOrder: (orderId: string, sessionRevision: number) => Promise<void>;
+  pendingOrderRecoveryChallengeId: string | null;
+  requestPendingOrderRecovery?: (phone: string) => Promise<PendingCheckoutRecovery>;
+  confirmPendingOrderRecovery?: (challengeId: string, code: string) => Promise<Order>;
 };
 
 const CheckoutContext = createContext<Context | null>(null);
@@ -35,7 +38,7 @@ function fingerprint(cart: CartLine[]) {
 }
 
 export function CheckoutProvider({ children }: PropsWithChildren) {
-  const { api, demoApi, guestSession, checkoutStorageKey, cart, clearCart } = useShop();
+  const { api, demoApi, guestSession, checkoutStorageKey, cart, clearCart, webCheckout } = useShop();
   const cartRef = useRef(cart);
   const clearCartRef = useRef(clearCart);
   const running = useRef(false);
@@ -136,6 +139,11 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     resumeCheckout: (retryDeclined, contact) => run(() => controller.resume(retryDeclined, contact)),
     finishExpiredHold,
     rememberRecoveredOrder: (orderId, sessionRevision) => run(() => controller.rememberRecoveredOrder(orderId, sessionRevision)),
+    pendingOrderRecoveryChallengeId: journal?.active?.phase === 'creating' ? journal.active.recoveryChallengeId ?? null : null,
+    requestPendingOrderRecovery: webCheckout && api.requestPendingCheckoutRecovery
+      ? (phone) => run(() => controller.requestPendingOrderRecovery(phone)) : undefined,
+    confirmPendingOrderRecovery: webCheckout && api.verifyPendingCheckoutRecovery
+      ? (challengeId, code) => run(() => controller.confirmPendingOrderRecovery(challengeId, code)) : undefined,
   };
 
   return <CheckoutContext.Provider value={value}>{children}</CheckoutContext.Provider>;
