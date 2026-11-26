@@ -134,8 +134,7 @@ async function checkCheckoutPreflight(caPath) {
   assert.match(result.stdout, /Checkout EN and RW handoffs and Expo entry verified\./);
 }
 
-function verifyPaymentRow(orderId) {
-  assert.ok(uuid.test(orderId), 'fixture order requires a UUID');
+function fixtureDatabase() {
   assert.match(project, /^cc-storefront-[0-9a-f-]{8,36}$/);
   const database = spawnSync('docker', ['ps', '--format', '{{.ID}}',
     '--filter', 'label=com.docker.compose.project=' + project,
@@ -144,6 +143,12 @@ function verifyPaymentRow(orderId) {
   assert.equal(database.status, 0, 'could not find the Compose PostgreSQL fixture');
   const id = database.stdout.trim();
   assert.match(id, /^[0-9a-f]{12,64}$/, 'expected one PostgreSQL fixture container');
+  return id;
+}
+
+function verifyPaymentRow(orderId) {
+  assert.ok(uuid.test(orderId), 'fixture order requires a UUID');
+  const id = fixtureDatabase();
   const query = spawnSync('docker', ['exec', id, 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1',
     '-U', 'storefront_fixture', '-d', 'storefront_fixture', '-c',
     `SELECT count(*), count(*) FILTER (WHERE o.checkout_channel='web' AND o.payment_status='paid' AND p.status='paid')
@@ -151,6 +156,22 @@ function verifyPaymentRow(orderId) {
   ], { encoding: 'utf8', timeout: 10000 });
   assert.equal(query.status, 0, 'fixture database query failed');
   assert.equal(query.stdout.trim(), '1|1', 'order must have exactly one verified payment attempt');
+}
+
+async function waitForFixturePhoneDispatch(challengeId) {
+  assert.ok(uuid.test(challengeId), 'fixture challenge requires a UUID');
+  const database = fixtureDatabase();
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    const query = spawnSync('docker', ['exec', database, 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1',
+      '-U', 'storefront_fixture', '-d', 'storefront_fixture', '-c',
+      `SELECT state FROM order_access_challenges WHERE id = '${challengeId}'`,
+    ], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(query.status, 0, 'fixture verification dispatch query failed');
+    if (query.stdout.trim() === 'sent') return;
+    await delay(150);
+  }
+  assert.fail('the fixture did not dispatch the SMS challenge');
 }
 
 async function newContext(browser, options, allowHostedPayment = true) {
@@ -357,26 +378,26 @@ async function checkSettledOrderRecovery(page, context, order, oldSessionId) {
   await button(page, 'Verify this order by phone').click();
   assert.equal(await page.getByLabel('Order number', { exact: true }).inputValue(), order.id.slice(-8).toUpperCase());
   await page.getByLabel('Phone number', { exact: true }).fill('+250700000000');
+  const requested = responseFor('/api/v1/web/order-access/challenges', 'POST');
   await button(page, 'Request verification code').click();
+  const challenge = await requested;
+  assert.ok(challenge.ok(), 'the returning browser must request its own challenge');
+  const { challengeId } = await challenge.json();
   await shown(page, 'Verify your phone');
+  await waitForFixturePhoneDispatch(challengeId);
   const codeInput = page.getByLabel('Verification code', { exact: true });
+  await codeInput.fill('418263');
   let verified;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    await codeInput.fill('418263');
-    assert.equal(await codeInput.inputValue(), '418263');
-    const result = page.waitForResponse(response => response.request().method() === 'POST'
-      && /\/api\/v1\/web\/order-access\/challenges\/[^/]+\/verify$/.test(new URL(response.url()).pathname));
-    await button(page, 'Verify and open order').click();
-    try {
-      verified = await result;
-    } catch (error) {
-      if (evidence) await page.screenshot({ path: resolve(evidence, 'order-recovery-verification-failed.png'),
-        mask: [codeInput, page.getByLabel('Phone number', { exact: true })], animations: 'disabled' });
-      throw error;
-    }
-    if (verified.ok()) break;
-    assert.equal(verified.status(), 404);
-    await delay(500);
+  try {
+    [verified] = await Promise.all([
+      page.waitForResponse(response => response.request().method() === 'POST'
+        && new URL(response.url()).pathname === '/api/v1/web/order-access/challenges/' + challengeId + '/verify', { timeout: 20_000 }),
+      button(page, 'Verify and open order').click(),
+    ]);
+  } catch (error) {
+    if (evidence) await page.screenshot({ path: resolve(evidence, 'order-recovery-verification-failed.png'),
+      mask: [codeInput, page.getByLabel('Phone number', { exact: true })], animations: 'disabled' });
+    throw error;
   }
   assert.ok(verified?.ok(), 'the returning browser must recover the paid order by phone');
   assert.equal((await verified.json()).orderId, order.id);
