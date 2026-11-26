@@ -21,6 +21,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import org.apache.commons.logging.LogFactory;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
@@ -341,6 +342,13 @@ class FiscalReceiptIntegrationTest {
         upload(manager.bearer(), order.id(), "EBM-PDF", "9200", PDF).andExpect(status().isOk());
         api.perform(get(receiptPath(order.id())).header(HttpHeaders.AUTHORIZATION, order.owner().bearer()))
             .andExpect(status().isOk()).andExpect(content().bytes(PDF));
+    }
+
+    @Test
+    void suppressesPdfBoxDiagnosticsInTheApplicationLoggingSystem() {
+        assertThat(LogFactory.getLog("org.apache.pdfbox.pdfparser.COSParser").isErrorEnabled()).isFalse();
+        assertThat(LogFactory.getLog("org.apache.pdfbox.pdmodel.PDPageTree").isErrorEnabled()).isFalse();
+        assertThat(LogFactory.getLog(OperatorReceipts.class).isErrorEnabled()).isTrue();
     }
 
     @Test

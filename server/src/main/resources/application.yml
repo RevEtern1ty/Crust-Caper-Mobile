@@ -27,6 +27,10 @@ server:
     include-message: never
     include-binding-errors: never
     include-stacktrace: never
+logging:
+  level:
+    # PDF parser diagnostics can include values from the uploaded receipt.
+    org.apache.pdfbox: "OFF"
 management:
   endpoints:
     web:
