@@ -145,8 +145,8 @@ class ApiRequestDiagnosticsIntegrationTest {
         String store = "private-unhandled-store";
         Catalog target = AopTestUtils.getUltimateTargetObject(catalog);
         doThrow(new IllegalStateException("private-unhandled-exception")).when(target).menu(store);
-        assertThatThrownBy(() -> api.perform(get(MENU_ROUTE, store)))
-            .hasRootCauseExactlyInstanceOf(IllegalStateException.class);
+        api.perform(get(MENU_ROUTE, store)).andExpect(status().isInternalServerError())
+            .andExpect(jsonPath("$.code").value("service_unavailable"));
         assertCounts(before, 1, 1);
 
         var unmapped = new MockHttpServletRequest("GET", "/api/v1/fallback-probe");
@@ -177,6 +177,38 @@ class ApiRequestDiagnosticsIntegrationTest {
         assertThat(delivered.isCommitted()).isTrue();
         assertThat(delivered.getStatus()).isEqualTo(HttpServletResponse.SC_OK);
         assertCounts(before, 2, 2);
+    }
+
+    @Test
+    void unexpectedFailureReplacesUncommittedSuccessHeadersAndBufferedBody() throws Exception {
+        var request = new MockHttpServletRequest("GET", "/api/v1/fallback-probe");
+        var response = new MockHttpServletResponse();
+        diagnostics.doFilter(request, response, (ignored, result) -> {
+            var partial = (HttpServletResponse) result;
+            partial.setHeader(HttpHeaders.LOCATION, "https://fixture.example.test/old");
+            partial.setHeader(HttpHeaders.SET_COOKIE, "fixture=discarded");
+            partial.setHeader(HttpHeaders.CONTENT_DISPOSITION, "attachment");
+            partial.setHeader(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN);
+            partial.setHeader(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS, REQUEST_ID);
+            partial.addHeader(HttpHeaders.VARY, HttpHeaders.ORIGIN);
+            partial.addHeader(HttpHeaders.VARY, HttpHeaders.ACCESS_CONTROL_REQUEST_HEADERS);
+            partial.setContentLength(17);
+            partial.getWriter().write("fixture-old-body");
+            throw new ServletException("fixture-private-exception");
+        });
+        assertThat(response.getStatus()).isEqualTo(500);
+        assertThat(response.getHeader(REQUEST_ID)).matches(UUID_V4);
+        assertThat(response.getHeader(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN)).isEqualTo(ORIGIN);
+        assertThat(response.getHeader(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS)).isEqualTo(REQUEST_ID);
+        assertThat(response.getHeaders(HttpHeaders.VARY))
+            .containsExactly(HttpHeaders.ORIGIN, HttpHeaders.ACCESS_CONTROL_REQUEST_HEADERS);
+        assertThat(response.getHeader(HttpHeaders.LOCATION)).isNull();
+        assertThat(response.getHeader(HttpHeaders.SET_COOKIE)).isNull();
+        assertThat(response.getHeader(HttpHeaders.CONTENT_DISPOSITION)).isNull();
+        assertThat(Integer.parseInt(response.getHeader(HttpHeaders.CONTENT_LENGTH)))
+            .isEqualTo(response.getContentAsByteArray().length);
+        assertThat(response.getContentAsString()).contains("\"code\":\"service_unavailable\"")
+            .doesNotContain("fixture-old-body", "fixture-private-exception");
     }
 
     private void assertCounts(Snapshot baseline, long requests, long errors) throws Exception {

@@ -5,6 +5,10 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
@@ -12,6 +16,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.core.NestedExceptionUtils;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.servlet.HandlerMapping;
@@ -23,12 +29,19 @@ public final class ApiRequestDiagnostics extends OncePerRequestFilter {
     private static final Logger LOG = LoggerFactory.getLogger(ApiRequestDiagnostics.class);
     private static final String STATE = ApiRequestDiagnostics.class.getName() + ".state";
     private static final String CATEGORY = ApiRequestDiagnostics.class.getName() + ".category";
+    private static final List<String> CORS_HEADERS = List.of(HttpHeaders.VARY,
+        HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS,
+        HttpHeaders.ACCESS_CONTROL_ALLOW_CREDENTIALS);
+    private static final ApiModels.Problem UNEXPECTED_PROBLEM = new ApiModels.Problem(
+        "urn:crustcaper:problem:service_unavailable", "Internal Server Error", 500, "service_unavailable");
     private final CommerceErrorMetrics metrics;
+    private final CommerceJson json;
 
     private record RequestState(String id, long startedAt) {}
 
-    ApiRequestDiagnostics(CommerceErrorMetrics metrics) {
+    ApiRequestDiagnostics(CommerceErrorMetrics metrics, CommerceJson json) {
         this.metrics = metrics;
+        this.json = json;
     }
 
     static void markFailure(HttpServletRequest request, String category) {
@@ -59,23 +72,26 @@ public final class ApiRequestDiagnostics extends OncePerRequestFilter {
         try {
             chain.doFilter(request, response);
         } catch (ServletException | RuntimeException failure) {
-            // The container renders the error after this dispatch. Count it before that dispatch.
-            if (!request.getMethod().equals("OPTIONS")
-                    && (isServerError(response.getStatus()) || (!response.isCommitted()
-                        && !(NestedExceptionUtils.getMostSpecificCause(failure) instanceof IOException)))) {
-                metrics.record(true);
+            if (NestedExceptionUtils.getMostSpecificCause(failure) instanceof IOException) throw failure;
+            if (response.isCommitted()) {
+                if (isServerError(response.getStatus())) observe(request, response, state);
+                throw failure;
             }
-            throw failure;
+            // Finish the API response here so the ID, HTTP status and safe log event describe the same failure.
+            writeUnexpectedProblem(response, state.id());
+            markFailure(request, "unexpected");
         }
-        if (isAsyncStarted(request)) return;
+        if (!isAsyncStarted(request)) observe(request, response, state);
+    }
 
+    private void observe(HttpServletRequest request, HttpServletResponse response, RequestState state) {
         int status = response.getStatus();
         boolean serverError = isServerError(status);
         Object pattern = request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
         if (!request.getMethod().equals("OPTIONS") && (serverError || (status >= 200 && status < 400 && pattern != null))) {
             metrics.record(serverError);
         }
-        if (status >= 500) {
+        if (serverError) {
             // The MVC mapping contains placeholders. Never substitute the actual request URI.
             Object category = request.getAttribute(CATEGORY);
             LOG.warn("api_request_failed requestId={} route={} method={} status={} category={} elapsedMs={}",
@@ -83,6 +99,20 @@ public final class ApiRequestDiagnostics extends OncePerRequestFilter {
                 category == null ? "unavailable" : category,
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - state.startedAt()));
         }
+    }
+
+    private void writeUnexpectedProblem(HttpServletResponse response, String id) throws IOException {
+        byte[] body = json.write(UNEXPECTED_PROBLEM).getBytes(StandardCharsets.UTF_8);
+        Map<String, List<String>> cors = new LinkedHashMap<>();
+        for (String name : CORS_HEADERS) cors.put(name, List.copyOf(response.getHeaders(name)));
+        response.reset();
+        cors.forEach((name, values) -> values.forEach(value -> response.addHeader(name, value)));
+        response.setHeader(HEADER, id);
+        response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+        response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+        response.setContentType(MediaType.APPLICATION_PROBLEM_JSON_VALUE);
+        response.setContentLength(body.length);
+        response.getOutputStream().write(body);
     }
 
     private static boolean isServerError(int status) {
