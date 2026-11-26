@@ -191,10 +191,14 @@ final class OrderAccessService {
                 """).params(guest, claimed.orderId()).update();
             if (changed != 1) throw ApiFailure.notFound();
         }
+        // Only a newly approved ordinary OTP can establish or refresh privacy access.
         jdbc.sql("""
-            INSERT INTO order_read_grants (guest_session_id, order_id) VALUES (?, ?)
-            ON CONFLICT (guest_session_id, order_id) DO NOTHING
-            """).params(guest, claimed.orderId()).update();
+            INSERT INTO order_read_grants (guest_session_id, order_id, privacy_verified_at)
+            VALUES (?, ?, CASE WHEN ? THEN NULL ELSE clock_timestamp() END)
+            ON CONFLICT (guest_session_id, order_id) DO UPDATE
+                SET privacy_verified_at = GREATEST(order_read_grants.privacy_verified_at, EXCLUDED.privacy_verified_at)
+                WHERE EXCLUDED.privacy_verified_at IS NOT NULL
+            """).params(guest, claimed.orderId(), claimed.checkoutRecovery()).update();
         return new VerifiedOrder(claimed.orderId());
     }
 
