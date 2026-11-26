@@ -87,7 +87,7 @@ final class CommerceController {
     @GetMapping("/orders/{id}")
     ResponseEntity<OrderService.ReadOrder> order(@RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String bearer,
         @PathVariable String id) {
-        return privateResponse(orders.readOrder(sessions.authenticate(bearer), ApiFailure.uuid(id, ApiFailure.notFound())));
+        return privateResponse(orders.getMobileOrder(sessions.authenticate(bearer), ApiFailure.uuid(id, ApiFailure.notFound())));
     }
 
     @PostMapping("/orders/{id}/reorder")

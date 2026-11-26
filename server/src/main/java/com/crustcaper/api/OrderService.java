@@ -264,7 +264,15 @@ public class OrderService {
         return WebOrder.from(result.order(), Boolean.TRUE.equals(result.recoveryReadOnly()));
     }
 
-    ReadOrder readOrder(UUID guest, UUID id) {
+    ReadOrder getMobileOrder(UUID guest, UUID id) {
+        ReadOrder result = readOrder(guest, id);
+        Order order = result.order();
+        // A settled order can close the saved payment journal and can be used to reorder.
+        return order.status().equals("awaiting_payment") || order.paymentStatus().equals("processing")
+            ? result : new ReadOrder(order, null);
+    }
+
+    private ReadOrder readOrder(UUID guest, UUID id) {
         OrderSnapshot snapshot = jdbc.sql(ORDER_SNAPSHOT + "WHERE orders.id = ? " + VISIBLE_TO_GUEST)
             .params(id, guest, guest).query(this::snapshotRow).optional().orElseThrow(ApiFailure::notFound);
         if (!snapshot.order().canCheckout(guest)) return new ReadOrder(view(snapshot, false), true);

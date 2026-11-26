@@ -589,6 +589,14 @@ class WebCommerceIntegrationTest {
             .query(UUID.class).single()).isEqualTo(nextGuest.id());
         verify(gateway).open(argThat(input -> input.checkoutChannel() == PaymentGateway.CheckoutChannel.MOBILE
             && input.reference().equals(attempt)));
+        long total = jdbc.sql("SELECT total FROM orders WHERE id = ?").param(UUID.fromString(order)).query(Long.class).single();
+        orders.settlePayment(new PaymentGateway.VerifiedPayment(attempt, "native-" + attempt, total, "RWF",
+            PaymentGateway.PaymentResult.PAID));
+        api.perform(nativeRequest(GET, orderPath, firstGuest)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.paymentStatus").value("paid"))
+            .andExpect(jsonPath("$.recoveryReadOnly").doesNotExist());
+        api.perform(nativeRequest(POST, orderPath + "/payments", firstGuest).header(KEY, "after-settlement"))
+            .andExpect(status().isNotFound());
     }
 
     @Test
