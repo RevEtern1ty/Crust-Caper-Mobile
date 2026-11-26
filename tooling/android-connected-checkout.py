@@ -5,6 +5,7 @@ Use `python tooling/android-connected-checkout.py APK EVIDENCE_DIR --adb PATH`.
 The local Release APK uses http://10.0.2.2:<api-port>/api/v1 by default.
 Use --adb-reverse for APKs built with http://127.0.0.1:<api-port>/api/v1.
 Use --upgrade-from OLD_APK for an in-place upgrade during a pending checkout.
+Use --late-receipt-pdf FIXTURE_PDF to attach a synthetic receipt after pickup.
 Start the matching Spring Boot local API on the host loopback with a fresh test database.
 """
 
@@ -112,15 +113,16 @@ class LocalApi:
                 "The test API must use http://127.0.0.1:<port>/api/v1")
         self.host, self.port = url.hostname, url.port
 
-    def request(self, method, route, status, *, token=None, data=None):
-        headers = {"Accept": "application/json"}
+    def request(self, method, route, status, *, token=None, data=None, headers=None):
+        headers = {"Accept": "application/json", **(headers or {})}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        if data is not None:
+        if data is not None and not isinstance(data, bytes):
             headers["Content-Type"] = "application/json"
+            data = json.dumps(data)
         try:
             with closing(http.client.HTTPConnection(self.host, self.port, timeout=8)) as connection:
-                connection.request(method, route, json.dumps(data) if data is not None else None, headers)
+                connection.request(method, route, data, headers)
                 response = connection.getresponse()
                 require(response.status == status, f"Unexpected response in {method} {route.split('/')[-1]}: {response.status}")
                 return None if status == 204 else json.loads(response.read())
@@ -151,6 +153,22 @@ class LocalApi:
 
     def logout(self, token):
         self.request("DELETE", "/api/v1/operator/sessions/current", 204, token=token)
+
+    def attach_late_receipt(self, order_id, manager, pdf):
+        matches = self.request("GET", f"/api/v1/operator/receipts?orderCode={order_id}", 200, token=manager)
+        require(len(matches) == 1, "Expected one fiscal receipt entry for the fixture order")
+        order = matches[0]
+        require(order.get("orderId") == order_id and order.get("status") == "collected"
+                and order.get("receiptStatus") == "pending" and order.get("currency") == "RWF",
+                "The receipt must still be pending after pickup")
+        reference = "ANDROID-TEST-" + order_id[-8:].upper()
+        issued = self.request("PUT", f"/api/v1/operator/orders/{order_id}/receipt", 200, token=manager,
+                              data=pdf, headers={"Content-Type": "application/pdf",
+                                                 "X-Receipt-Reference": reference,
+                                                 "X-Receipt-Total-RWF": str(order["total"])})
+        require(issued.get("orderId") == order_id and issued.get("status") == "collected"
+                and issued.get("receiptStatus") == "issued" and issued.get("receiptReference") == reference,
+                "The manager did not attach the fixture receipt after pickup")
 
 
 def box(node):
@@ -444,11 +462,21 @@ def checkout(args, evidence):
         device.collected(reference, code)
         require(not api.queue(kitchen), "The collected order remains in the active kitchen queue")
         device.capture(evidence / "collected.png")
+        if args.late_receipt_pdf:
+            device.wait_label("The receipt is pending.", scroll="down")
+            manager = api.login("demo-manager", "manager")
+            sessions.append(manager)
+            api.attach_late_receipt(order_id, manager, args.late_receipt_pdf.read_bytes())
+            print("The manager attached a receipt after pickup. Wait for the share action without refreshing", flush=True)
+            device.wait_label("Share receipt", scroll="down", timeout=35)
+            device.capture(evidence / "receipt-after-pickup.png")
         device.launch()
         device.tap_label("Orders")
         device.collected(reference, code)
         checks = ["exact installed APK", "same pending order after force-stop", "synthetic payment",
                   "paid kitchen order", "ready and collected updates without refresh", "collected order after force-stop"]
+        if args.late_receipt_pdf:
+            checks.append("late receipt appeared after pickup without a manual refresh")
         if previous:
             checks.insert(1, "in-place upgrade preserved the pending checkout and authorized order access")
         if args.adb_reverse:
@@ -500,12 +528,17 @@ def main():
                         help="Use a local APK built for 127.0.0.1 and map the API port on the dedicated emulator")
     parser.add_argument("--check-session-end", action="store_true",
                         help="End the guest session on builds with the order-access settings screen")
+    parser.add_argument("--late-receipt-pdf", type=Path, metavar="FIXTURE_PDF",
+                        help="Attach a synthetic receipt after pickup while the customer view stays open")
     args = parser.parse_args()
 
     try:
         require(args.apk.is_file(), "The APK must be an existing file")
         if args.upgrade_from:
             require(args.upgrade_from.is_file(), "The previous APK must be an existing file")
+        if args.late_receipt_pdf:
+            require(args.late_receipt_pdf.is_file() and 0 < args.late_receipt_pdf.stat().st_size <= 1024 * 1024,
+                    "Use an existing synthetic receipt PDF of at most one MiB")
         args.evidence.mkdir(parents=True, exist_ok=True)
         require(not any(args.evidence.iterdir()), "Use an empty evidence directory")
     except (OSError, SmokeFailure) as error:
