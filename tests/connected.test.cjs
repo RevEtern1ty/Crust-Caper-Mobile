@@ -1406,6 +1406,96 @@ test('fiscal receipt attachment survives a filter change and an older list respo
   await capture(page, 'connected-fiscal-receipt-race');
 });
 
+test('manager finds and attaches a fiscal receipt beyond the rolling queue', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const kitchen = await operator('demo-kitchen');
+  const pickup = await operator('demo-pickup');
+  const order = await readyForPickup(kitchen);
+  t.after(async () => {
+    await send(`/operator/orders/${order.id}/status`, {
+      method: 'POST', token: pickup, data: { status: 'collected', pickupCode: order.pickupCode },
+    });
+    for (const token of [kitchen, pickup]) await send('/operator/sessions/current', { method: 'DELETE', token });
+  });
+
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.setDefaultTimeout(6500);
+  const listUrl = api + '/operator/receipts';
+  const origin = new URL(api).origin;
+  await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+  await page.route(listUrl, async route => {
+    const response = await route.fetch({ timeout: 8_000 });
+    if (!response.ok()) return route.fulfill({ response });
+    // Only the browser's rolling list omits the target. Exact queries and writes still use the real API.
+    const rows = (await response.json()).filter(row => row.orderId !== order.id);
+    await route.fulfill({ response, json: rows });
+  });
+  const lookups = [];
+  const uploads = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (request.method() === 'GET' && url.pathname === new URL(listUrl).pathname && url.searchParams.has('orderCode')) {
+      lookups.push(url.searchParams.get('orderCode'));
+    }
+    if (request.method() === 'PUT' && request.url() === api + `/operator/orders/${order.id}/receipt`) uploads.push(request);
+  });
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-manager');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  const rolling = page.waitForResponse(response => response.url() === listUrl && response.ok());
+  await button(page, 'Sign in').click();
+  await button(page, 'Fiscal receipts').click();
+  assert.ok((await (await rolling).json()).every(row => row.orderId !== order.id));
+
+  const search = page.getByLabel('Filter by order number');
+  const card = page.getByRole('list', { name: 'Orders for fiscal receipts' }).getByRole('listitem')
+    .filter({ has: page.getByRole('heading', { name: `Order ${order.number}`, exact: true }) });
+  await search.fill(order.number);
+  assert.equal(await card.count(), 0);
+  assert.deepEqual(lookups, []);
+  const match = reference => page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return url.pathname === new URL(listUrl).pathname && url.searchParams.get('orderCode')?.toLowerCase() === reference;
+  });
+  const find = button(page, 'Find order');
+  await find.waitFor();
+  const exact = match(order.number.slice(1).toLowerCase());
+  await find.click();
+  const found = await exact;
+  assert.equal(found.status(), 200);
+  assert.deepEqual((await found.json()).map(row => row.orderId), [order.id]);
+  await card.getByText('Awaiting receipt', { exact: true }).waitFor();
+
+  const refresh = button(page, 'Refresh fiscal receipts');
+  await refresh.click();
+  await refresh.click({ trial: true });
+  await card.getByText('Awaiting receipt', { exact: true }).waitFor();
+  const { total } = await send(`/orders/${order.id}`, { token: order.token }).then(response => response.json());
+  const reference = `LOOKUP-${order.number.slice(1)}`;
+  const pdf = testReceipt();
+  await card.getByLabel('EBM receipt reference').fill(reference);
+  await card.getByLabel('Total printed on receipt (RWF)').fill(String(total));
+  await card.getByLabel('EBM receipt PDF').setInputFiles({ name: 'synthetic-ebm-lookup.pdf', mimeType: 'application/pdf', buffer: pdf });
+  await button(card, 'Attach receipt').click();
+  await card.getByText('Attached', { exact: true }).waitFor();
+  await card.getByText(`EBM reference ${reference}`, { exact: true }).waitFor();
+
+  await search.fill(order.id);
+  assert.equal(await card.count(), 0);
+  const full = match(order.id);
+  await search.press('Enter');
+  assert.deepEqual((await (await full).json()).map(row => row.receiptReference), [reference]);
+  await card.getByText('Attached', { exact: true }).waitFor();
+  assert.equal(lookups.length, 2, 'The input must look up exact orders only on submit');
+  assert.equal(uploads.length, 1);
+  const persisted = await send(`/orders/${order.id}/receipt`, { token: order.token });
+  assert.equal(persisted.status, 200);
+  assert.ok(Buffer.from(await persisted.arrayBuffer()).equals(pdf));
+  await capture(page, 'connected-fiscal-exact-lookup');
+});
+
 test('connected checkout, receipt, pickup, recovery, payment return and restaurant cancellation', { timeout: 70_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/, 'Run only against a local integration API');
   const server = createPreviewServer(dist);

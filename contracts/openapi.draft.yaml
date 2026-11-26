@@ -986,17 +986,39 @@ paths:
     get:
       operationId: listOperatorReceipts
       security: [{ operatorBearer: [] }]
+      parameters:
+        - name: orderCode
+          in: query
+          description: Exact case-insensitive match on the eight-hex order number or the full hyphenated order ID. Omit it for the rolling queue.
+          schema:
+            type: string
+            pattern: '^(?:[0-9A-Fa-f]{8}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$'
       responses:
         '200':
-          description: Up to 100 paid orders for the manager's store, starting with orders awaiting a receipt.
+          description: Up to 100 paid orders for the manager's store, starting with orders awaiting a receipt. An exact lookup returns one matching paid order or an empty list.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
           content:
             application/json:
               schema:
                 type: array
                 maxItems: 100
                 items: { $ref: '#/components/schemas/OperatorReceipt' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '409':
+          description: More than one eligible order in this store shares the short order code. The full order ID resolves the ambiguity.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetails'
+                  - properties:
+                      status: { const: 409 }
+                      code: { const: receipt_order_code_ambiguous }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/orders/{id}/cancel:
     post:
       operationId: cancelPaidOrder
