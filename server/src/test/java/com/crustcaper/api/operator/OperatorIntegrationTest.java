@@ -23,6 +23,7 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
@@ -99,6 +100,7 @@ class OperatorIntegrationTest {
         Staff kitchen = newStaff(store, "kitchen");
         String staffBearer = login(kitchen);
         OrderFixture accepted = newOrder(store, true);
+        removeSoldItem(accepted);
         OrderFixture unpaid = newOrder(store, false);
         OrderFixture differentStore = newOrder(newStore(), true);
 
@@ -128,6 +130,46 @@ class OperatorIntegrationTest {
                 .andExpect(jsonPath("$.currency").value("RWF"));
         change(staffBearer, differentStore.orderId(), "preparing", null).andExpect(status().isNotFound());
         change(staffBearer, unpaid.orderId(), "preparing", null).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void kitchenReadsSoldFactsAndHistoricalFallbackAfterCatalogChanges() throws Exception {
+        String kitchen = login(newStaff(store, "kitchen"));
+        OrderFixture sold = newOrder(store, true);
+        OrderFixture historical = newOrder(store, true);
+        removeSoldItem(historical);
+        JsonNode snapshot = json.readTree("""
+                {"catalogVersion":"sold-version","name":{"en":"Sold special","rw":"Izina ryagurishijwe"},
+                 "ingredients":[{"en":"Sale recipe","rw":"Ibigize byagurishijwe"}],
+                 "allergens":[{"en":"Sale allergen","rw":"Allergène yagurishijwe"}],
+                 "modifiers":[{"id":"extra-cheese","name":{"en":"Sold cheese","rw":"Foromaje yagurishijwe"},"price":500}]}
+                """);
+        jdbc.sql("""
+                UPDATE orders SET lines = jsonb_set(lines, '{0,soldItem}', CAST(? AS jsonb)) WHERE id = ?
+                """).params(snapshot.toString(), UUID.fromString(sold.orderId())).update();
+        jdbc.sql("""
+                UPDATE menu_products SET product = jsonb_set(product, '{name,en}', to_jsonb(CAST(? AS text)))
+                WHERE store_id = ? AND sku = 'double-smash'
+                """).params("Renamed catalog item", store).update();
+
+        JsonNode orders = body(api.perform(get(OPERATOR + "/orders").header(HttpHeaders.AUTHORIZATION, kitchen))
+                .andExpect(status().isOk())).path("orders");
+        Map<String, JsonNode> lines = new HashMap<>();
+        for (JsonNode order : orders) lines.put(order.path("id").asString(), order.path("lines").get(0));
+        JsonNode soldLine = lines.get(sold.orderId());
+        assertThat(keys(soldLine)).containsExactlyInAnyOrder("sku", "modifierIds", "quantity", "soldItem");
+        assertThat(soldLine.get("soldItem")).isEqualTo(snapshot);
+        JsonNode historicalLine = lines.get(historical.orderId());
+        assertThat(keys(historicalLine)).containsExactlyInAnyOrder("sku", "modifierIds", "quantity");
+        assertThat(historicalLine.path("sku").asString()).isEqualTo("double-smash");
+        assertThat(historicalLine.path("modifierIds").get(0).asString()).isEqualTo("extra-cheese");
+        JsonNode preparing = body(change(kitchen, sold.orderId(), "preparing", null).andExpect(status().isOk()));
+        assertThat(preparing.path("lines").get(0).path("soldItem")).isEqualTo(snapshot);
+    }
+
+    private void removeSoldItem(OrderFixture order) {
+        jdbc.sql("UPDATE orders SET lines = lines #- '{0,soldItem}' WHERE id = ?")
+                .param(UUID.fromString(order.orderId())).update();
     }
 
     @Test
