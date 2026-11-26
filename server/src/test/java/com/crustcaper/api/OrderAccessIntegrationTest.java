@@ -12,6 +12,8 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 import com.crustcaper.api.recovery.PhoneVerificationGateway;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -244,6 +246,67 @@ class OrderAccessIntegrationTest {
     }
 
     @Test
+    void losingTheInitialAcknowledgementStillLetsTheGuestUseTheFirstSms() throws Exception {
+        ExistingOrder target = order(guest(), "lost-acknowledgement", PHONE);
+        String seeker = guest();
+        String otherGuest = guest();
+        UUID original = challenge(seeker, target.code(), PHONE);
+        awaitState(original, "sent");
+
+        // Restart the same request after the initial acknowledgement is lost in transit.
+        UUID retry = challenge(seeker, "#" + target.code().toLowerCase(Locale.ROOT), PHONE);
+        assertThat(retry).isEqualTo(original);
+        assertThat(jdbc.sql("SELECT count(*) FROM order_access_challenges WHERE guest_session_id = ?")
+            .param(sessions.authenticate(seeker)).query(Long.class).single()).isEqualTo(1);
+
+        // Previous releases could retain a closed retry alongside the original sent challenge.
+        UUID oldRetry = UUID.randomUUID();
+        byte[] oldDigest = MessageDigest.getInstance("SHA-256")
+            .digest((oldRetry + ":" + PHONE).getBytes(StandardCharsets.US_ASCII));
+        jdbc.sql("""
+            INSERT INTO order_access_challenges (id, guest_session_id, order_code, phone_digest, state, expires_at)
+            VALUES (?, ?, ?, ?, 'closed', clock_timestamp() + interval '10 minutes')
+            """).params(oldRetry, sessions.authenticate(seeker), target.code().toLowerCase(Locale.ROOT), oldDigest).update();
+        assertThat(challenge(seeker, target.code(), PHONE)).isEqualTo(original);
+
+        verifyChallenge(otherGuest, retry, OTP).andExpect(status().isNotFound());
+        UUID otherAcknowledgement = challenge(otherGuest, target.code(), PHONE);
+        assertThat(otherAcknowledgement).isNotEqualTo(retry);
+        awaitState(otherAcknowledgement, "closed");
+        verifyChallenge(otherGuest, otherAcknowledgement, OTP).andExpect(status().isNotFound());
+        verifyChallenge(seeker, retry, OTP).andExpect(status().isOk())
+            .andExpect(jsonPath("$.orderId").value(target.id().toString()));
+        assertThat(challenge(seeker, target.code(), PHONE)).isEqualTo(original);
+        verify(gateway, times(1)).send(PHONE);
+        verify(gateway, times(1)).check(anyString(), anyString());
+    }
+
+    @Test
+    void concurrentStartsWithTheSameGuestReferenceAndPhoneShareOneAcknowledgement() throws Exception {
+        ExistingOrder target = order(guest(), "concurrent-challenge", PHONE);
+        String seeker = guest();
+        var start = new CountDownLatch(1);
+        UUID first;
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            var firstRequest = pool.submit(() -> {
+                if (!start.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Test barrier timed out");
+                return challenge(seeker, target.code(), PHONE);
+            });
+            var secondRequest = pool.submit(() -> {
+                if (!start.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Test barrier timed out");
+                return challenge(seeker, "#" + target.code(), PHONE);
+            });
+            start.countDown();
+            first = firstRequest.get(5, TimeUnit.SECONDS);
+            assertThat(secondRequest.get(5, TimeUnit.SECONDS)).isEqualTo(first);
+        }
+        awaitState(first, "sent");
+        assertThat(jdbc.sql("SELECT count(*) FROM order_access_challenges WHERE guest_session_id = ?")
+            .param(sessions.authenticate(seeker)).query(Long.class).single()).isEqualTo(1);
+        verify(gateway, times(1)).send(PHONE);
+    }
+
+    @Test
     void genericStartDoesNotDispatchForWrongPhoneUnknownCodeOrCollidingSuffix() throws Exception {
         String owner = guest();
         String seeker = guest();
@@ -254,10 +317,13 @@ class OrderAccessIntegrationTest {
         String unknownCode = first.code().equals("00000000") || second.code().equals("00000000") ? "EEEEEEEE" : "00000000";
         UUID unknown = challenge(seeker, unknownCode, PHONE);
         awaitState(unknown, "closed");
+        assertThat(challenge(seeker, first.code(), "+250700000001")).isEqualTo(wrongPhone);
+        assertThat(challenge(seeker, unknownCode, PHONE)).isEqualTo(unknown);
         UUID colliding = UUID.fromString("00000000-0000-4000-8000-0000" + first.code());
         jdbc.sql("UPDATE orders SET id = ? WHERE id = ?").params(colliding, second.id()).update();
         UUID collision = challenge(seeker, first.code(), PHONE);
         awaitState(collision, "closed");
+        assertThat(challenge(seeker, first.code(), PHONE)).isEqualTo(collision).isNotEqualTo(wrongPhone);
 
         for (UUID challenge : List.of(wrongPhone, unknown, collision, UUID.randomUUID())) {
             verifyChallenge(seeker, challenge, OTP).andExpect(status().isNotFound())
@@ -277,9 +343,9 @@ class OrderAccessIntegrationTest {
         start(seeker, "00000000", "250 700 000 000").andExpect(status().isBadRequest());
 
         UUID inRate = challenge(seeker, "00000000", PHONE);
-        challenge(seeker, "00000000", PHONE);
-        challenge(seeker, "00000000", PHONE);
-        UUID overRate = challenge(seeker, "00000000", PHONE);
+        challenge(seeker, "00000001", PHONE);
+        challenge(seeker, "00000002", PHONE);
+        UUID overRate = challenge(seeker, "00000003", PHONE);
         assertThat(jdbc.sql("SELECT count(*) FROM order_access_challenges WHERE guest_session_id = ?")
             .param(sessions.authenticate(seeker)).query(Long.class).single()).isEqualTo(3);
         verifyChallenge(seeker, overRate, OTP).andExpect(status().isNotFound());
@@ -382,6 +448,7 @@ class OrderAccessIntegrationTest {
         awaitState(challenge, "sent");
         jdbc.sql("UPDATE order_access_challenges SET expires_at = clock_timestamp() WHERE id = ?")
             .param(challenge).update();
+        assertThat(challenge(seeker, order.code(), PHONE)).isNotEqualTo(challenge);
         verifyChallenge(seeker, challenge, OTP).andExpect(status().isNotFound());
         verify(gateway, times(0)).check(anyString(), anyString());
     }

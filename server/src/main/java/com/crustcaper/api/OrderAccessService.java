@@ -83,10 +83,10 @@ final class OrderAccessService {
                 SELECT id FROM locked_guest WHERE expires_at > clock_timestamp()
                 """)
                 .param(guest).query(UUID.class).optional().orElseThrow(ApiFailure::unauthenticated);
-            if (checkoutOrder != null) {
-                UUID sent = findCheckoutChallenge(guest, checkoutOrder, channel, phone);
-                if (sent != null) return sent;
-            }
+            UUID replay = checkoutOrder == null
+                ? findOrderChallenge(guest, reference, phone)
+                : findCheckoutChallenge(guest, checkoutOrder, channel, phone);
+            if (replay != null) return replay;
             long recent = jdbc.sql("""
                 SELECT count(*) FROM order_access_challenges
                 WHERE guest_session_id = ? AND created_at > clock_timestamp() - interval '10 minutes'
@@ -106,17 +106,31 @@ final class OrderAccessService {
         return new ChallengeReceipt(acknowledged);
     }
 
+    private UUID findOrderChallenge(UUID guest, String reference, String phone) {
+        // Reuse admitted acknowledgements for closed decoys as well as delivered challenges.
+        // The acknowledgement must not reveal which requests matched an order or reached the provider.
+        return matchingPhoneChallenge(jdbc.sql("""
+            SELECT id, phone_digest FROM order_access_challenges
+            WHERE guest_session_id = ? AND NOT checkout_recovery AND order_code = ?
+                AND expires_at > clock_timestamp()
+            ORDER BY created_at, id LIMIT ?
+            """).params(guest, reference, MAX_CHALLENGES), phone);
+    }
+
     private UUID findCheckoutChallenge(UUID guest, UUID order, CheckoutChannel channel, String phone) {
-        return jdbc.sql("""
+        return matchingPhoneChallenge(jdbc.sql("""
             SELECT id, phone_digest FROM order_access_challenges
             WHERE guest_session_id = ? AND checkout_recovery AND order_id = ?
                 AND mobile_checkout_recovery = ? AND state <> 'closed' AND expires_at > clock_timestamp()
             ORDER BY created_at DESC LIMIT ?
-            """).params(guest, order, channel == CheckoutChannel.MOBILE, MAX_CHALLENGES)
-            .query((rs, row) -> {
-                UUID id = rs.getObject("id", UUID.class);
-                return MessageDigest.isEqual(rs.getBytes("phone_digest"), digest(id, phone)) ? id : null;
-            }).list().stream().filter(Objects::nonNull).findFirst().orElse(null);
+            """).params(guest, order, channel == CheckoutChannel.MOBILE, MAX_CHALLENGES), phone);
+    }
+
+    private UUID matchingPhoneChallenge(JdbcClient.StatementSpec candidates, String phone) {
+        return candidates.query((rs, row) -> {
+            UUID id = rs.getObject("id", UUID.class);
+            return MessageDigest.isEqual(rs.getBytes("phone_digest"), digest(id, phone)) ? id : null;
+        }).list().stream().filter(Objects::nonNull).findFirst().orElse(null);
     }
 
     private boolean queueHasRoom() {
