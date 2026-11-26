@@ -13,7 +13,7 @@ import { copy, money } from '../src/ui/format';
 
 export default function PaymentScreen() {
   const { from } = useLocalSearchParams<{ from?: string }>();
-  const { mode, demoApi, settleLocalTestPayment, checkoutAllowed, locale } = useShop();
+  const { mode, demoApi, settleLocalTestPayment, checkoutAllowed, webCheckout, locale } = useShop();
   const { journal } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const active = journal?.active;
@@ -26,6 +26,7 @@ export default function PaymentScreen() {
   const processing = !failed && order?.paymentStatus === 'processing' && order.paymentAttempt !== null && !order.recoveryReadOnly;
   const checkingPayment = order ? hasInconsistentPayment(order) : loading;
   const onDevice = Platform.OS === 'android' || Platform.OS === 'ios';
+  const canOpenHostedPayment = checkoutAllowed && (onDevice || webCheckout);
   function goToOrders() {
     if (from === 'orders' && router.canGoBack()) router.back();
     else router.replace('/(tabs)/orders');
@@ -57,7 +58,7 @@ export default function PaymentScreen() {
   }
 
   async function openHostedPayment() {
-    if (!onDevice || !checkoutAllowed || !processing || !order.paymentAttempt || running.current) return;
+    if (!canOpenHostedPayment || !processing || !order.paymentAttempt || running.current) return;
 
     const shouldNavigate = guardNavigation();
     const attemptId = order.paymentAttempt.id;
@@ -70,6 +71,10 @@ export default function PaymentScreen() {
       if (!shouldNavigate() || current?.status !== 'awaiting_payment' || current.paymentStatus !== 'processing' || current.recoveryReadOnly
         || attempt?.id !== attemptId || !attempt.checkoutUrl) return;
 
+      if (webCheckout) {
+        window.location.assign(attempt.checkoutUrl);
+        return;
+      }
       await openBrowserAsync(attempt.checkoutUrl);
       await refresh();
     } catch {
@@ -125,7 +130,7 @@ export default function PaymentScreen() {
                 'The payment page is unavailable. Refresh to check this payment, or follow it later in Orders.',
                 'Urupapuro rwo kwishyura ntiruboneka. Vugurura uko ubu bwishyu buhagaze cyangwa ubukurikirane nyuma muri Komande.',
               )}</Text>
-            ) : onDevice && checkoutAllowed ? (
+            ) : canOpenHostedPayment ? (
               <Button label={t('Open payment page', 'Fungura urupapuro rwo kwishyura')}
                 onPress={() => { void openHostedPayment(); }} busy={busy === 'browser'} disabled={loading} />
             ) : <Text>{t('Open the Android or iOS app to pay.', 'Fungura porogaramu ya Android cyangwa iOS kugira ngo wishyure.')}</Text>

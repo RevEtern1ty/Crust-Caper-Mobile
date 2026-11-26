@@ -104,5 +104,11 @@ export const sessionResponse = z.object({
   refreshExpiresAt: timestamp,
 });
 
+export const webSessionResponse = z.strictObject({
+  sessionId: z.guid().refine(value => value === value.toLowerCase()),
+  expiresAt: timestamp,
+});
+export const webOrderResponse = orderResponse.safeExtend({ recoveryReadOnly: z.literal(true).optional() });
+
 export const orderAccessChallenge = z.object({ challengeId: z.guid() });
 export const orderAccessGrant = z.object({ orderId: z.guid().refine((id) => id === id.toLowerCase()) });

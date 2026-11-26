@@ -28,6 +28,7 @@ export type ConnectedConfig = {
   storeId: string;
   pspHosts: string[];
   pushProjectId?: string;
+  webCheckout?: boolean;
 };
 
 type Options = {
@@ -54,7 +55,7 @@ const knownConflicts = new Set<string>([
 const expoPushTokenPattern = /^(?:Expo|Exponent)PushToken\[[A-Za-z0-9_-]{1,128}\]$/;
 const pickupAlertStatus = z.object({ enabled: z.boolean(), available: z.boolean() });
 
-function invalidResponse(): never {
+export function invalidResponse(): never {
   throw new ApiError('invalid_response');
 }
 
@@ -66,7 +67,7 @@ function refreshInput(guest: SavedSession) {
   return { refreshToken: guest.refreshToken, ...(guest.rotationKey ? { rotationKey: guest.rotationKey } : {}) };
 }
 
-function safeHttps(value: string | null | undefined, allow?: (url: URL) => boolean): string | null {
+export function safeHttps(value: string | null | undefined, allow?: (url: URL) => boolean): string | null {
   if (!value || value !== value.trim() || /[\u0000-\u0020\u007f\\]/.test(value)) return null;
   try {
     const url = new URL(value);
@@ -79,7 +80,7 @@ function safeHttps(value: string | null | undefined, allow?: (url: URL) => boole
   return null;
 }
 
-function errorCode(status: number, problem: unknown): ApiErrorCode {
+export function errorCode(status: number, problem: unknown): ApiErrorCode {
   if (status === 400 || status === 422) return 'invalid_input';
   if (status === 401 || status === 403) return 'unauthenticated';
   if (status === 404) return 'not_found';

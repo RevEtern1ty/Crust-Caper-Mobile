@@ -36,6 +36,7 @@ function Routes() {
       <Stack.Screen name="payment" options={{ title: mode === 'demo'
         ? copy(locale, 'Test payment', 'Kwishyura by’igerageza') : copy(locale, 'Payment', 'Kwishyura') }} />
       <Stack.Screen name="payment-return" options={{ headerShown: false }} />
+      <Stack.Screen name="web-payment-return" options={{ headerShown: false }} />
       <Stack.Screen name="order-recovery" options={{ title: copy(locale, 'Find an order', 'Shaka komande') }} />
       <Stack.Screen name="settings" options={{ title: copy(locale, 'Settings', 'Amagenamiterere') }} />
     </Stack>

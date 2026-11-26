@@ -66,6 +66,10 @@ function httpsOrigin(value: string, name: string): URL {
 export default ({ config }: ConfigContext): ExpoConfig => {
   const profile = process.env.CRUSTCAPER_BUILD_PROFILE ?? 'demo';
   const pushProfile = profile === 'stage' || profile === 'production';
+  const webCheckout = process.env.CRUSTCAPER_WEB_CHECKOUT === 'true';
+  if (webCheckout && !pushProfile) {
+    throw new Error('CRUSTCAPER_WEB_CHECKOUT requires a stage or production HTTPS profile.');
+  }
   const pushProjectId = pushProfile ? process.env.CRUSTCAPER_PUSH_PROJECT_ID?.trim().toLowerCase() || undefined : undefined;
   if (pushProjectId && !projectIdPattern.test(pushProjectId)) {
     throw new Error('CRUSTCAPER_PUSH_PROJECT_ID must be a UUID for this build profile.');
@@ -155,7 +159,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     extra: {
       ...config.extra,
       ...(pushProjectId ? { eas: { ...config.extra?.eas, projectId: pushProjectId } } : {}),
-      restaurant: { profile, apiBaseUrl: api.origin + '/api/v1', storeId, pspHosts, pushProjectId },
+      restaurant: { profile, apiBaseUrl: api.origin + '/api/v1', storeId, pspHosts, pushProjectId, webCheckout },
     },
   };
   return pushProjectId ? withFirebasePickupAlerts(resolved) : withoutPickupAlertEntitlement(resolved);

@@ -13,6 +13,7 @@ import { lineKey, MAX_QUANTITY } from '../domain/cart';
 import { createDemoApi } from '../domain/demo-api';
 import type { CartLine, DemoApi, Locale, Menu, ShopApi } from '../domain/types';
 import { createLiveApi, type ConnectedConfig, type LiveShopApi } from '../live/http-api';
+import { createWebLiveApi, webCheckoutAvailable } from '../live/web-api';
 import type { Draft } from './draft-storage';
 import { privateStorage } from './private-storage';
 import { useShopDraft } from './use-shop-draft';
@@ -24,12 +25,15 @@ if (!settings || !['demo', 'local', 'stage', 'production'].includes(settings.pro
   throw new Error('CrustCaper runtime profile is missing.');
 }
 const connected = settings.profile !== 'demo' ? settings : null;
+const httpsWeb = !!connected && connected.profile !== 'local' && Platform.OS === 'web';
+const webCheckout = !!connected && httpsWeb && connected.webCheckout === true && webCheckoutAvailable(connected);
 const pushProjectId = connected && connected.profile !== 'local' && (Platform.OS === 'android' || Platform.OS === 'ios')
   ? paymentReturnOrderId(connected.pushProjectId) : null;
 const runtimeScope = connected ? [
   connected.profile, new URL(connected.apiBaseUrl).hostname, new URL(connected.apiBaseUrl).port || '443', connected.storeId,
 ].join('.') : null;
-const checkoutStorageKey = runtimeScope ? CHECKOUT_JOURNAL_KEY + '.' + runtimeScope : CHECKOUT_JOURNAL_KEY;
+const checkoutStorageKey = runtimeScope
+  ? CHECKOUT_JOURNAL_KEY + '.' + runtimeScope + (httpsWeb ? '.web' : '') : CHECKOUT_JOURNAL_KEY;
 const menuKey = runtimeScope ? 'crustcaper.menu.v1.' + runtimeScope : 'crustcaper.menu.v1';
 const demoStorage = Platform.OS === 'web' ? {
   async getItem(key: string) {
@@ -44,17 +48,17 @@ const demoStorage = Platform.OS === 'web' ? {
   setItem: privateStorage.setItem,
 } : AsyncStorage;
 const demoApi = connected ? null : createDemoApi({ storage: demoStorage, newId: randomUUID });
-const liveApi = connected ? createLiveApi({
-  config: connected,
-  storage: privateStorage,
-  journalKey: checkoutStorageKey,
-  newInstallationId: pushProjectId ? randomUUID : undefined,
-  newRotationKey: randomUUID,
+const liveApi = connected ? (httpsWeb ? createWebLiveApi({
+  config: connected, storage: privateStorage, journalKey: checkoutStorageKey,
+  browser: { available: () => webCheckout, locks: () => navigator.locks },
+}) : createLiveApi({
+  config: connected, storage: privateStorage, journalKey: checkoutStorageKey,
+  newInstallationId: pushProjectId ? randomUUID : undefined, newRotationKey: randomUUID,
   // The React Native XHR-backed fetch does not enforce RequestInit.redirect.
   fetcher: Platform.OS === 'web' ? undefined : expoFetch,
-}) : null;
+})) : null;
 const api: ShopApi = liveApi ?? demoApi!;
-const guestSession: GuestSessionLifecycle | undefined = liveApi ? {
+const guestSession: GuestSessionLifecycle | undefined = liveApi && (!httpsWeb || webCheckout) ? {
   end: () => liveApi.endGuestSession(),
   hasEndPending: () => liveApi.hasGuestSessionEndPending(),
 } : undefined;
@@ -97,6 +101,7 @@ type Shop = Draft & {
   settleLocalTestPayment: LiveShopApi['settleLocalTestPayment'];
   checkoutStorageKey: string;
   checkoutAllowed: boolean;
+  webCheckout: boolean;
   pushProjectId: string | null;
   fixturePhotos: boolean;
   menu: Menu | null;
@@ -225,7 +230,8 @@ export function ShopProvider({ children }: PropsWithChildren) {
     <ShopContext.Provider value={{
       ...draft, api, demoApi, guestSession, settleLocalTestPayment: liveApi?.settleLocalTestPayment,
       checkoutStorageKey, mode: connected ? 'connected' : 'demo',
-      checkoutAllowed: !connected || connected.profile === 'local' || Platform.OS !== 'web',
+      checkoutAllowed: !httpsWeb || webCheckout,
+      webCheckout,
       pushProjectId,
       fixturePhotos: !connected || connected.profile === 'local',
       menu, status, refreshing, hydrated, draftSaving, draftStorageError, retryDraftStorage, total, count,
