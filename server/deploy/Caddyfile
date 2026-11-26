@@ -31,6 +31,8 @@
 		header_up -Cookie
 		header_up -Authorization
 		header_up -X-CrustCaper-Session
+		header_up -X-CrustCaper-Client-IP
+		header_up -X-CrustCaper-Edge-Proof
 		header_down -Set-Cookie
 		transport http {
 			dial_timeout 2s
@@ -120,6 +122,8 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 				max_size 64KiB
 			}
 			reverse_proxy api:8080 {
+				header_up X-CrustCaper-Client-IP {http.request.remote.host}
+				header_up X-CrustCaper-Edge-Proof {env.CRUSTCAPER_EDGE_RATE_PROOF}
 				health_uri /actuator/health/readiness
 				health_interval 5s
 				health_timeout 3s

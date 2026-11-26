@@ -45,6 +45,15 @@ management:
         readiness:
           include: readinessState,db
 crustcaper:
+  edge-rate:
+    enabled: ${CRUSTCAPER_EDGE_RATE_ENABLED:false}
+    proof: ${CRUSTCAPER_EDGE_RATE_PROOF:}
+    sessions-per-minute: ${CRUSTCAPER_EDGE_RATE_SESSIONS_PER_MINUTE:120}
+    otp-starts-per-minute: ${CRUSTCAPER_EDGE_RATE_OTP_STARTS_PER_MINUTE:30}
+    otp-verifications-per-minute: ${CRUSTCAPER_EDGE_RATE_OTP_VERIFICATIONS_PER_MINUTE:60}
+    staff-logins-per-minute: ${CRUSTCAPER_EDGE_RATE_STAFF_LOGINS_PER_MINUTE:30}
+    quotes-per-minute: ${CRUSTCAPER_EDGE_RATE_QUOTES_PER_MINUTE:120}
+    orders-per-minute: ${CRUSTCAPER_EDGE_RATE_ORDERS_PER_MINUTE:60}
   checkout:
     quotas:
       quotes-per-session: ${CRUSTCAPER_CHECKOUT_QUOTES_PER_SESSION:30}

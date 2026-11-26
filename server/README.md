@@ -43,7 +43,7 @@ The Gradle suite exercises both a fresh schema and an upgrade from populated V22
 
 Requests wait up to five seconds for a PostgreSQL connection from the runtime pool. Runtime pgJDBC connections default to a three-second socket connect timeout and a six-second socket read timeout. Parameters with the same names in the JDBC URL take precedence. Flyway opens a separate connection at startup using the same JDBC URL and credentials by default, so migrations can run beyond the runtime read timeout. [pgJDBC connection parameters](https://jdbc.postgresql.org/documentation/use/)
 
-Checkout creation limits apply across API instances through PostgreSQL. Configure the four optional quota variables for the expected pilot traffic. Apply network request limits at the public ingress. [Checkout limits](docs/OPERATIONS.md#лимиты-оформления)
+Checkout creation limits apply across API instances through PostgreSQL. Configure the four optional quota variables for the expected pilot traffic. The bundled HTTPS ingress also enables network quotas for one API instance. When using the base Compose file with another ingress, apply network quotas at that ingress. [Checkout limits](docs/OPERATIONS.md#лимиты-оформления)
 
 For `stage`, `prod` and `production`, the API checks both JDBC URLs before connecting. Each URL must specify `sslmode=verify-full` and an absolute `sslrootcert` path to a certificate file readable by the API. Put the runtime URL in `CRUSTCAPER_DB_URL` and use the standard PostgreSQL driver and TLS transport. If you set a separate `spring.flyway.url`, apply the same requirements there. [pgJDBC TLS configuration](https://jdbc.postgresql.org/documentation/ssl/)
 
@@ -67,9 +67,14 @@ Create `/etc/crustcaper/stage/compose.env` with the following deployment values.
 | `CRUSTCAPER_HTTPS_HOST` | Exact staging hostname, without a scheme or port. |
 | `CRUSTCAPER_HTTPS_BIND_IP` | Host listener IP. Use `127.0.0.1` with hostname `localhost` for a private local HTTPS rehearsal. |
 | `CRUSTCAPER_API_ENV_FILE` | Absolute path to the API environment file. |
+| `CRUSTCAPER_EDGE_RATE_ENV_FILE` | Absolute path to the separate shared edge proof environment file. |
 | `CRUSTCAPER_POSTGRES_CA_FILE` | Absolute path to the CA PEM file, readable by the API container's UID `10001`. |
 
 Store the API variables from the Deployment configuration section in a separate host file with mode `0600`. Use raw `KEY=value` lines without shell quoting. Set `SPRING_PROFILES_ACTIVE=stage`, `CRUSTCAPER_PAYMENT_PROVIDER=flutterwave`, the approved `CRUSTCAPER_FLUTTERWAVE_PAYMENT_OPTIONS`, and `CRUST_PAYMENT_RETURN_URL=https://<staging-host>/payment-return`. Set the JDBC URL to `jdbc:postgresql://<db-host>:5432/<db>?sslmode=verify-full&sslrootcert=/run/crustcaper/postgres-ca.crt`. The database hostname must match its certificate. Keep API secrets out of Compose interpolation values and use `config --quiet` for validation. [pgJDBC TLS configuration](https://jdbc.postgresql.org/documentation/ssl/)
+
+Create a separate mode `0600` file for the edge once per environment. It contains one raw `CRUSTCAPER_EDGE_RATE_PROOF` value generated with `openssl rand -hex 32`. List only that file's path in `compose.env`. The HTTPS overlay provides it to Caddy and the API and automatically enables the API network quotas. Recreate both services together when rotating the proof. The API refuses to start with an invalid proof while quotas are enabled. Keep the API port private and use `config --quiet` when validating the deployment.
+
+For this single-host mode, connect clients directly to Caddy so the limiter can use the source address of the TLS connection. An upstream proxy that terminates client connections will share the quota of its own address. For a CDN, another public proxy, or multiple API replicas, enforce the shared policy at the public ingress and restrict origin access to that ingress. [Network quotas](docs/OPERATIONS.md#сетевые-лимиты)
 
 Configure `CRUSTCAPER_APP_LINK_IOS_APP_ID` with the signed Apple application identifier and `CRUSTCAPER_APP_LINK_ANDROID_PACKAGE` with the signed Android package. Supply the comma-separated, colon-delimited SHA-256 signing certificate fingerprints in `CRUSTCAPER_APP_LINK_ANDROID_FINGERPRINTS`. An unconfigured platform's association URL returns 404. [Connected release checks](../docs/runbooks/CONNECTED_RELEASE.md)
 

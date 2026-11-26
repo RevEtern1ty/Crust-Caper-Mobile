@@ -6,6 +6,7 @@ const { tmpdir } = require('node:os');
 const { basename, dirname, join, resolve } = require('node:path');
 const { openStorefrontFixture } = require('./storefront-load.cjs');
 const { openStaffSession } = require('./storefront-load-kitchen.cjs');
+const { networkRateWitnesses, networkRateSessionLimit, runNetworkRateLimit } = require('./storefront-network-rate-limit.cjs');
 const { fixtureDatabaseUrl, preparePostgresTls, postgresCaMount, postgresJdbcTlsQuery, postgresTlsEntrypoint,
   postgresTlsMount, postgresTlsRuntime } = require('./storefront-postgres-tls.cjs');
 
@@ -119,10 +120,11 @@ function postgresService(host, name, password, tlsDirectory, volumes, labels) {
   };
 }
 
-async function prepareFixture(directory, testClasses, env, { paymentRestart, errorRehearsal, databaseRecovery }) {
+async function prepareFixture(directory, testClasses, env, { paymentRestart, errorRehearsal, databaseRecovery, networkRateLimit }) {
   const fixturePassword = randomBytes(24).toString('hex');
   const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
+  const edgeRateEnvironment = join(directory, 'edge-rate.env');
   const composeEnvironment = join(directory, 'compose.env');
   const { tlsDirectory, caFile: databaseCa, caFingerprint } = await preparePostgresTls(directory, env, run);
   const caddyfile = join(directory, 'Caddyfile');
@@ -171,6 +173,7 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
     ] : []),
     '',
   ].join('\n'), { mode: 0o600 });
+  await writeFile(edgeRateEnvironment, `CRUSTCAPER_EDGE_RATE_PROOF=${randomBytes(32).toString('hex')}\n`, { mode: 0o600 });
   await writeFile(composeEnvironment, '');
 
   const site = 'https://{$CRUSTCAPER_HTTPS_HOST} {';
@@ -202,6 +205,7 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
           postgres: { condition: 'service_healthy' },
           ...(paymentRestart && { provider: { condition: 'service_started' } }),
         },
+        ...(networkRateLimit && { environment: { CRUSTCAPER_EDGE_RATE_SESSIONS_PER_MINUTE: String(networkRateSessionLimit) } }),
         volumes: [fixtureClasses],
         ...(paymentRestart && { command: ['--restart-api'], restart: 'no' }),
       },
@@ -222,7 +226,10 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
         restart: 'no',
       } }),
       catalog: { pull_policy: 'never' },
-      edge: { volumes: [mount(caddyfile, '/etc/caddy/Caddyfile')] },
+      edge: {
+        volumes: [mount(caddyfile, '/etc/caddy/Caddyfile')],
+        ...(networkRateLimit && { networks: ['default', 'catalog_private', 'network_rate_clients'] }),
+      },
       postgres: postgresService('postgres', database, fixturePassword, tlsDirectory, [
         mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
         operators,
@@ -230,10 +237,12 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
         ...(databaseRecovery ? ['source_db:/var/lib/postgresql/data'] : []),
       ], databaseRecovery ? recoveryLabel : errorRehearsal ? errorRehearsalLabel : undefined),
       ...(databaseRecovery && { [recoveryHost]: recoveryPostgres }),
+      ...(networkRateLimit && networkRateWitnesses()),
     },
     ...(databaseRecovery && { volumes: { source_db: {}, recovered_db: {} } }),
+    ...(networkRateLimit && { networks: { network_rate_clients: { internal: true } } }),
   }, null, 2), { mode: 0o600 });
-  return { apiEnvironment, composeEnvironment, databaseCa, overlay, recoveryOverlay, fixtureMfaKey };
+  return { apiEnvironment, edgeRateEnvironment, composeEnvironment, databaseCa, overlay, recoveryOverlay, fixtureMfaKey };
 }
 
 async function confirmPostgresTls(compose) {
@@ -321,10 +330,11 @@ async function main() {
   const availability = mode === '--availability';
   const errorRehearsal = mode === '--error-rehearsal';
   const databaseRecovery = mode === '--database-recovery';
+  const networkRateLimit = mode === '--network-rate-limit';
   const kitchenRestart = mode === '--kitchen-restart';
   const paymentRestart = mode === '--payment-restart' || kitchenRestart || databaseRecovery;
-  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart && !availability && !errorRehearsal)) {
-    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart | --availability | --error-rehearsal | --database-recovery]');
+  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart && !availability && !errorRehearsal && !networkRateLimit)) {
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart | --availability | --error-rehearsal | --database-recovery | --network-rate-limit]');
   }
   const script = databaseRecovery ? 'tooling/storefront-database-recovery.cjs'
     : errorRehearsal ? 'tooling/storefront-error-rehearsal.cjs'
@@ -370,12 +380,14 @@ async function main() {
       await copyFile(join(root, 'assets', 'menu', `${fixturePhoto.sku}.jpg`), join(photos, fixturePhoto.file));
       await writeFile(join(photos, 'double-smash-r39.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
     }
-    const settings = await prepareFixture(directory, testClasses, hostEnv, { paymentRestart, errorRehearsal, databaseRecovery });
+    const settings = await prepareFixture(directory, testClasses, hostEnv,
+      { paymentRestart, errorRehearsal, databaseRecovery, networkRateLimit });
     const env = {
       ...hostEnv,
       CRUSTCAPER_API_IMAGE: apiImage,
       CRUSTCAPER_CATALOG_IMAGE: catalogImage,
       CRUSTCAPER_API_ENV_FILE: dockerPath(settings.apiEnvironment),
+      CRUSTCAPER_EDGE_RATE_ENV_FILE: dockerPath(settings.edgeRateEnvironment),
       CRUSTCAPER_POSTGRES_CA_FILE: dockerPath(settings.databaseCa),
       CRUSTCAPER_HTTPS_HOST: fixtureHost,
       CRUSTCAPER_HTTPS_BIND_IP: '127.0.0.1',
@@ -407,6 +419,11 @@ async function main() {
     ]);
     await importCatalog(compose, { load, catalogPhotos, availability, project, browserCa, fixtureMfaKey: settings.fixtureMfaKey });
     if (evidence) await mkdir(evidence, { recursive: true });
+    if (networkRateLimit) {
+      await runNetworkRateLimit({ compose, fixtureHost, browserCa, evidence,
+        signal: AbortSignal.any([interruption.signal, AbortSignal.timeout(85_000)]) });
+      return;
+    }
     if (databaseRecovery) {
       const { runDatabaseRecovery } = require('./storefront-database-recovery.cjs');
       const recoverySignal = AbortSignal.any([interruption.signal, AbortSignal.timeout(240000)]);

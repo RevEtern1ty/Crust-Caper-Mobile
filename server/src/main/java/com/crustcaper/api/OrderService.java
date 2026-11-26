@@ -158,15 +158,26 @@ public class OrderService {
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public Order createOrder(UUID guest, String key, OrderInput input) {
-        return createOrder(guest, key, input, CheckoutChannel.MOBILE);
+        return createOrder(guest, key, input, CheckoutChannel.MOBILE, null);
+    }
+
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public Order createOrder(UUID guest, String key, OrderInput input, Runnable networkAdmission) {
+        return createOrder(guest, key, input, CheckoutChannel.MOBILE, networkAdmission);
     }
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public Order createWebOrder(UUID guest, String key, OrderInput input) {
-        return createOrder(guest, key, input, CheckoutChannel.WEB);
+        return createOrder(guest, key, input, CheckoutChannel.WEB, null);
     }
 
-    private Order createOrder(UUID guest, String key, OrderInput input, CheckoutChannel channel) {
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public Order createWebOrder(UUID guest, String key, OrderInput input, Runnable networkAdmission) {
+        return createOrder(guest, key, input, CheckoutChannel.WEB, networkAdmission);
+    }
+
+    private Order createOrder(UUID guest, String key, OrderInput input, CheckoutChannel channel,
+                              Runnable networkAdmission) {
         validateKey(key);
         if (input == null) throw ApiFailure.invalid();
         UUID quoteId = ApiFailure.uuid(input.quoteId(), ApiFailure.invalid());
@@ -199,6 +210,7 @@ public class OrderService {
         StoredQuote quote = jdbc.sql("SELECT * FROM quotes WHERE id = ? AND guest_session_id = ? AND web_checkout = ?")
             .params(quoteId, guest, channel == CheckoutChannel.WEB).query(this::quoteRow)
             .optional().orElseThrow(() -> ApiFailure.conflict("quote_expired"));
+        if (networkAdmission != null) networkAdmission.run();
         requireSupportedTotal(quote.total());
         Catalog.StoreData store = catalog.store(quote.storeId(), true);
         Catalog.SlotData slot = catalog.slot(quote.storeId(), quote.slotId(), true);

@@ -1,10 +1,13 @@
 package com.crustcaper.api;
 
+import static com.crustcaper.api.EdgeRateLimits.CLIENT_IP;
+import static com.crustcaper.api.EdgeRateLimits.EDGE_PROOF;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.options;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -17,11 +20,13 @@ import jakarta.servlet.http.Cookie;
 import java.net.URI;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -33,6 +38,7 @@ import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.bean.override.convention.TestBean;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
@@ -60,15 +66,25 @@ class CheckoutQuotaIntegrationTest {
     private static final String EARLY = "quota-early";
     private static final String LATER = "quota-later";
     private static final String LATEST = "quota-latest";
+    private static final String PROOF = "34".repeat(32);
+    private static final AtomicInteger NETWORK_FIXTURES = new AtomicInteger();
 
     @Autowired MockMvc api;
     @Autowired ObjectMapper json;
     @MockitoSpyBean JdbcClient jdbc;
+    @TestBean(methodName = "fixedEdgeRateLimits") EdgeRateLimits edgeRateLimits;
 
     private final List<String> stores = new ArrayList<>();
     private final List<UUID> guests = new ArrayList<>();
     private OffsetDateTime initialClock;
     private String store;
+
+    static EdgeRateLimits fixedEdgeRateLimits() {
+        var limits = new EnumMap<EdgeRateLimits.Category, Integer>(EdgeRateLimits.Category.class);
+        for (var category : EdgeRateLimits.Category.values()) limits.put(category, 120);
+        limits.put(EdgeRateLimits.Category.ORDER, 2);
+        return new EdgeRateLimits(true, PROOF, limits, 100, () -> 17);
+    }
 
     @BeforeEach
     void fixture() {
@@ -196,6 +212,51 @@ class CheckoutQuotaIntegrationTest {
         assertThat(quoteCount(store)).isOne();
     }
 
+    @Test
+    void networkNewOrderLimitSpansChannelsAndPreservesExactReplayAndConflict() throws Exception {
+        String localOrigin = "http://127.0.0.1:8765";
+        api.perform(options(API + "/orders").header(HttpHeaders.ORIGIN, localOrigin)
+                .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(HttpHeaders.ACCESS_CONTROL_REQUEST_HEADERS, "Authorization, Idempotency-Key, Content-Type"))
+            .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, localOrigin));
+
+        String other = fixtureStore();
+        var mobile = nativeGuest();
+        var browser = browserGuest();
+        var anotherMobile = nativeGuest();
+        String mobileQuote = quoteId(createQuote(nativePost("/quotes", mobile), store, EARLY));
+        String webQuote = quoteId(createQuote(webPost("/quotes", browser), store, LATER));
+        String rejectedQuote = quoteId(createQuote(nativePost("/quotes", anotherMobile), other, LATEST));
+        String sameNetwork = "198.51.100.7";
+        String mobileKey = "network-mobile-order";
+        String webKey = "network-web-order";
+        String mobileOrder = body(submit(nativePost("/orders", mobile, sameNetwork), mobileQuote, mobileKey)
+            .andExpect(status().isOk())).path("id").asString();
+        String webOrder = body(submit(webPost("/orders", browser, sameNetwork), webQuote, webKey)
+            .andExpect(status().isOk())).path("id").asString();
+
+        var rejected = submit(nativePost("/orders", anotherMobile, sameNetwork).header(HttpHeaders.ORIGIN, localOrigin),
+            rejectedQuote, "network-third-order").andExpect(header().string(HttpHeaders.RETRY_AFTER, "43"))
+            .andExpect(header().string(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, localOrigin))
+            .andExpect(result -> assertThat(result.getResponse().getHeader(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS))
+                .contains(HttpHeaders.RETRY_AFTER));
+        assertRateLimited(rejected);
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?").param(other).query(Long.class).single())
+            .isZero();
+
+        submit(nativePost("/orders", mobile, sameNetwork), mobileQuote, mobileKey)
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(mobileOrder));
+        submit(webPost("/orders", browser, sameNetwork), webQuote, webKey)
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(webOrder));
+        submit(nativePost("/orders", mobile, sameNetwork), rejectedQuote, mobileKey)
+            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("conflict"));
+        assertThat(activeOrders()).containsExactlyInAnyOrder(mobileOrder, webOrder);
+
+        submit(nativePost("/orders", anotherMobile), rejectedQuote, "network-third-order").andExpect(status().isOk());
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?").param(other).query(Long.class).single())
+            .isOne();
+    }
+
     private void checkoutClock(long minutes) {
         OffsetDateTime pinned = initialClock.plusMinutes(minutes);
         checkoutClock(pinned, pinned);
@@ -230,22 +291,28 @@ class CheckoutQuotaIntegrationTest {
     }
 
     private NativeGuest nativeGuest() throws Exception {
-        JsonNode session = body(api.perform(post(API + "/guest-sessions")).andExpect(status().isOk()));
+        String address = networkFixture();
+        JsonNode session = body(api.perform(edge(post(API + "/guest-sessions"), address)).andExpect(status().isOk()));
         guests.add(UUID.fromString(session.path("sessionId").asString()));
-        return new NativeGuest("Bearer " + session.path("accessToken").asString());
+        return new NativeGuest("Bearer " + session.path("accessToken").asString(), address);
     }
 
     private BrowserGuest browserGuest() throws Exception {
-        var response = api.perform(guardedWebPost("/session")).andExpect(status().isOk()).andReturn().getResponse();
+        String address = networkFixture();
+        var response = api.perform(edge(guardedWebPost("/session"), address)).andExpect(status().isOk()).andReturn().getResponse();
         UUID id = UUID.fromString(body(response).path("sessionId").asString());
         Cookie cookie = response.getCookie("__Host-crustcaper-web");
         assertThat(cookie).isNotNull();
         guests.add(id);
-        return new BrowserGuest(id, cookie);
+        return new BrowserGuest(id, cookie, address);
     }
 
     private static MockHttpServletRequestBuilder nativePost(String path, NativeGuest guest) {
-        return post(API + path).header(HttpHeaders.AUTHORIZATION, guest.bearer());
+        return nativePost(path, guest, guest.sourceAddress());
+    }
+
+    private static MockHttpServletRequestBuilder nativePost(String path, NativeGuest guest, String address) {
+        return edge(post(API + path).header(HttpHeaders.AUTHORIZATION, guest.bearer()), address);
     }
 
     private static MockHttpServletRequestBuilder guardedWebPost(String path) {
@@ -254,7 +321,19 @@ class CheckoutQuotaIntegrationTest {
     }
 
     private static MockHttpServletRequestBuilder webPost(String path, BrowserGuest guest) {
-        return guardedWebPost(path).cookie(guest.cookie()).header("X-CrustCaper-Session", guest.id().toString());
+        return webPost(path, guest, guest.sourceAddress());
+    }
+
+    private static MockHttpServletRequestBuilder webPost(String path, BrowserGuest guest, String address) {
+        return edge(guardedWebPost(path).cookie(guest.cookie()).header("X-CrustCaper-Session", guest.id().toString()), address);
+    }
+
+    private static MockHttpServletRequestBuilder edge(MockHttpServletRequestBuilder request, String address) {
+        return request.header(EDGE_PROOF, PROOF).header(CLIENT_IP, address);
+    }
+
+    private static String networkFixture() {
+        return "2001:db8:1:" + Integer.toHexString(NETWORK_FIXTURES.incrementAndGet()) + "::1";
     }
 
     private static void awaitStart(CountDownLatch ready, CountDownLatch start) throws InterruptedException {
@@ -309,6 +388,6 @@ class CheckoutQuotaIntegrationTest {
         return json.readTree(response.getContentAsByteArray());
     }
 
-    private record NativeGuest(String bearer) {}
-    private record BrowserGuest(UUID id, Cookie cookie) {}
+    private record NativeGuest(String bearer, String sourceAddress) {}
+    private record BrowserGuest(UUID id, Cookie cookie, String sourceAddress) {}
 }

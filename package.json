@@ -35,6 +35,7 @@
     "test:storefront:availability": "node tooling/storefront-stack.cjs --availability",
     "test:storefront:api-errors": "node tooling/storefront-stack.cjs --error-rehearsal",
     "test:storefront:database-recovery": "node tooling/storefront-stack.cjs --database-recovery",
+    "test:storefront:network-rate-limit": "node tooling/storefront-stack.cjs --network-rate-limit",
     "monitor:storefront": "node server/tooling/storefront-availability.mjs",
     "monitor:api-errors": "node server/tooling/api-error-watch.mjs",
     "start:local-stack": "node tooling/local-stack.cjs"

@@ -13,6 +13,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestAttribute;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -78,8 +79,9 @@ final class CommerceController {
 
     @PostMapping("/orders")
     ResponseEntity<Order> order(@RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String bearer,
-        @RequestHeader(value = KEY, required = false) String key, @RequestBody OrderInput input) {
-        return privateResponse(orders.createOrder(sessions.authenticate(bearer), key, input));
+        @RequestHeader(value = KEY, required = false) String key, @RequestBody OrderInput input,
+        @RequestAttribute(value = EdgeRateLimits.ORDER_ADMISSION, required = false) Runnable networkAdmission) {
+        return privateResponse(orders.createOrder(sessions.authenticate(bearer), key, input, networkAdmission));
     }
 
     @GetMapping("/orders/recovery")

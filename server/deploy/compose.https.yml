@@ -1,11 +1,19 @@
 services:
   api:
     ports: !reset []
+    env_file:
+      - path: ${CRUSTCAPER_EDGE_RATE_ENV_FILE:?Set a path to the edge rate limit environment file}
+        format: raw
+    environment:
+      CRUSTCAPER_EDGE_RATE_ENABLED: "true"
 
   edge:
     image: caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
     depends_on:
       - api
+    env_file:
+      - path: ${CRUSTCAPER_EDGE_RATE_ENV_FILE:?Set a path to the edge rate limit environment file}
+        format: raw
     environment:
       CRUSTCAPER_HTTPS_HOST: ${CRUSTCAPER_HTTPS_HOST:?Set the public staging hostname}
     ports:

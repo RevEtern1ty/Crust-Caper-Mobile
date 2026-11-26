@@ -54,6 +54,7 @@ paths:
       operationId: createGuestSession
       responses:
         '200': { $ref: '#/components/responses/GuestSession' }
+        '429': { $ref: '#/components/responses/NetworkRateExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /guest-sessions/refresh:
     post:
@@ -68,6 +69,7 @@ paths:
         '200': { $ref: '#/components/responses/GuestSession' }
         '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/NetworkRateExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /guest-sessions/revoke:
     post:
@@ -168,6 +170,7 @@ paths:
         '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '429': { $ref: '#/components/responses/NetworkRateExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /orders/{id}:
     parameters:
@@ -374,6 +377,7 @@ paths:
                   challengeId: { type: string, format: uuid }
         '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
+        '429': { $ref: '#/components/responses/NetworkRateExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /order-access/challenges/{challengeId}/verify:
     post:
@@ -413,6 +417,7 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/NotFoundProblem' }
+        '429': { $ref: '#/components/responses/NetworkRateExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /web/session:
     get:
@@ -431,6 +436,7 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/WebSession' }
         '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '429': { $ref: '#/components/responses/NetworkRateExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
     delete:
       operationId: deleteWebSession
@@ -514,6 +520,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/WebOriginRejected' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '429': { $ref: '#/components/responses/NetworkRateExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /web/orders/recovery:
     get:
@@ -648,6 +655,7 @@ paths:
         '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '429': { $ref: '#/components/responses/NetworkRateExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /web/order-access/challenges/{challengeId}/verify:
     post:
@@ -670,6 +678,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/WebOriginRejected' }
         '404': { $ref: '#/paths/~1order-access~1challenges~1{challengeId}~1verify/post/responses/404' }
+        '429': { $ref: '#/components/responses/NetworkRateExceeded' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/sessions:
     post:
@@ -708,7 +717,7 @@ paths:
                   role: { type: string, enum: [kitchen, pickup, manager] }
         '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
-        '429': { $ref: '#/components/responses/OperatorRateLimited' }
+        '429': { $ref: '#/components/responses/OperatorLoginRateLimited' }
   /operator/sessions/current:
     delete:
       operationId: revokeOperatorSession
@@ -1777,20 +1786,23 @@ components:
                   code:
                     enum: [quote_expired, quote_changed, slot_unavailable, conflict, reservation_expired, payment_pending, payment_mismatch]
     CheckoutQuotaExceeded:
-      description: The current UTC minute's limit for new quotes or reservations was reached for this session or restaurant. An exact replay of a committed order does not use another allowance.
+      description: The current minute's limit for quotes or new reservations was reached for the session, restaurant or client network. An exact replay of a committed order does not use another allowance.
       headers:
         Retry-After:
           description: Seconds to wait until the next quota window.
           schema: { type: integer, minimum: 1, maximum: 60 }
       content:
         application/problem+json:
-          schema:
-            allOf:
-              - $ref: '#/components/schemas/ProblemDetails'
-              - type: object
-                properties:
-                  status: { const: 429 }
-                  code: { const: rate_limited }
+          schema: { $ref: '#/components/schemas/RateLimitProblem' }
+    NetworkRateExceeded:
+      description: The current minute's limit for this operation was reached for the client network.
+      headers:
+        Retry-After:
+          description: Seconds to wait until the next quota window.
+          schema: { type: integer, minimum: 1, maximum: 60 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/RateLimitProblem' }
     ServiceUnavailable:
       description: The service or upstream provider is temporarily unavailable.
       headers:
@@ -1823,13 +1835,26 @@ components:
           schema: { type: integer, const: 120 }
       content:
         application/problem+json:
+          schema: { $ref: '#/components/schemas/RateLimitProblem' }
+    OperatorLoginRateLimited:
+      description: The client network or operator account reached its login limit.
+      headers:
+        Retry-After:
           schema:
-            allOf:
-              - $ref: '#/components/schemas/ProblemDetails'
-              - properties:
-                  status: { const: 429 }
-                  code: { const: rate_limited }
+            anyOf:
+              - { type: integer, minimum: 1, maximum: 60 }
+              - { type: integer, const: 120 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/RateLimitProblem' }
   schemas:
+    RateLimitProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status: { const: 429 }
+            code: { const: rate_limited }
     PickupAlert:
       type: object
       required: [available, enabled]

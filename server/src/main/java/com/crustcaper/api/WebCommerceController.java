@@ -66,8 +66,9 @@ final class WebCommerceController {
 
     @PostMapping("/orders")
     ResponseEntity<WebOrder> order(@RequestAttribute(GUEST_ATTRIBUTE) UUID guest,
-        @RequestHeader(value = KEY, required = false) String key, @RequestBody OrderInput input) {
-        Order order = orders.createWebOrder(guest, key, input);
+        @RequestHeader(value = KEY, required = false) String key, @RequestBody OrderInput input,
+        @RequestAttribute(value = EdgeRateLimits.ORDER_ADMISSION, required = false) Runnable networkAdmission) {
+        Order order = orders.createWebOrder(guest, key, input, networkAdmission);
         return privateResponse(WebOrder.from(order, false));
     }
 

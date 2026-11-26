@@ -165,6 +165,11 @@ jobs:
             docker image inspect --format 'catalog={{.Id}}' "$CRUSTCAPER_FIXTURE_CATALOG_IMAGE"
           } >"$CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR/candidate.txt"
           npm run test:storefront:catalog-photos
+      - name: Verify client network quotas through the HTTPS ingress
+        timeout-minutes: 5
+        env:
+          CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: ${{ runner.temp }}/crustcaper-https-evidence/network-rate-limit
+        run: npm run test:storefront:network-rate-limit
       - name: Verify scheduled payment reconciliation and the open kitchen board after a forced API stop
         timeout-minutes: 5
         env:
