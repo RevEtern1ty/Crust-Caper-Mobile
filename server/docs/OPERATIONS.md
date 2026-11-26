@@ -54,13 +54,42 @@
 
 На локальном сервере с `SPRING_PROFILES_ACTIVE=local` и провайдером `local` создаются синтетические сотрудники `demo-kitchen`, `demo-pickup` и `demo-manager` для тестовой точки. Пароль каждой локальной записи `local-demo-passphrase`. Префикс `demo-` зарезервирован для этих записей. Их пароли и сессии отвергаются вне локального режима даже при наличии строк в базе.
 
-Для подключённой точки заведите сотрудника через операцию администратора БД. Сгенерируйте пароль и передайте его сотруднику по защищённому каналу. Инструмент считывает пароль без отображения и выводит только хеш. Из директории `server/` после компиляции Java запустите в интерактивном терминале:
+Для подключённой точки администратор БД создаёт отдельную учётную запись для каждого сотрудника. Сгенерируйте пароль и передайте его сотруднику по защищённому каналу. Генератор считывает пароль без отображения и выводит хеш. Из каталога `server/` после компиляции Java запустите его в интерактивном терминале.
 
 ```sh
 java -cp build/classes/java/main com.crustcaper.api.operator.OperatorPasswordHash
 ```
 
-В транзакции вставьте запись в `operator_accounts` с уникальным UUID и логином в нижнем регистре, `store_id` существующей точки, одной из трёх ролей и полученным `password_hash`. Для смены пароля обновите хеш и удалите активные строки этого `operator_id` из `operator_sessions`. Для прекращения доступа установите `enabled=false` и отзовите сессии. История `operator_order_events` остаётся привязана к исходному сотруднику.
+Для собранного серверного JAR используйте тот же генератор через штатный загрузчик Spring Boot.
+
+```sh
+java -Dloader.main=com.crustcaper.api.operator.OperatorPasswordHash -cp crustcaper-api.jar org.springframework.boot.loader.launch.PropertiesLauncher
+```
+
+Запустите [инструмент управления доступом](../tooling/operator-accounts.psql) через `psql` на выделенном подключении администратора. Для окружения настройте PostgreSQL service с проверкой имени сервера и утверждённым CA. Сверьте точку и точное имя базы. Введите хеш в приглашении PowerShell, чтобы сохранить его вне аргументов командной строки и истории оболочки. Пример выполняется из корня репозитория.
+
+```powershell
+$operatorDatabase = 'crustcaper_stage'
+$operatorAccount = @{
+    operation = 'create'
+    storeId = 'kigali'
+    accountId = [Guid]::NewGuid().ToString()
+    username = 'staff-example'
+    role = 'kitchen'
+    passwordHash = Read-Host 'Paste the generated password hash' -MaskInput
+}
+try {
+    $operatorAccount | ConvertTo-Json -Compress | ForEach-Object {
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_))
+    } | psql -X --no-password --dbname='service=crustcaper-stage' -v "operator_database=$operatorDatabase" -f server/tooling/operator-accounts.psql
+} finally {
+    $operatorAccount.Remove('passwordHash')
+}
+```
+
+Сохраните идентификатор сотрудника из результата в реестре доступа. Для смены пароля передайте `operation = 'rotate'`, тот же `storeId`, `accountId` и `username`, а также новый хеш без поля `role`. Смена пароля сбрасывает блокировку входа и отзывает все сессии в одной транзакции. Для прекращения доступа используйте `operation = 'disable'` и три поля идентификации. Отключённая учётная запись остаётся в истории действий. Повтор точной смены пароля и повтор отключения безопасны.
+
+Используйте один и тот же UUID после неопределённого результата создания. Если инструмент сообщает о существующей записи, сверьте сотрудника и точку в реестре. Вывод инструмента содержит результат операции и число отозванных сессий. Хеш при передаче через stdin требует той же защиты, что и другие секреты.
 
 ## Проверка контура
 

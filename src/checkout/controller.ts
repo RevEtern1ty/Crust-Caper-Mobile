@@ -1,5 +1,6 @@
 import { ApiError, type Order, type OrderInput, type Quote, type ShopApi } from '../domain/types';
 import { paymentReturnOrderId } from './payment-return';
+import { isExpiredUnpaidHold } from './pickup-hold';
 
 export const CHECKOUT_JOURNAL_KEY = 'crustcaper.checkout.v1';
 const maxRecentOrders = 10;
@@ -237,6 +238,14 @@ export class CheckoutController {
       };
       await this.save(intent);
       return this.startPayment(intent);
+    });
+  }
+
+  async finishExpiredHold(order: Order): Promise<void> {
+    await this.exclusive(async () => {
+      const active = this.journal.active;
+      if (active?.phase !== 'paying' || active.orderId !== order.id || order.recoveryReadOnly || !isExpiredUnpaidHold(order)) return;
+      await this.track(active);
     });
   }
 

@@ -10,6 +10,7 @@ import { privateStorage } from '../state/private-storage';
 import { useShop } from '../state/shop';
 import { CheckoutController, CheckoutError, type CheckoutContact, type CheckoutJournal } from './controller';
 import { nextOrderStatusDelay, type OrderStatusResult } from './order-status-polling';
+import { isExpiredUnpaidHold } from './pickup-hold';
 
 type Context = {
   journal: CheckoutJournal | null;
@@ -23,6 +24,7 @@ type Context = {
   retryRestore: () => Promise<void>;
   beginCheckout: (quote: Quote, cart: CartLine[], contact: CheckoutContact) => Promise<Order>;
   resumeCheckout: (retryDeclined?: boolean, contact?: CheckoutContact) => Promise<Order>;
+  finishExpiredHold: (order: Order) => Promise<void>;
   rememberRecoveredOrder: (orderId: string, sessionRevision: number) => Promise<void>;
 };
 
@@ -99,6 +101,12 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     }
   }, [controller, publishJournal]);
 
+  const finishExpiredHold = useCallback(async (order: Order) => {
+    const active = controller.snapshot.active;
+    if (active?.phase !== 'paying' || active.orderId !== order.id || order.recoveryReadOnly || !isExpiredUnpaidHold(order)) return;
+    await run(() => controller.finishExpiredHold(order));
+  }, [controller, run]);
+
   const value: Context = {
     journal: endingGuestSession ? null : journal,
     requestedOrderId: endingGuestSession ? null : requestedOrderId,
@@ -126,6 +134,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     },
     beginCheckout: (quote, snapshot, contact) => run(async () => controller.begin(quote, await fingerprint(snapshot), contact)),
     resumeCheckout: (retryDeclined, contact) => run(() => controller.resume(retryDeclined, contact)),
+    finishExpiredHold,
     rememberRecoveredOrder: (orderId, sessionRevision) => run(() => controller.rememberRecoveredOrder(orderId, sessionRevision)),
   };
 
@@ -156,13 +165,17 @@ type StatusPolling = {
 };
 
 export function useOrderStatus(orderId: string | null) {
-  const { api, mode } = useShop();
+  const { api, mode, pickupNow } = useShop();
+  const { finishExpiredHold } = useCheckout();
   const [known, setKnown] = useState<Order | null>(null);
   const [failure, setFailure] = useState<{ orderId: string; error: unknown } | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const version = useRef(0);
   const pending = useRef<Promise<Order | null> | null>(null);
   const polling = useRef<StatusPolling | null>(null);
+  const pickupClock = useRef(pickupNow);
+
+  useEffect(() => { pickupClock.current = pickupNow; }, [pickupNow]);
 
   const refresh = useCallback((silent = false) => {
     const monitor = polling.current;
@@ -183,6 +196,10 @@ export function useOrderStatus(orderId: string | null) {
         setKnown(order);
         setFailure(null);
         monitor.onResult({ order });
+        if (isExpiredUnpaidHold(order)) {
+          // A reordered basket can retry the local journal transition if this best-effort write fails.
+          void finishExpiredHold(order).catch(() => undefined);
+        }
         return order;
       } catch (error) {
         if (request !== version.current) return null;
@@ -201,7 +218,7 @@ export function useOrderStatus(orderId: string | null) {
     return latest.finally(() => {
       if (pending.current === latest) pending.current = null;
     });
-  }, [api, orderId]);
+  }, [api, finishExpiredHold, orderId]);
 
   useFocusEffect(useCallback(() => {
     if (!orderId) return;
@@ -215,7 +232,7 @@ export function useOrderStatus(orderId: string | null) {
       onResult: (result) => {
         if (polling.current !== monitor) return;
         consecutiveFailures = 'error' in result ? consecutiveFailures + 1 : 0;
-        const delay = nextOrderStatusDelay(mode, result, ++attempts, consecutiveFailures);
+        const delay = nextOrderStatusDelay(mode, result, ++attempts, consecutiveFailures, pickupClock.current());
         if (delay !== null) timer = setTimeout(() => { void refresh(true); }, delay);
       },
     };

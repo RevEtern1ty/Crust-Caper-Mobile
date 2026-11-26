@@ -143,6 +143,44 @@ test('a lost payment response recovers the existing attempt and prevents another
   deepEqual(f.orderCalls, ['key-1']);
 });
 
+test('a confirmed expired unpaid hold retires only its own pending intent without creating an order or payment', async () => {
+  const f = fixture();
+  f.dropPaymentResponse();
+  await rejects(f.restart().begin(await f.quote(), 'original-cart'), /Payment response lost/);
+  const saved = f.savedJournal();
+  const order = await f.api.getOrder(saved.active.orderId);
+  ok(order.paymentAttempt);
+  await f.api.setDemoPaymentResult(order.id, order.paymentAttempt.id, 'declined');
+  const controller = f.restart();
+  const declined = await f.api.getOrder(order.id);
+  equal(declined.status, 'awaiting_payment');
+  await controller.finishExpiredHold(declined);
+  deepEqual(f.savedJournal(), saved);
+
+  f.setTime('2026-11-25T10:20:00Z');
+  const expired = await f.api.getOrder(order.id);
+  equal(expired.status, 'cancelled');
+  equal(expired.paymentStatus, 'declined');
+  await controller.finishExpiredHold({ ...expired, id: 'another-order' });
+  await controller.finishExpiredHold({ ...expired, recoveryReadOnly: true });
+  await controller.finishExpiredHold({ ...expired, paymentStatus: 'processing' });
+  await controller.finishExpiredHold({ ...expired, paymentStatus: 'refund_pending' });
+  deepEqual(f.savedJournal(), saved);
+
+  await controller.finishExpiredHold(expired);
+  await controller.finishExpiredHold(expired);
+  const tracked = { phase: 'tracking', orderId: order.id, key: saved.active.key };
+  deepEqual((await f.restart().restore()).active, tracked);
+  deepEqual(f.savedJournal().orderIds, [order.id]);
+  deepEqual(f.orderCalls, ['key-1']);
+  deepEqual(f.paymentCalls, ['key-2']);
+  deepEqual(f.cartClears, []);
+  const replacement = await controller.begin(await f.quote(), 'explicit-new-cart');
+  ok(replacement.id !== order.id);
+  deepEqual(f.orderCalls, ['key-1', 'key-3']);
+  deepEqual(f.paymentCalls, ['key-2', 'key-4']);
+});
+
 test('a cancelled hold lets a guest start a separate order while the old payment is still checked', async () => {
   const f = fixture();
   f.dropPaymentResponse();

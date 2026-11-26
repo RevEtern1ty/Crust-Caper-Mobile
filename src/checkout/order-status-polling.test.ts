@@ -34,6 +34,23 @@ test('connected pending payments and refunds remain open to updates', () => {
   assert.equal(check('refunded'), null);
 });
 
+test('awaiting unpaid and declined holds refresh infrequently and check again just after the deadline', () => {
+  const now = Date.parse('2026-11-25T10:00:00Z');
+  for (const mode of ['connected', 'demo'] as const) {
+    for (const paymentStatus of ['unpaid', 'declined'] as const) {
+      const order = { status: 'awaiting_payment' as const, paymentStatus };
+      const future = (delay: number) => ({ order: { ...order, reservationExpiresAt: new Date(now + delay).toISOString() } });
+      assert.equal(nextOrderStatusDelay(mode, future(5 * 60_000), 12, 0, now), 60_000);
+      assert.equal(nextOrderStatusDelay(mode, future(3200), 12, 0, now), 4200);
+      assert.equal(nextOrderStatusDelay(mode, future(0), 12, 0, now), 15_000);
+      assert.equal(nextOrderStatusDelay(mode, future(-1000), 12, 0, now), 15_000);
+      assert.equal(nextOrderStatusDelay(mode, { order: { ...order, reservationExpiresAt: 'invalid' } }, 12, 0, now), 15_000);
+      assert.equal(nextOrderStatusDelay(mode, future(3000), 12, 0, NaN), 15_000);
+      assert.equal(nextOrderStatusDelay(mode, { order: { ...order, status: 'cancelled' } }, 12, 0, now), null);
+    }
+  }
+});
+
 test('the demo retains its bounded polling window', () => {
   const result = { order: { status: 'awaiting_payment', paymentStatus: 'processing' } } as const;
   assert.equal(nextOrderStatusDelay('demo', result, 8, 0), 3000);

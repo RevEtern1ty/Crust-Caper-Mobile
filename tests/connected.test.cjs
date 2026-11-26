@@ -199,6 +199,130 @@ async function placeBrowserOrder(page, origin, buyer, screenshot) {
   return { order, attempt };
 }
 
+test('open Orders reconciles a declined checkout after its pickup hold expires', { timeout: 50_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const fixturePath = process.env.CRUSTCAPER_EXPIRE_ORDER_FIXTURE;
+  const expireOrder = fixturePath ? require(resolve(fixturePath)) : null;
+  if (fixturePath) assert.equal(typeof expireOrder, 'function', 'The isolated expiry fixture must export one callback');
+
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(7500);
+  await page.clock.install();
+
+  const writes = [];
+  page.on('request', request => {
+    if (request.method() !== 'POST' || !request.url().startsWith(api + '/')) return;
+    const path = request.url().slice(api.length);
+    if (/^\/(?:quotes|orders(?:\/[^/]+\/(?:payments|reorder))?)$/.test(path)) writes.push(path);
+  });
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const { order, attempt } = await placeBrowserOrder(page, origin, { ...contact, email: 'hold-expiry-fixture@example.test' });
+  const orderPath = `/orders/${order.id}`;
+  const initialWrites = ['/quotes', '/orders', orderPath + '/payments'];
+  const settlement = page.waitForResponse(response =>
+    response.url() === `${api}/local${orderPath}/payments/${attempt.id}/result`
+    && response.request().method() === 'POST' && response.ok());
+  await button(page, 'Decline local test payment').click();
+  const declined = await (await settlement).json();
+  assert.equal(declined.id, order.id);
+  assert.equal(declined.status, 'awaiting_payment');
+  assert.equal(declined.paymentStatus, 'declined');
+  assert.equal(declined.paymentAttempt.id, attempt.id);
+  assert.ok(Date.parse(declined.reservationExpiresAt) > Date.now());
+  await shown(page, 'Payment declined');
+  await button(page, 'Retry payment').waitFor();
+  assert.equal(await button(page, 'Review reorder').count(), 0);
+  assert.deepEqual(writes, initialWrites);
+
+  const orderUrl = api + orderPath;
+  if (expireOrder) {
+    await expireOrder({ orderId: order.id, expectedReservationExpiresAt: declined.reservationExpiresAt });
+  } else {
+    // The standard browser suite has no database admin access. Project only this declined order past its hold.
+    await page.route(orderUrl, async route => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const response = await route.fetch();
+      const record = await response.json();
+      assert.equal(response.status(), 200);
+      assert.equal(record.id, order.id);
+      assert.equal(record.paymentStatus, 'declined');
+      assert.equal(record.paymentAttempt.id, attempt.id);
+      const reservationExpiresAt = new Date(Date.now() - 1000).toISOString();
+      await route.fulfill({ response, json: { ...record, status: 'cancelled', reservationExpiresAt } });
+    });
+  }
+  const automatedRead = page.waitForResponse(async response => {
+    if (response.url() !== orderUrl || response.request().method() !== 'GET' || !response.ok()) return false;
+    return (await response.json()).status === 'cancelled';
+  });
+  const openOrdersUrl = page.url();
+  await page.clock.fastForward(65_000);
+  const expiredOrder = await (await automatedRead).json();
+  assert.equal(page.url(), openOrdersUrl, 'The order screen should reconcile in place');
+  assert.equal(expiredOrder.id, order.id);
+  assert.equal(expiredOrder.status, 'cancelled');
+  assert.equal(expiredOrder.paymentStatus, 'declined');
+  assert.equal(expiredOrder.paymentAttempt.id, attempt.id);
+  assert.ok(Date.parse(expiredOrder.reservationExpiresAt) <= Date.now());
+  if (expireOrder) {
+    const token = await page.evaluate(() => {
+      const key = Object.keys(sessionStorage).find(name => name.endsWith('.guest'));
+      return key ? JSON.parse(sessionStorage.getItem(key)).accessToken : null;
+    });
+    assert.ok(token, 'The browser should retain the original guest session');
+    const retained = await send(orderPath, { token });
+    assert.equal(retained.status, 200);
+    assert.deepEqual(await retained.json(), expiredOrder, 'The optional fixture must return authoritative API state without browser projection');
+  }
+
+  const checkRecovery = async ({ locale, heading, notice, retry, reorder }) => {
+    await shown(page, heading);
+    await shown(page, notice);
+    assert.equal(await button(page, retry).count(), 0);
+    await withLargeText(page, async () => {
+      const message = page.getByText(notice, { exact: true });
+      await message.scrollIntoViewIfNeeded();
+      assert.equal(await message.evaluate(element => {
+        const { left, right } = element.getBoundingClientRect();
+        return left >= 0 && right <= window.innerWidth && element.scrollWidth <= element.clientWidth + 1;
+      }), true);
+      await button(page, reorder).click({ trial: true });
+      await capture(page, `connected-hold-expired-${locale}-320-large-text`);
+    });
+  };
+  await checkRecovery({
+    locale: 'en', heading: 'Order cancelled', retry: 'Retry payment', reorder: 'Review reorder',
+    notice: 'Your pickup hold ended. Review a new order to choose another time.',
+  });
+  assert.deepEqual(writes, initialWrites);
+
+  const preview = page.waitForResponse(response =>
+    response.url() === orderUrl + '/reorder' && response.request().method() === 'POST' && response.ok());
+  await button(page, 'Review reorder').click();
+  assert.deepEqual((await (await preview).json()).lines, expiredOrder.lines);
+  await shown(page, 'Available items today');
+  await button(page, 'Add these items to cart').waitFor();
+  assert.deepEqual(writes, [...initialWrites, orderPath + '/reorder']);
+
+  await page.goto(origin + '/settings');
+  await button(page, 'Kinyarwanda').click();
+  await shown(page, 'Amagenamiterere');
+  await page.goto(origin + '/orders');
+  await checkRecovery({
+    locale: 'rw', heading: 'Komande yahagaritswe', retry: 'Ongera ugerageze ubwishyu', reorder: 'Reba komande nshya isa n’iyi',
+    notice: 'Igihe cyabikiwe komande cyarangiye. Reba komande nshya uhitemo ikindi gihe.',
+  });
+  assert.deepEqual(writes, [...initialWrites, orderPath + '/reorder']);
+});
+
 test('a shared order previews the mobile cart limit before saving it', { timeout: 40_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const buyer = { ...contact, email: 'reorder-fixture@example.test' };

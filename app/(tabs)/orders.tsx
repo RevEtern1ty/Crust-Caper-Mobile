@@ -9,6 +9,7 @@ import { ReorderPanel } from '../../src/checkout/reorder-panel';
 import { reorderOfferForCart } from '../../src/checkout/reorder-review';
 import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
 import { PickupAlertPanel } from '../../src/checkout/pickup-alert';
+import { isAwaitingUnpaidHold, isExpiredUnpaidHold } from '../../src/checkout/pickup-hold';
 import { shareReceipt } from '../../src/checkout/receipt-sharing';
 import { ApiError, type DemoKitchenStatus, type ReorderResult } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
@@ -19,7 +20,7 @@ type Action = 'resume' | 'reorder' | 'kitchen' | 'receipt';
 
 export default function OrdersScreen() {
   const { api, mode, demoApi, checkoutAllowed, locale, menu, cart, hydrated, replaceCart } = useShop();
-  const { journal, requestedOrderId, setRequestedOrderId, restoreFailed, retryRestore, resumeCheckout, busy } = useCheckout();
+  const { journal, requestedOrderId, setRequestedOrderId, restoreFailed, retryRestore, resumeCheckout, finishExpiredHold, busy } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const latestId = journal?.orderIds[0] ?? null;
   const [choice, setChoice] = useState<{ latest: string | null; id: string } | null>(null);
@@ -48,8 +49,8 @@ export default function OrdersScreen() {
   const active = journal?.active;
   const ongoingCreate = active?.phase === 'creating';
   const activeOrder = active && active.phase !== 'creating' && active.orderId === orderId;
-  const canResume = checkoutAllowed && activeOrder && !!order && !order.recoveryReadOnly && order.status === 'awaiting_payment'
-    && (order.paymentStatus === 'unpaid' || order.paymentStatus === 'declined');
+  const canResume = checkoutAllowed && activeOrder && !!order && !order.recoveryReadOnly && isAwaitingUnpaidHold(order);
+  const expiredHold = !!order && isExpiredUnpaidHold(order);
   const nextKitchen: DemoKitchenStatus | null = order?.status === 'accepted' ? 'preparing'
     : order?.status === 'preparing' ? 'ready' : order?.status === 'ready' ? 'collected' : null;
   const repeat = preview?.orderId === orderId ? preview.result : null;
@@ -209,13 +210,18 @@ export default function OrdersScreen() {
             />
           )}
 
-          {checkoutAllowed && !order.recoveryReadOnly && activeOrder && active?.phase === 'paying' && !canResume
+          {checkoutAllowed && !order.recoveryReadOnly && activeOrder && active?.phase === 'paying' && !canResume && !expiredHold
             && (order.paymentStatus !== 'processing' || (mode === 'connected' && order.status === 'cancelled')) && (
             <Button
               label={t('Restore saved checkout', 'Ongera ufungure ubwishyu bwabitswe')}
               onPress={() => resume()} variant="secondary" busy={busy || action === 'resume'} disabled={!hydrated}
             />
           )}
+
+          {expiredHold && <Card><Text accessibilityLiveRegion="polite">{order.recoveryReadOnly
+            ? t('Your pickup hold ended.', 'Igihe cyabikiwe komande cyarangiye.')
+            : t('Your pickup hold ended. Review a new order to choose another time.',
+              'Igihe cyabikiwe komande cyarangiye. Reba komande nshya uhitemo ikindi gihe.')}</Text></Card>}
 
           {(order.paymentStatus === 'refund_pending' || order.paymentStatus === 'refunded') && (
             <Card><Text>{order.paymentStatus === 'refunded'
@@ -245,12 +251,14 @@ export default function OrdersScreen() {
               <Text variant="small" tone="muted">{t('The receipt is pending.', 'Inyemezabwishyu iracyategerejwe.')}</Text>
             )}
             {!order.recoveryReadOnly && (order.paymentStatus === 'paid' || order.status === 'cancelled') ? (
-              <Button label={t('Review reorder', 'Reba komande nshya isa n’iyi')} variant="secondary" busy={action === 'reorder'} disabled={!!action} onPress={() => {
-                void run('reorder', async () => {
-                  const offer = await api.reorder(order.id);
-                  setPreview({ orderId: order.id, result: reorderOfferForCart(offer) });
-                });
-              }} />
+              <Button label={t('Review reorder', 'Reba komande nshya isa n’iyi')} variant="secondary" busy={action === 'reorder'}
+                disabled={!!action || (expiredHold && busy)} onPress={() => {
+                  void run('reorder', async () => {
+                    if (expiredHold) await finishExpiredHold(order);
+                    const offer = await api.reorder(order.id);
+                    setPreview({ orderId: order.id, result: reorderOfferForCart(offer) });
+                  });
+                }} />
             ) : null}
           </Card>
 
