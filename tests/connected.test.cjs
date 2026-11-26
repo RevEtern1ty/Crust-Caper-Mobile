@@ -437,7 +437,8 @@ test('pickup staff locate a paid order without the buyer screen and verify the e
 
   const cardHeading = page.getByRole('list', { name: 'Orders', exact: true })
     .getByRole('heading', { name: `Order ${order.number}`, exact: true });
-  const card = page.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem').filter({ has: cardHeading });
+  const card = page.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem')
+    .filter({ has: page.getByRole('heading', { name: `Order ${order.number}`, exact: true }) });
   await button(lookup, 'Open order in queue').click();
   assert.equal(await cardHeading.evaluate(heading => document.activeElement === heading), true);
   const confirm = button(card, 'Confirm pickup');
