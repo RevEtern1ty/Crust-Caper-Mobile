@@ -315,7 +315,7 @@ export default function OrdersScreen() {
         </>
       )}
 
-      {(problem || failed) && <Text accessibilityRole="alert" tone="red">{problem ?? (needsPhoneVerification
+      {(problem || failed) && <Text selectable accessibilityRole="alert" tone="red">{problem ?? (needsPhoneVerification
         ? t('Verify your phone number to open this saved order.', 'Emeza nimero ya telefoni kugira ngo ufungure iyi komande yabitswe.')
         : checkoutError(statusError, locale))}</Text>}
       {orderId && !showDelayedPayment && <Button label={t('Refresh order status', 'Vugurura uko komande ihagaze')} onPress={() => { void refresh(); }} busy={loading} variant="secondary" />}

@@ -109,7 +109,7 @@ export default function PaymentScreen() {
             <Button label={t('Go to Orders', 'Jya muri Komande')} onPress={goToOrders} />
           </>
         )}
-        {(problem || failed) && <Text tone="red" accessibilityRole="alert">{problem ?? checkoutError(error, locale)}</Text>}
+        {(problem || failed) && <Text selectable tone="red" accessibilityRole="alert">{problem ?? checkoutError(error, locale)}</Text>}
       </Card> : (
         <Card>
           <Text variant="heading" accessibilityLiveRegion="polite">{checkingPayment
@@ -140,7 +140,7 @@ export default function PaymentScreen() {
             'Igihe cyabikiwe komande cyarangiye. Vugurura uko ubu bwishyu buhagaze cyangwa ubukurikirane nyuma muri Komande.',
           )}</Text>}
           {delayedPayment && !failed && <Text tone="muted" accessibilityLiveRegion="polite">{delayedPaymentLabel(locale)}</Text>}
-          {(problem || failed) && <Text tone="red" accessibilityRole="alert">{problem ?? checkoutError(error, locale)}</Text>}
+          {(problem || failed) && <Text selectable tone="red" accessibilityRole="alert">{problem ?? checkoutError(error, locale)}</Text>}
           {orderId && <Button label={t('Refresh payment status', 'Vugurura uko ubwishyu buhagaze')} variant="secondary"
             onPress={() => { setProblem(null); void refresh(); }} busy={loading} disabled={!!busy} />}
           <Button label={t('Go to Orders', 'Jya muri Komande')} variant="ghost" onPress={goToOrders} disabled={!!busy} />

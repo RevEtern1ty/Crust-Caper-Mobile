@@ -316,7 +316,7 @@ export default function CheckoutScreen() {
     return (
       <Screen safeBottom bottom={(
         <View style={styles.stack}>
-          {problem && <Text tone="red" accessibilityRole="alert">{problem.message}</Text>}
+          {problem && <Text selectable tone="red" accessibilityRole="alert">{problem.message}</Text>}
           <Button label={t('Resume checkout', 'Komeza kwishyura')} onPress={() => { void submit(); }}
             busy={busy} disabled={draftSaving || !!draftStorageError} />
         </View>
@@ -339,7 +339,7 @@ export default function CheckoutScreen() {
               ? t('An order is waiting to be restored.', 'Hari komande itegereje kongera gufungurwa.')
               : savedOrder ? t('Your latest order is in Orders.', 'Komande yawe ya nyuma iri muri Komande.')
                 : t('Your cart is empty.', 'Agatebo kawe karimo ubusa.')}</Text>
-          {problem && <Text tone="red" accessibilityRole="alert">{problem.message}</Text>}
+          {problem && <Text selectable tone="red" accessibilityRole="alert">{problem.message}</Text>}
           <Button
             label={viewOrders ? t('Go to Orders', 'Jya muri Komande') : t('Browse menu', 'Reba ibiribwa')}
             onPress={() => router.replace(viewOrders ? '/(tabs)/orders' : '/(tabs)')}
@@ -352,7 +352,7 @@ export default function CheckoutScreen() {
   return (
     <Screen key={quote ? 'review' : 'details'} safeBottom bottom={(
       <View style={styles.stack}>
-        {problem && !(closed && problem.canEditCart) && <Text tone="red" accessibilityRole="alert">{problem.message}</Text>}
+        {problem && !(closed && problem.canEditCart) && <Text selectable tone="red" accessibilityRole="alert">{problem.message}</Text>}
         {requiresCartEdit || closed ? (
           <Button label={t('Edit cart', 'Hindura agatebo')} onPress={editCart} disabled={controlsLocked} />
         ) : (

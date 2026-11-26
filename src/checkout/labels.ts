@@ -58,6 +58,14 @@ export function changeLabel(change: QuoteChange, locale: Locale, menu: Menu | nu
 }
 
 export function checkoutError(error: unknown, locale: Locale) {
+  const message = checkoutErrorMessage(error, locale);
+  if (error instanceof ApiError && error.requestId) {
+    return `${message}\n${copy(locale, 'Support ID', 'Nomero y’ubufasha')} ${error.requestId}`;
+  }
+  return message;
+}
+
+function checkoutErrorMessage(error: unknown, locale: Locale) {
   if (error instanceof CheckoutError && error.code === 'active_checkout') {
     return copy(locale, 'Continue the current order from Orders.', 'Komeza komande yawe muri Komande.');
   }

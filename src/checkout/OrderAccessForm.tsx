@@ -230,7 +230,7 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
   return (
     <Screen key={step.kind} safeBottom bottom={(
       <View style={styles.stack}>
-        {problem && <Text tone="red" accessibilityRole="alert">{problem}</Text>}
+        {problem && <Text selectable tone="red" accessibilityRole="alert">{problem}</Text>}
         <Button label={step.kind === 'details' ? (pendingOrder
           ? t('Check saved checkout', 'Genzura ubwishyu bwabitswe') : t('Request verification code', 'Saba kode yo kwemeza'))
           : step.kind === 'code' ? (privacy
