@@ -127,6 +127,13 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .availability-store .button { flex: 0 1 auto; }
 .availability-item { display: grid; gap: .75rem; }
 .availability-note { color: var(--green); font-weight: 720; margin-bottom: .85rem; }
+.pickup-schedule { display: grid; gap: .65rem; margin-bottom: 1rem; }
+.pickup-schedule-form { display: grid; gap: .45rem; max-width: 30rem; }
+.pickup-schedule-times { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr)); gap: .55rem; margin-block: .3rem; }
+.pickup-schedule-times label { display: grid; gap: .35rem; min-width: 0; }
+.pickup-schedule-form input { width: 100%; min-width: 0; }
+.pickup-schedule-form .button { margin-top: .35rem; }
+.pickup-schedule .payment-review-help, .pickup-schedule .problem, .pickup-schedule .availability-note { margin: 0; }
 .pickup-limits { display: grid; gap: .8rem; margin-bottom: 1rem; }
 .pickup-limit-form { display: grid; gap: .55rem; max-width: 30rem; }
 .pickup-limit-form select { width: 100%; min-width: 0; min-height: 3rem; padding: .62rem .6rem; border: 1px solid var(--border); border-radius: .65rem; background: var(--white); color: var(--ink); font: inherit; text-overflow: ellipsis; }

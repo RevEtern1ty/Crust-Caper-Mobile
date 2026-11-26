@@ -172,6 +172,31 @@ BEGIN
     PERFORM pg_temp.catalog_assert(current_version IS DISTINCT FROM (location->>'version'),
         'Choose a new catalog version');
 
+    IF jsonb_array_length(payload->'slots') > 0 THEN
+        PERFORM pg_temp.catalog_assert(NOT EXISTS (
+            WITH supplied AS MATERIALIZED (
+                SELECT value->>'id' AS id, (value->>'startsAt')::timestamptz AS starts_at,
+                    (value->>'endsAt')::timestamptz AS ends_at
+                FROM jsonb_array_elements(payload->'slots')
+            ), resulting AS (
+                SELECT s.id, s.starts_at, s.ends_at,
+                    (s.starts_at, s.ends_at) IS DISTINCT FROM (saved.starts_at, saved.ends_at) AS changed
+                FROM supplied s LEFT JOIN public.pickup_slots saved
+                    ON saved.store_id = target_store_id AND saved.id = s.id
+                UNION ALL
+                SELECT saved.id, saved.starts_at, saved.ends_at, false
+                FROM public.pickup_slots saved
+                WHERE saved.store_id = target_store_id AND NOT EXISTS (SELECT FROM supplied s WHERE s.id = saved.id)
+            ), previous AS (
+                SELECT starts_at, changed, max(ends_at) OVER before_window AS previous_end,
+                    max(ends_at) FILTER (WHERE changed) OVER before_window AS previous_changed_end
+                FROM resulting
+                WINDOW before_window AS (ORDER BY starts_at, id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+            )
+            SELECT FROM previous WHERE (changed AND starts_at < previous_end) OR starts_at < previous_changed_end
+        ), 'New or rescheduled pickup windows must not overlap the resulting schedule');
+    END IF;
+
     FOR slot IN SELECT value FROM jsonb_array_elements(payload->'slots') ORDER BY value->>'id' LOOP
         target_slot_id := slot->>'id';
         SELECT saved.starts_at, saved.ends_at INTO old_start, old_end FROM public.pickup_slots saved

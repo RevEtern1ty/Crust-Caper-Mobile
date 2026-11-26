@@ -60,6 +60,8 @@ class LocalCatalog implements CommandLineRunner {
                 json.write(text("Kigali, Rwanda", "Kigali, u Rwanda")),
                 json.write(text("Local test location", "Aho kugeragereza")))
             .update();
+        // Coordinate fixture seeding with shift publication and catalog imports.
+        jdbc.sql("SELECT id FROM stores WHERE id = ? FOR UPDATE").param(STORE).query(String.class).single();
         for (int position = 0; position < MENU.size(); position++) {
             Product product = MENU.get(position);
             jdbc.sql("""
@@ -76,8 +78,12 @@ class LocalCatalog implements CommandLineRunner {
             SELECT ?, 'slot-' || extract(epoch FROM slot_start)::bigint,
                 slot_start, slot_start + interval '10 min', 4
             FROM base, generate_series(base.starts, base.starts + interval '7 days', interval '10 min') AS slot_start
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pickup_slots saved WHERE saved.store_id = ?
+                    AND saved.starts_at < slot_start + interval '10 min' AND saved.ends_at > slot_start
+            )
             ON CONFLICT (store_id, id) DO NOTHING
-            """).param(STORE).update();
+            """).params(STORE, STORE).update();
     }
 
     private static Product product(String sku, String category, long price, String en, String rw,

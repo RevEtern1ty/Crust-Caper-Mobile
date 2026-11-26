@@ -476,7 +476,7 @@ paths:
         '403': { $ref: '#/components/responses/OperatorForbidden' }
     patch:
       operationId: setMenuAvailability
-      description: Modify the manager's own restaurant, one of its menu items or a future pickup window, using the current catalog version. A pickup limit must cover active reservations. The request body is limited to 2 KiB.
+      description: Modify availability for the manager's restaurant using the current catalog version. A pickup limit must cover active reservations. A pickup schedule adds future ten-minute windows without changing existing windows. An exact retry of a published schedule ID and values returns the latest snapshot even when the expected version is old. The request body is limited to 2 KiB.
       security: [{ operatorBearer: [] }]
       requestBody:
         required: true
@@ -504,6 +504,21 @@ paths:
                     expectedVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
                     slotId: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
                     capacity: { type: integer, minimum: 0, maximum: 2147483647 }
+                - type: object
+                  additionalProperties: false
+                  required: [expectedVersion, pickupSchedule]
+                  properties:
+                    expectedVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    pickupSchedule:
+                      type: object
+                      additionalProperties: false
+                      required: [id, date, start, end, capacity]
+                      properties:
+                        id: { type: string, format: uuid, description: Client-generated ID for retrying the same publication. }
+                        date: { type: string, format: date, description: Local calendar date in Africa/Kigali. }
+                        start: { type: string, pattern: '^(?:[01][0-9]|2[0-3]):[0-5]0$', description: Inclusive Kigali time. }
+                        end: { type: string, pattern: '^(?:[01][0-9]|2[0-3]):[0-5]0$', description: Exclusive Kigali time on the same date. }
+                        capacity: { type: integer, minimum: 1, maximum: 2147483647 }
       responses:
         '200': { $ref: '#/components/responses/OperatorAvailability' }
         '400': { $ref: '#/components/responses/InvalidInput' }
@@ -512,7 +527,7 @@ paths:
         '404': { description: The item or pickup window does not exist in the assigned restaurant. }
         '415': { description: The request body must be sent as application/json. }
         '409':
-          description: The catalog version changed, the window has started, or the new limit is below its active reservations.
+          description: The catalog version changed, the window has started, the limit is below active reservations, or the new schedule overlaps existing windows or reuses an ID with different values.
           content:
             application/problem+json:
               schema:
@@ -520,7 +535,7 @@ paths:
                   - $ref: '#/components/schemas/ProblemDetails'
                   - properties:
                       status: { const: 409 }
-                      code: { enum: [catalog_version_conflict, slot_update_closed, slot_capacity_below_reserved] }
+                      code: { enum: [catalog_version_conflict, slot_update_closed, slot_capacity_below_reserved, pickup_schedule_started, pickup_schedule_overlap, pickup_schedule_conflict] }
   /operator/receipts:
     get:
       operationId: listOperatorReceipts

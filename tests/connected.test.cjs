@@ -297,16 +297,16 @@ test('a shared order previews the mobile cart limit before saving it', { timeout
   assert.deepEqual(await savedLines(), [{ ...originalLine, quantity: 11 }]);
 });
 
-async function withLargeText(page, inspect) {
-  await page.evaluate(() => {
-    for (const node of document.querySelectorAll('div, span, p, h1, h2, h3')) {
+async function withLargeText(page, inspect, selector = 'div, span, p, h1, h2, h3') {
+  await page.evaluate(selector => {
+    for (const node of document.querySelectorAll(selector)) {
       if (node.children.length || !node.textContent.trim() || node.closest('[aria-hidden=true], [hidden]')) continue;
       const { fontSize, lineHeight } = getComputedStyle(node);
       node.dataset.testZoomStyles = JSON.stringify([node.style.fontSize, node.style.lineHeight]);
       node.style.fontSize = `${parseFloat(fontSize) * 2}px`;
       if (Number.isFinite(parseFloat(lineHeight))) node.style.lineHeight = `${parseFloat(lineHeight) * 2}px`;
     }
-  });
+  }, selector);
   try {
     await inspect();
   } finally {
@@ -1575,5 +1575,177 @@ test('pickup limits protect existing holds, block additional checkout and open t
   await shown(page, 'Current limit: ' + slot.capacity);
   assert.equal((await menu()).slots.find(item => item.id === slot.id).available, true);
   assert.equal((await second.place()).status, 200);
+  assert.deepEqual(errors, []);
+});
+
+test('manager reviews and publishes pickup windows once after a lost reply', { timeout: 50_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const path = '/operator/availability';
+  const menuPath = '/stores/kigali/menu';
+  const manager = await operator('demo-manager');
+  const getMenu = async () => {
+    const response = await send(menuPath);
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const getAvailability = async () => {
+    const response = await send(path, { token: manager });
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const initial = await getAvailability();
+  const menuBefore = await getMenu();
+  const product = menuBefore.products.find(item => item.sku === 'double-smash' && item.available);
+  assert.ok(initial.open && menuBefore.store.open && product, 'The local fixture must offer Double Smash for pickup');
+  const firstShift = initial.slots.length === 0 && menuBefore.slots.length === 0;
+  // The shared local fixture seeds a dense seven-day schedule. An empty fixture can exercise the first shift in the public menu.
+  const day = new Date(Date.now() + ((firstShift ? 1 : 9) * 24 + 2) * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const date = process.env.CRUSTCAPER_TEST_PICKUP_SCHEDULE_DATE ?? day;
+  const start = '17:00';
+  const end = '17:20';
+  const capacity = 1;
+  const startsAt = Date.parse(`${date}T${start}:00+02:00`);
+  assert.ok(Number.isFinite(startsAt) && startsAt > Date.now());
+  const endsAt = startsAt + 20 * 60 * 1000;
+  assert.equal(initial.slots.some(slot => Date.parse(slot.startsAt) < endsAt && Date.parse(slot.endsAt) > startsAt), false);
+
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 844 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(8500);
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const submissions = [];
+  const replies = [];
+  const operatorPage = new URL('/operator/index.html', api);
+  await restrictToOperatorAssets(page);
+  await page.route(api + '/operator/**', async route => {
+    if (route.request().url() !== api + path || route.request().method() !== 'PATCH') return route.continue();
+    submissions.push(route.request().postDataJSON());
+    const response = await route.fetch();
+    replies.push({ status: response.status(), snapshot: await response.json() });
+    if (replies.length === 1 && response.ok()) return route.abort('connectionreset');
+    return route.fulfill({ response });
+  });
+  await page.goto(operatorPage.href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-manager');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(page, 'Sign in').click();
+  await button(page, 'Menu availability').click();
+  const schedule = page.getByRole('region', { name: 'Publish pickup windows' });
+  await schedule.waitFor();
+  await schedule.getByLabel('Pickup date (Kigali)', { exact: true }).fill(date);
+  await schedule.getByLabel('Start time (Kigali)', { exact: true }).fill(start);
+  await schedule.getByLabel('End time (Kigali)', { exact: true }).fill(end);
+  await schedule.getByLabel('Orders per window', { exact: true }).fill(String(capacity));
+  assert.equal((await getAvailability()).version, initial.version);
+
+  const review = button(schedule, 'Review pickup schedule');
+  const dialog = page.getByRole('dialog', { name: 'Review pickup schedule' });
+  const summary = `${date}, ${start}–${end} Kigali time. 2 pickup windows, 1 order per window.`;
+  await review.click();
+  await dialog.waitFor();
+  await dialog.getByText(summary, { exact: true }).waitFor();
+  const publish = button(dialog, 'Publish windows');
+  const edit = button(dialog, 'Edit schedule');
+  assert.equal(submissions.length, 0, 'Review must not submit a publication');
+  await edit.click();
+  await dialog.waitFor({ state: 'hidden' });
+  assert.equal(submissions.length, 0, 'Returning to editing must not submit a publication');
+  assert.equal(await schedule.getByLabel('Pickup date (Kigali)', { exact: true }).inputValue(), date);
+  await review.click();
+  await dialog.waitFor();
+  for (const width of [320, 390, 430]) {
+    await page.setViewportSize({ width, height: 844 });
+    const inspect = async size => {
+      await publish.scrollIntoViewIfNeeded();
+      const reachable = await publish.evaluate(element => {
+        const { left, top, right, bottom, width, height } = element.getBoundingClientRect();
+        const hit = document.elementFromPoint(left + width / 2, top + height / 2);
+        return width >= 44 && height >= 44 && left >= 0 && top >= 0
+          && right <= window.innerWidth && bottom <= window.innerHeight && element.contains(hit);
+      });
+      assert.ok(reachable, `Publish must be reachable at ${width}px with ${size} text`);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+      await capture(page, `operator-pickup-schedule-review-${width}-${size}`);
+    };
+    await inspect('normal');
+    await withLargeText(page, () => inspect('large'), 'div, span, p, h1, h2, h3, button');
+  }
+
+  assert.equal(submissions.length, 0, 'Only confirmation may send a publication');
+  assert.equal((await getAvailability()).version, initial.version);
+  assert.equal((await getMenu()).version, menuBefore.version);
+  await publish.click();
+  await shown(page, 'Publication could not be confirmed. Retry the same schedule before making changes.');
+  assert.equal(submissions.length, 1);
+  assert.equal(replies[0].status, 200, 'The first request committed before Chrome lost its reply');
+  const request = submissions[0];
+  assert.match(request.pickupSchedule.id, /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+  assert.deepEqual(request, { expectedVersion: initial.version, pickupSchedule: {
+    id: request.pickupSchedule.id, date, start, end, capacity,
+  } });
+  const committed = replies[0].snapshot;
+  assert.notEqual(committed.version, initial.version);
+  const slotIds = [1, 2].map(index => `shift-${request.pickupSchedule.id}-${index}`);
+  const afterLost = await getMenu();
+  assert.equal(afterLost.version, committed.version, 'The publication reached the public catalog before the retry');
+  await capture(page, 'operator-pickup-schedule-unconfirmed');
+
+  await button(dialog, 'Close review').click();
+  await dialog.waitFor({ state: 'hidden' });
+  assert.equal(await schedule.getByLabel('Pickup date (Kigali)', { exact: true }).isDisabled(), true);
+  assert.equal(submissions.length, 1, 'Closing review must leave the uncertain publication pending');
+  await button(schedule, 'Review pending publication').click();
+  await dialog.getByText(summary, { exact: true }).waitFor();
+  await button(page, 'Retry publication').click();
+  await shown(page, 'Published 2 pickup windows.');
+  await capture(page, 'operator-pickup-schedule-published');
+  assert.deepEqual(submissions, [request, request], 'A lost reply must reuse the exact request and publication id');
+  assert.deepEqual(replies.map(reply => reply.status), [200, 200]);
+  assert.equal(replies[1].snapshot.version, committed.version);
+  assert.equal((await getAvailability()).version, committed.version);
+  const publishedMenu = await getMenu();
+  assert.equal(publishedMenu.version, committed.version);
+
+  const windowTimes = slotIds.map((id, index) => ({
+    id, startsAt: new Date(startsAt + index * 10 * 60 * 1000).toISOString(),
+    endsAt: new Date(startsAt + (index + 1) * 10 * 60 * 1000).toISOString(),
+  }));
+  if (firstShift) {
+    assert.deepEqual(publishedMenu.slots.map(slot => ({
+      ...slot, startsAt: new Date(slot.startsAt).toISOString(), endsAt: new Date(slot.endsAt).toISOString(),
+    })), windowTimes.map(slot => ({ ...slot, available: true })));
+  }
+
+  const { accessToken: token } = await send('/guest-sessions', { method: 'POST' }).then(response => response.json());
+  const quote = async slotId => send('/quotes', { method: 'POST', token, data: {
+    storeId: menuBefore.store.id, slotId, lines: [{ sku: product.sku, modifierIds: [], quantity: 1, unitPrice: product.price }],
+  } });
+  const quotes = [];
+  for (const slot of windowTimes) {
+    const offered = await quote(slot.id);
+    assert.equal(offered.status, 200);
+    const selected = await offered.json();
+    assert.equal(selected.slotId, slot.id);
+    assert.equal(new Date(selected.pickupStartsAt).toISOString(), slot.startsAt);
+    assert.equal(new Date(selected.pickupEndsAt).toISOString(), slot.endsAt);
+    quotes.push(selected.quoteId);
+  }
+  const placed = await send('/orders', { method: 'POST', token, key: randomUUID(), data: { quoteId: quotes[0], ...contact } });
+  assert.equal(placed.status, 200);
+  const order = await placed.json();
+  assert.equal(order.slotId, slotIds[0]);
+  assert.equal(order.status, 'awaiting_payment');
+  assert.equal(order.paymentStatus, 'unpaid');
+  const occupied = await quote(slotIds[0]);
+  assert.equal(occupied.status, 409);
+  assert.equal((await occupied.json()).code, 'slot_unavailable');
+  if (firstShift) {
+    assert.deepEqual((await getMenu()).slots.map(slot => [slot.id, slot.available]), [
+      [slotIds[0], false],
+      [slotIds[1], true],
+    ]);
+  }
   assert.deepEqual(errors, []);
 });

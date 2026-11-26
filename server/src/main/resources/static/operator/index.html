@@ -135,6 +135,28 @@
           </div>
           <p class="problem" id="availability-problem" role="alert" hidden></p>
           <p class="availability-note" id="availability-note" role="status" hidden></p>
+          <section class="order-card pickup-schedule" id="pickup-schedule" aria-labelledby="pickup-schedule-title" hidden>
+            <h3 class="order-title" id="pickup-schedule-title">Publish pickup windows</h3>
+            <p class="payment-review-help" id="pickup-schedule-help">Publish ten-minute windows for one date in Kigali.</p>
+            <form class="pickup-schedule-form" id="pickup-schedule-form" method="post" novalidate>
+              <label for="pickup-schedule-date">Pickup date (Kigali)</label>
+              <input id="pickup-schedule-date" type="date" required aria-describedby="pickup-schedule-help pickup-schedule-problem">
+              <div class="pickup-schedule-times">
+                <label>Start time (Kigali)
+                  <input id="pickup-schedule-start" type="time" step="600" required aria-describedby="pickup-schedule-problem">
+                </label>
+                <label>End time (Kigali)
+                  <input id="pickup-schedule-end" type="time" step="600" required aria-describedby="pickup-schedule-problem">
+                </label>
+              </div>
+              <label for="pickup-schedule-capacity">Orders per window</label>
+              <input id="pickup-schedule-capacity" type="number" min="1" max="2147483647" step="1" inputmode="numeric"
+                required aria-describedby="pickup-schedule-problem">
+              <button class="button button-primary" id="pickup-schedule-review" type="submit">Review pickup schedule</button>
+            </form>
+            <p class="problem" id="pickup-schedule-problem" role="alert" tabindex="-1" hidden></p>
+            <p class="availability-note" id="pickup-schedule-note" role="status" tabindex="-1" hidden></p>
+          </section>
           <section class="order-card pickup-limits" id="pickup-limits" aria-labelledby="pickup-limits-title" hidden>
             <h3 class="order-title" id="pickup-limits-title">Pickup limits</h3>
             <p id="pickup-limits-empty" role="status" hidden>No upcoming pickup windows.</p>
@@ -159,6 +181,18 @@
         </section>
       </section>
     </main>
+
+    <dialog class="cancellation-dialog" id="pickup-schedule-dialog" aria-labelledby="pickup-schedule-dialog-title"
+      aria-describedby="pickup-schedule-summary">
+      <h2 id="pickup-schedule-dialog-title">Review pickup schedule</h2>
+      <p id="pickup-schedule-summary"></p>
+      <p id="pickup-schedule-progress" role="status" tabindex="-1" hidden></p>
+      <p class="problem" id="pickup-schedule-dialog-problem" role="alert" tabindex="-1" hidden></p>
+      <form class="cancellation-actions" id="pickup-schedule-confirm" method="post">
+        <button class="button button-secondary" id="pickup-schedule-edit" type="button" autofocus>Edit schedule</button>
+        <button class="button button-primary" id="pickup-schedule-publish" type="submit">Publish windows</button>
+      </form>
+    </dialog>
 
     <dialog class="cancellation-dialog" id="cancellation-dialog" aria-labelledby="cancellation-title" aria-describedby="cancellation-description">
       <h2 id="cancellation-title"></h2>

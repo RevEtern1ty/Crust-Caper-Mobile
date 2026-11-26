@@ -1,3 +1,5 @@
+import { mountPickupSchedule } from './pickup-schedule.js';
+
 const maxPickupLimit = 2_147_483_647;
 const kigaliDay = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kigali', day: 'numeric', month: 'short' });
 const kigaliTime = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kigali', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
@@ -48,6 +50,18 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
   let busy = false;
   let verified = false;
   let selectedSlotId = null;
+  const schedule = mountPickupSchedule({
+    currentSession, request, messageFor, showMessage, closeSession, accept,
+    currentAvailability: () => ({ busy, verified, snapshot }),
+    setBusy(value) {
+      busy = value;
+      syncButtons();
+    },
+    markUnverified() {
+      verified = false;
+      syncButtons();
+    },
+  });
 
   function syncButtons() {
     refresh.disabled = busy;
@@ -58,6 +72,7 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
     pickupWindowSelect.disabled = slotDisabled;
     pickupLimitInput.disabled = slotDisabled;
     pickupLimitSave.disabled = slotDisabled;
+    schedule.sync();
   }
 
   function selectedSlot() {
@@ -315,6 +330,7 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
       showMessage(note);
       showMessage(pickupLimitProblem);
       showMessage(pickupLimitNote);
+      schedule.reset();
       render();
     },
   };

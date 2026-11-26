@@ -19,6 +19,8 @@ import tools.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HexFormat;
@@ -70,6 +72,7 @@ class OperatorIntegrationTest {
     @AfterEach
     void removeOnlyOperatorFixtures() {
         for (String fixtureStore : stores) {
+            jdbc.sql("DELETE FROM pickup_schedule_publications WHERE store_id = ?").param(fixtureStore).update();
             jdbc.sql("DELETE FROM operator_availability_events WHERE store_id = ?").param(fixtureStore).update();
             jdbc.sql("DELETE FROM operator_order_events WHERE store_id = ?").param(fixtureStore).update();
             jdbc.sql("DELETE FROM operator_sessions WHERE operator_id IN (SELECT id FROM operator_accounts WHERE store_id = ?)")
@@ -834,6 +837,157 @@ class OperatorIntegrationTest {
         assertThat(auditCount(store)).isEqualTo(1);
     }
 
+    @Test
+    void managerPublishesKigaliWindowsAndTheCustomerCanReserveOne() throws Exception {
+        jdbc.sql("""
+                UPDATE pickup_slots SET starts_at = now() - interval '30 minutes',
+                    ends_at = now() - interval '20 minutes' WHERE store_id = ?
+                """).param(store).update();
+        Staff staff = newStaff(store, "manager");
+        String manager = login(staff);
+        String kitchen = login(newStaff(store, "kitchen"));
+        String pickup = login(newStaff(store, "pickup"));
+        String other = newStore();
+        String otherManager = login(newStaff(other, "manager"));
+        LocalDate date = tomorrowInKigali();
+        UUID shiftId = UUID.randomUUID();
+        String version = availability(manager).path("version").asString();
+        String change = scheduleChange(version, shiftId, date, "11:30", "12:00", 3);
+
+        api.perform(get(API + "/stores/{id}/menu", store)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.slots").isEmpty());
+        api.perform(patch(OPERATOR + "/availability").contentType(MediaType.APPLICATION_JSON).content(change))
+                .andExpect(status().isUnauthorized());
+        updateAvailability(kitchen, change).andExpect(status().isForbidden());
+        updateAvailability(pickup, change).andExpect(status().isForbidden());
+        updateAvailability(otherManager, scheduleChange(availability(otherManager).path("version").asString(),
+                shiftId, date, "11:30", "12:00", 2)).andExpect(status().isOk());
+
+        String firstSlot = "shift-" + shiftId + "-1";
+        JsonNode published = body(updateAvailability(manager, change).andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.open").value(true)).andExpect(jsonPath("$.slots.length()").value(3))
+                .andExpect(jsonPath("$.slots[0].id").value(firstSlot))
+                .andExpect(jsonPath("$.slots[0].startsAt").value(date + "T09:30:00Z"))
+                .andExpect(jsonPath("$.slots[2].endsAt").value(date + "T10:00:00Z")));
+        String revision = published.path("version").asString();
+        assertThat(revision).isNotEqualTo(version);
+        api.perform(get(API + "/stores/{id}/menu", store)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.slots[0].id").value(firstSlot))
+                .andExpect(jsonPath("$.slots[0].available").value(true));
+        String guest = newGuest();
+        String quoteId = body(quote(guest, store, firstSlot).andExpect(status().isOk())).path("quoteId").asString();
+        String orderId = body(createOrder(guest, quoteId, "first-shift-order")
+                .andExpect(status().isOk()).andExpect(jsonPath("$.slotId").value(firstSlot))).path("id").asString();
+        assertThat(availability(manager).path("slots").get(0).path("reserved").asInt()).isEqualTo(1);
+
+        String current = body(updateAvailability(manager, storeChange(revision, false)).andExpect(status().isOk()))
+                .path("version").asString();
+        updateAvailability(manager, change).andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(current)).andExpect(jsonPath("$.open").value(false))
+                .andExpect(jsonPath("$.slots[0].reserved").value(1));
+        updateAvailability(manager, scheduleChange(version, shiftId, date, "11:30", "12:00", 4))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("pickup_schedule_conflict"));
+        updateAvailability(manager, scheduleChange(version, UUID.randomUUID(), date, "12:00", "12:10", 3))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("catalog_version_conflict"));
+        assertThat(jdbc.sql("""
+                SELECT operator_username || ':' || previous_version || ':' || new_version
+                FROM pickup_schedule_publications WHERE store_id = ? AND id = ? AND operator_id = ? AND capacity = 3
+                """).params(store, shiftId, staff.id()).query(String.class).single())
+                .isEqualTo(staff.username() + ":" + version + ":" + revision);
+        assertThat(jdbc.sql("SELECT slot_id FROM orders WHERE id = ?").param(UUID.fromString(orderId))
+                .query(String.class).single()).isEqualTo(firstSlot);
+    }
+
+    @Test
+    void pickupScheduleValidatesBoundsAndAllowsAdjacentAndNextDayWindows() throws Exception {
+        String manager = login(newStaff(store, "manager"));
+        LocalDate date = tomorrowInKigali();
+        String version = availability(manager).path("version").asString();
+        UUID shiftId = UUID.randomUUID();
+        for (String invalid : List.of(
+                scheduleChange(version, shiftId, date, "11:35", "11:50", 3),
+                scheduleChange(version, shiftId, date, "11:30", "11:45", 3),
+                scheduleChange(version, shiftId, date, "23:50", "24:00", 3),
+                scheduleChange(version, shiftId, date, "23:50", "00:00", 3),
+                scheduleChange(version, shiftId, date, "11:30", "11:30", 3),
+                scheduleChange(version, shiftId, date, "11:30", "12:00", 0),
+                scheduleChange(version, shiftId, date, "11:30", "12:00", -1),
+                scheduleChange(version, shiftId, date, "11:30", "12:00", 2147483648L),
+                scheduleChange(version, shiftId, date, "11:30", "12:00", 1.5),
+                scheduleChange(version, shiftId, "2027-02-30", "11:30", "12:00", 3),
+                scheduleChange(version, shiftId, date, "11:30", "12:00", 3).replace(shiftId.toString(), "bad-key"))) {
+            updateAvailability(manager, invalid).andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.code").value("invalid_input"));
+        }
+        updateAvailability(manager, scheduleChange(version, shiftId, date.minusDays(2), "11:30", "12:00", 3))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("pickup_schedule_started"));
+        String first = body(updateAvailability(manager, scheduleChange(version, shiftId, date, "11:30", "12:00", Integer.MAX_VALUE))
+                .andExpect(status().isOk())).path("version").asString();
+        updateAvailability(manager, scheduleChange(first, UUID.randomUUID(), date, "11:20", "11:40", 3))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("pickup_schedule_overlap"));
+        updateAvailability(manager, scheduleChange(first, UUID.randomUUID(), date, "11:40", "12:00", 3))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("pickup_schedule_overlap"));
+        String adjacent = body(updateAvailability(manager, scheduleChange(first, UUID.randomUUID(), date, "12:00", "12:10", 3))
+                .andExpect(status().isOk())).path("version").asString();
+        updateAvailability(manager, scheduleChange(adjacent, UUID.randomUUID(), date.plusDays(1), "11:30", "12:00", 3))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.slots.length()").value(8));
+        assertThat(jdbc.sql("SELECT count(*) FROM pickup_schedule_publications WHERE store_id = ?")
+                .param(store).query(Long.class).single()).isEqualTo(3);
+        assertThat(jdbc.sql("SELECT capacity FROM pickup_slots WHERE store_id = ? AND id = ?")
+                .params(store, "shift-" + shiftId + "-1").query(Integer.class).single()).isEqualTo(Integer.MAX_VALUE);
+    }
+
+    @Test
+    void aCollidingSlotIdRollsBackTheEntireShiftAndLeavesTheOriginalSlot() throws Exception {
+        String manager = login(newStaff(store, "manager"));
+        UUID shiftId = UUID.randomUUID();
+        String prefix = "shift-" + shiftId;
+        jdbc.sql("""
+                INSERT INTO pickup_slots (store_id, id, starts_at, ends_at, capacity)
+                VALUES (?, ?, now() + interval '4 days', now() + interval '4 days 10 minutes', 7)
+                """).params(store, prefix + "-2").update();
+        String version = availability(manager).path("version").asString();
+        String change = scheduleChange(version, shiftId, tomorrowInKigali(), "11:30", "11:50", 3);
+        updateAvailability(manager, change).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("pickup_schedule_conflict"));
+        assertThat(availability(manager).path("version").asString()).isEqualTo(version);
+        assertThat(jdbc.sql("SELECT id || ':' || capacity FROM pickup_slots WHERE store_id = ? AND id LIKE ?")
+                .params(store, prefix + "%").query(String.class).list()).containsExactly(prefix + "-2:7");
+        assertThat(jdbc.sql("SELECT count(*) FROM pickup_schedule_publications WHERE store_id = ?")
+                .param(store).query(Long.class).single()).isZero();
+    }
+
+    @Test
+    void anExactRetryAfterTheShiftElapsedReturnsTheCurrentCatalog() throws Exception {
+        Staff actor = newStaff(store, "manager");
+        String manager = login(actor);
+        UUID publishedId = UUID.randomUUID();
+        LocalDate elapsed = tomorrowInKigali().minusDays(2);
+        jdbc.sql("""
+                INSERT INTO pickup_schedule_publications (store_id, id, schedule_date, start_time, end_time, capacity,
+                    operator_id, operator_username, previous_version, new_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'before-shift', 'published-shift')
+                """).params(store, publishedId, elapsed, LocalTime.of(11, 30), LocalTime.of(12, 0), 3,
+                    actor.id(), actor.username()).update();
+        String current = availability(manager).path("version").asString();
+        updateAvailability(manager, scheduleChange("before-shift", publishedId, elapsed, "11:30", "12:00", 3))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.version").value(current))
+                .andExpect(jsonPath("$.slots.length()").value(1));
+        updateAvailability(manager, scheduleChange(current, UUID.randomUUID(), elapsed, "11:30", "12:00", 3))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("pickup_schedule_started"));
+    }
+
+    private LocalDate tomorrowInKigali() {
+        return jdbc.sql("SELECT (clock_timestamp() AT TIME ZONE 'Africa/Kigali')::date + 1")
+                .query(LocalDate.class).single();
+    }
+
+    private String scheduleChange(String version, UUID id, Object date, String start, String end, Number capacity) {
+        return json.writeValueAsString(Map.of("expectedVersion", version, "pickupSchedule", Map.of(
+                "id", id.toString(), "date", date.toString(), "start", start, "end", end, "capacity", capacity)));
+    }
+
     private JsonNode availability(String bearer) throws Exception {
         return body(api.perform(get(OPERATOR + "/availability").header(HttpHeaders.AUTHORIZATION, bearer))
             .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store")));
@@ -923,10 +1077,14 @@ class OperatorIntegrationTest {
     }
 
     private ResultActions quote(String bearer, String storeId) throws Exception {
+        return quote(bearer, storeId, SLOT);
+    }
+
+    private ResultActions quote(String bearer, String storeId, String slotId) throws Exception {
         return api.perform(post(API + "/quotes").header(HttpHeaders.AUTHORIZATION, bearer)
                 .contentType(MediaType.APPLICATION_JSON).content("""
                     {"storeId":"%s","slotId":"%s","lines":[{"sku":"double-smash","modifierIds":["extra-cheese"],"quantity":1,"unitPrice":9700}]}
-                    """.formatted(storeId, SLOT)));
+                    """.formatted(storeId, slotId)));
     }
 
     private ResultActions createOrder(String bearer, String quoteId, String key) throws Exception {
