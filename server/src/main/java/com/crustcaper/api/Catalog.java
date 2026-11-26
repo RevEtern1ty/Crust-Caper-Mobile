@@ -29,10 +29,18 @@ class Catalog {
             AND catalog_product_has_stock(p.store_id, p.sku, :soldAt) THEN p.product
             ELSE jsonb_set(p.product, '{available}', 'false'::jsonb) END AS product
         """;
-    private static final String MENU_SALE_PRODUCT = SALE_PRODUCT + """
-        , CASE WHEN p.product->'available' = 'true'::jsonb AND p.sale_hours <> '[]'::jsonb
-            AND catalog_product_has_stock(p.store_id, p.sku, :soldAt)
-            THEN catalog_next_sale_change(p.sale_hours, :soldAt) END AS next_sale_change
+    private static final String MENU_PRODUCTS = """
+        SELECT CASE WHEN stock.available_from = :soldAt AND catalog_sale_active(p.sale_hours, :soldAt)
+                    THEN p.product ELSE jsonb_set(p.product, '{available}', 'false'::jsonb) END AS product,
+            CASE WHEN p.product->'available' = 'true'::jsonb THEN
+                CASE
+                    WHEN stock.available_from > :soldAt THEN stock.available_from
+                    WHEN stock.available_from = :soldAt AND p.sale_hours <> '[]'::jsonb
+                        THEN catalog_next_sale_change(p.sale_hours, :soldAt)
+                END
+            END AS next_sale_change
+        FROM menu_products p
+        CROSS JOIN LATERAL catalog_product_stock_available_from(p.store_id, p.sku, :soldAt) AS stock(available_from)
         """;
     private static final String SLOT_QUERY = """
         SELECT id, starts_at, ends_at, capacity FROM pickup_slots WHERE store_id = ?
@@ -102,7 +110,7 @@ class Catalog {
                 slots.set(MENU_SLOT_LIMIT - 1, available);
             }
         }
-        List<MenuProduct> products = productRows(MENU_SALE_PRODUCT, storeId, channel, checkedAt, false)
+        List<MenuProduct> products = productRows(MENU_PRODUCTS, storeId, channel, checkedAt, false)
             .query((rs, n) -> {
                 OffsetDateTime nextSaleChange = rs.getObject("next_sale_change", OffsetDateTime.class);
                 return new MenuProduct(json.read(rs.getString("product"), Product.class),
@@ -159,14 +167,14 @@ class Catalog {
     }
 
     List<Product> products(String storeId, CheckoutChannel channel, Instant now, boolean lock) {
-        return productRows(SALE_PRODUCT, storeId, channel, dbTime(now), lock)
+        return productRows("SELECT " + SALE_PRODUCT + " FROM menu_products p\n", storeId, channel, dbTime(now), lock)
             .query((rs, n) -> json.read(rs.getString("product"), Product.class)).list();
     }
 
-    private JdbcClient.StatementSpec productRows(String projection, String storeId, CheckoutChannel channel,
+    private JdbcClient.StatementSpec productRows(String selectProducts, String storeId, CheckoutChannel channel,
                                                   OffsetDateTime checkedAt, boolean lock) {
-        return jdbc.sql("SELECT " + projection + """
-                FROM menu_products p WHERE p.store_id = :storeId AND :channel = ANY(p.sale_channels)
+        return jdbc.sql(selectProducts + """
+                WHERE p.store_id = :storeId AND :channel = ANY(p.sale_channels)
                 ORDER BY p.position, p.sku
                 """ + (lock ? " FOR SHARE" : ""))
             .param("storeId", storeId).param("channel", channel.name().toLowerCase(Locale.ROOT))

@@ -1544,7 +1544,7 @@ paths:
 components:
   headers:
     NextSaleChangeAt:
-      description: Earliest upcoming availability change caused by the published sales hours of a product in this channel. Omitted when no product has a scheduled change. Clients can calculate the delay from X-Availability-Checked-At.
+      description: Earliest expected change from published sales hours or expiry of an unpaid reservation that currently exhausts stock in this channel. Revalidate at that time because payment or other changes can affect availability. Clients can calculate the delay from X-Availability-Checked-At.
       schema: { $ref: '#/components/schemas/Timestamp' }
   securitySchemes:
     webGuest:
