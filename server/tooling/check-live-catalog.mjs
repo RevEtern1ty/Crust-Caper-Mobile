@@ -164,15 +164,26 @@ async function readCheckoutFile(url, label, accept, acceptedTypes, limitMiB) {
 }
 
 function readExpoCheckoutConfig(source) {
-  // Expo SDK 55 embeds app.config.ts extra.restaurant in the public serialized manifest.
-  const manifests = source.matchAll(/\\"extra\\":\{\\"restaurant\\":(\{[^{}]{1,2048}\})/g);
-  const match = manifests.next().value;
-  if (!match || !manifests.next().done) return null;
-  try {
-    return JSON.parse(JSON.parse('"' + match[1] + '"'));
-  } catch {
-    return null;
+  // Expo SDK 55 embeds the JSON string in the expo-constants web manifest getter.
+  const getter = ',get manifest(){return"';
+  const marker = source.indexOf(getter);
+  if (marker === -1 || source.indexOf(getter, marker + getter.length) !== -1) return null;
+  const start = marker + getter.length - 1;
+  const literal = source.slice(start, start + 64 * 1024);
+  for (let end = 1; end < literal.length; end++) {
+    if (literal[end] === '\\') {
+      end++;
+    } else if (literal[end] === '"') {
+      if (!source.startsWith('},get manifest2(){return null}', start + end + 1)) return null;
+      try {
+        const manifest = JSON.parse(JSON.parse(literal.slice(0, end + 1)));
+        return manifest?.extra?.restaurant ?? null;
+      } catch {
+        return null;
+      }
+    }
   }
+  return null;
 }
 
 async function checkExpoEntry(url, expectedDigest, storeId) {

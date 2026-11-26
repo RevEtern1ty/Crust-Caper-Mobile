@@ -28,11 +28,13 @@ async function mockFetch(requested, options, scenario) {
       ],
     });
   }
-  const expoConfig = { extra: { restaurant: {
+  const expoConfig = { extra: { ...scenario.expoExtra, restaurant: {
     profile: 'stage', apiBaseUrl: `${origin}/api/v1`, storeId: 'kigali', webCheckout: true, ...scenario.expoConfig,
   } } };
+  const constants = `{get deviceYearClass(){return null},get manifest(){return${JSON.stringify(JSON.stringify(expoConfig))}},get manifest2(){return null}}`;
   const bundle = scenario.bundle ?? `throw new Error('Published code must not run during preflight');
-    globalThis.expoConfig = JSON.parse(${JSON.stringify(JSON.stringify(expoConfig))});`;
+    globalThis.expoConstants = ${constants};
+    ${scenario.duplicateManifest ? `globalThis.otherConstants = ${constants};` : ''}`;
   const script = '/_expo/static/js/web/entry-' + createHash('md5').update(bundle).digest('hex') + '.js';
   if (url.pathname === '/menu/en/double-smash' || url.pathname === '/menu/rw/double-smash') {
     const locale = url.pathname.split('/')[2];
@@ -176,6 +178,18 @@ test('checkout gate requests the same available item via both localized catalog 
   assert.match(result.stdout, /Checkout EN and RW handoffs and Expo entry verified/);
 });
 
+test('checkout gate reads the Expo manifest when EAS and nested settings precede the restaurant', () => {
+  const result = run({
+    expoExtra: {
+      eas: { projectId: '2f90168f-b697-4b39-9e72-e80c092d32c2' },
+      other: { restaurant: { storeId: 'elsewhere', metadata: ['quoted "text"', 'a closing brace }'] } },
+    },
+    expoConfig: { nested: { message: 'escaped slash \\ and "quoted text" }' } },
+  }, '--checkout');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Checkout EN and RW handoffs and Expo entry verified/);
+});
+
 test('checkout gate rejects changed or hidden catalog links and unsafe script addresses', () => {
   const cases = [
     [{ missingDetail: true }, /Storefront \/menu\/rw: missing the selected item link/],
@@ -208,6 +222,10 @@ test('checkout gate rejects an invalid shell, missing, truncated and invalid bun
     [{ bundleLength: 12 * 1024 * 1024 + 1 }, /exceeds the 12 MiB limit/],
     [{ bundleBody: 'truncated copy' }, /content does not match its published filename/],
     [{ bundle: 'function {' }, /invalid JavaScript/],
+    [{ duplicateManifest: true }, /not configured for this same-origin store/],
+    [{ expoExtra: { nested: { restaurant: {
+      webCheckout: true, profile: 'stage', apiBaseUrl: origin + '/api/v1', storeId: 'kigali',
+    } } }, expoConfig: { storeId: 'other-store' } }, /not configured for this same-origin store/],
     [{ expoConfig: { webCheckout: false } }, /not configured for this same-origin store/],
     [{ expoConfig: { profile: 'local' } }, /not configured for this same-origin store/],
     [{ expoConfig: { storeId: 'other-store' } }, /not configured for this same-origin store/],
