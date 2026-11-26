@@ -242,6 +242,13 @@ jobs:
           sudo setfacl -m "u:$(id -u):rw" /dev/kvm
           [[ -r /dev/kvm && -w /dev/kvm ]]
 
+          # QEMU loads the PulseAudio client library even with -no-audio.
+          if ! ldconfig -p | grep -F 'libpulse.so.0' >/dev/null; then
+            timeout --kill-after=5s 2m sudo apt-get -o Acquire::Retries=2 update
+            timeout --kill-after=5s 2m sudo apt-get -o Acquire::Retries=2 install -y --no-install-recommends libpulse0
+          fi
+          ldconfig -p | grep -F 'libpulse.so.0' >> "$receipt"
+
           # The runner image already provides the SDK licenses; fail rather than accept any prompts.
           timeout --kill-after=5s 6m "$android_tools/sdkmanager" --sdk_root="$ANDROID_HOME" --install emulator "$image" </dev/null
           "$emulator" -version
