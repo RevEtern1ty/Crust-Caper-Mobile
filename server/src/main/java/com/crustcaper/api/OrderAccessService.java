@@ -34,7 +34,7 @@ final class OrderAccessService {
 
     record ChallengeReceipt(UUID challengeId) {}
     record VerifiedOrder(UUID orderId) {}
-    private record Pending(UUID id, String orderCode, byte[] phoneDigest) {}
+    private record Pending(UUID id, String orderCode, byte[] phoneDigest, UUID checkoutOrder) {}
     private record Candidate(UUID orderId, String phone) {
         @Override
         public String toString() { return "RecoveryCandidate[redacted]"; }
@@ -43,7 +43,7 @@ final class OrderAccessService {
         @Override
         public String toString() { return "RecoveryDelivery[redacted]"; }
     }
-    private record Verification(UUID orderId, String providerReference, int attempts, String state) {
+    private record Verification(UUID orderId, String providerReference, int attempts, String state, boolean checkoutRecovery) {
         @Override
         public String toString() { return "RecoveryVerification[redacted]"; }
     }
@@ -56,26 +56,63 @@ final class OrderAccessService {
 
     ChallengeReceipt start(UUID guest, String orderCode, String phone) {
         requireGateway();
-        if (orderCode == null || !ORDER_CODE.matcher(orderCode).matches()
-            || phone == null || !PHONE.matcher(phone).matches()) throw ApiFailure.invalid();
+        validatePhone(phone);
+        if (orderCode == null || !ORDER_CODE.matcher(orderCode).matches()) throw ApiFailure.invalid();
         String reference = orderCode.substring(orderCode.length() - 8).toLowerCase(Locale.ROOT);
+        return enqueue(guest, reference, null, phone);
+    }
+
+    ChallengeReceipt startCheckoutRecovery(UUID guest, UUID orderId, String phone) {
+        requireGateway();
+        validatePhone(phone);
+        return enqueue(guest, null, orderId, phone);
+    }
+
+    static void validatePhone(String phone) {
+        if (phone == null || !PHONE.matcher(phone).matches()) throw ApiFailure.invalid();
+    }
+
+    private ChallengeReceipt enqueue(UUID guest, String reference, UUID checkoutOrder, String phone) {
         UUID challenge = UUID.randomUUID();
-        transactions.executeWithoutResult(tx -> {
-            jdbc.sql("SELECT id FROM guest_sessions WHERE id = ? AND expires_at > clock_timestamp() FOR UPDATE")
+        UUID acknowledged = transactions.execute(tx -> {
+            jdbc.sql("""
+                WITH locked_guest AS MATERIALIZED (
+                    SELECT id, expires_at FROM guest_sessions WHERE id = ? FOR UPDATE
+                )
+                SELECT id FROM locked_guest WHERE expires_at > clock_timestamp()
+                """)
                 .param(guest).query(UUID.class).optional().orElseThrow(ApiFailure::unauthenticated);
+            if (checkoutOrder != null) {
+                UUID sent = findCheckoutChallenge(guest, checkoutOrder, phone);
+                if (sent != null) return sent;
+            }
             long recent = jdbc.sql("""
                 SELECT count(*) FROM order_access_challenges
                 WHERE guest_session_id = ? AND created_at > clock_timestamp() - interval '10 minutes'
                 """).param(guest).query(Long.class).single();
             if (recent < MAX_CHALLENGES && queueHasRoom()) {
-                // The request path never queries orders or contacts the provider.
+                // The worker validates the contact and sends the challenge asynchronously.
                 jdbc.sql("""
-                    INSERT INTO order_access_challenges (id, guest_session_id, order_code, phone_digest, state, expires_at)
-                    VALUES (?, ?, ?, ?, 'queued', clock_timestamp() + interval '10 minutes')
-                    """).params(challenge, guest, reference, digest(challenge, phone)).update();
+                    INSERT INTO order_access_challenges
+                        (id, guest_session_id, order_code, phone_digest, order_id, checkout_recovery, state, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'queued', clock_timestamp() + interval '10 minutes')
+                    """).params(challenge, guest, reference, digest(challenge, phone), checkoutOrder, checkoutOrder != null).update();
             }
+            return challenge;
         });
-        return new ChallengeReceipt(challenge);
+        return new ChallengeReceipt(acknowledged);
+    }
+
+    private UUID findCheckoutChallenge(UUID guest, UUID order, String phone) {
+        return jdbc.sql("""
+            SELECT id, phone_digest FROM order_access_challenges
+            WHERE guest_session_id = ? AND checkout_recovery AND order_id = ? AND expires_at > clock_timestamp()
+            ORDER BY created_at DESC LIMIT ?
+            """).params(guest, order, MAX_CHALLENGES)
+            .query((rs, row) -> {
+                UUID id = rs.getObject("id", UUID.class);
+                return MessageDigest.isEqual(rs.getBytes("phone_digest"), digest(id, phone)) ? id : null;
+            }).list().stream().filter(Objects::nonNull).findFirst().orElse(null);
     }
 
     private boolean queueHasRoom() {
@@ -112,13 +149,13 @@ final class OrderAccessService {
 
     private Verification claimVerification(UUID guest, UUID challenge) {
         Verification stored = jdbc.sql("""
-            SELECT order_id, provider_reference, attempts, state FROM order_access_challenges
+            SELECT order_id, provider_reference, attempts, state, checkout_recovery FROM order_access_challenges
             WHERE id = ? AND guest_session_id = ?
               AND (state = 'verified' OR expires_at > clock_timestamp())
             FOR UPDATE
             """).params(challenge, guest)
             .query((rs, row) -> new Verification(rs.getObject("order_id", UUID.class), rs.getString("provider_reference"),
-                rs.getInt("attempts"), rs.getString("state")))
+                rs.getInt("attempts"), rs.getString("state"), rs.getBoolean("checkout_recovery")))
             .optional().orElseThrow(ApiFailure::notFound);
         if (stored.state().equals("verified")) return stored;
         if (!stored.state().equals("sent") || stored.attempts() >= MAX_ATTEMPTS || stored.providerReference() == null) {
@@ -126,7 +163,8 @@ final class OrderAccessService {
         }
         jdbc.sql("UPDATE order_access_challenges SET attempts = attempts + 1, state = 'checking' WHERE id = ?")
             .param(challenge).update();
-        return new Verification(stored.orderId(), stored.providerReference(), stored.attempts() + 1, "checking");
+        return new Verification(stored.orderId(), stored.providerReference(), stored.attempts() + 1, "checking",
+            stored.checkoutRecovery());
     }
 
     private void finishUnsuccessfulVerification(UUID challenge, Verification claimed, boolean expired) {
@@ -146,6 +184,13 @@ final class OrderAccessService {
             """).params(challenge, guest, claimed.orderId(), claimed.providerReference(), claimed.attempts()).update();
         if (completed != 1) throw ApiFailure.notFound();
 
+        if (claimed.checkoutRecovery()) {
+            int changed = jdbc.sql("""
+                UPDATE orders SET web_checkout_guest_session_id = ?
+                WHERE id = ? AND checkout_channel = 'web'
+                """).params(guest, claimed.orderId()).update();
+            if (changed != 1) throw ApiFailure.notFound();
+        }
         jdbc.sql("""
             INSERT INTO order_read_grants (guest_session_id, order_id) VALUES (?, ?)
             ON CONFLICT (guest_session_id, order_id) DO NOTHING
@@ -184,16 +229,18 @@ final class OrderAccessService {
 
     private Delivery claimDelivery() {
         Pending next = jdbc.sql("""
-            SELECT c.id, c.order_code, c.phone_digest FROM order_access_challenges c
+            SELECT c.id, c.order_code, c.phone_digest, CASE WHEN c.checkout_recovery THEN c.order_id END AS checkout_order
+            FROM order_access_challenges c
             WHERE c.state = 'queued' AND c.expires_at > clock_timestamp()
               AND EXISTS (SELECT FROM guest_sessions g WHERE g.id = c.guest_session_id AND g.expires_at > clock_timestamp())
             ORDER BY c.created_at, c.id LIMIT 1 FOR UPDATE OF c SKIP LOCKED
             """).query((rs, row) -> new Pending(rs.getObject("id", UUID.class), rs.getString("order_code"),
-                rs.getBytes("phone_digest"))).optional().orElse(null);
+                rs.getBytes("phone_digest"), rs.getObject("checkout_order", UUID.class))).optional().orElse(null);
         if (next == null) return null;
-        List<Candidate> matches = jdbc.sql("SELECT id, phone FROM orders WHERE right(id::text, 8) = ? LIMIT 2")
-            .param(next.orderCode())
-            .query((rs, row) -> new Candidate(rs.getObject("id", UUID.class), rs.getString("phone"))).list();
+        List<Candidate> matches = (next.checkoutOrder() == null
+            ? jdbc.sql("SELECT id, phone FROM orders WHERE right(id::text, 8) = ? LIMIT 2").param(next.orderCode())
+            : jdbc.sql("SELECT id, phone FROM orders WHERE id = ? AND checkout_channel = 'web'").param(next.checkoutOrder()))
+                .query((rs, row) -> new Candidate(rs.getObject("id", UUID.class), rs.getString("phone"))).list();
         if (matches.size() != 1
             || !MessageDigest.isEqual(next.phoneDigest(), digest(next.id(), matches.getFirst().phone()))) {
             close(next.id());

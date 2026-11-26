@@ -4,7 +4,9 @@ import static com.crustcaper.api.ApiModels.*;
 import static com.crustcaper.api.CommerceController.privateResponse;
 import static com.crustcaper.api.WebCommerceAccess.GUEST_ATTRIBUTE;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.servlet.http.HttpServletRequest;
+import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import org.springframework.http.CacheControl;
@@ -27,15 +29,25 @@ final class WebCommerceController {
     private final WebGuestSessions sessions;
     private final OrderService orders;
     private final OrderAccessController orderAccess;
+    private final OrderAccessService access;
     private final CustomerReceiptController receipts;
 
     WebCommerceController(WebGuestSessions sessions, OrderService orders, OrderAccessController orderAccess,
-        CustomerReceiptController receipts) {
+        OrderAccessService access, CustomerReceiptController receipts) {
         this.sessions = sessions;
         this.orders = orders;
         this.orderAccess = orderAccess;
+        this.access = access;
         this.receipts = receipts;
     }
+
+    record CheckoutRecoveryInput(String quoteId, String key, String phone) {
+        @Override
+        public String toString() { return "WebCheckoutRecovery[redacted]"; }
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    record CheckoutRecovery(String state, Instant retryAt, UUID challengeId) {}
 
     @GetMapping("/session")
     ResponseEntity<WebGuestSessions.Session> session(HttpServletRequest request) {
@@ -60,7 +72,22 @@ final class WebCommerceController {
 
     @PostMapping("/quotes")
     ResponseEntity<Quote> quote(@RequestAttribute(GUEST_ATTRIBUTE) UUID guest, @RequestBody QuoteInput input) {
-        return privateResponse(orders.createQuote(guest, input));
+        return privateResponse(orders.createWebQuote(guest, input));
+    }
+
+    @PostMapping("/checkout-recovery")
+    ResponseEntity<CheckoutRecovery> recoverCheckout(@RequestAttribute(GUEST_ATTRIBUTE) UUID guest,
+        @RequestBody CheckoutRecoveryInput input) {
+        OrderAccessService.validatePhone(input.phone());
+        OrderService.WebCheckoutLookup lookup = orders.lookupWebCheckout(input.quoteId(), input.key());
+        if (lookup.orderId() != null) {
+            UUID challenge = access.startCheckoutRecovery(guest, lookup.orderId(), input.phone()).challengeId();
+            return privateResponse(new CheckoutRecovery("verify", null, challenge));
+        }
+        if (lookup.retryAt() != null) {
+            return privateResponse(new CheckoutRecovery("waiting", lookup.retryAt(), null));
+        }
+        return privateResponse(new CheckoutRecovery("not_placed", null, null));
     }
 
     @PostMapping("/orders")

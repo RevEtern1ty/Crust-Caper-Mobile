@@ -43,6 +43,9 @@ public class OrderService {
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final TypeReference<List<CartLine>> CART_LINES = new TypeReference<>() {};
     private static final String ORDER = "SELECT * FROM orders WHERE id = ?";
+    private static final String CHECKOUT_GUEST = """
+        AND (orders.guest_session_id = ? OR orders.web_checkout_guest_session_id = ?)
+        """;
     private static final String VISIBLE_TO_GUEST = """
         AND (orders.guest_session_id = ? OR EXISTS (
             SELECT FROM order_read_grants g WHERE g.guest_session_id = ? AND g.order_id = orders.id
@@ -78,8 +81,12 @@ public class OrderService {
         UUID id, UUID quoteId, UUID owner, String storeId, String slotId, String phone, String email,
         List<CartLine> lines, long total, long tax, String status, String paymentStatus, String pickupCode,
         String receiptStatus, String receiptUrl, Instant createdAt, Instant reservationExpiresAt,
-        Instant startsAt, Instant endsAt, CheckoutChannel checkoutChannel
-    ) {}
+        Instant startsAt, Instant endsAt, CheckoutChannel checkoutChannel, UUID recoveredGuest
+    ) {
+        boolean canCheckout(UUID guest) {
+            return owner.equals(guest) || guest.equals(recoveredGuest);
+        }
+    }
 
     private record OrderSnapshot(StoredOrder order, PaymentAttempt attempt, Instant checkedAt) {}
     private record ReadOrder(Order order, boolean readOnly) {}
@@ -91,6 +98,7 @@ public class OrderService {
     }
 
     private record PaymentStart(Attempt attempt, StoredOrder order, boolean openGateway) {}
+    record WebCheckoutLookup(UUID orderId, Instant retryAt) {}
 
     OrderService(JdbcClient jdbc, Catalog catalog, CommerceJson json, PaymentGateway gateway,
                  TransactionTemplate transactions, @Value("${crustcaper.payment.provider}") String provider) {
@@ -105,6 +113,15 @@ public class OrderService {
 
     @Transactional
     public Quote createQuote(UUID guest, QuoteInput input) {
+        return createQuote(guest, input, false);
+    }
+
+    @Transactional
+    public Quote createWebQuote(UUID guest, QuoteInput input) {
+        return createQuote(guest, input, true);
+    }
+
+    private Quote createQuote(UUID guest, QuoteInput input, boolean webCheckout) {
         validateQuote(input);
         Instant now = databaseNow();
         Catalog.StoreData store = catalog.store(input.storeId(), false);
@@ -119,11 +136,11 @@ public class OrderService {
         UUID id = UUID.randomUUID();
         jdbc.sql("""
             INSERT INTO quotes (id, guest_session_id, store_id, slot_id, pickup_starts_at, pickup_ends_at,
-                lines, total, tax, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?)
+                lines, total, tax, expires_at, web_checkout)
+            VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?)
             """)
             .params(id, guest, input.storeId(), slot.id(), dbTime(slot.startsAt()), dbTime(slot.endsAt()),
-                json.write(current.lines()), total, tax, dbTime(expiresAt))
+                json.write(current.lines()), total, tax, dbTime(expiresAt), webCheckout)
             .update();
         return new Quote(id, input.storeId(), slot.id(), current.lines(), total - tax, tax, total, CURRENCY,
             expiresAt, current.changes(), slot.startsAt(), slot.endsAt());
@@ -210,6 +227,30 @@ public class OrderService {
         return view(existing, true);
     }
 
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public WebCheckoutLookup lookupWebCheckout(String quote, String key) {
+        validateKey(key);
+        UUID quoteId = ApiFailure.uuid(quote, ApiFailure.invalid());
+        if (!quoteId.toString().equalsIgnoreCase(quote)) throw ApiFailure.invalid();
+        // Order creation locks this same guest before checking quote expiry and inserting.
+        jdbc.sql("""
+            SELECT g.id FROM quotes q JOIN guest_sessions g ON g.id = q.guest_session_id
+            WHERE q.id = ? AND q.web_checkout
+            FOR UPDATE OF g
+            """).param(quoteId).query(UUID.class).optional().orElseThrow(ApiFailure::notFound);
+        // Use a new statement to see a commit made while waiting for the guest's lock.
+        return jdbc.sql("""
+            SELECT o.id, o.request_key, o.checkout_channel, q.expires_at, q.expires_at > clock_timestamp() AS active
+            FROM quotes q LEFT JOIN orders o ON o.quote_id = q.id WHERE q.id = ?
+            """).param(quoteId).query((rs, row) -> {
+                UUID orderId = rs.getObject("id", UUID.class);
+                if (orderId != null && (!"web".equals(rs.getString("checkout_channel"))
+                    || !key.equals(rs.getString("request_key")))) throw ApiFailure.notFound();
+                Instant retryAt = orderId == null && rs.getBoolean("active") ? readTime(rs, "expires_at") : null;
+                return new WebCheckoutLookup(orderId, retryAt);
+            }).optional().orElseThrow(ApiFailure::notFound);
+    }
+
     public Order getOrder(UUID guest, UUID id) {
         return readOrder(guest, id).order();
     }
@@ -222,7 +263,7 @@ public class OrderService {
     private ReadOrder readOrder(UUID guest, UUID id) {
         OrderSnapshot snapshot = jdbc.sql(ORDER_SNAPSHOT + "WHERE orders.id = ? " + VISIBLE_TO_GUEST)
             .params(id, guest, guest).query(this::snapshotRow).optional().orElseThrow(ApiFailure::notFound);
-        if (!snapshot.order().owner().equals(guest)) return new ReadOrder(view(snapshot, false), true);
+        if (!snapshot.order().canCheckout(guest)) return new ReadOrder(view(snapshot, false), true);
         PaymentAttempt attempt = snapshot.attempt();
         if (attempt != null && attempt.status().equals("processing") && !localPayments
             && claimVerification(attempt.id())) {
@@ -292,7 +333,7 @@ public class OrderService {
             boolean invalidRequest = error.kind() == PaymentGatewayException.Kind.INVALID_REQUEST;
             if (invalidRequest || error.kind() == PaymentGatewayException.Kind.NOT_DISPATCHED) {
                 boolean expired = Objects.requireNonNull(transactions.execute(
-                    tx -> rejectUndispatchedPayment(guest, attempt, invalidRequest)));
+                    tx -> rejectUndispatchedPayment(attempt, invalidRequest)));
                 if (expired) throw ApiFailure.conflict("reservation_expired");
                 throw invalidRequest ? ApiFailure.invalid() : ApiFailure.unavailable();
             }
@@ -301,8 +342,8 @@ public class OrderService {
         }
     }
 
-    private boolean rejectUndispatchedPayment(UUID guest, Attempt attempt, boolean invalidRequest) {
-        StoredOrder order = owned(guest, attempt.orderId(), true);
+    private boolean rejectUndispatchedPayment(Attempt attempt, boolean invalidRequest) {
+        StoredOrder order = owned(null, attempt.orderId(), true);
         boolean expired = !order.reservationExpiresAt().isAfter(databaseNow());
         Attempt current = latest(order.id());
         if (current == null || !current.id().equals(attempt.id()) || !order.paymentStatus().equals("processing")
@@ -436,14 +477,14 @@ public class OrderService {
     }
 
     private OrderSnapshot ownedSnapshot(UUID guest, UUID id) {
-        return jdbc.sql(ORDER_SNAPSHOT + "WHERE orders.id = ? AND orders.guest_session_id = ?")
-            .params(id, guest).query(this::snapshotRow).optional().orElseThrow(ApiFailure::notFound);
+        return jdbc.sql(ORDER_SNAPSHOT + "WHERE orders.id = ? " + CHECKOUT_GUEST)
+            .params(id, guest, guest).query(this::snapshotRow).optional().orElseThrow(ApiFailure::notFound);
     }
 
     private StoredOrder owned(UUID guest, UUID id, boolean lock) {
-        var sql = jdbc.sql(ORDER + (guest != null ? " AND guest_session_id = ?" : "") + (lock ? " FOR UPDATE" : ""))
+        var sql = jdbc.sql(ORDER + (guest != null ? " " + CHECKOUT_GUEST : "") + (lock ? " FOR UPDATE" : ""))
             .param(id);
-        if (guest != null) sql.param(guest);
+        if (guest != null) sql.params(guest, guest);
         return sql.query(this::orderRow).optional().orElseThrow(ApiFailure::notFound);
     }
 
@@ -480,7 +521,8 @@ public class OrderService {
             rs.getString("pickup_code"), rs.getString("receipt_status"), rs.getString("receipt_url"),
             readTime(rs, "created_at"), readTime(rs, "reservation_expires_at"),
             readTime(rs, "pickup_starts_at"), readTime(rs, "pickup_ends_at"),
-            CheckoutChannel.valueOf(rs.getString("checkout_channel").toUpperCase(Locale.ROOT)));
+            CheckoutChannel.valueOf(rs.getString("checkout_channel").toUpperCase(Locale.ROOT)),
+            rs.getObject("web_checkout_guest_session_id", UUID.class));
     }
 
     private OrderSnapshot snapshotRow(ResultSet rs, int row) throws SQLException {
