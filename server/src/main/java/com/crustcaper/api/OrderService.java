@@ -10,6 +10,8 @@ import com.crustcaper.api.payment.PaymentGateway.PaymentRequest;
 import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
 import com.crustcaper.api.payment.PaymentGatewayException;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonUnwrapped;
 import tools.jackson.core.type.TypeReference;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -90,7 +92,8 @@ public class OrderService {
     }
 
     private record OrderSnapshot(StoredOrder order, PaymentAttempt attempt, Instant checkedAt) {}
-    private record ReadOrder(Order order, boolean readOnly) {}
+    record ReadOrder(@JsonUnwrapped Order order,
+                     @JsonInclude(JsonInclude.Include.NON_NULL) Boolean recoveryReadOnly) {}
 
     private record Attempt(UUID id, UUID orderId, String status, String checkoutUrl, String providerTransactionId) {
         PaymentAttempt view() {
@@ -258,10 +261,10 @@ public class OrderService {
 
     WebOrder getWebOrder(UUID guest, UUID id) {
         ReadOrder result = readOrder(guest, id);
-        return WebOrder.from(result.order(), result.readOnly());
+        return WebOrder.from(result.order(), Boolean.TRUE.equals(result.recoveryReadOnly()));
     }
 
-    private ReadOrder readOrder(UUID guest, UUID id) {
+    ReadOrder readOrder(UUID guest, UUID id) {
         OrderSnapshot snapshot = jdbc.sql(ORDER_SNAPSHOT + "WHERE orders.id = ? " + VISIBLE_TO_GUEST)
             .params(id, guest, guest).query(this::snapshotRow).optional().orElseThrow(ApiFailure::notFound);
         if (!snapshot.order().canCheckout(guest)) return new ReadOrder(view(snapshot, false), true);
@@ -278,7 +281,7 @@ public class OrderService {
             }
             snapshot = ownedSnapshot(guest, id);
         }
-        return new ReadOrder(view(snapshot, true), false);
+        return new ReadOrder(view(snapshot, true), null);
     }
 
     public Reorder reorder(UUID guest, UUID id) {

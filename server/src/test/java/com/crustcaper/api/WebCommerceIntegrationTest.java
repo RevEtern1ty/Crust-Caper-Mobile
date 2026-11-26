@@ -523,7 +523,8 @@ class WebCommerceIntegrationTest {
             .andExpect(jsonPath("$.orderId").value(order));
 
         api.perform(nativeRequest(GET, orderPath, replacement)).andExpect(status().isOk())
-            .andExpect(jsonPath("$.status").value("awaiting_payment"));
+            .andExpect(jsonPath("$.status").value("awaiting_payment"))
+            .andExpect(jsonPath("$.recoveryReadOnly").doesNotExist());
         api.perform(nativeRequest(GET, orderPath + "/data-export", replacement)).andExpect(status().isNotFound());
         api.perform(nativeRequest(GET, nativeOrders + "/recovery", replacement).header(KEY, key)).andExpect(status().isNotFound());
         api.perform(nativeRequest(GET, nativeOrders + "/" + otherOrder, replacement)).andExpect(status().isNotFound());
@@ -566,15 +567,20 @@ class WebCommerceIntegrationTest {
         verifyNativeChallenge(firstGuest, first, OTP).andExpect(status().isOk());
         var attempt = body(api.perform(nativeRequest(POST, orderPath + "/payments", firstGuest).header(KEY, "first-guest"))
             .andExpect(status().isOk())).path("id").asString();
+        UUID duringCooldown = nativeCheckoutChallenge(nextGuest, quote, key, PHONE);
+        awaitChallengeState(duringCooldown, "closed");
+        verifyNativeChallenge(nextGuest, duringCooldown, OTP).andExpect(status().isNotFound());
         jdbc.sql("UPDATE order_access_challenges SET reserved_at = clock_timestamp() - interval '12 minutes' WHERE id = ?")
             .param(first).update();
 
         UUID next = nativeCheckoutChallenge(nextGuest, quote, key, PHONE);
+        assertThat(next).isNotEqualTo(duringCooldown);
         awaitDelivery(next);
         verifyNativeChallenge(nextGuest, next, OTP).andExpect(status().isOk());
         verifyNativeChallenge(firstGuest, first, OTP).andExpect(status().isNotFound());
         api.perform(nativeRequest(GET, orderPath, firstGuest)).andExpect(status().isOk())
-            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").isEmpty());
+            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").isEmpty())
+            .andExpect(jsonPath("$.recoveryReadOnly").value(true));
         api.perform(nativeRequest(POST, orderPath + "/payments", firstGuest).header(KEY, "first-guest"))
             .andExpect(status().isNotFound());
         api.perform(nativeRequest(POST, orderPath + "/payments", nextGuest).header(KEY, "first-guest"))

@@ -135,11 +135,13 @@ class OrderAccessIntegrationTest {
 
         api.perform(get(ORDERS + "/" + target.id()).header(HttpHeaders.AUTHORIZATION, newDevice))
             .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(target.id().toString()))
-            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").isEmpty());
+            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").isEmpty())
+            .andExpect(jsonPath("$.recoveryReadOnly").value(true));
         api.perform(post(ORDERS + "/" + target.id() + "/reorder").header(HttpHeaders.AUTHORIZATION, newDevice))
             .andExpect(status().isOk()).andExpect(jsonPath("$.lines[0].sku").value("double-smash"));
         api.perform(get(ORDERS + "/" + target.id()).header(HttpHeaders.AUTHORIZATION, owner))
-            .andExpect(status().isOk()).andExpect(jsonPath("$.paymentAttempt.checkoutUrl").value(CHECKOUT));
+            .andExpect(status().isOk()).andExpect(jsonPath("$.paymentAttempt.checkoutUrl").value(CHECKOUT))
+            .andExpect(jsonPath("$.recoveryReadOnly").doesNotExist());
         api.perform(get(ORDERS + "/" + unrelated.id()).header(HttpHeaders.AUTHORIZATION, newDevice))
             .andExpect(status().isNotFound());
         api.perform(post(ORDERS + "/" + target.id() + "/payments").header(HttpHeaders.AUTHORIZATION, newDevice)

@@ -110,7 +110,7 @@ final class OrderAccessService {
         return jdbc.sql("""
             SELECT id, phone_digest FROM order_access_challenges
             WHERE guest_session_id = ? AND checkout_recovery AND order_id = ?
-                AND mobile_checkout_recovery = ? AND expires_at > clock_timestamp()
+                AND mobile_checkout_recovery = ? AND state <> 'closed' AND expires_at > clock_timestamp()
             ORDER BY created_at DESC LIMIT ?
             """).params(guest, order, channel == CheckoutChannel.MOBILE, MAX_CHALLENGES)
             .query((rs, row) -> {
