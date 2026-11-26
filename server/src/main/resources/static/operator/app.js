@@ -355,7 +355,7 @@ function pickupWindow(start, end) {
 
 function pickupLookupQueueCard(fresh) {
   const entry = pickupLookup?.entry;
-  if (!fresh || !entry || !Object.hasOwn(statuses, entry.status)) return null;
+  if (!fresh || !entry || pickupLookup.unverified || !Object.hasOwn(statuses, entry.status)) return null;
   const card = cards.get(entry.orderId)?.card;
   return card?.isConnected ? card : null;
 }
@@ -365,8 +365,9 @@ function syncPickupLookupQueue(fresh) {
   const order = entry && fresh ? cards.get(entry.orderId)?.order : null;
   if (order && pickupLookupProgress[order.status] > pickupLookupProgress[entry.status]) entry.status = order.status;
   if (entry) {
-    pickupLookupStatus.dataset.status = entry.status;
-    changeText(pickupLookupStatus, pickupLookupLabels[entry.status]);
+    const label = pickupLookupLabels[entry.status];
+    pickupLookupStatus.dataset.status = pickupLookup.unverified ? 'unverified' : entry.status;
+    changeText(pickupLookupStatus, pickupLookup.unverified ? `Last known: ${label}` : label);
   }
   pickupLookupOpen.hidden = !pickupLookupQueueCard(fresh);
 }
@@ -394,10 +395,33 @@ function clearPickupLookup() {
   renderPickupLookup();
 }
 
-async function findPickupOrder() {
+function checkMissingPickupLookup() {
+  const entry = pickupLookup?.entry;
+  if (!entry || !Object.hasOwn(statuses, entry.status) || pickupLookup.queueStates.get(entry.orderId) !== 'missing') return;
+  pickupLookup.queueStates.set(entry.orderId, 'checked');
+  void findPickupOrder(entry.orderId);
+}
+
+function observePickupLookupQueue() {
+  const lookup = pickupLookup;
+  if (!lookup) return;
+  const present = new Set(orders.filter(({ id }) => matchesOrderCode(id, lookup.code)).map(({ id }) => id));
+  for (const [id, state] of lookup.queueStates) {
+    if (state === 'present' && !present.has(id)) lookup.queueStates.set(id, 'missing');
+  }
+  for (const id of present) lookup.queueStates.set(id, 'present');
+
+  if (lookup.entry && Object.hasOwn(statuses, lookup.entry.status)) {
+    const state = lookup.queueStates.get(lookup.entry.orderId);
+    if (state) lookup.unverified = state !== 'present';
+    checkMissingPickupLookup();
+  }
+}
+
+async function findPickupOrder(revalidateId) {
   const current = availableSession();
-  if (!staffPickup(current) || pickupLookup?.loading) return;
-  const code = exactOrderCode(pickupLookupCode.value);
+  if (!staffPickup(current) || (!revalidateId && pickupLookup?.loading)) return;
+  const code = revalidateId ? pickupLookup?.code : exactOrderCode(pickupLookupCode.value);
   if (!code) {
     pickupLookupCode.setAttribute('aria-invalid', 'true');
     showMessage(pickupLookupProblem, 'Enter the eight-character order number or the full order ID.');
@@ -405,20 +429,28 @@ async function findPickupOrder() {
     return;
   }
 
-  const entry = pickupLookup?.code === code ? pickupLookup.entry : null;
-  const lookup = { code, entry, loading: true, controller: new AbortController(), outcomes: new Map() };
+  const previous = pickupLookup?.code === code ? pickupLookup : null;
+  const queueStates = previous?.queueStates ?? new Map();
+  if (queueFresh()) {
+    for (const { id } of orders) if (matchesOrderCode(id, code)) queueStates.set(id, 'present');
+  }
+  const lookup = { code, entry: previous?.entry ?? null, loading: true, controller: new AbortController(),
+    outcomes: previous?.outcomes ?? new Map(), queueStates, unverified: previous?.unverified ?? false };
+  const startingQueue = queueSnapshot;
+  const requestCode = revalidateId ?? code;
   pickupLookup = lookup;
+  previous?.controller.abort();
   pickupLookupCode.removeAttribute('aria-invalid');
   pickupLookupFind.setAttribute('aria-disabled', 'true');
   showMessage(pickupLookupProblem);
   showMessage(pickupLookupNotice, 'Finding pickup order…');
   renderPickupLookup();
   try {
-    const data = await request('/orders/lookup?' + new URLSearchParams({ orderCode: code }), {
+    const data = await request('/orders/lookup?' + new URLSearchParams({ orderCode: requestCode }), {
       token: current.accessToken, signal: lookup.controller.signal,
     });
     if (session !== current || pickupLookup !== lookup) return;
-    if (typeof data?.orderId !== 'string' || !uuid.test(data.orderId) || !matchesOrderCode(data.orderId, code)
+    if (typeof data?.orderId !== 'string' || !uuid.test(data.orderId) || !matchesOrderCode(data.orderId, requestCode)
       || !(Object.hasOwn(statuses, data.status) || data.status === 'collected')
       || typeof data.pickupStartsAt !== 'string' || typeof data.pickupEndsAt !== 'string'
       || !(Date.parse(data.pickupStartsAt) < Date.parse(data.pickupEndsAt))) {
@@ -428,16 +460,26 @@ async function findPickupOrder() {
     const status = pickupLookupProgress[priorStatus] > pickupLookupProgress[data.status] ? priorStatus : data.status;
     lookup.entry = { orderId: data.orderId, status: lookup.outcomes.get(data.orderId) ?? status,
       pickupStartsAt: data.pickupStartsAt, pickupEndsAt: data.pickupEndsAt };
+    const queueState = lookup.queueStates.get(data.orderId);
+    // A response begun before a later omission cannot certify a still-active pickup.
+    lookup.unverified = Object.hasOwn(statuses, lookup.entry.status)
+      && (queueState === 'missing' || (queueState === 'checked' && startingQueue !== queueSnapshot));
     showMessage(pickupLookupNotice);
   } catch (error) {
     if (session !== current || pickupLookup !== lookup) return;
     if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
     else {
-      lookup.entry = null;
       showMessage(pickupLookupNotice);
+      const terminal = lookup.entry && !Object.hasOwn(statuses, lookup.entry.status);
+      const preserveLastKnown = !!lookup.entry && (terminal || lookup.unverified || !(error instanceof ApiError)
+        || error.status >= 500);
+      if (!preserveLastKnown) lookup.entry = null;
+      lookup.unverified = preserveLastKnown && !terminal;
       if (error instanceof ApiError && error.status === 404) {
-        showMessage(pickupLookupNotice, 'No paid pickup order matches that number.');
+        showMessage(pickupLookupNotice, preserveLastKnown ? 'This order is no longer available for pickup lookup.'
+          : 'No paid pickup order matches that number.');
       } else if (error instanceof ApiError && error.status === 409 && error.code === 'order_code_ambiguous') {
+        lookup.entry = null;
         showMessage(pickupLookupProblem, 'More than one order has that code. Enter the full order ID.');
       } else {
         showMessage(pickupLookupProblem, messageFor(error, 'The pickup order could not be found right now. Try again.'));
@@ -449,6 +491,7 @@ async function findPickupOrder() {
       lookup.outcomes.clear();
       pickupLookupFind.removeAttribute('aria-disabled');
       renderPickupLookup();
+      checkMissingPickupLookup();
     }
   }
 }
@@ -458,6 +501,7 @@ function rememberPickupLookupOutcome(orderId, status) {
   if (pickupLookup.loading) pickupLookup.outcomes.set(orderId, status);
   if (pickupLookup.entry?.orderId !== orderId) return;
   pickupLookup.entry.status = status;
+  pickupLookup.unverified = false;
   renderPickupLookup();
 }
 
@@ -1212,6 +1256,7 @@ async function refreshQueue(force = false) {
     sawExternalOrders ||= externalOrders.length !== 0;
     queueSnapshot = { serverTime, receivedAt: performance.now() };
     needsQueueRefresh = false;
+    observePickupLookupQueue();
     renderOrders();
     showMessage(queueProblem);
     updateTime.textContent = `Updated at ${timeFormat.format(new Date(serverTime ?? Date.now()))} Kigali time`;
