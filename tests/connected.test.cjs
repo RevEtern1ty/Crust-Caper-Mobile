@@ -1549,6 +1549,103 @@ test('the buyer can open the cart from product details and return to their selec
   await shown(page, 'Double Smash');
 });
 
+test('a selected item option survives a menu refresh until the buyer explicitly removes it', { timeout: 35_000 }, async t => {
+  const menuPath = '/stores/kigali/menu?channel=mobile';
+  const menuResponse = await send(menuPath);
+  assert.ok(menuResponse.ok);
+  const menu = await menuResponse.json();
+  const product = menu.products.find(item => item.sku === 'double-smash' && item.available);
+  assert.ok(product?.modifiers.some(option => option.id === 'no-pickles'));
+  assert.ok(product.modifiers.some(option => option.id === 'extra-cheese'));
+
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const menuUrl = api + menuPath;
+  const { hostname, port } = new URL(api);
+  const draftKey = `crustcaper.draft.v1.local.${hostname}.${port || '443'}.kigali`;
+  const savedOptions = () => page.evaluate(key => {
+    const draft = JSON.parse(sessionStorage.getItem(key));
+    return draft.cart.find(line => line.sku === 'double-smash').modifierIds.slice().sort();
+  }, draftKey);
+  let offerPicklesOption = true;
+  await page.route(menuUrl, route => route.fulfill({
+    json: offerPicklesOption ? menu : {
+      ...menu,
+      version: menu.version + '-without-no-pickles',
+      products: menu.products.map(item => item.sku === product.sku
+        ? { ...item, modifiers: item.modifiers.filter(option => option.id !== 'no-pickles') }
+        : item),
+    },
+    headers: { 'Access-Control-Allow-Origin': origin },
+  }));
+
+  async function refreshOnReturn(offerOption) {
+    offerPicklesOption = offerOption;
+    await Promise.all([
+      page.waitForResponse(response => response.url() === menuUrl && response.ok()),
+      page.evaluate(() => {
+        for (const state of ['hidden', 'visible']) {
+          Object.defineProperty(document, 'visibilityState', { configurable: true, value: state });
+          document.dispatchEvent(new Event('visibilitychange'));
+        }
+        Reflect.deleteProperty(document, 'visibilityState');
+      }),
+    ]);
+  }
+
+  await page.goto(origin);
+  await button(page, /^Double Smash,/).click();
+  const cheese = button(page, /Extra cheese/);
+  const noPickles = button(page, /No pickles/);
+  await cheese.click();
+  await noPickles.click();
+  await button(page, /^Add to cart/).click();
+  await button(page, /^View cart/).click();
+  await shown(page, 'Your cart');
+  await button(page, 'Edit options').click();
+  const save = button(page, /^Save item/);
+  assert.equal(await noPickles.getAttribute('aria-pressed'), 'true');
+  const originalOptions = ['extra-cheese', 'no-pickles'];
+  assert.deepEqual(await savedOptions(), originalOptions);
+
+  const problem = page.getByRole('alert').filter({ hasText: 'Some selected options are no longer available. Review your selection before saving.' });
+  const remove = button(page, 'Remove unavailable options');
+  await refreshOnReturn(false);
+  await noPickles.waitFor({ state: 'hidden' });
+  assert.deepEqual(await savedOptions(), originalOptions);
+  assert.equal(await save.isEnabled(), false, 'Save must not silently discard a selected option that vanished from the menu');
+  await problem.waitFor();
+  await remove.waitFor();
+  assert.equal(await cheese.getAttribute('aria-pressed'), 'true');
+
+  await refreshOnReturn(true);
+  assert.equal(await noPickles.getAttribute('aria-pressed'), 'true');
+  await problem.waitFor({ state: 'hidden' });
+  assert.equal(await save.isEnabled(), true);
+  assert.deepEqual(await savedOptions(), originalOptions);
+
+  await refreshOnReturn(false);
+  await problem.waitFor();
+  await remove.click();
+  await problem.waitFor({ state: 'hidden' });
+  assert.equal(await cheese.getAttribute('aria-pressed'), 'true');
+  assert.deepEqual(await savedOptions(), originalOptions, 'Only saving the reviewed edit may update the existing cart line');
+  await save.click();
+  await shown(page, 'Your cart');
+  await shown(page, 'Extra cheese');
+  assert.deepEqual(await savedOptions(), ['extra-cheese']);
+});
+
 test('the menu and Pickup show the checkout window when the device clock is a day ahead', { timeout: 35_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const server = createPreviewServer(dist);
