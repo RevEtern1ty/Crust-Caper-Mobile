@@ -3,6 +3,8 @@ package com.crustcaper.api.operator;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.not;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
@@ -12,6 +14,7 @@ import jakarta.servlet.ServletInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -160,7 +163,60 @@ class FiscalReceiptIntegrationTest {
             .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(100))
             .andExpect(jsonPath("$[0].orderId").value(earlierHandoff.id().toString()))
             .andExpect(jsonPath("$[1].orderId").value(laterHandoff.id().toString()))
-            .andExpect(jsonPath("$[99].receiptStatus").value("pending"));
+            .andExpect(jsonPath("$[99].receiptStatus").value("pending"))
+            .andExpect(jsonPath("$[*].orderId", not(hasItem(pending.id().toString()))))
+            .andExpect(jsonPath("$[*].orderId", not(hasItem(issued.id().toString()))));
+
+        exactReceipt(manager, pending.id().toString().substring(28).toUpperCase(Locale.ROOT))
+            .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+            .andExpect(jsonPath("$.length()").value(1))
+            .andExpect(jsonPath("$[0].orderId").value(pending.id().toString()))
+            .andExpect(jsonPath("$[0].receiptStatus").value("pending"));
+        exactReceipt(manager, issued.id().toString().toUpperCase(Locale.ROOT))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(1))
+            .andExpect(jsonPath("$[0].orderId").value(issued.id().toString()))
+            .andExpect(jsonPath("$[0].receiptReference").value("EBM-ISSUED"));
+    }
+
+    @Test
+    void exactReceiptLookupScopesPaidOrderCodesToOneManagerStore() throws Exception {
+        String otherStore = store();
+        Manager manager = staff(store, "manager");
+        Manager otherManager = staff(otherStore, "manager");
+        Manager kitchen = staff(store, "kitchen");
+        Manager pickup = staff(store, "pickup");
+        String code = "A1B2C3D4";
+        Order paid = order(store, true, UUID.fromString("10000000-0000-4000-8000-0000a1b2c3d4"));
+        Order unpaid = order(store, false, UUID.fromString("20000000-0000-4000-8000-0000a1b2c3d4"));
+        Order elsewhere = order(otherStore, true, UUID.fromString("30000000-0000-4000-8000-0000a1b2c3d4"));
+
+        api.perform(get(OPERATOR + "/receipts").queryParam("orderCode", code)).andExpect(status().isUnauthorized());
+        exactReceipt(kitchen, code).andExpect(status().isForbidden());
+        exactReceipt(pickup, code).andExpect(status().isForbidden());
+        exactReceipt(manager, code).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(1))
+            .andExpect(jsonPath("$[0].orderId").value(paid.id().toString()));
+        exactReceipt(otherManager, code).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(1))
+            .andExpect(jsonPath("$[0].orderId").value(elsewhere.id().toString()));
+        for (String missing : List.of("F0E1D2C3", unpaid.id().toString(), elsewhere.id().toString())) {
+            exactReceipt(manager, missing).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(0));
+        }
+        for (String invalid : List.of("", "A1B2C3D", "A1B2C3D4E", "#A1B2C3D4", "A1B2C3Dg", " " + code,
+                "00000000-0000-4000-8000-0000zzzzzzzz", "00000000-0000-4000-8000-0000")) {
+            exactReceipt(manager, invalid).andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("invalid_input"));
+        }
+        api.perform(get(OPERATOR + "/receipts").queryParam("orderCode", code, code)
+                .header(HttpHeaders.AUTHORIZATION, manager.bearer()))
+            .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("invalid_input"));
+
+        Order collision = order(store, true, UUID.fromString("40000000-0000-4000-8000-0000a1b2c3d4"));
+        exactReceipt(manager, code).andExpect(status().isConflict())
+            .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+            .andExpect(jsonPath("$.code").value("receipt_order_code_ambiguous"));
+        for (Order match : List.of(paid, collision)) {
+            exactReceipt(manager, match.id().toString()).andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1)).andExpect(jsonPath("$[0].orderId").value(match.id().toString()));
+        }
     }
 
     @Test
@@ -300,6 +356,10 @@ class FiscalReceiptIntegrationTest {
     }
 
     private Order order(String location, boolean paid) throws Exception {
+        return order(location, paid, null);
+    }
+
+    private Order order(String location, boolean paid, UUID fixtureId) throws Exception {
         Guest guest = guest();
         String quote = body(api.perform(post(API + "/quotes").header(HttpHeaders.AUTHORIZATION, guest.bearer())
             .contentType(MediaType.APPLICATION_JSON).content("""
@@ -309,6 +369,10 @@ class FiscalReceiptIntegrationTest {
             .header(KEY, "order").contentType(MediaType.APPLICATION_JSON)
             .content("{\"quoteId\":\"" + quote + "\",\"phone\":\"" + PHONE + "\"}"))
             .andExpect(status().isOk())).path("id").asString());
+        if (fixtureId != null) {
+            jdbc.sql("UPDATE orders SET id = ? WHERE id = ?").params(fixtureId, id).update();
+            id = fixtureId;
+        }
         if (paid) {
             String attempt = body(api.perform(post(API + "/orders/" + id + "/payments")
                 .header(HttpHeaders.AUTHORIZATION, guest.bearer()).header(KEY, "payment")).andExpect(status().isOk()))
@@ -318,6 +382,11 @@ class FiscalReceiptIntegrationTest {
                 .content("{\"status\":\"paid\"}")).andExpect(status().isOk());
         }
         return new Order(id, guest);
+    }
+
+    private ResultActions exactReceipt(Manager manager, String code) throws Exception {
+        return api.perform(get(OPERATOR + "/receipts").queryParam("orderCode", code)
+            .header(HttpHeaders.AUTHORIZATION, manager.bearer()));
     }
 
     private ResultActions upload(String bearer, UUID order, String reference, String total, byte[] pdf) throws Exception {

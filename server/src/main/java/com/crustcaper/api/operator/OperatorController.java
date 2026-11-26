@@ -98,8 +98,9 @@ final class OperatorController {
 
     @GetMapping("/receipts")
     ResponseEntity<List<ReceiptOrder>> receipts(
-            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(receipts.pendingAndRecent(authorization));
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+            @RequestParam(value = "orderCode", required = false) String orderCode) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(receipts.list(authorization, orderCode));
     }
 
     @PutMapping("/orders/{id}/receipt")
