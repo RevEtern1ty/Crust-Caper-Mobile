@@ -79,8 +79,9 @@ const mount = (source, target) => ({
   bind: { create_host_path: false },
 });
 
-async function prepareFixture(directory, testClasses) {
+async function prepareFixture(directory, testClasses, load) {
   const fixturePassword = randomBytes(24).toString('hex');
+  const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
   const composeEnvironment = join(directory, 'compose.env');
   const unusedDatabaseCa = join(directory, 'postgres-ca.crt');
@@ -93,7 +94,7 @@ async function prepareFixture(directory, testClasses) {
     `CRUSTCAPER_DB_URL=jdbc:postgresql://postgres:5432/${database}`,
     `CRUSTCAPER_DB_USER=${database}`,
     `CRUSTCAPER_DB_PASSWORD=${fixturePassword}`,
-    `CRUSTCAPER_OPERATOR_MFA_KEY=${randomBytes(32).toString('base64')}`,
+    `CRUSTCAPER_OPERATOR_MFA_KEY=${fixtureMfaKey}`,
     '',
   ].join('\n'), { mode: 0o600 });
   // Bind the same CA mount as deployed Compose, using a private fixture network for PostgreSQL.
@@ -134,25 +135,33 @@ async function prepareFixture(directory, testClasses) {
           test: ['CMD', 'pg_isready', '-U', database, '-d', database],
           interval: '2s', timeout: '3s', retries: 15,
         },
-        volumes: [mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql')],
+        volumes: [
+          mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
+          ...(load ? [mount(join(root, 'server', 'tooling', 'operator-accounts.psql'), '/fixture/operator-accounts.psql')] : []),
+        ],
       },
     },
   }, null, 2), { mode: 0o600 });
-  return { apiEnvironment, composeEnvironment, unusedDatabaseCa, overlay };
+  return { apiEnvironment, composeEnvironment, unusedDatabaseCa, overlay, fixtureMfaKey };
 }
 
-async function importCatalog(compose) {
+async function importCatalog(compose, load) {
   const catalog = JSON.parse(await readFile(join(root, 'server', 'tooling', 'catalog.example.json'), 'utf8'));
   catalog.store.open = true;
   for (const product of catalog.products) product.available = true;
   const pickupStarts = Date.now() + 3600000;
-  catalog.slots = Array.from({ length: 4 }, (_, index) => {
+  const windows = load
+    ? [
+      ...Array.from({ length: 8 }, (_, index) => ({ id: `fixture-load-${index}`, capacity: 12 })),
+      { id: 'fixture-capacity', capacity: 4 },
+    ]
+    : Array.from({ length: 4 }, (_, index) => ({ id: `fixture-slot-${index}`, capacity: 10 }));
+  catalog.slots = windows.map((window, index) => {
     const startsAt = pickupStarts + index * 600000;
     return {
-      id: `fixture-slot-${index}`,
+      ...window,
       startsAt: new Date(startsAt).toISOString(),
       endsAt: new Date(startsAt + 600000).toISOString(),
-      capacity: 10,
     };
   });
   await compose('Import the synthetic catalog through the production importer', [
@@ -162,6 +171,16 @@ async function importCatalog(compose) {
 }
 
 async function main() {
+  const modes = process.argv.slice(2);
+  const [mode] = modes;
+  if (modes.length > 1 || (mode !== undefined && mode !== '--load' && mode !== '--load-smoke')) {
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke]');
+  }
+  const load = mode !== undefined;
+  const scenarios = load
+    ? ['tooling/storefront-load.cjs', ...(mode === '--load-smoke' ? ['--smoke'] : [])]
+    : ['--test', 'tests/storefront-https.test.cjs'];
+  if (load) await access(join(root, 'tooling', 'storefront-load.cjs'));
   const apiImage = candidateImage('CRUSTCAPER_FIXTURE_API_IMAGE', process.env.CRUSTCAPER_FIXTURE_API_IMAGE);
   const catalogImage = candidateImage('CRUSTCAPER_FIXTURE_CATALOG_IMAGE', process.env.CRUSTCAPER_FIXTURE_CATALOG_IMAGE);
   const web = resolve(root, process.env.CRUSTCAPER_FIXTURE_STOREFRONT_DIR ?? 'dist-storefront-test');
@@ -180,7 +199,7 @@ async function main() {
   const browserCa = join(directory, 'browser-ca.crt');
   let stop;
   try {
-    const settings = await prepareFixture(directory, testClasses);
+    const settings = await prepareFixture(directory, testClasses, load);
     const env = {
       ...hostEnv,
       CRUSTCAPER_API_IMAGE: apiImage,
@@ -204,21 +223,21 @@ async function main() {
       { cleanup: true, timeout: 45000 });
     await compose('Start the storefront HTTPS fixture', ['up', '-d', '--wait', '--wait-timeout', '90'],
       { timeout: 120000 });
-    await importCatalog(compose);
+    await importCatalog(compose, load);
     await compose('Copy the storefront fixture TLS root', [
       'cp', 'edge:/data/caddy/pki/authorities/local/root.crt', dockerPath(browserCa),
     ]);
     if (evidence) await mkdir(evidence, { recursive: true });
-    await run('Verify the storefront against isolated HTTPS', process.execPath,
-      ['--test', 'tests/storefront-https.test.cjs'], {
-        env: {
-          ...hostEnv,
-          CRUSTCAPER_HTTPS_TEST_CA: browserCa,
-          CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT: project,
-          ...(evidence && { CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: evidence }),
-        },
-        timeout: 180000,
-      });
+    await run('Verify the storefront against isolated HTTPS', process.execPath, scenarios, {
+      env: {
+        ...hostEnv,
+        CRUSTCAPER_HTTPS_TEST_CA: browserCa,
+        CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT: project,
+        ...(evidence && { CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: evidence }),
+        ...(load && { CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY: settings.fixtureMfaKey }),
+      },
+      timeout: mode === '--load' ? 300000 : 180000,
+    });
   } finally {
     if (stop) await stop();
     const target = await realpath(directory);
