@@ -75,6 +75,37 @@ function transport(handler: (call: Call) => Response | Promise<Response>) {
   return { calls, fetcher };
 }
 
+test('connected order reads retain validated purchased items without putting them into repeat offers', async () => {
+  const { storage } = memory();
+  const soldItem = {
+    catalogVersion: 'sale-1', name: { en: 'Original burger', rw: 'Burgeri ya mbere' },
+    ingredients: [{ en: 'Bun', rw: 'Umugati' }],
+    allergens: [{ en: 'Wheat', rw: 'Ingano' }],
+    modifiers: [{ id: 'extra-cheese', name: { en: 'Extra cheese', rw: 'Foromaje y’inyongera' }, price: 500 }],
+  };
+  const selectedLine = { ...cartLine, modifierIds: ['extra-cheese'] };
+  let orderLine: object = { ...selectedLine, soldItem };
+  const { fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) return Response.json(session, { status: 201 });
+    assert.equal(call.token, 'Bearer ' + accessToken);
+    if (call.url.endsWith(`/orders/${order.id}/reorder`)) {
+      return Response.json({ lines: [{ ...selectedLine, unitPrice: 9800, soldItem }], changes: [] });
+    }
+    assert.equal(call.url, config.apiBaseUrl + '/orders/' + order.id);
+    return Response.json({ ...order, lines: [orderLine] });
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  assert.deepEqual((await api.getOrder(order.id)).lines, [{ ...selectedLine, soldItem }]);
+  assert.deepEqual(await api.reorder(order.id), { lines: [{ ...selectedLine, unitPrice: 9800 }], changes: [] });
+
+  orderLine = selectedLine;
+  assert.deepEqual((await api.getOrder(order.id)).lines, [selectedLine]);
+  orderLine = { ...selectedLine, soldItem: { ...soldItem, modifiers: [{ ...soldItem.modifiers[0], id: 'no-pickles' }] } };
+  await assert.rejects(api.getOrder(order.id), { code: 'invalid_response' });
+  orderLine = { ...selectedLine, soldItem: { ...soldItem, allergens: [{ en: 'Wheat' }] } };
+  await assert.rejects(api.getOrder(order.id), { code: 'invalid_response' });
+});
+
 test('pickup alert reads, opt-in and opt-out are bearer scoped and reuse a private installation after restart', async () => {
   const { storage, data } = memory();
   const fixtureToken = 'ExpoPushToken[test-fixture]';

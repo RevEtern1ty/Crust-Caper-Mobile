@@ -4,7 +4,7 @@ import { AppState, Platform, Pressable, StyleSheet, View } from 'react-native';
 
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../../src/checkout/context';
 import { CheckoutError } from '../../src/checkout/controller';
-import { checkoutError, delayedPaymentLabel, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
+import { checkoutError, delayedPaymentLabel, displayOrderId, kitchenLabel, orderItemLabels, paymentLabel } from '../../src/checkout/labels';
 import { ReorderPanel } from '../../src/checkout/reorder-panel';
 import { reorderOfferForCart } from '../../src/checkout/reorder-review';
 import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
@@ -279,15 +279,18 @@ export default function OrdersScreen() {
 
           <Card>
             <Text variant="heading">{t('Order details', 'Ibisobanuro bya komande')}</Text>
-            {order.lines.map((line) => (
-              <View key={`${line.sku}:${line.modifierIds.join(',')}`} style={styles.row}>
-                <View style={styles.shrink}>
-                  <Text>{line.quantity} × {itemName(line.sku, locale, menu)}</Text>
-                  {line.modifierIds.length > 0 && <Text variant="small" tone="muted">{itemOptions(line, locale, menu)}</Text>}
+            {order.lines.map((line) => {
+              const { name, options } = orderItemLabels(line, locale, menu);
+              return (
+                <View key={`${line.sku}:${line.modifierIds.join(',')}`} style={styles.row}>
+                  <View style={styles.shrink}>
+                    <Text>{line.quantity} × {name}</Text>
+                    {!!options && <Text variant="small" tone="muted">{options}</Text>}
+                  </View>
+                  <Text style={styles.amount}>{money(line.quantity * line.unitPrice)}</Text>
                 </View>
-                <Text style={styles.amount}>{money(line.quantity * line.unitPrice)}</Text>
-              </View>
-            ))}
+              );
+            })}
             {mode === 'demo' && order.paymentStatus === 'paid' && (
               <Text variant="small" tone="muted">{t('Fiscal receipt unavailable in the demo.', 'Inyemezabwishyu yemewe ntiboneka mu igerageza.')}</Text>
             )}

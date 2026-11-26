@@ -1,4 +1,4 @@
-import { ApiError, type CartLine, type KitchenStatus, type Locale, type Menu, type PaymentStatus, type QuoteChange } from '../domain/types';
+import { ApiError, type CartLine, type KitchenStatus, type Locale, type Menu, type OrderLine, type PaymentStatus, type QuoteChange } from '../domain/types';
 import { copy, money } from '../ui/format';
 import { CheckoutError } from './controller';
 
@@ -40,6 +40,13 @@ export function itemName(sku: string, locale: Locale, menu: Menu | null) {
 export function itemOptions(line: CartLine, locale: Locale, menu: Menu | null) {
   const modifiers = menu?.products.find((product) => product.sku === line.sku)?.modifiers;
   return line.modifierIds.map((id) => modifiers?.find((modifier) => modifier.id === id)?.name[locale] ?? id).join(' · ');
+}
+
+export function orderItemLabels(line: OrderLine, locale: Locale, menu: Menu | null) {
+  const { soldItem } = line;
+  return soldItem
+    ? { name: soldItem.name[locale], options: soldItem.modifiers.map(({ name }) => name[locale]).join(' · ') }
+    : { name: itemName(line.sku, locale, menu), options: itemOptions(line, locale, menu) };
 }
 
 export function displayOrderId(id: string) {

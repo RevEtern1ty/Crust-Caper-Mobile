@@ -6,6 +6,7 @@ const timestamp = z.iso.datetime({ offset: true });
 const amount = z.int().min(0);
 const localized = z.object({ en: z.string(), rw: z.string() });
 const link = z.string().max(2048).nullish().transform(value => value ?? undefined);
+const modifier = z.object({ id: identifier, name: localized, price: amount });
 const slot = z.object({ id: identifier, startsAt: timestamp, endsAt: timestamp, available: z.boolean() })
   .refine(value => Date.parse(value.startsAt) < Date.parse(value.endsAt));
 
@@ -18,7 +19,7 @@ const product = z.object({
   allergens: z.array(localized),
   price: amount,
   available: z.boolean(),
-  modifiers: z.array(z.object({ id: identifier, name: localized, price: amount })),
+  modifiers: z.array(modifier),
   photoUrl: link,
 });
 
@@ -45,6 +46,21 @@ const cartLine = z.object({
   quantity: z.int().min(1).max(MAX_SHARED_QUANTITY),
   unitPrice: amount,
 });
+const orderLine = cartLine.extend({
+  soldItem: z.object({
+    catalogVersion: identifier,
+    name: localized,
+    ingredients: z.array(localized),
+    allergens: z.array(localized),
+    modifiers: z.array(modifier),
+  }).optional(),
+}).refine(({ soldItem, modifierIds }) => {
+  if (!soldItem) return true;
+  const selected = soldItem.modifiers;
+  return selected.length === modifierIds.length
+    && new Set(selected.map(({ id }) => id)).size === selected.length
+    && selected.every(({ id }) => modifierIds.includes(id));
+}, { path: ['soldItem', 'modifiers'] });
 const change = z.object({
   kind: z.enum(['price', 'unavailable', 'slot']),
   sku: identifier.nullish().transform(value => value ?? undefined),
@@ -78,7 +94,7 @@ const orderFields = z.object({
   id: identifier,
   storeId: identifier,
   slotId: identifier,
-  lines: z.array(cartLine),
+  lines: z.array(orderLine),
   total: amount,
   tax: amount,
   currency: z.literal('RWF'),

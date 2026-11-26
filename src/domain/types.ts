@@ -55,6 +55,16 @@ export type CartLine = {
   unitPrice: number
 }
 
+export type OrderLine = CartLine & {
+  soldItem?: {
+    catalogVersion: string
+    name: Localized
+    ingredients: Localized[]
+    allergens: Localized[]
+    modifiers: Modifier[]
+  }
+}
+
 export type QuoteChange = {
   kind: 'price' | 'unavailable' | 'slot'
   sku?: string
@@ -107,7 +117,7 @@ export type Order = {
   id: string
   storeId: string
   slotId: string
-  lines: CartLine[]
+  lines: OrderLine[]
   total: number
   tax: number
   currency: 'RWF'
