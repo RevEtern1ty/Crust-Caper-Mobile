@@ -75,6 +75,25 @@
         <p class="queue-notice" id="pickup-uncertain-notice" role="status" hidden></p>
         <p class="queue-notice" id="external-queue-notice" role="status" tabindex="-1" hidden></p>
         <p class="queue-notice" id="external-pending-notice" role="status" hidden></p>
+        <section class="pickup-lookup order-card" id="pickup-lookup" aria-labelledby="pickup-lookup-title" hidden>
+          <h2 id="pickup-lookup-title">Pickup order lookup</h2>
+          <p class="payment-review-help" id="pickup-lookup-help">Use the eight-character order number or full order ID. Confirm pickup in the queue with the six-digit code. If the customer cannot open their order or show the code, follow the approved handoff procedure.</p>
+          <form id="pickup-lookup-form">
+            <label for="pickup-lookup-code">Order number or ID</label>
+            <input id="pickup-lookup-code" type="search" maxlength="36" autocomplete="off" spellcheck="false" placeholder="#1A2B3C4D" aria-describedby="pickup-lookup-help">
+            <button class="button button-secondary" id="pickup-lookup-find" type="submit">Find pickup order</button>
+          </form>
+          <p class="problem" id="pickup-lookup-problem" role="alert" hidden></p>
+          <p class="payment-review-help" id="pickup-lookup-notice" role="status" hidden></p>
+          <article id="pickup-lookup-result" aria-labelledby="pickup-lookup-order" hidden>
+            <div class="order-header">
+              <h3 class="order-title" id="pickup-lookup-order"></h3>
+              <span class="order-status" id="pickup-lookup-status" role="status"></span>
+            </div>
+            <p class="pickup-window" id="pickup-lookup-window"></p>
+            <button class="button button-secondary" id="pickup-lookup-open" type="button" hidden>Open order in queue</button>
+          </article>
+        </section>
         <p class="empty-state" id="empty-state" hidden>No paid orders are waiting.</p>
         <ul class="order-list" id="order-list" aria-label="Orders"></ul>
 

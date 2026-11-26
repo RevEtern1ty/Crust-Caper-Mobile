@@ -23,6 +23,17 @@ const kitchenSoundToggle = element('kitchen-sound-toggle');
 const kitchenSoundStatus = element('kitchen-sound-status');
 const queueNotice = element('queue-notice');
 const pickupUncertainNotice = element('pickup-uncertain-notice');
+const pickupLookupSection = element('pickup-lookup');
+const pickupLookupForm = element('pickup-lookup-form');
+const pickupLookupCode = element('pickup-lookup-code');
+const pickupLookupFind = element('pickup-lookup-find');
+const pickupLookupProblem = element('pickup-lookup-problem');
+const pickupLookupNotice = element('pickup-lookup-notice');
+const pickupLookupResult = element('pickup-lookup-result');
+const pickupLookupOrder = element('pickup-lookup-order');
+const pickupLookupStatus = element('pickup-lookup-status');
+const pickupLookupWindow = element('pickup-lookup-window');
+const pickupLookupOpen = element('pickup-lookup-open');
 const updateTime = element('update-time');
 const orderList = element('order-list');
 const emptyState = element('empty-state');
@@ -72,6 +83,8 @@ const roles = {
   manager: { name: 'Manager', heading: 'Order queue' },
 };
 const statuses = { accepted: 'New', preparing: 'Preparing', ready: 'Ready for pickup' };
+const pickupLookupLabels = { ...statuses, accepted: 'Accepted', collected: 'Collected', cancelled: 'Cancelled' };
+const pickupLookupProgress = { accepted: 0, preparing: 1, ready: 2, collected: 3, cancelled: 3 };
 const deliveryProgress = { accepted: 0, preparing: 1, ready: 2 };
 const paymentReasons = {
   duplicate_transaction: 'Duplicate payment',
@@ -110,6 +123,7 @@ let receipts = [];
 let receiptRefresh = null;
 let receiptLookup = null;
 let lastReceiptLookupId = null;
+let pickupLookup = null;
 let timer;
 let kitchenTimer;
 let refreshVersion = 0;
@@ -236,8 +250,21 @@ function orderNumber(id) {
   return `#${id.slice(-8).toUpperCase()}`;
 }
 
+function exactOrderCode(input) {
+  const code = input.trim().toLowerCase().replace(/^#(?=[0-9a-f]{8}$)/, '');
+  return /^[0-9a-f]{8}$/.test(code) || uuid.test(code) ? code : null;
+}
+
+function matchesOrderCode(orderId, code) {
+  return orderId === code || (code.length === 8 && orderId.endsWith(code));
+}
+
 function staffKitchen(current) {
   return current?.role === 'kitchen' || current?.role === 'manager';
+}
+
+function staffPickup(current) {
+  return current?.role === 'pickup' || current?.role === 'manager';
 }
 
 function queueVisible() {
@@ -296,6 +323,7 @@ function syncKitchenSignal() {
     changeText(kitchenSoundStatus, kitchenSoundState === 'on' ? (fresh ? 'Order sound is on.' : 'Order sound is paused until the queue is refreshed.')
       : kitchenSoundState === 'failed' ? 'Order sound could not be started. Select Enable order sound to try again.' : 'Order sound is off.');
   }
+  syncPickupLookupQueue(fresh);
   const active = session && session.expiresAt > Date.now();
   void orderSound.update(active && kitchen && fresh && waiting > 0, now);
 }
@@ -323,6 +351,114 @@ function pickupWindow(start, end) {
   const endDay = dayFormat.format(endDate);
   const endLabel = day === endDay ? timeFormat.format(endDate) : `${endDay}, ${timeFormat.format(endDate)}`;
   return `Pickup ${day}, ${timeFormat.format(startDate)}–${endLabel}`;
+}
+
+function pickupLookupQueueCard(fresh) {
+  const entry = pickupLookup?.entry;
+  if (!fresh || !entry || !Object.hasOwn(statuses, entry.status)) return null;
+  const card = cards.get(entry.orderId)?.card;
+  return card?.isConnected ? card : null;
+}
+
+function syncPickupLookupQueue(fresh) {
+  const entry = pickupLookup?.entry;
+  const order = entry && fresh ? cards.get(entry.orderId)?.order : null;
+  if (order && pickupLookupProgress[order.status] > pickupLookupProgress[entry.status]) entry.status = order.status;
+  if (entry) {
+    pickupLookupStatus.dataset.status = entry.status;
+    changeText(pickupLookupStatus, pickupLookupLabels[entry.status]);
+  }
+  pickupLookupOpen.hidden = !pickupLookupQueueCard(fresh);
+}
+
+function renderPickupLookup() {
+  const entry = pickupLookup?.entry;
+  pickupLookupResult.hidden = !entry;
+  changeText(pickupLookupOrder, entry ? `Order ${orderNumber(entry.orderId)}` : '');
+  changeText(pickupLookupWindow, entry ? `${pickupWindow(entry.pickupStartsAt, entry.pickupEndsAt)} Kigali time` : '');
+  if (!entry) {
+    delete pickupLookupStatus.dataset.status;
+    changeText(pickupLookupStatus, '');
+  }
+  syncPickupLookupQueue(queueFresh());
+}
+
+function clearPickupLookup() {
+  const lookup = pickupLookup;
+  pickupLookup = null;
+  lookup?.controller.abort();
+  pickupLookupFind.removeAttribute('aria-disabled');
+  pickupLookupCode.removeAttribute('aria-invalid');
+  showMessage(pickupLookupProblem);
+  showMessage(pickupLookupNotice);
+  renderPickupLookup();
+}
+
+async function findPickupOrder() {
+  const current = availableSession();
+  if (!staffPickup(current) || pickupLookup?.loading) return;
+  const code = exactOrderCode(pickupLookupCode.value);
+  if (!code) {
+    pickupLookupCode.setAttribute('aria-invalid', 'true');
+    showMessage(pickupLookupProblem, 'Enter the eight-character order number or the full order ID.');
+    pickupLookupCode.focus();
+    return;
+  }
+
+  const entry = pickupLookup?.code === code ? pickupLookup.entry : null;
+  const lookup = { code, entry, loading: true, controller: new AbortController(), outcomes: new Map() };
+  pickupLookup = lookup;
+  pickupLookupCode.removeAttribute('aria-invalid');
+  pickupLookupFind.setAttribute('aria-disabled', 'true');
+  showMessage(pickupLookupProblem);
+  showMessage(pickupLookupNotice, 'Finding pickup order…');
+  renderPickupLookup();
+  try {
+    const data = await request('/orders/lookup?' + new URLSearchParams({ orderCode: code }), {
+      token: current.accessToken, signal: lookup.controller.signal,
+    });
+    if (session !== current || pickupLookup !== lookup) return;
+    if (typeof data?.orderId !== 'string' || !uuid.test(data.orderId) || !matchesOrderCode(data.orderId, code)
+      || !(Object.hasOwn(statuses, data.status) || data.status === 'collected')
+      || typeof data.pickupStartsAt !== 'string' || typeof data.pickupEndsAt !== 'string'
+      || !(Date.parse(data.pickupStartsAt) < Date.parse(data.pickupEndsAt))) {
+      throw new ApiError(502, 'invalid_response');
+    }
+    const priorStatus = lookup.entry?.orderId === data.orderId ? lookup.entry.status : null;
+    const status = pickupLookupProgress[priorStatus] > pickupLookupProgress[data.status] ? priorStatus : data.status;
+    lookup.entry = { orderId: data.orderId, status: lookup.outcomes.get(data.orderId) ?? status,
+      pickupStartsAt: data.pickupStartsAt, pickupEndsAt: data.pickupEndsAt };
+    showMessage(pickupLookupNotice);
+  } catch (error) {
+    if (session !== current || pickupLookup !== lookup) return;
+    if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
+    else {
+      lookup.entry = null;
+      showMessage(pickupLookupNotice);
+      if (error instanceof ApiError && error.status === 404) {
+        showMessage(pickupLookupNotice, 'No paid pickup order matches that number.');
+      } else if (error instanceof ApiError && error.status === 409 && error.code === 'order_code_ambiguous') {
+        showMessage(pickupLookupProblem, 'More than one order has that code. Enter the full order ID.');
+      } else {
+        showMessage(pickupLookupProblem, messageFor(error, 'The pickup order could not be found right now. Try again.'));
+      }
+    }
+  } finally {
+    if (session === current && pickupLookup === lookup) {
+      lookup.loading = false;
+      lookup.outcomes.clear();
+      pickupLookupFind.removeAttribute('aria-disabled');
+      renderPickupLookup();
+    }
+  }
+}
+
+function rememberPickupLookupOutcome(orderId, status) {
+  if (!pickupLookup || !matchesOrderCode(orderId, pickupLookup.code)) return;
+  if (pickupLookup.loading) pickupLookup.outcomes.set(orderId, status);
+  if (pickupLookup.entry?.orderId !== orderId) return;
+  pickupLookup.entry.status = status;
+  renderPickupLookup();
 }
 
 function checkedOrder(order, completed = false) {
@@ -839,9 +975,8 @@ function clearReceiptLookup() {
 async function findReceipt() {
   const current = availableSession();
   if (current?.role !== 'manager' || receiptLookup?.state === 'loading') return;
-  const value = fiscalReceiptsFilter.value.trim().toLowerCase();
-  const code = value.replace(/^#(?=[0-9a-f]{8}$)/, '');
-  if (!/^[0-9a-f]{8}$/.test(code) && !uuid.test(code)) {
+  const code = exactOrderCode(fiscalReceiptsFilter.value);
+  if (!code) {
     fiscalReceiptsFilter.setAttribute('aria-invalid', 'true');
     showMessage(fiscalReceiptsLookupProblem, 'Enter the eight-character order number or the full order ID.');
     fiscalReceiptsFilter.focus();
@@ -863,7 +998,7 @@ async function findReceipt() {
     if (!Array.isArray(data) || data.length > 1) throw new ApiError(502, 'invalid_response');
     if (data.length === 1) {
       const found = checkedReceipt(data[0]);
-      if (found.orderId !== code && !(code.length === 8 && found.orderId.endsWith(code))) {
+      if (!matchesOrderCode(found.orderId, code)) {
         throw new ApiError(502, 'invalid_response');
       }
       lookup.entry = found.receiptStatus === 'pending' ? lookup.attachments.get(found.orderId) ?? found : found;
@@ -980,6 +1115,9 @@ function closeSession(message = '') {
   clearInterval(timer);
   clearInterval(kitchenTimer);
   session = null;
+  clearPickupLookup();
+  pickupLookupCode.value = '';
+  pickupLookupSection.hidden = true;
   closeCancellation('', false);
   showMessage(queueNotice);
   showMessage(pickupUncertainNotice);
@@ -1308,6 +1446,7 @@ function showPickupOutcome(id, status, confirmedByCurrentOperator) {
     refreshButton.disabled = false;
     const focusWasOnOrder = cards.get(id)?.card.contains(document.activeElement);
     orders = orders.filter(item => item.id !== id);
+    rememberPickupLookupOutcome(id, status);
     renderOrders();
     const message = status === 'cancelled' ? `Order ${number} was cancelled. Do not hand it out.`
       : confirmedByCurrentOperator ? `Pickup for order ${number} was confirmed by this account.`
@@ -1483,6 +1622,7 @@ async function submitCancellation() {
   const recorded = exceptions?.find((entry) => entry.orderId === selection.id && entry.reason === 'restaurant_cancelled');
   if (cancelledOrder || recorded) {
     orders = orders.filter((order) => order.id !== selection.id);
+    rememberPickupLookupOutcome(selection.id, 'cancelled');
     renderOrders();
     const refund = cancelledOrder?.paymentStatus === 'refunded' || recorded?.refund
       ? 'The refund is recorded in Payment review.' : 'Complete the refund and record it in Payment review.';
@@ -1534,6 +1674,7 @@ loginForm.addEventListener('submit', async (event) => {
     emptyState.hidden = true;
     signIn.hidden = true;
     workstation.hidden = false;
+    pickupLookupSection.hidden = !staffPickup(session);
     paymentReview.hidden = data.role !== 'manager';
     paymentReviewJump.hidden = paymentReview.hidden;
     fiscalReceipts.hidden = paymentReview.hidden;
@@ -1612,6 +1753,17 @@ fiscalReceiptsFilter.addEventListener('input', () => {
 fiscalReceiptsSearch.addEventListener('submit', (event) => {
   event.preventDefault();
   void findReceipt();
+});
+pickupLookupCode.addEventListener('input', clearPickupLookup);
+pickupLookupForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  void findPickupOrder();
+});
+pickupLookupOpen.addEventListener('click', () => {
+  const title = pickupLookupQueueCard(queueFresh())?.querySelector('.order-title');
+  if (!title) return;
+  title.tabIndex = -1;
+  title.focus();
 });
 document.addEventListener('visibilitychange', recheckQueue);
 document.addEventListener('freeze', () => {

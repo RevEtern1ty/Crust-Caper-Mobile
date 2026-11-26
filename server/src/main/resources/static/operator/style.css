@@ -94,6 +94,14 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .pickup-form > div { flex: 1 1 8rem; min-width: 0; }
 .pickup-form input { display: block; margin-top: .3rem; }
 .pickup-form button { flex: 1 0 8rem; }
+.pickup-lookup { max-width: 36rem; margin-bottom: 1rem; }
+.pickup-lookup h2 { font-size: 1.13rem; }
+.pickup-lookup h3 { margin: 0; }
+.pickup-lookup form { display: grid; gap: .45rem; margin-block: .8rem; }
+.pickup-lookup .button { justify-self: start; max-width: 100%; overflow-wrap: anywhere; }
+.pickup-lookup .button[aria-disabled="true"] { opacity: .55; cursor: default; }
+#pickup-lookup-result { margin-top: .8rem; padding-top: .8rem; border-top: 1px solid var(--border); }
+#order-list .order-title:focus-visible { outline: .19rem solid var(--green); outline-offset: .15rem; }
 .order-problem { margin-top: .75rem; font-size: .9rem; }
 .external-intake, .external-channel { overflow-wrap: anywhere; }
 .external-intake-form, .external-form-fields, .external-fields, .external-item, .external-items, .external-modifiers, .external-modifier {
