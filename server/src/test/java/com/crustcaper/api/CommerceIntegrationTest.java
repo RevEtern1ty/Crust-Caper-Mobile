@@ -61,6 +61,22 @@ class CommerceIntegrationTest {
 
     private enum OrderRead { OWNER, RECOVERY, CREATE_REPLAY }
 
+    private enum SoldFactChange {
+        NAME("{name,en}", "\"Changed product\""),
+        INGREDIENT("{ingredients}", "[{\"en\":\"Changed ingredient\",\"rw\":\"Ibyahinduwe\"}]"),
+        ALLERGEN("{allergens,0,en}", "\"Changed allergen\""),
+        MODIFIER_NAME("{modifiers,0,name,en}", "\"Changed option\""),
+        MODIFIER_PRICE("{modifiers,0,price}", "600");
+
+        private final String path;
+        private final String value;
+
+        SoldFactChange(String path, String value) {
+            this.path = path;
+            this.value = value;
+        }
+    }
+
     @Autowired MockMvc api;
     @Autowired ObjectMapper json;
     @Autowired Catalog catalog;
@@ -247,6 +263,83 @@ class CommerceIntegrationTest {
         assertThat(updated.path("total").asLong()).isEqualTo(9800);
         assertThat(updated.path("changes").get(0).path("kind").asString("")).isEqualTo("price");
         create(owner, updated.path("quoteId").asString(""), "approved").andExpect(status().isOk());
+    }
+
+    @ParameterizedTest
+    @EnumSource(SoldFactChange.class)
+    void samePriceSoldItemChangesRequireAReviewedQuote(SoldFactChange change) throws Exception {
+        String owner = guest();
+        JsonNode quoted = selectedOptionQuote(owner, false);
+
+        jdbc.sql("""
+            UPDATE menu_products SET product = jsonb_set(product, CAST(? AS text[]), CAST(? AS jsonb))
+            WHERE store_id = ?
+            """).params(change.path, change.value, store).update();
+        if (change == SoldFactChange.MODIFIER_PRICE) {
+            // Moving 100 RWF from the base price to the chosen option leaves the total unchanged.
+            setProductPrice(9100);
+        }
+        create(owner, quoted.path("quoteId").asString(""), "stale-sold-item")
+            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("quote_changed"));
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?")
+            .param(store).query(Long.class).single()).isZero();
+
+        JsonNode updated = selectedOptionQuote(owner, false);
+        assertThat(updated.path("total")).isEqualTo(quoted.path("total"));
+        create(owner, updated.path("quoteId").asString(""), "accepted-sold-item").andExpect(status().isOk());
+    }
+
+    @Test
+    void storedSoldItemIsDerivedFromTheCatalogAndSurvivesLaterCatalogChanges() throws Exception {
+        String owner = guest();
+        var product = catalog.products(store, false).getFirst();
+        String version = catalog.store(store, false).version();
+        JsonNode expected = json.readTree(json.writeValueAsBytes(new ApiModels.SoldItem(
+            version, product.name(), product.ingredients(), product.allergens(), List.of(product.modifiers().getFirst()))));
+
+        JsonNode quote = selectedOptionQuote(owner, true);
+        assertThat(quote.at("/lines/0/soldItem")).isEqualTo(expected);
+        jdbc.sql("UPDATE stores SET version = 'unrelated-version' WHERE id = ?").param(store).update();
+        String quoteId = quote.path("quoteId").asString("");
+        String key = "placed-sold-item";
+        JsonNode order = body(create(owner, quoteId, key).andExpect(status().isOk()));
+        assertThat(order.at("/lines/0/soldItem")).isEqualTo(expected);
+        String orderId = order.path("id").asString("");
+
+        jdbc.sql("DELETE FROM menu_products WHERE store_id = ?").param(store).update();
+        JsonNode stored = json.readTree(jdbc.sql("SELECT lines FROM orders WHERE id = ?")
+            .param(UUID.fromString(orderId)).query(String.class).single());
+        assertThat(stored.at("/0/soldItem")).isEqualTo(expected);
+        JsonNode reread = body(api.perform(get(orderPath(orderId)).header(HttpHeaders.AUTHORIZATION, owner))
+            .andExpect(status().isOk()));
+        assertThat(reread.at("/lines/0/soldItem")).isEqualTo(expected);
+        assertThat(body(create(owner, quoteId, key).andExpect(status().isOk())).at("/lines/0/soldItem"))
+            .isEqualTo(expected);
+        api.perform(get(orderPath(orderId)).header(HttpHeaders.AUTHORIZATION, guest()))
+            .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void unplacedLegacyQuoteRequiresRefreshButPlacedLegacyOrderCanStillBeReadAndReplayed() throws Exception {
+        String owner = guest();
+        String stale = quote(owner).path("quoteId").asString("");
+        jdbc.sql("UPDATE quotes SET lines = lines #- '{0,soldItem}' WHERE id = ?").param(UUID.fromString(stale)).update();
+        create(owner, stale, "legacy-pending").andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("quote_changed"));
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?")
+            .param(store).query(Long.class).single()).isZero();
+
+        String placedQuote = quote(owner).path("quoteId").asString("");
+        String key = "legacy-placed";
+        String orderId = body(create(owner, placedQuote, key).andExpect(status().isOk())).path("id").asString("");
+        jdbc.sql("UPDATE quotes SET lines = lines #- '{0,soldItem}' WHERE id = ?")
+            .param(UUID.fromString(placedQuote)).update();
+        jdbc.sql("UPDATE orders SET lines = lines #- '{0,soldItem}' WHERE id = ?")
+            .param(UUID.fromString(orderId)).update();
+        api.perform(get(orderPath(orderId)).header(HttpHeaders.AUTHORIZATION, owner))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.lines[0].soldItem").doesNotHaveJsonPath());
+        create(owner, placedQuote, key).andExpect(status().isOk()).andExpect(jsonPath("$.id").value(orderId))
+            .andExpect(jsonPath("$.lines[0].soldItem").doesNotHaveJsonPath());
     }
 
     @Test
@@ -594,6 +687,16 @@ class CommerceIntegrationTest {
 
     private JsonNode quote(String bearer) throws Exception {
         return body(quoteRequest(bearer, 1, 9200).andExpect(status().isOk()));
+    }
+
+    private JsonNode selectedOptionQuote(String bearer, boolean includeForgedFacts) throws Exception {
+        var forged = includeForgedFacts ? new ApiModels.SoldItem(
+            "forged", new ApiModels.Localized("Forged", "Forged"), List.of(), List.of(), List.of()) : null;
+        var line = new ApiModels.CartLine("double-smash", List.of("extra-cheese"), 1, 9700, forged);
+        return body(api.perform(post(ROOT + "/quotes").header(HttpHeaders.AUTHORIZATION, bearer)
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(json.writeValueAsString(new ApiModels.QuoteInput(store, SLOT, List.of(line)))))
+            .andExpect(status().isOk()));
     }
 
     private ResultActions quoteRequest(String bearer, int quantity, long unitPrice) throws Exception {

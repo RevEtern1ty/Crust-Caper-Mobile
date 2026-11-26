@@ -130,10 +130,11 @@ public class OrderService {
     private Quote createQuote(UUID guest, QuoteInput input, boolean webCheckout) {
         validateQuote(input);
         Instant now = databaseNow();
-        Catalog.StoreData store = catalog.store(input.storeId(), false);
+        Catalog.QuoteCatalog quotedCatalog = catalog.quoteCatalog(input.storeId(), input.lines());
+        Catalog.StoreData store = quotedCatalog.store();
         Catalog.SlotData slot = catalog.slot(input.storeId(), input.slotId(), false);
         if (!catalog.available(store.store(), slot, now)) throw ApiFailure.conflict("slot_unavailable");
-        Reorder current = Catalog.reconcile(input.lines(), catalog.products(input.storeId(), false));
+        Reorder current = Catalog.reconcile(input.lines(), quotedCatalog.products(), store.version());
         long total = total(current.lines());
         requireSupportedTotal(total);
         long divisor = 10_000L + store.taxBasisPoints();
@@ -204,10 +205,11 @@ public class OrderService {
             throw ApiFailure.conflict("quote_changed");
         }
         if (!catalog.available(store.store(), slot, now)) throw ApiFailure.conflict("slot_unavailable");
-        Reorder current = Catalog.reconcile(quote.lines(), catalog.products(quote.storeId(), true));
+        Reorder current = Catalog.reconcile(quote.lines(), catalog.products(quote.storeId(), true), store.version());
         long divisor = 10_000L + store.taxBasisPoints();
         long tax = (quote.total() * store.taxBasisPoints() + divisor / 2) / divisor;
-        if (quote.total() <= 0 || !current.changes().isEmpty() || tax != quote.tax()) {
+        if (quote.total() <= 0 || !current.changes().isEmpty() || tax != quote.tax()
+            || !sameSoldItems(quote.lines(), current.lines())) {
             throw ApiFailure.conflict("quote_changed");
         }
         // PostgreSQL rechecks capacity while holding the slot row, before inserting the reservation.
@@ -224,6 +226,19 @@ public class OrderService {
                 dbTime(slot.startsAt()), dbTime(slot.endsAt()), channel.name().toLowerCase(Locale.ROOT))
             .update();
         return view(ownedSnapshot(guest, id), true);
+    }
+
+    private static boolean sameSoldItems(List<CartLine> quoted, List<CartLine> current) {
+        if (quoted.size() != current.size()) return false;
+        for (int line = 0; line < quoted.size(); line++) {
+            SoldItem before = quoted.get(line).soldItem();
+            SoldItem after = current.get(line).soldItem();
+            // A previous release's quote cannot establish which recipe was offered.
+            if (before == null || after == null || !before.name().equals(after.name())
+                || !before.ingredients().equals(after.ingredients()) || !before.allergens().equals(after.allergens())
+                || !new HashSet<>(before.modifiers()).equals(new HashSet<>(after.modifiers()))) return false;
+        }
+        return true;
     }
 
     public Order recover(UUID guest, String key) {

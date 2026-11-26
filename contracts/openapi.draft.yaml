@@ -1734,6 +1734,7 @@ components:
               sku: { type: string }
               modifierIds: { type: array, items: { type: string } }
               quantity: { type: integer, minimum: 1 }
+              soldItem: { $ref: '#/components/schemas/SoldItem' }
         total:
           $ref: '#/components/schemas/Amount'
           description: Persisted total of the direct order in whole RWF.
@@ -2038,6 +2039,23 @@ components:
         submittedAt: { $ref: '#/components/schemas/Timestamp' }
         status: { $ref: '#/components/schemas/OrderErasureStatus' }
         reviewedAt: { type: ['string', 'null'], format: date-time }
+    SoldItem:
+      type: object
+      readOnly: true
+      required: [catalogVersion, name, ingredients, allergens, modifiers]
+      description: Server-derived facts from the accepted catalog edition. Present on new quotes and orders, and absent on historical orders that never stored these facts.
+      properties:
+        catalogVersion:
+          type: string
+          description: Catalog edition used for the quote. Unrelated catalog changes do not change the saved edition.
+        name: { $ref: '#/components/schemas/Localized' }
+        ingredients: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+        allergens: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+        modifiers:
+          type: array
+          maxItems: 25
+          items: { $ref: '#/components/schemas/Modifier' }
+          description: Exactly the options selected on this line, with their original names and RWF prices.
     CartLine:
       type: object
       required: [sku, modifierIds, quantity, unitPrice]
@@ -2051,6 +2069,9 @@ components:
         unitPrice:
           $ref: '#/components/schemas/Amount'
           description: Client estimate in a quote request. Recalculated by the server.
+        soldItem:
+          $ref: '#/components/schemas/SoldItem'
+          description: Ignored as input. Order creation requires a fresh quote when any of these material facts have changed.
     QuoteRequest:
       type: object
       required: [storeId, slotId, lines]

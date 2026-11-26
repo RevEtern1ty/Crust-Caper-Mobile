@@ -55,6 +55,7 @@ class Catalog {
         """;
 
     record StoreData(Store store, String version, Instant updatedAt, int taxBasisPoints) {}
+    record QuoteCatalog(StoreData store, List<Product> products) {}
     record SlotData(String id, Instant startsAt, Instant endsAt, int capacity) {}
 
     private final JdbcClient jdbc;
@@ -95,13 +96,37 @@ class Catalog {
     StoreData store(String id, boolean lock) {
         return jdbc.sql("SELECT * FROM stores WHERE id = ?" + (lock ? " FOR SHARE" : ""))
             .param(id)
-            .query((rs, n) -> new StoreData(
-                new Store(rs.getString("id"), json.read(rs.getString("name"), Localized.class),
-                    json.read(rs.getString("area"), Localized.class), rs.getBoolean("open"),
-                    json.read(rs.getString("hours"), Localized.class),
-                    rs.getString("support_url"), rs.getString("directions_url")),
-                rs.getString("version"), readTime(rs, "updated_at"), rs.getInt("tax_basis_points")))
+            .query((rs, n) -> storeRow(rs))
             .optional().orElseThrow(ApiFailure::notFound);
+    }
+
+    QuoteCatalog quoteCatalog(String storeId, List<CartLine> lines) {
+        // One statement ties the version and selected products to the same catalog snapshot.
+        return jdbc.sql("""
+            SELECT s.*, p.product FROM stores s
+            LEFT JOIN menu_products p ON p.store_id = s.id AND p.sku IN (:skus)
+            WHERE s.id = :storeId ORDER BY p.position, p.sku
+            """)
+            .param("storeId", storeId).param("skus", lines.stream().map(CartLine::sku).distinct().toList())
+            .query(rs -> {
+                if (!rs.next()) throw ApiFailure.notFound();
+                StoreData store = storeRow(rs);
+                List<Product> products = new ArrayList<>();
+                do {
+                    String product = rs.getString("product");
+                    if (product != null) products.add(json.read(product, Product.class));
+                } while (rs.next());
+                return new QuoteCatalog(store, products);
+            });
+    }
+
+    private StoreData storeRow(ResultSet rs) throws SQLException {
+        return new StoreData(
+            new Store(rs.getString("id"), json.read(rs.getString("name"), Localized.class),
+                json.read(rs.getString("area"), Localized.class), rs.getBoolean("open"),
+                json.read(rs.getString("hours"), Localized.class),
+                rs.getString("support_url"), rs.getString("directions_url")),
+            rs.getString("version"), readTime(rs, "updated_at"), rs.getInt("tax_basis_points"));
     }
 
     List<Product> products(String storeId, boolean lock) {
@@ -129,6 +154,10 @@ class Catalog {
     }
 
     static Reorder reconcile(List<CartLine> lines, List<Product> products) {
+        return reconcile(lines, products, null);
+    }
+
+    static Reorder reconcile(List<CartLine> lines, List<Product> products, String catalogVersion) {
         List<CartLine> accepted = new ArrayList<>();
         List<QuoteChange> changes = new ArrayList<>();
         for (CartLine line : lines) {
@@ -148,7 +177,9 @@ class Catalog {
             if (unitPrice != line.unitPrice()) {
                 changes.add(new QuoteChange("price", line.sku(), line.unitPrice(), unitPrice));
             }
-            accepted.add(new CartLine(line.sku(), options.stream().map(Modifier::id).toList(), line.quantity(), unitPrice));
+            SoldItem soldItem = catalogVersion == null ? null
+                : new SoldItem(catalogVersion, product.name(), product.ingredients(), product.allergens(), options);
+            accepted.add(new CartLine(line.sku(), options.stream().map(Modifier::id).toList(), line.quantity(), unitPrice, soldItem));
         }
         return new Reorder(List.copyOf(accepted), List.copyOf(changes));
     }
