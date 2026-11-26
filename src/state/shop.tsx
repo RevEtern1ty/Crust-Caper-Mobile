@@ -7,7 +7,7 @@ import {
 } from 'react';
 import type { PropsWithChildren } from 'react';
 import { AppState, Platform } from 'react-native';
-import { CHECKOUT_JOURNAL_KEY } from '../checkout/controller';
+import { CHECKOUT_JOURNAL_KEY, type GuestSessionLifecycle } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
 import { lineKey } from '../domain/cart';
 import { createDemoApi } from '../domain/demo-api';
@@ -50,10 +50,15 @@ const liveApi = connected ? createLiveApi({
   storage: privateStorage,
   journalKey: checkoutStorageKey,
   newInstallationId: pushProjectId ? randomUUID : undefined,
+  newRotationKey: randomUUID,
   // The React Native XHR-backed fetch does not enforce RequestInit.redirect.
   fetcher: Platform.OS === 'web' ? undefined : expoFetch,
 }) : null;
 const api: ShopApi = liveApi ?? demoApi!;
+const guestSession: GuestSessionLifecycle | undefined = liveApi ? {
+  end: () => liveApi.endGuestSession(),
+  hasEndPending: () => liveApi.hasGuestSessionEndPending(),
+} : undefined;
 
 type MenuStatus = 'loading' | 'ready' | 'stale' | 'unavailable';
 
@@ -89,6 +94,7 @@ type Shop = Draft & {
   mode: 'demo' | 'connected';
   api: ShopApi;
   demoApi: DemoApi | null;
+  guestSession?: GuestSessionLifecycle;
   settleLocalTestPayment: LiveShopApi['settleLocalTestPayment'];
   checkoutStorageKey: string;
   checkoutAllowed: boolean;
@@ -204,7 +210,7 @@ export function ShopProvider({ children }: PropsWithChildren) {
   const count = draft.cart.reduce((sum, line) => sum + line.quantity, 0);
   return (
     <ShopContext.Provider value={{
-      ...draft, api, demoApi, settleLocalTestPayment: liveApi?.settleLocalTestPayment,
+      ...draft, api, demoApi, guestSession, settleLocalTestPayment: liveApi?.settleLocalTestPayment,
       checkoutStorageKey, mode: connected ? 'connected' : 'demo',
       checkoutAllowed: !connected || connected.profile === 'local' || Platform.OS !== 'web',
       pushProjectId,

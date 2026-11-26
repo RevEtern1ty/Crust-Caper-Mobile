@@ -46,19 +46,33 @@ paths:
   /guest-sessions/refresh:
     post:
       operationId: refreshGuestSession
+      description: Clients that have a sessionId save a rotationKey before refreshing. Retrying that key with the previous token returns the same successor while that successor remains current. Older clients can omit the key.
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [refreshToken]
-              properties:
-                refreshToken: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
+            schema: { $ref: '#/components/schemas/GuestRefreshInput' }
       responses:
         '200': { $ref: '#/components/responses/GuestSession' }
         '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /guest-sessions/revoke:
+    post:
+      operationId: revokeGuestSession
+      description: Ends the guest session without deleting its orders. When the latest refresh outcome is unknown, send the same previous token and saved rotationKey. A well-formed request is idempotent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GuestRefreshInput' }
+      responses:
+        '204':
+          description: This request left no matching credential active.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+        '400': { $ref: '#/components/responses/InvalidInput' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /quotes:
     post:
@@ -964,10 +978,17 @@ components:
       type: object
       required: [accessToken, expiresAt, refreshToken, refreshExpiresAt]
       properties:
+        sessionId: { type: string, format: uuid, description: Stable session identifier for clients that rotate refresh credentials. }
         accessToken: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
         expiresAt: { $ref: '#/components/schemas/Timestamp' }
         refreshToken: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
         refreshExpiresAt: { $ref: '#/components/schemas/Timestamp' }
+    GuestRefreshInput:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
+        rotationKey: { type: string, format: uuid, description: Securely generated operation key persisted before the first rotation request. }
     Localized:
       type: object
       required: [en, rw]

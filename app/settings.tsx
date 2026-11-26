@@ -1,13 +1,39 @@
-import { Platform, Pressable, StyleSheet, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { Platform, Pressable, StyleSheet, type Text as NativeText, View } from 'react-native';
+import { useCheckout } from '../src/checkout/context';
+import { CheckoutError } from '../src/checkout/controller';
 import { useShop } from '../src/state/shop';
-import { Card, colors, Icon, Screen, Text } from '../src/ui/core';
+import { Button, Card, colors, Icon, Screen, Text } from '../src/ui/core';
 import { copy } from '../src/ui/format';
 
 const languages = [{ id: 'en', name: 'English' }, { id: 'rw', name: 'Kinyarwanda' }] as const;
 
 export default function SettingsScreen() {
   const { locale, mode, setLocale, hydrated } = useShop();
+  const { journal, busy, restoreFailed, retryRestore, guestSessionEndPending, endGuestSession } = useCheckout();
+  const [confirmEnd, setConfirmEnd] = useState(false);
+  const [ended, setEnded] = useState(false);
+  const [endError, setEndError] = useState<'active' | 'failed' | null>(null);
+  const orderAccessHeading = useRef<NativeText>(null);
   const isWeb = Platform.OS === 'web';
+  const t = (en: string, rw: string) => copy(locale, en, rw);
+
+  useEffect(() => {
+    if (isWeb && (confirmEnd || guestSessionEndPending || ended)) orderAccessHeading.current?.focus();
+  }, [confirmEnd, ended, guestSessionEndPending, isWeb]);
+
+  async function endSession() {
+    if (!endGuestSession || busy) return;
+    setEndError(null);
+    try {
+      await endGuestSession();
+      setEnded(true);
+      setConfirmEnd(false);
+    } catch (error) {
+      setEndError(error instanceof CheckoutError && error.code === 'active_checkout' ? 'active' : 'failed');
+    }
+  }
+
   return (
     <Screen safeBottom>
       <View role={isWeb ? 'group' : undefined} aria-labelledby={isWeb ? 'language-heading' : undefined} style={styles.languages}>
@@ -25,6 +51,30 @@ export default function SettingsScreen() {
           </Pressable>;
         })}
       </View>
+      {endGuestSession && <Card>
+        <Text ref={orderAccessHeading} tabIndex={isWeb ? -1 : undefined} variant="heading" accessibilityRole="header">
+          {t('Order access', 'Uburenganzira bwo kureba komande')}
+        </Text>
+        {ended && <Text accessibilityLiveRegion="polite">{t('Order access was cleared on this device.', 'Uburenganzira bwo kureba komande kuri iki gikoresho bwakuweho.')}</Text>}
+        {!ended && (guestSessionEndPending || confirmEnd) && <>
+          <Text>{guestSessionEndPending
+            ? t('Finish ending this session to clear saved order access.', 'Rangiza gusoza iki gihe kugira ngo ukureho uburenganzira bwo kureba komande.')
+            : t('This clears saved order access on this device. Keep your order number to find an order again by phone.',
+              'Ibi bikuraho uburenganzira bwo kureba komande kuri iki gikoresho. Bika nimero ya komande kugira ngo wongere kuyibona ukoresheje telefoni.')}</Text>
+          {endError && <Text tone="red" accessibilityRole="alert">{endError === 'active'
+            ? t('Finish or collect your open orders before ending this session.', 'Rangiza cyangwa ufate komande zigikomeza mbere yo gusoza iki gihe.')
+            : t('We couldn’t end this session. Try again.', 'Ntitwashoboye gusoza iki gihe. Ongera ugerageze.')}</Text>}
+          <Button label={guestSessionEndPending ? t('Retry ending the session', 'Ongera ugerageze gusoza iki gihe') : t('Confirm end session', 'Emeza gusoza iki gihe')}
+            onPress={() => { void endSession(); }} busy={busy} />
+          {!guestSessionEndPending && <Button label={t('Keep my session', 'Komeza gukoresha iki gihe')} onPress={() => {
+            setConfirmEnd(false);
+            setEndError(null);
+          }} variant="ghost" disabled={busy} />}
+        </>}
+        {!ended && !guestSessionEndPending && !confirmEnd && (restoreFailed
+          ? <Button label={t('Retry opening saved orders', 'Ongera ugerageze gufungura komande zabitswe')} onPress={() => { void retryRestore(); }} variant="secondary" busy={busy} />
+          : <Button label={t('End guest session', 'Soza igihe cy’umushyitsi')} onPress={() => setConfirmEnd(true)} variant="secondary" disabled={!journal || busy} />)}
+      </Card>}
       {mode === 'demo' && <Card>
         <Text variant="heading">{copy(locale, 'CrustCaper Demo', 'Igerageza rya CrustCaper')}</Text>
         <Text>{copy(locale, 'Orders and payments use test data. Follow their status under Orders.', 'Komande no kwishyura bikoresha amakuru y’igerageza. Kurikirana uko bimeze muri Komande.')}</Text>

@@ -56,7 +56,13 @@ final class CommerceController {
 
     @PostMapping("/guest-sessions/refresh")
     ResponseEntity<GuestSession> refresh(@RequestBody GuestRefresh input) {
-        return privateResponse(sessions.refresh(input.refreshToken()));
+        return privateResponse(sessions.refresh(input.refreshToken(), input.rotationKey()));
+    }
+
+    @PostMapping("/guest-sessions/revoke")
+    ResponseEntity<Void> revoke(@RequestBody GuestRefresh input) {
+        sessions.revoke(input.refreshToken(), input.rotationKey());
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
 
     @PostMapping("/quotes")

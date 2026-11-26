@@ -24,8 +24,11 @@ public final class ApiModels {
     ) {}
     public record Slot(String id, Instant startsAt, Instant endsAt, boolean available) {}
     public record Menu(String version, Instant updatedAt, Store store, List<Product> products, List<Slot> slots) {}
-    public record GuestSession(String accessToken, Instant expiresAt, String refreshToken, Instant refreshExpiresAt) {}
-    public record GuestRefresh(String refreshToken) {}
+    public record GuestSession(String accessToken, Instant expiresAt, String refreshToken, Instant refreshExpiresAt,
+                               UUID sessionId) {}
+    public record GuestRefresh(String refreshToken, @JsonInclude(JsonInclude.Include.NON_NULL) String rotationKey) {
+        public GuestRefresh(String refreshToken) { this(refreshToken, null); }
+    }
     public record CartLine(String sku, List<String> modifierIds, int quantity, long unitPrice) {}
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record QuoteChange(String kind, String sku, Long previousPrice, Long currentPrice) {}

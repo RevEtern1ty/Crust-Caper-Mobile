@@ -191,6 +191,104 @@ async function placeBrowserOrder(page, origin, buyer, screenshot) {
   return { order, attempt };
 }
 
+test('guest rotation and logout recover from committed responses lost by the browser', { timeout: 65_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.setDefaultTimeout(9500);
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const readGuest = () => page.evaluate(() => {
+    const key = Object.keys(sessionStorage).find(name => name.endsWith('.guest'));
+    return key ? JSON.parse(sessionStorage.getItem(key)) : null;
+  });
+  const { order, attempt } = await placeBrowserOrder(page, origin, { ...contact, email: 'session-lifecycle@example.test' });
+  const original = await readGuest();
+  assert.ok(original?.sessionId);
+
+  await page.goto(origin + '/settings');
+  await button(page, 'End guest session').click();
+  await button(page, 'Confirm end session').click();
+  await shown(page, 'Finish or collect your open orders before ending this session.');
+  assert.equal((await send(`/orders/${order.id}`, { token: original.accessToken })).status, 200);
+
+  const kitchen = await operator('demo-kitchen');
+  const pickup = await operator('demo-pickup');
+  const paid = await send(`/local/orders/${order.id}/payments/${attempt.id}/result`, {
+    method: 'POST', token: original.accessToken, data: { status: 'paid' },
+  });
+  assert.equal(paid.status, 200);
+  const statusPath = `/operator/orders/${order.id}/status`;
+  for (const status of ['preparing', 'ready']) {
+    assert.equal((await send(statusPath, { method: 'POST', token: kitchen, data: { status } })).status, 200);
+  }
+  const { pickupCode } = await send(`/orders/${order.id}`, { token: original.accessToken }).then(response => response.json());
+  const collected = await send(statusPath, { method: 'POST', token: pickup, data: { status: 'collected', pickupCode } });
+  assert.equal(collected.status, 200);
+
+  const refreshPath = api + '/guest-sessions/refresh';
+  const refreshKeys = [];
+  page.on('request', request => {
+    if (request.url() === refreshPath && request.method() === 'POST') refreshKeys.push(request.postDataJSON().rotationKey);
+  });
+  const rotation = Promise.withResolvers();
+  await page.route(refreshPath, async route => {
+    try {
+      const response = await route.fetch();
+      const update = await response.json();
+      await route.abort('connectionreset');
+      rotation.resolve({ status: response.status(), update });
+    } catch (error) { rotation.reject(error); }
+  }, { times: 1 });
+  // Advance the saved access deadline so the normal adapter refreshes on the next order read.
+  await page.evaluate(() => {
+    const key = Object.keys(sessionStorage).find(name => name.endsWith('.guest'));
+    const session = JSON.parse(sessionStorage.getItem(key));
+    session.expiresAt = '2000-01-01T00:00:00Z';
+    sessionStorage.setItem(key, JSON.stringify(session));
+  });
+  await page.goto(origin + '/orders');
+  const { status, update } = await rotation.promise;
+  assert.equal(status, 200);
+  assert.equal(update.sessionId, original.sessionId);
+  assert.notEqual(update.refreshToken, original.refreshToken);
+  await page.reload();
+  await shown(page, 'Picked up');
+  const resumed = await readGuest();
+  assert.ok(refreshKeys.length >= 2 && refreshKeys.every(key => key === refreshKeys[0]));
+  assert.equal(resumed.refreshToken, update.refreshToken);
+  assert.equal((await send('/guest-sessions/refresh', { method: 'POST', data: { refreshToken: original.refreshToken } })).status, 401);
+
+  const revoked = Promise.withResolvers();
+  await page.route(api + '/guest-sessions/revoke', async route => {
+    try {
+      const response = await route.fetch();
+      await route.abort('connectionreset');
+      revoked.resolve(response.status());
+    } catch (error) { revoked.reject(error); }
+  }, { times: 1 });
+  await page.goto(origin + '/settings');
+  await button(page, 'End guest session').click();
+  await button(page, 'Confirm end session').click();
+  assert.equal(await revoked.promise, 204);
+  await shown(page, 'Finish ending this session to clear saved order access.');
+  for (const bearer of [original.accessToken, resumed.accessToken]) {
+    assert.equal((await send(`/orders/${order.id}`, { token: bearer })).status, 401);
+  }
+  await page.reload();
+  await button(page, 'Retry ending the session').click();
+  await shown(page, 'Order access was cleared on this device.');
+  assert.equal(await readGuest(), null);
+  await page.goto(origin + '/orders');
+  await shown(page, 'No orders yet');
+});
+
 test('connected checkout, receipt, pickup, recovery, payment return and restaurant cancellation', { timeout: 70_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/, 'Run only against a local integration API');
   const server = createPreviewServer(dist);

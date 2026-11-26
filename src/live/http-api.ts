@@ -7,9 +7,11 @@ import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import { menuResponse, orderAccessChallenge, orderAccessGrant, orderResponse, paymentResponse, quoteResponse, reorderResponse, sessionResponse } from './wire';
 
 type Session = z.infer<typeof sessionResponse>;
+const savedSession = sessionResponse.extend({ rotationKey: z.guid().optional() });
+type SavedSession = z.infer<typeof savedSession>;
 type Fetcher = (url: string, options: RequestInit) => Promise<Pick<Response, 'ok' | 'status' | 'redirected' | 'url' | 'json' | 'headers' | 'body'>>;
 const recoverySession = z.object({
-  guest: sessionResponse,
+  guest: savedSession,
   previous: z.string().nullable(),
   challengeId: z.guid().nullable(),
   grants: z.array(z.guid()).max(10),
@@ -30,15 +32,18 @@ export type ConnectedConfig = {
 
 type Options = {
   config: ConnectedConfig;
-  storage: Storage;
+  storage: Storage & { removeItem(key: string): Promise<void> };
   journalKey: string;
   fetcher?: Fetcher;
   now?: () => number;
   timeoutMs?: number;
   newInstallationId?: () => string;
+  newRotationKey?: () => string;
 };
 
 export interface LiveShopApi extends ShopApi {
+  endGuestSession(): Promise<void>;
+  hasGuestSessionEndPending(): Promise<boolean>;
   settleLocalTestPayment?: (orderId: string, attemptId: string, status: 'paid' | 'declined') => Promise<Order>;
 }
 
@@ -51,6 +56,14 @@ const pickupAlertStatus = z.object({ enabled: z.boolean(), available: z.boolean(
 
 function invalidResponse(): never {
   throw new ApiError('invalid_response');
+}
+
+function sameGuest(left: Session, right: Session): boolean {
+  return left.sessionId && right.sessionId ? left.sessionId === right.sessionId : left.refreshToken === right.refreshToken;
+}
+
+function refreshInput(guest: SavedSession) {
+  return { refreshToken: guest.refreshToken, ...(guest.rotationKey ? { rotationKey: guest.rotationKey } : {}) };
 }
 
 function safeHttps(value: string | null | undefined, allow?: (url: URL) => boolean): string | null {
@@ -80,11 +93,14 @@ function errorCode(status: number, problem: unknown): ApiErrorCode {
 
 export function createLiveApi({
   config, storage, journalKey, fetcher = fetch, now = Date.now, timeoutMs = 15_000, newInstallationId,
+  newRotationKey = () => globalThis.crypto.randomUUID(),
 }: Options): LiveShopApi {
   const base = new URL(config.apiBaseUrl);
   const endpoint = base.origin + '/api/v1';
   const sessionKey = journalKey + '.guest';
   const recoveryKey = journalKey + '.recovery-guest';
+  const endKey = journalKey + '.end-guest';
+  const installationKey = journalKey + '.installation';
   const hosts = new Set(config.pspHosts);
   const orderPath = (id: string) => '/orders/' + encodeURIComponent(id);
   const receiptPath = (id: string) => orderPath(id) + '/receipt';
@@ -92,8 +108,11 @@ export function createLiveApi({
   let activation: Promise<boolean> | null = null;
   let recoveryQueue: Promise<void> = Promise.resolve();
   let pendingRecovery: RecoverySession | null = null;
-  let primaryChallenge: { id: string; refreshToken: string } | null = null;
+  let primaryChallenge: { id: string; guest: Session } | null = null;
   let installation: Promise<string> | null = null;
+  const guestWork = new Set<Promise<unknown>>();
+  let ending: Promise<void> | null = null;
+  let guestRevision = 0;
 
   const checkedPayment = (attempt: PaymentAttempt): PaymentAttempt => ({
     ...attempt,
@@ -144,7 +163,7 @@ export function createLiveApi({
       if (response.status === 401 && (token || path === '/guest-sessions/refresh')) throw new GuestRejected();
       if (pdf && !response.ok) throw new ApiError(errorCode(response.status, null));
       if (pdf && response.status !== 200) invalidResponse();
-      if (method === 'DELETE' && response.ok && response.status !== 204) invalidResponse();
+      if ((method === 'DELETE' || path === '/guest-sessions/revoke') && response.ok && response.status !== 204) invalidResponse();
       const payload: unknown = pdf ? await readReceiptPdf(response) : response.status === 204 ? null : await response.json().catch(() => null);
       if (!response.ok) throw new ApiError(errorCode(response.status, payload));
       const parsed = schema.safeParse(payload);
@@ -189,10 +208,34 @@ export function createLiveApi({
     }
   }
 
-  function refreshSession(refreshToken: string): Promise<Session> {
-    return request({
-      path: '/guest-sessions/refresh', method: 'POST', schema: sessionResponse, body: { refreshToken },
+  function guestSnapshot(raw: string | null): string | null {
+    return raw === null ? null : decodeSaved(raw, savedSession).sessionId ?? raw;
+  }
+
+  function matchesGuestSnapshot(raw: string | null, snapshot: string | null): boolean {
+    if (raw === snapshot) return true;
+    if (raw === null || snapshot === null) return false;
+    const guest = decodeSaved(raw, savedSession);
+    return paymentReturnOrderId(snapshot) ? guest.sessionId === snapshot : sameGuest(guest, decodeSaved(snapshot, savedSession));
+  }
+
+  async function renewGuest(existing: SavedSession, save: (guest: SavedSession) => Promise<unknown>): Promise<Session> {
+    let pending = existing;
+    if (existing.sessionId && !existing.rotationKey) {
+      const rotationKey = newRotationKey();
+      if (!paymentReturnOrderId(rotationKey)) throw new ApiError('storage_unavailable');
+      pending = { ...existing, rotationKey };
+      await save(pending);
+    }
+    const refreshed = await request({
+      path: '/guest-sessions/refresh', method: 'POST', schema: sessionResponse, body: refreshInput(pending),
     });
+    if (pending.rotationKey
+      ? !pending.sessionId || refreshed.sessionId !== pending.sessionId || refreshed.refreshToken === pending.refreshToken
+      : refreshed.refreshToken !== pending.refreshToken || (pending.sessionId && refreshed.sessionId !== pending.sessionId)) invalidResponse();
+    if (Date.parse(refreshed.expiresAt) <= now() || Date.parse(refreshed.refreshExpiresAt) <= now()) invalidResponse();
+    await save(refreshed);
+    return refreshed;
   }
 
   function guestSession(rejectedAccessToken?: string): Promise<Session> {
@@ -201,14 +244,12 @@ export function createLiveApi({
     sessionPromise = (async () => {
       const raw = await readSaved(sessionKey);
       if (raw !== null) {
-        const existing = decodeSaved(raw, sessionResponse);
-        if (Date.parse(existing.expiresAt) > now() && existing.accessToken !== rejectedAccessToken) {
+        const existing = decodeSaved(raw, savedSession);
+        if (!existing.rotationKey && Date.parse(existing.expiresAt) > now() && existing.accessToken !== rejectedAccessToken) {
           return existing;
         }
         if (Date.parse(existing.refreshExpiresAt) > now()) {
-          const refreshed = await refreshSession(existing.refreshToken);
-          if (refreshed.refreshToken !== existing.refreshToken) invalidResponse();
-          return durableSession(refreshed);
+          return renewGuest(existing, guest => writeSaved(sessionKey, JSON.stringify(guest)));
         }
       }
       // Never replace the identity behind a durable checkout with a fresh guest.
@@ -227,16 +268,34 @@ export function createLiveApi({
       if (!(error instanceof GuestRejected)) throw error;
       const updated = await retry();
       // A request started by the previous identity must not be repeated after recovery.
-      if (updated.refreshToken !== guest.refreshToken) throw error;
+      if (!sameGuest(updated, guest)) throw error;
       return request({ ...options, token: updated.accessToken });
     }
   }
 
-  async function primaryRequest<T>(options: Parameters<typeof request<T>>[0], expectedRefreshToken?: string) {
-    const guest = await guestSession();
-    if (expectedRefreshToken !== undefined && guest.refreshToken !== expectedRefreshToken) throw new ApiError('unauthenticated');
-    const payload = await sendWithGuest(options, guest, () => guestSession(guest.accessToken));
-    return { payload, refreshToken: guest.refreshToken };
+  async function hasGuestSessionEndPending() {
+    return ending !== null || await readSaved(endKey) !== null;
+  }
+
+  function withGuestWork<T>(operation: () => Promise<T>): Promise<T> {
+    const revision = guestRevision;
+    const active = (async () => {
+      if (await hasGuestSessionEndPending() || revision !== guestRevision) throw new ApiError('unauthenticated');
+      const result = await operation();
+      if (revision !== guestRevision) throw new ApiError('unauthenticated');
+      return result;
+    })();
+    guestWork.add(active);
+    return active.finally(() => { guestWork.delete(active); });
+  }
+
+  function primaryRequest<T>(options: Parameters<typeof request<T>>[0], expectedGuest?: Session) {
+    return withGuestWork(async () => {
+      const guest = await guestSession();
+      if (expectedGuest && !sameGuest(guest, expectedGuest)) throw new ApiError('unauthenticated');
+      const payload = await sendWithGuest(options, guest, () => guestSession(guest.accessToken));
+      return { payload, guest };
+    });
   }
 
   async function authorized<T>(options: Parameters<typeof request<T>>[0]): Promise<T> {
@@ -244,7 +303,13 @@ export function createLiveApi({
   }
 
   function queueRecovery<T>(operation: () => Promise<T>): Promise<T> {
-    const next = recoveryQueue.then(operation);
+    const queued = recoveryQueue;
+    const revision = guestRevision;
+    const next = withGuestWork(async () => {
+      await queued;
+      if (revision !== guestRevision) throw new ApiError('unauthenticated');
+      return operation();
+    });
     recoveryQueue = next.then(() => undefined, () => undefined);
     return next;
   }
@@ -260,15 +325,16 @@ export function createLiveApi({
     pendingRecovery = record;
   }
 
-  function sendRecovery<T>(options: Parameters<typeof request<T>>[0], record: RecoverySession): Promise<T> {
-    return sendWithGuest(options, record.guest, async () => {
+  async function sendRecovery<T>(options: Parameters<typeof request<T>>[0], record: RecoverySession): Promise<T> {
+    async function renewRecovery() {
       if (Date.parse(record.guest.refreshExpiresAt) <= now()) throw new ApiError('unauthenticated');
-      const refreshed = await refreshSession(record.guest.refreshToken);
-      if (refreshed.refreshToken !== record.guest.refreshToken) invalidResponse();
-      record.guest = refreshed;
-      await saveRecovery(record);
-      return refreshed;
-    });
+      return renewGuest(record.guest, async guest => {
+        await saveRecovery({ ...record, guest });
+        record.guest = guest;
+      });
+    }
+    if (record.guest.rotationKey) await renewRecovery();
+    return sendWithGuest(options, record.guest, renewRecovery);
   }
 
   function activateRecovery(record: RecoverySession, orderId: string, observedOrder?: Order): Promise<boolean> {
@@ -277,8 +343,8 @@ export function createLiveApi({
       await reading?.catch(() => undefined);
       const current = await readSaved(sessionKey);
       // The main write can succeed even when a storage response was lost.
-      if (current !== null && decodeSaved(current, sessionResponse).refreshToken === record.guest.refreshToken) return true;
-      if (current !== record.previous) return false;
+      if (current !== null && sameGuest(decodeSaved(current, savedSession), record.guest)) return true;
+      if (!matchesGuestSnapshot(current, record.previous)) return false;
 
       const raw = await readSaved(journalKey);
       let active;
@@ -297,7 +363,7 @@ export function createLiveApi({
       return true;
     })().then(async (activated) => {
       if (activated) {
-        if (record.challengeId) primaryChallenge = { id: record.challengeId, refreshToken: record.guest.refreshToken };
+        if (record.challengeId) primaryChallenge = { id: record.challengeId, guest: record.guest };
         pendingRecovery = null;
         await writeSaved(recoveryKey, 'null').catch(() => undefined);
       }
@@ -321,21 +387,44 @@ export function createLiveApi({
   }
 
   function pickupInstallation(): Promise<string> {
-    installation ??= (async () => {
-      const key = journalKey + '.installation';
-      const saved = await storage.getItem(key);
+    installation ??= withGuestWork(async () => {
+      const saved = await readSaved(installationKey);
       const id = paymentReturnOrderId(saved ?? newInstallationId?.());
       if (!id) throw new ApiError('storage_unavailable');
-      if (saved === null) await storage.setItem(key, id);
+      if (saved === null) await writeSaved(installationKey, id);
       return id;
-    })().catch(() => {
+    }).catch(error => {
       installation = null;
-      throw new ApiError('storage_unavailable');
+      throw error;
     });
     return installation;
   }
 
   return {
+    hasGuestSessionEndPending,
+    endGuestSession() {
+      if (ending) return ending;
+      guestRevision++;
+      ending = (async () => {
+        await Promise.allSettled(guestWork);
+        await writeSaved(endKey, 'pending');
+        const raw = await readSaved(sessionKey);
+        const recovery = await loadRecovery();
+        const primary = raw === null ? null : decodeSaved(raw, savedSession);
+        for (const guest of [primary, recovery?.guest]) {
+          if (guest) await request({ path: '/guest-sessions/revoke', method: 'POST', schema: z.null(), body: refreshInput(guest) });
+        }
+        pendingRecovery = null;
+        primaryChallenge = null;
+        installation = null;
+        try {
+          for (const key of [sessionKey, recoveryKey, installationKey, journalKey, endKey]) await storage.removeItem(key);
+        } catch {
+          throw new ApiError('storage_unavailable');
+        }
+      })().finally(() => { ending = null; });
+      return ending;
+    },
     async getMenu() {
       const menu = await request({
         path: '/stores/' + encodeURIComponent(config.storeId) + '/menu?channel=mobile', schema: menuResponse,
@@ -403,21 +492,21 @@ export function createLiveApi({
         const before = await readSaved(sessionKey);
         try {
           const result = await primaryRequest(options);
-          primaryChallenge = { id: result.payload.challengeId, refreshToken: result.refreshToken };
+          primaryChallenge = { id: result.payload.challengeId, guest: result.guest };
           return result.payload;
         } catch (error) {
           if (!(error instanceof GuestRejected)) throw error;
         }
 
         const previous = await readSaved(sessionKey);
-        if (previous !== before && (previous === null || before === null
-          || decodeSaved(previous, sessionResponse).refreshToken !== decodeSaved(before, sessionResponse).refreshToken)) {
+        if (!matchesGuestSnapshot(previous, guestSnapshot(before))) {
           throw new ApiError('unauthenticated');
         }
         const saved = await loadRecovery();
-        const reusable = saved?.previous === previous && Date.parse(saved.guest.refreshExpiresAt) > now() ? saved : null;
+        const reusable = saved && matchesGuestSnapshot(previous, saved.previous)
+          && Date.parse(saved.guest.refreshExpiresAt) > now() ? saved : null;
         const guest = reusable?.guest ?? await request({ path: '/guest-sessions', method: 'POST', schema: sessionResponse });
-        const provisional = { guest, previous, challengeId: null, grants: reusable?.grants ?? [] };
+        const provisional = { guest, previous: guestSnapshot(previous), challengeId: null, grants: reusable?.grants ?? [] };
         await saveRecovery(provisional);
         const result = await sendRecovery(options, provisional);
         const challenge = { ...provisional, challengeId: result.challengeId };
@@ -432,7 +521,7 @@ export function createLiveApi({
       const options = { path, method: 'POST', schema: orderAccessGrant, body: { code } } as const;
       return queueRecovery(async () => {
         if (primaryChallenge?.id === challengeId) {
-          return (await primaryRequest(options, primaryChallenge.refreshToken)).payload;
+          return (await primaryRequest(options, primaryChallenge.guest)).payload;
         }
         const record = await loadRecovery();
         if (record?.challengeId !== challengeId) return authorized(options);

@@ -17,10 +17,13 @@ type Context = {
   setRequestedOrderId: (orderId: string | null) => void;
   restoreFailed: boolean;
   busy: boolean;
+  guestSessionEndPending: boolean;
+  guestSessionRevision: number;
+  endGuestSession?: () => Promise<void>;
   retryRestore: () => Promise<void>;
   beginCheckout: (quote: Quote, cart: CartLine[], contact: CheckoutContact) => Promise<Order>;
   resumeCheckout: (retryDeclined?: boolean, contact?: CheckoutContact) => Promise<Order>;
-  rememberRecoveredOrder: (orderId: string) => Promise<void>;
+  rememberRecoveredOrder: (orderId: string, sessionRevision: number) => Promise<void>;
 };
 
 const CheckoutContext = createContext<Context | null>(null);
@@ -30,7 +33,7 @@ function fingerprint(cart: CartLine[]) {
 }
 
 export function CheckoutProvider({ children }: PropsWithChildren) {
-  const { api, demoApi, checkoutStorageKey, cart, clearCart } = useShop();
+  const { api, demoApi, guestSession, checkoutStorageKey, cart, clearCart } = useShop();
   const cartRef = useRef(cart);
   const clearCartRef = useRef(clearCart);
   const running = useRef(false);
@@ -38,6 +41,8 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
   const [requestedOrderId, setRequestedOrderId] = useState<string | null>(null);
   const [restoreFailed, setRestoreFailed] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [endingGuestSession, setEndingGuestSession] = useState(false);
+  const [guestSessionEndPending, setGuestSessionEndPending] = useState(false);
 
   useEffect(() => {
     cartRef.current = cart;
@@ -49,6 +54,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     storage: privateStorage,
     storageKey: checkoutStorageKey,
     newKey: randomUUID,
+    guestSession,
     demoContact: demoApi ? { phone: DEMO_PHONE } : undefined,
     allowMissingDemoOrders: !!demoApi,
     listDemoOrderRefs: demoApi ? (limit) => demoApi.listDemoOrderRefs(limit) : undefined,
@@ -58,20 +64,26 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
         await clearCartRef.current(current);
       }
     },
-  }), [api, checkoutStorageKey, demoApi]);
+  }), [api, checkoutStorageKey, demoApi, guestSession]);
+
+  const publishJournal = useCallback((saved: CheckoutJournal) => {
+    setJournal(saved);
+    setGuestSessionEndPending(controller.guestSessionEndPending);
+    if (controller.guestSessionEndPending) setRequestedOrderId(null);
+  }, [controller]);
 
   useEffect(() => {
     let active = true;
     void controller.restore().then((saved) => {
       if (active) {
-        setJournal(saved);
+        publishJournal(saved);
         setRestoreFailed(false);
       }
     }, () => {
       if (active) setRestoreFailed(true);
     });
     return () => { active = false; };
-  }, [controller]);
+  }, [controller, publishJournal]);
 
   const run = useCallback(async <Result,>(operation: () => Promise<Result>) => {
     if (running.current) throw new CheckoutError('active_checkout');
@@ -81,29 +93,40 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     try {
       return await operation();
     } finally {
-      setJournal(controller.snapshot);
+      publishJournal(controller.snapshot);
       setBusy(false);
       running.current = false;
     }
-  }, [controller]);
+  }, [controller, publishJournal]);
 
   const value: Context = {
-    journal,
-    requestedOrderId,
+    journal: endingGuestSession ? null : journal,
+    requestedOrderId: endingGuestSession ? null : requestedOrderId,
     setRequestedOrderId,
     restoreFailed,
     busy,
+    guestSessionEndPending,
+    guestSessionRevision: controller.guestSessionRevision,
+    endGuestSession: guestSession ? () => run(async () => {
+      setEndingGuestSession(true);
+      try {
+        await controller.endGuestSession();
+        setRequestedOrderId(null);
+      } finally {
+        setEndingGuestSession(false);
+      }
+    }) : undefined,
     retryRestore: async () => {
       setRestoreFailed(false);
       try {
-        setJournal(await controller.restore());
+        publishJournal(await controller.restore());
       } catch {
         setRestoreFailed(true);
       }
     },
     beginCheckout: (quote, snapshot, contact) => run(async () => controller.begin(quote, await fingerprint(snapshot), contact)),
     resumeCheckout: (retryDeclined, contact) => run(() => controller.resume(retryDeclined, contact)),
-    rememberRecoveredOrder: (orderId) => run(() => controller.rememberRecoveredOrder(orderId)),
+    rememberRecoveredOrder: (orderId, sessionRevision) => run(() => controller.rememberRecoveredOrder(orderId, sessionRevision)),
   };
 
   return <CheckoutContext.Provider value={value}>{children}</CheckoutContext.Provider>;

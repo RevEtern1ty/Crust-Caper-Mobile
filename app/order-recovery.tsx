@@ -1,5 +1,5 @@
 import { router, useLocalSearchParams } from 'expo-router';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { StyleSheet, TextInput, View } from 'react-native';
 import { normalizePhone } from '../src/checkout/contact';
 import { useCheckout, useRouteActionGuard } from '../src/checkout/context';
@@ -9,13 +9,13 @@ import { useShop } from '../src/state/shop';
 import { Button, Card, colors, Screen, Text } from '../src/ui/core';
 import { copy } from '../src/ui/format';
 
-type Step = { kind: 'details' } | { kind: 'code'; challengeId: string } | { kind: 'save'; orderId: string };
+type Step = { kind: 'details' } | { kind: 'code'; challengeId: string } | { kind: 'save'; orderId: string; sessionRevision: number };
 type Field = 'orderCode' | 'phone' | 'code';
 
 export default function OrderRecoveryScreen() {
   const { from, orderCode: savedCode } = useLocalSearchParams<{ from?: string; orderCode?: string }>();
   const { api, checkoutAllowed, locale, mode } = useShop();
-  const { rememberRecoveredOrder, setRequestedOrderId } = useCheckout();
+  const { guestSessionEndPending, guestSessionRevision, rememberRecoveredOrder, setRequestedOrderId } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const [step, setStep] = useState<Step>({ kind: 'details' });
   const [orderCode, setOrderCode] = useState(() =>
@@ -29,8 +29,20 @@ export default function OrderRecoveryScreen() {
   const phoneInput = useRef<TextInput>(null);
   const codeInput = useRef<TextInput>(null);
   const running = useRef(false);
+  const displayedRevision = useRef(guestSessionRevision);
   const t = (en: string, rw: string) => copy(locale, en, rw);
-  const available = mode === 'connected' && checkoutAllowed && !!api.requestOrderAccess && !!api.verifyOrderAccess;
+  const available = mode === 'connected' && checkoutAllowed && !guestSessionEndPending && !!api.requestOrderAccess && !!api.verifyOrderAccess;
+
+  useEffect(() => {
+    if (displayedRevision.current === guestSessionRevision) return;
+    displayedRevision.current = guestSessionRevision;
+    setStep({ kind: 'details' });
+    setOrderCode('');
+    setPhone('');
+    setCode('');
+    setProblem(null);
+    setInvalid(null);
+  }, [guestSessionRevision]);
 
   function goToOrders() {
     if (from === 'orders' && router.canGoBack()) router.back();
@@ -65,6 +77,7 @@ export default function OrderRecoveryScreen() {
     }
 
     const shouldNavigate = guardNavigation();
+    const sessionRevision = step.kind === 'save' ? step.sessionRevision : guestSessionRevision;
     let saving = step.kind === 'save';
     running.current = true;
     setPending(true);
@@ -73,26 +86,26 @@ export default function OrderRecoveryScreen() {
     try {
       if (step.kind === 'details' && normalizedPhone) {
         const { challengeId } = await api.requestOrderAccess({ orderCode: reference, phone: normalizedPhone });
-        if (shouldNavigate()) setStep({ kind: 'code', challengeId });
+        if (shouldNavigate() && displayedRevision.current === sessionRevision) setStep({ kind: 'code', challengeId });
         return;
       }
 
       const orderId = step.kind === 'code'
         ? (await api.verifyOrderAccess(step.challengeId, code)).orderId
         : step.kind === 'save' ? step.orderId : null;
-      if (!orderId) return;
+      if (!orderId || displayedRevision.current !== sessionRevision) return;
       saving = true;
       setCode('');
       setPhone('');
       setOrderCode('');
-      setStep({ kind: 'save', orderId });
-      await rememberRecoveredOrder(orderId);
+      setStep({ kind: 'save', orderId, sessionRevision });
+      await rememberRecoveredOrder(orderId, sessionRevision);
       if (shouldNavigate()) {
         setRequestedOrderId(orderId);
         goToOrders();
       }
     } catch (error) {
-      if (!shouldNavigate()) return;
+      if (!shouldNavigate() || displayedRevision.current !== sessionRevision) return;
       if (saving) {
         setProblem(t('The order was verified. Try saving it on this device again.', 'Komande yemejwe. Ongera ugerageze kuyibika kuri iki gikoresho.'));
       } else if (step.kind === 'code' && error instanceof ApiError && (error.code === 'not_found' || error.code === 'invalid_input')) {
@@ -119,7 +132,9 @@ export default function OrderRecoveryScreen() {
     return (
       <Screen safeBottom>
         <Text variant="title" accessibilityRole="header">{t('Find an order', 'Shaka komande')}</Text>
-        <Text>{t('Use a connected CrustCaper app to recover an order.', 'Koresha porogaramu ya CrustCaper ihujwe na serivisi kugira ngo ubone komande.')}</Text>
+        <Text>{guestSessionEndPending
+          ? t('Finish ending this session in Settings.', 'Rangiriza gusoza iki gihe mu Magenamiterere.')
+          : t('Use a connected CrustCaper app to recover an order.', 'Koresha porogaramu ya CrustCaper ihujwe na serivisi kugira ngo ubone komande.')}</Text>
         <Button label={t('Go to Orders', 'Jya muri Komande')} onPress={goToOrders} />
       </Screen>
     );

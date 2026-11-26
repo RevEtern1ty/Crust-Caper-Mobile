@@ -45,9 +45,10 @@ const order = {
 
 function memory() {
   const data = new Map<string, string>();
-  const storage: Storage = {
+  const storage: Storage & { removeItem(key: string): Promise<void> } = {
     async getItem(key) { return data.get(key) ?? null; },
     async setItem(key, value) { data.set(key, value); },
+    async removeItem(key) { data.delete(key); },
   };
   return { data, storage };
 }
@@ -430,8 +431,9 @@ test('promotion write failure allows verification to retry with the same provisi
   data.set(journalKey, oldJournal);
   data.set(journalKey + '.guest', JSON.stringify(expiredGuest));
   let rejectMainWrite = true;
-  const unreliableStorage: Storage = {
+  const unreliableStorage: typeof storage = {
     getItem: storage.getItem,
+    removeItem: storage.removeItem,
     async setItem(key, value) {
       if (key === journalKey + '.guest' && rejectMainWrite) throw new Error('fixture write failed');
       await storage.setItem(key, value);
@@ -672,6 +674,148 @@ test('refresh keeps the old guest and retries an unauthorized write with its ori
   assert.equal((await api.createOrder(contact, 'same-key')).id, order.id);
   assert.deepEqual(calls.filter(call => call.url.endsWith('/orders')).map(call => call.key), ['same-key', 'same-key']);
   assert.equal(JSON.parse((await storage.getItem(journalKey + '.guest')) ?? '{}').accessToken, renewed.accessToken);
+});
+
+const sessionKey = journalKey + '.guest';
+const rotationId = '3924cf26-6df1-4b2a-8f24-2ea91f0cf94d';
+const rotatable = { ...session, sessionId: '1de47e8f-b6a9-457e-aa68-3c79463d12f5' };
+const rotated = { ...rotatable, accessToken: 'updated_' + 'c'.repeat(40), refreshToken: 'successor_' + 'd'.repeat(40) };
+
+for (const failure of ['network', 'storage'] as const) {
+  test(`rotating refresh survives a lost ${failure} reply with the saved rotation key and same order`, async () => {
+    const { storage, data } = memory();
+    const stored = { ...rotatable, expiresAt: '2026-11-25T09:55:00Z' };
+    data.set(sessionKey, JSON.stringify(stored));
+    let first = true;
+    const set = storage.setItem;
+    storage.setItem = async (key, value) => {
+      if (failure === 'storage' && first && key === sessionKey && JSON.parse(value).refreshToken === rotated.refreshToken) {
+        first = false;
+        throw new Error('fixture final save failed');
+      }
+      await set(key, value);
+    };
+    const { calls, fetcher } = transport(call => {
+      if (call.url.endsWith('/guest-sessions/refresh')) {
+        assert.deepEqual(call.body, { refreshToken, rotationKey: rotationId });
+        assert.deepEqual(JSON.parse(data.get(sessionKey)!), { ...stored, rotationKey: rotationId });
+        if (failure === 'network' && first) {
+          first = false;
+          throw new Error('fixture reply lost');
+        }
+        return Response.json(rotated);
+      }
+      assert.ok(call.url.endsWith('/orders/' + order.id));
+      assert.equal(call.token, 'Bearer ' + rotated.accessToken);
+      return Response.json(order);
+    });
+    const options = { config, storage, journalKey, fetcher, now };
+    await assert.rejects(createLiveApi({ ...options, newRotationKey: () => rotationId }).getOrder(order.id),
+      { code: failure === 'network' ? 'network_unavailable' : 'storage_unavailable' });
+    const reopened = createLiveApi({ ...options, newRotationKey: () => assert.fail('must reuse the persisted rotation key') });
+    assert.equal((await reopened.getOrder(order.id)).id, order.id);
+    assert.deepEqual(JSON.parse(data.get(sessionKey)!), rotated);
+    assert.equal(calls.filter(call => call.url.endsWith('/guest-sessions/refresh')).length, 2);
+  });
+}
+
+test('phone verification stays bound to the guest identity across normal credential rotation', async () => {
+  const { data, storage } = memory();
+  data.set(sessionKey, JSON.stringify(rotatable));
+  let time = now();
+  const { fetcher } = transport(call => {
+    if (call.url.endsWith('/order-access/challenges')) {
+      assert.equal(call.token, 'Bearer ' + accessToken);
+      return Response.json({ challengeId: recoveryChallengeId });
+    }
+    if (call.url.endsWith('/guest-sessions/refresh')) {
+      assert.deepEqual(call.body, { refreshToken, rotationKey: rotationId });
+      return Response.json({ ...rotated, expiresAt: '2026-11-29T10:00:00Z' });
+    }
+    assert.ok(call.url.endsWith('/verify'));
+    assert.equal(call.token, 'Bearer ' + rotated.accessToken);
+    return Response.json({ orderId: recoveryOrderId });
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now: () => time, newRotationKey: () => rotationId });
+  const challenge = await api.requestOrderAccess!(recoveryContact);
+  time = Date.parse('2026-11-27T10:00:00Z');
+  assert.equal((await api.verifyOrderAccess!(challenge.challengeId, '418263')).orderId, recoveryOrderId);
+});
+
+test('logout retries a lost response, revokes both guests and clears only private checkout state', async () => {
+  const { data, storage } = memory();
+  data.set(sessionKey, JSON.stringify({ ...rotatable, rotationKey: rotationId }));
+  data.set(journalKey + '.recovery-guest', JSON.stringify({
+    guest: recoveryGuest, previous: rotatable.sessionId, challengeId: recoveryChallengeId, grants: [recoveryOrderId],
+  }));
+  data.set(journalKey + '.installation', installationId);
+  data.set(journalKey, JSON.stringify({ version: 1, active: null, orderIds: [recoveryOrderId] }));
+  data.set('catalog-cache', 'keep');
+  const { calls, fetcher } = transport(call => {
+    assert.ok(call.url.endsWith('/guest-sessions/revoke'));
+    assert.ok(data.get(journalKey + '.end-guest'));
+    if (call.body && Reflect.get(call.body as object, 'refreshToken') === refreshToken && calls.length === 1) {
+      assert.deepEqual(call.body, { refreshToken, rotationKey: rotationId });
+      throw new Error('fixture revoke reply lost');
+    }
+    return new Response(null, { status: 204 });
+  });
+  const options = { config, storage, journalKey, fetcher, now };
+  await assert.rejects(createLiveApi(options).endGuestSession(), { code: 'network_unavailable' });
+  const reopened = createLiveApi(options);
+  assert.equal(await reopened.hasGuestSessionEndPending(), true);
+  await assert.rejects(reopened.getOrder(order.id), { code: 'unauthenticated' });
+  assert.equal(calls.length, 1);
+  await reopened.endGuestSession();
+  assert.equal(await reopened.hasGuestSessionEndPending(), false);
+  assert.deepEqual(calls.map(call => call.body), [
+    { refreshToken, rotationKey: rotationId }, { refreshToken, rotationKey: rotationId }, { refreshToken: recoveryGuest.refreshToken },
+  ]);
+  assert.deepEqual([...data], [['catalog-cache', 'keep']]);
+});
+
+test('logout drains authenticated work and suppresses a stale order response', async () => {
+  const { data, storage } = memory();
+  data.set(sessionKey, JSON.stringify(rotatable));
+  const started = Promise.withResolvers<void>();
+  const reply = Promise.withResolvers<Response>();
+  const { calls, fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions/revoke')) return new Response(null, { status: 204 });
+    started.resolve();
+    return reply.promise;
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  const previous = assert.rejects(api.getOrder(order.id), { code: 'unauthenticated' });
+  await started.promise;
+  const ended = api.endGuestSession();
+  await assert.rejects(api.getOrder(order.id), { code: 'unauthenticated' });
+  assert.equal(calls.length, 1);
+  reply.resolve(Response.json(order));
+  await Promise.all([ended, previous]);
+  assert.deepEqual(calls[1]?.body, { refreshToken });
+  assert.equal(data.has(sessionKey), false);
+});
+
+test('logout does not start order verification that was still queued', async () => {
+  const { data, storage } = memory();
+  data.set(sessionKey, JSON.stringify(rotatable));
+  const started = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<Response>();
+  const { calls, fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions/revoke')) return new Response(null, { status: 204 });
+    assert.ok(call.url.endsWith('/order-access/challenges'));
+    started.resolve();
+    return response.promise;
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  const challenge = assert.rejects(api.requestOrderAccess!(recoveryContact), { code: 'unauthenticated' });
+  await started.promise;
+  const queued = assert.rejects(api.verifyOrderAccess!(recoveryChallengeId, '418263'), { code: 'unauthenticated' });
+  const ending = api.endGuestSession();
+  response.resolve(Response.json({ challengeId: recoveryChallengeId }));
+  await Promise.all([challenge, queued, ending]);
+  assert.equal(calls.length, 2);
+  assert.ok(calls[1]?.url.endsWith('/guest-sessions/revoke'));
 });
 
 test('only the local profile can call the integration payment endpoint', () => {

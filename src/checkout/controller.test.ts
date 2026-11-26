@@ -3,7 +3,7 @@ import { test } from 'node:test';
 
 import { createDemoApi, DEMO_PHONE } from '../domain/demo-api';
 import { ApiError, type CartLine, type OrderInput } from '../domain/types';
-import { CHECKOUT_JOURNAL_KEY, CheckoutController, type CheckoutContact } from './controller';
+import { CHECKOUT_JOURNAL_KEY, CheckoutController, type CheckoutContact, type GuestSessionLifecycle } from './controller';
 
 const line: CartLine = { sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: 9200 };
 
@@ -32,10 +32,11 @@ function fixture() {
     newId: () => `id-${++id}`,
   });
 
-  const restart = (allowMissingDemoOrders = true, recoverFromLedger = false) => new CheckoutController({
+  const restart = (allowMissingDemoOrders = true, recoverFromLedger = false, guestSession?: GuestSessionLifecycle) => new CheckoutController({
     demoContact: { phone: DEMO_PHONE },
     allowMissingDemoOrders,
     listDemoOrderRefs: recoverFromLedger ? api.listDemoOrderRefs : undefined,
+    guestSession,
     api: {
       ...api,
       async getOrder(orderId) {
@@ -494,4 +495,103 @@ test('an invalid grant or a failed history write leaves the saved orders intact'
 
   deepEqual(restored.snapshot, saved);
   deepEqual(f.savedJournal(), saved);
+});
+
+test('ending a guest session waits for checkout and pickup, then invalidates older recovery results', async () => {
+  const f = fixture();
+  let ended = 0;
+  const controller = f.restart(false, false, {
+    async hasEndPending() { return false; },
+    async end() { ended++; f.removeJournal(); },
+  });
+  const previousRevision = controller.guestSessionRevision;
+  const placing = controller.begin(await f.quote(), 'cart');
+  await rejects(controller.endGuestSession(), { code: 'active_checkout' });
+  const order = await placing;
+  ok(order.paymentAttempt);
+
+  equal(controller.snapshot.active?.phase, 'tracking');
+  await rejects(controller.endGuestSession(), { code: 'active_checkout' });
+  await f.api.setDemoPaymentResult(order.id, order.paymentAttempt.id, 'paid');
+  await rejects(controller.endGuestSession(), { code: 'active_checkout' });
+  equal(ended, 0);
+  deepEqual(f.savedJournal().orderIds, [order.id]);
+
+  for (const state of ['preparing', 'ready', 'collected'] as const) await f.api.setDemoOrderStatus(order.id, state);
+  await controller.endGuestSession();
+  equal(ended, 1);
+  equal(f.savedJournal(), null);
+  deepEqual(controller.snapshot, { version: 1, active: null, orderIds: [] });
+  await rejects(controller.rememberRecoveredOrder(recoveredOrderId, previousRevision), { code: 'unauthenticated' });
+  equal(f.savedJournal(), null);
+});
+
+test('an uncertain session end hides history on restart and can finish without order access', async () => {
+  const f = fixture();
+  const saved = { version: 1, active: null, orderIds: ['old-order'] };
+  f.restoreLegacyJournal(saved);
+  let pending = false;
+  let attempts = 0;
+  const lifecycle: GuestSessionLifecycle = {
+    async hasEndPending() { return pending; },
+    async end() {
+      pending = true;
+      if (++attempts === 1) throw new ApiError('network_unavailable');
+      f.removeJournal();
+      pending = false;
+    },
+  };
+  const controller = f.restart(false, false, lifecycle);
+  deepEqual(await controller.restore(), saved);
+  await rejects(controller.endGuestSession(), { code: 'network_unavailable' });
+  equal(controller.guestSessionEndPending, true);
+  deepEqual(controller.snapshot.orderIds, []);
+  deepEqual(f.savedJournal(), saved);
+
+  f.blockOrderReads();
+  const restored = f.restart(false, false, lifecycle);
+  deepEqual((await restored.restore()).orderIds, []);
+  equal(restored.guestSessionEndPending, true);
+  await rejects(restored.rememberRecoveredOrder(recoveredOrderId), { code: 'session_end_pending' });
+  await restored.endGuestSession();
+  equal(attempts, 2);
+  equal(restored.guestSessionEndPending, false);
+  equal(f.savedJournal(), null);
+});
+
+test('an expired reservation can end the session after the saved payment finishes checking', async () => {
+  const f = fixture();
+  const controller = f.restart(false, false, {
+    async hasEndPending() { return false; },
+    async end() { f.removeJournal(); },
+  });
+  f.dropPaymentResponse();
+  await rejects(controller.begin(await f.quote(), 'cart'), /Payment response lost/);
+  f.setTime('2026-11-25T10:11:00Z');
+  const order = await f.api.getOrder(f.savedJournal().active.orderId);
+  equal(order.status, 'cancelled');
+  equal(order.paymentStatus, 'processing');
+  ok(order.paymentAttempt);
+  await rejects(controller.endGuestSession(), { code: 'active_checkout' });
+  await f.api.setDemoPaymentResult(order.id, order.paymentAttempt.id, 'declined');
+  equal(f.savedJournal().active.phase, 'paying');
+  await controller.endGuestSession();
+  equal(f.savedJournal(), null);
+  deepEqual(controller.snapshot.orderIds, []);
+});
+
+test('a failed order check keeps the guest session and its journal open', async () => {
+  const f = fixture();
+  const saved = { version: 1, active: null, orderIds: ['old-order'] };
+  f.restoreLegacyJournal(saved);
+  let ended = 0;
+  const controller = f.restart(false, false, {
+    async hasEndPending() { return false; },
+    async end() { ended++; },
+  });
+  f.blockOrderReads();
+  await rejects(controller.endGuestSession(), /Temporarily unavailable/);
+  deepEqual(controller.snapshot, saved);
+  deepEqual(f.savedJournal(), saved);
+  equal(ended, 0);
 });

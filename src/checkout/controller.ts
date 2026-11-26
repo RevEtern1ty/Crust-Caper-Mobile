@@ -17,6 +17,11 @@ export type CheckoutJournal = {
 
 export type CheckoutContact = Pick<OrderInput, 'phone' | 'email'>;
 
+export type GuestSessionLifecycle = {
+  end: () => Promise<void>;
+  hasEndPending: () => Promise<boolean>;
+};
+
 type Dependencies = {
   api: Pick<ShopApi, 'createOrder' | 'getOrder' | 'startPayment' | 'recoverOrder'>;
   storage: {
@@ -29,10 +34,11 @@ type Dependencies = {
   demoContact?: CheckoutContact;
   allowMissingDemoOrders?: boolean;
   listDemoOrderRefs?: (limit: number) => Promise<{ orderId: string; key: string }[]>;
+  guestSession?: GuestSessionLifecycle;
 };
 
 export class CheckoutError extends Error {
-  constructor(readonly code: 'active_checkout' | 'invalid_journal' | 'missing_checkout' | 'contact_required') {
+  constructor(readonly code: 'active_checkout' | 'invalid_journal' | 'missing_checkout' | 'contact_required' | 'session_end_pending') {
     super(code);
   }
 }
@@ -96,22 +102,33 @@ export class CheckoutController {
   private loaded = false;
   private loading: Promise<void> | null = null;
   private running = false;
+  private endPending = false;
+  private revision = 0;
 
   constructor(private readonly dependencies: Dependencies) {}
 
   get snapshot(): CheckoutJournal {
-    return this.journal;
+    return this.endPending ? emptyJournal : this.journal;
+  }
+
+  get guestSessionEndPending(): boolean {
+    return this.endPending;
+  }
+
+  get guestSessionRevision(): number {
+    return this.revision;
   }
 
   async restore(): Promise<CheckoutJournal> {
     await this.load();
-    return this.journal;
+    return this.snapshot;
   }
 
-  async rememberRecoveredOrder(orderId: string): Promise<void> {
+  async rememberRecoveredOrder(orderId: string, sessionRevision = this.revision): Promise<void> {
     if (!paymentReturnOrderId(orderId)) throw new ApiError('invalid_response');
 
     await this.exclusive(async () => {
+      if (sessionRevision !== this.revision) throw new ApiError('unauthenticated');
       const { active, orderIds } = this.journal;
       if (orderIds.includes(orderId)) return;
 
@@ -121,6 +138,41 @@ export class CheckoutController {
       }
       await this.save(active, [...retained, orderId]);
     });
+  }
+
+  async endGuestSession(): Promise<void> {
+    const lifecycle = this.dependencies.guestSession;
+    if (!lifecycle) throw new ApiError('service_unavailable');
+
+    await this.exclusive(async () => {
+      if (!this.endPending) {
+        const { active, orderIds } = this.journal;
+        if (active?.phase === 'creating') throw new CheckoutError('active_checkout');
+        await Promise.all(orderIds.map(async orderId => {
+          const order = await this.dependencies.api.getOrder(orderId).catch(error => {
+            if (error instanceof ApiError && (error.code === 'unauthenticated' || error.code === 'not_found')) return null;
+            throw error;
+          });
+          const unresolved = order
+            ? order.paymentStatus === 'processing' || (order.status !== 'collected' && order.status !== 'cancelled')
+            : active?.phase === 'paying' && active.orderId === orderId;
+          if (unresolved) {
+            throw new CheckoutError('active_checkout');
+          }
+        }));
+      }
+
+      try {
+        await lifecycle.end();
+      } catch (error) {
+        this.endPending = await lifecycle.hasEndPending().catch(() => true);
+        if (this.endPending) this.revision++;
+        throw error;
+      }
+      this.journal = emptyJournal;
+      this.endPending = false;
+      this.revision++;
+    }, true);
   }
 
   async begin(quote: Quote, cartFingerprint: string, contact = this.dependencies.demoContact): Promise<Order> {
@@ -269,6 +321,11 @@ export class CheckoutController {
   }
 
   private async readJournal(): Promise<void> {
+    if (await this.dependencies.guestSession?.hasEndPending()) {
+      this.endPending = true;
+      this.loaded = true;
+      return;
+    }
     const raw = await this.dependencies.storage.getItem(this.dependencies.storageKey ?? CHECKOUT_JOURNAL_KEY);
     const listDemoOrderRefs = this.dependencies.allowMissingDemoOrders
       ? this.dependencies.listDemoOrderRefs : undefined;
@@ -305,13 +362,14 @@ export class CheckoutController {
     this.journal = next;
   }
 
-  private async exclusive<Result>(operation: () => Promise<Result>): Promise<Result> {
+  private async exclusive<Result>(operation: () => Promise<Result>, allowSessionEnd = false): Promise<Result> {
     if (this.running) {
       throw new CheckoutError('active_checkout');
     }
     this.running = true;
     try {
       await this.load();
+      if (this.endPending && !allowSessionEnd) throw new CheckoutError('session_end_pending');
       return await operation();
     } finally {
       this.running = false;

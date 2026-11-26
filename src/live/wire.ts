@@ -96,6 +96,7 @@ export const orderResponse = z.object({
   && Date.parse(value.pickupStartsAt) < Date.parse(value.pickupEndsAt));
 
 export const sessionResponse = z.object({
+  sessionId: z.guid().optional(),
   accessToken: z.string().min(32).max(512).regex(/^[A-Za-z0-9_-]+$/),
   expiresAt: timestamp,
   refreshToken: z.string().min(32).max(512).regex(/^[A-Za-z0-9_-]+$/),
