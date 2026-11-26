@@ -27,6 +27,14 @@ evidence_dir=$(mktemp -d)
 bash tooling/android-emulator-smoke.sh android/app/build/outputs/apk/release/app-release.apk demo "$evidence_dir"
 ```
 
+### Ручная проверка минимальной версии Android и подключённого iOS
+
+В GitHub Actions откройте **Mobile CI**, выберите ветку кандидата и запустите набор `pilot`. В поле `android_apk_run` укажите ID успешного запуска Mobile CI с APK `demo` и протоколом его запуска. Используйте ещё доступные артефакты этого запуска. Проверка сопоставляет исходники приложения, хеш APK и протокол первоначальной установки, затем дважды запускает тот же APK без сети на Android 9 (API 28). Сохраните протокол с фактической версией ОС и снимки.
+
+В том же прогоне симулятор iPhone запускает Release профиля `local`. Runner поднимает отдельную PostgreSQL 17 и Spring Boot с синтетическим каталогом Кигали. Запись запроса каталога с мобильного клиента и снимок подтверждают доступ к API и загрузку меню. Протокол сохраняется в артефакте `mobile-ios-simulator-smoke-<SHA>`. Образ Android устанавливается с лицензией, уже принятой в SDK runner.
+
+Подключённый iOS-прогон проверяет чтение каталога по loopback. Оплата, SMS, App Links, приёмка на физических устройствах и выпуск подписанных сборок описаны в [подключённой приёмке](#подключённая-приёмка).
+
 ### Заказ в локальном Android APK
 
 Соберите APK профиля `local` из чистой копии проверяемого SHA. Вариант для Linux использует образ `reactnativecommunity/react-native-android@sha256:71884cd2953769cdaedced1922970d3168d9028f74f78246c5f0cbc6d60598df`. В нём установлены JDK 17, Android API 36, Build Tools 36.0.0, CMake 3.30.5 и NDK 27.1.12297006. Подключите Node.js 24.22.0 согласно `.nvmrc` для установки зависимостей и сборки JS. [Dockerfile v20.1](https://github.com/react-native-community/docker-android/blob/v20.1/Dockerfile) · [Node.js 24.22.0](https://nodejs.org/dist/v24.22.0/)
