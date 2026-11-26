@@ -1,5 +1,5 @@
 {
-  "expectedVersion": null,
+  "expectedVersion": "catalog-bootstrap",
   "store": {
     "id": "kigali",
     "name": { "en": "CrustCaper Kigali", "rw": "CrustCaper Kigali" },
@@ -14,6 +14,8 @@
       "sku": "double-smash",
       "name": { "en": "Double Smash", "rw": "Double Smash" },
       "description": { "en": "Example description", "rw": "Ibisobanuro by’icyitegererezo" },
+      "recipeVersion": "recipe-001",
+      "allergenVersion": "allergens-001",
       "ingredients": [{ "en": "Example ingredient", "rw": "Ikigize ifunguro cy’icyitegererezo" }],
       "allergens": [{ "en": "Wheat", "rw": "Ingano" }],
       "category": "burgers",

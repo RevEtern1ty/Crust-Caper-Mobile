@@ -1025,6 +1025,69 @@ paths:
                   - properties:
                       status: { const: 409 }
                       code: { enum: [catalog_version_conflict, slot_update_closed, slot_capacity_below_reserved, pickup_schedule_started, pickup_schedule_overlap, pickup_schedule_conflict] }
+  /operator/catalog/recipe-approvals:
+    post:
+      operationId: approveCatalogRecipe
+      description: Record a manager's review of the exact recipe and allergen facts for the proposed catalog version at their assigned restaurant. Requires confirmation of ingredients, allergens and cross-contact. The same review can be repeated without replacing its author or timestamp. Publication is performed separately by the catalog importer. The request body is limited to 64 KiB.
+      security: [{ operatorBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [storeId, expectedVersion, catalogVersion, sku, crossContactConfirmed, facts]
+              properties:
+                storeId: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' }
+                expectedVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                catalogVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                sku: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                crossContactConfirmed: { const: true }
+                facts:
+                  type: object
+                  additionalProperties: false
+                  required: [recipeVersion, allergenVersion, ingredients, allergens]
+                  properties:
+                    recipeVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    allergenVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    ingredients: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+                    allergens: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+      responses:
+        '200':
+          description: The recorded review and whether the importer applied it.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [storeId, sku, expectedVersion, catalogVersion, recipeVersion, allergenVersion, approvedAt]
+                properties:
+                  storeId: { type: string }
+                  sku: { type: string }
+                  expectedVersion: { type: string }
+                  catalogVersion: { type: string }
+                  recipeVersion: { type: string }
+                  allergenVersion: { type: string }
+                  approvedAt: { type: string, format: date-time }
+                  appliedAt: { type: [string, 'null'], format: date-time }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { description: The assigned restaurant no longer exists. }
+        '409':
+          description: The version is stale or this proposal already has a review with different facts.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetails'
+                  - properties:
+                      status: { const: 409 }
+                      code: { enum: [catalog_version_conflict, catalog_recipe_conflict] }
+        '415': { description: The request body must be sent as application/json. }
   /operator/receipts:
     get:
       operationId: listOperatorReceipts

@@ -4,6 +4,8 @@ const { randomBytes, randomUUID } = require('node:crypto');
 const { access, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const { basename, dirname, join, resolve } = require('node:path');
+const { openStorefrontFixture } = require('./storefront-load.cjs');
+const { openStaffSession } = require('./storefront-load-kitchen.cjs');
 const { fixtureDatabaseUrl, preparePostgresTls, postgresCaMount, postgresJdbcTlsQuery, postgresTlsEntrypoint,
   postgresTlsMount, postgresTlsRuntime } = require('./storefront-postgres-tls.cjs');
 
@@ -21,6 +23,7 @@ const recoveryHost = 'postgres-recovery';
 const testMain = 'com.crustcaper.api.payment.WebCheckoutFixture';
 const scratchPrefix = 'cc-storefront-';
 const fixturePhoto = { sku: 'double-smash', file: 'double-smash-r39.jpg' };
+const fixtureBootstrapVersion = 'catalog-bootstrap';
 const legalFixtureVersion = '2026-05-01';
 const archivedPrivacyVersion = '2026-04-01';
 const errorRehearsalLabel = { 'crustcaper.fixture.error-rehearsal': '1' };
@@ -116,7 +119,7 @@ function postgresService(host, name, password, tlsDirectory, volumes, labels) {
   };
 }
 
-async function prepareFixture(directory, testClasses, env, { load, paymentRestart, catalogPhotos, errorRehearsal, databaseRecovery }) {
+async function prepareFixture(directory, testClasses, env, { paymentRestart, errorRehearsal, databaseRecovery }) {
   const fixturePassword = randomBytes(24).toString('hex');
   const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
@@ -222,7 +225,7 @@ async function prepareFixture(directory, testClasses, env, { load, paymentRestar
       edge: { volumes: [mount(caddyfile, '/etc/caddy/Caddyfile')] },
       postgres: postgresService('postgres', database, fixturePassword, tlsDirectory, [
         mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
-        ...(load || paymentRestart || catalogPhotos ? [operators] : []),
+        operators,
         ...recoveryTooling,
         ...(databaseRecovery ? ['source_db:/var/lib/postgresql/data'] : []),
       ], databaseRecovery ? recoveryLabel : errorRehearsal ? errorRehearsalLabel : undefined),
@@ -243,7 +246,7 @@ async function confirmPostgresTls(compose) {
   console.log(`Verified PostgreSQL TLS for the isolated ${database} API`);
 }
 
-async function importCatalog(compose, { load, catalogPhotos, availability }) {
+async function importCatalog(compose, { load, catalogPhotos, availability, project, browserCa, fixtureMfaKey }) {
   const catalog = JSON.parse(await readFile(join(root, 'server', 'tooling', 'catalog.example.json'), 'utf8'));
   catalog.store.open = !availability;
   for (const product of catalog.products) product.available = true;
@@ -267,10 +270,46 @@ async function importCatalog(compose, { load, catalogPhotos, availability }) {
       endsAt: new Date(startsAt + 600000).toISOString(),
     };
   });
-  await compose('Import the synthetic catalog through the production importer', [
+  const publish = (action, manifest) => compose(action, [
     'exec', '-T', 'postgres', 'psql', '-Xq', '--no-password', '-U', database, '-d', database,
     '-v', `catalog_database=${database}`, '-v', 'catalog_apply=true', '-f', '/fixture/import-catalog.psql',
-  ], { input: Buffer.from(JSON.stringify(catalog)).toString('base64') + '\n' });
+  ], { input: Buffer.from(JSON.stringify(manifest)).toString('base64') + '\n' });
+  await publish('Create the closed storefront fixture store', {
+    expectedVersion: null,
+    store: { ...catalog.store, open: false, version: fixtureBootstrapVersion },
+    products: [],
+    slots: [],
+  });
+
+  catalog.expectedVersion = fixtureBootstrapVersion;
+  const fixture = await openStorefrontFixture({ project, caFile: browserCa, signal: interruption.signal });
+  try {
+    const manager = await openStaffSession({ request: fixture.request, project, role: 'manager', fixtureMfaKey });
+    try {
+      for (const product of catalog.products) {
+        product.recipeVersion = 'fixture-recipe-001';
+        product.allergenVersion = 'fixture-allergens-001';
+        const { recipeVersion, allergenVersion, ingredients, allergens } = product;
+        const approval = await manager.request('/api/v1/operator/catalog/recipe-approvals', {
+          method: 'POST',
+          body: {
+            storeId: catalog.store.id,
+            expectedVersion: catalog.expectedVersion,
+            catalogVersion: catalog.store.version,
+            sku: product.sku,
+            crossContactConfirmed: true,
+            facts: { recipeVersion, allergenVersion, ingredients, allergens },
+          },
+        });
+        if (approval.status !== 200) throw new Error('Synthetic recipe approval failed (HTTP ' + approval.status + ')');
+      }
+    } finally {
+      await manager.close();
+    }
+  } finally {
+    fixture.close();
+  }
+  await publish('Import the approved synthetic catalog through the production importer', catalog);
 }
 
 async function main() {
@@ -331,7 +370,7 @@ async function main() {
       await copyFile(join(root, 'assets', 'menu', `${fixturePhoto.sku}.jpg`), join(photos, fixturePhoto.file));
       await writeFile(join(photos, 'double-smash-r39.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
     }
-    const settings = await prepareFixture(directory, testClasses, hostEnv, { load, paymentRestart, catalogPhotos, errorRehearsal, databaseRecovery });
+    const settings = await prepareFixture(directory, testClasses, hostEnv, { paymentRestart, errorRehearsal, databaseRecovery });
     const env = {
       ...hostEnv,
       CRUSTCAPER_API_IMAGE: apiImage,
@@ -363,10 +402,10 @@ async function main() {
     await compose('Start the storefront HTTPS fixture', ['up', '-d', '--wait', '--wait-timeout', '90'],
       { timeout: 120000 });
     await confirmPostgresTls(compose);
-    await importCatalog(compose, { load, catalogPhotos, availability });
     await compose('Copy the storefront fixture TLS root', [
       'cp', 'edge:/data/caddy/pki/authorities/local/root.crt', dockerPath(browserCa),
     ]);
+    await importCatalog(compose, { load, catalogPhotos, availability, project, browserCa, fixtureMfaKey: settings.fixtureMfaKey });
     if (evidence) await mkdir(evidence, { recursive: true });
     if (databaseRecovery) {
       const { runDatabaseRecovery } = require('./storefront-database-recovery.cjs');

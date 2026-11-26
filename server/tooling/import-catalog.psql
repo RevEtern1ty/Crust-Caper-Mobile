@@ -94,6 +94,12 @@ DECLARE
     checked_at timestamptz;
     occupied bigint;
     unit_max numeric;
+    proposed_product jsonb;
+    saved_product public.menu_products%ROWTYPE;
+    ingredients_changed boolean;
+    allergens_changed boolean;
+    proposed_recipe_version text;
+    proposed_allergen_version text;
 BEGIN
     PERFORM pg_temp.catalog_assert((SELECT count(*) = 1 FROM pg_temp.catalog_input), 'Supply exactly one UTF-8 JSON document');
     SELECT encoded INTO source FROM pg_temp.catalog_input;
@@ -120,14 +126,17 @@ BEGIN
 
     FOR product IN SELECT value FROM jsonb_array_elements(payload->'products') LOOP
         PERFORM pg_temp.catalog_assert(pg_temp.catalog_fields(product,
-            ARRAY['sku','name','description','ingredients','allergens','category','price','available','modifiers'], ARRAY['photoUrl'])
+            ARRAY['sku','name','description','ingredients','allergens','category','price','available','modifiers'],
+            ARRAY['photoUrl','recipeVersion','allergenVersion'])
             AND pg_temp.catalog_id(product->'sku') AND pg_temp.catalog_localized(product->'name')
             AND pg_temp.catalog_localized(product->'description')
             AND product->>'category' IN ('burgers','combos','sides','drinks')
             AND pg_temp.catalog_number(product->'price', 1000000000)
             AND jsonb_typeof(product->'available') = 'boolean'
             AND jsonb_typeof(product->'ingredients') = 'array' AND jsonb_typeof(product->'allergens') = 'array'
-            AND jsonb_typeof(product->'modifiers') = 'array' AND pg_temp.catalog_url(product->'photoUrl'),
+            AND jsonb_typeof(product->'modifiers') = 'array' AND pg_temp.catalog_url(product->'photoUrl')
+            AND (NOT (product ?| ARRAY['recipeVersion','allergenVersion'])
+                OR (pg_temp.catalog_id(product->'recipeVersion') AND pg_temp.catalog_id(product->'allergenVersion'))),
             'Product contains invalid or missing fields');
         PERFORM pg_temp.catalog_assert(NOT EXISTS (
             SELECT FROM jsonb_array_elements((product->'ingredients') || (product->'allergens')) AS element(value)
@@ -171,6 +180,53 @@ BEGIN
         'Catalog version conflict. Read the current store version and review stale changes');
     PERFORM pg_temp.catalog_assert(current_version IS DISTINCT FROM (location->>'version'),
         'Choose a new catalog version');
+    PERFORM pg_temp.catalog_assert(current_version IS NOT NULL
+        OR (location->'open' = 'false'::jsonb AND jsonb_array_length(payload->'products') = 0),
+        'Create a new store closed with an empty product list before assigning a named manager');
+
+    FOR proposed_product IN SELECT value FROM jsonb_array_elements(payload->'products') ORDER BY value->>'sku' LOOP
+        SELECT saved.* INTO saved_product FROM public.menu_products saved
+        WHERE saved.store_id = target_store_id AND saved.sku = proposed_product->>'sku';
+        ingredients_changed := (saved_product.product->'ingredients') IS DISTINCT FROM (proposed_product->'ingredients');
+        allergens_changed := (saved_product.product->'allergens') IS DISTINCT FROM (proposed_product->'allergens');
+        proposed_recipe_version := proposed_product->>'recipeVersion';
+        proposed_allergen_version := proposed_product->>'allergenVersion';
+
+        -- Omitting both editions preserves saved facts and editions for an unchanged product.
+        IF saved_product.sku IS NULL OR ingredients_changed OR allergens_changed
+            OR (proposed_recipe_version IS NOT NULL AND (proposed_recipe_version, proposed_allergen_version)
+                IS DISTINCT FROM (saved_product.recipe_version, saved_product.allergen_version)) THEN
+            PERFORM pg_temp.catalog_assert(proposed_recipe_version IS NOT NULL AND proposed_allergen_version IS NOT NULL,
+                format('Product %s requires recipeVersion and allergenVersion', proposed_product->>'sku'));
+            PERFORM pg_temp.catalog_assert(NOT ingredients_changed OR proposed_recipe_version IS DISTINCT FROM saved_product.recipe_version,
+                format('Product %s changed ingredients and requires a new recipeVersion', proposed_product->>'sku'));
+            PERFORM pg_temp.catalog_assert(NOT allergens_changed OR proposed_allergen_version IS DISTINCT FROM saved_product.allergen_version,
+                format('Product %s changed allergens and requires a new allergenVersion', proposed_product->>'sku'));
+            PERFORM pg_temp.catalog_assert(NOT EXISTS (
+                SELECT FROM public.catalog_recipe_approvals prior
+                WHERE prior.store_id = target_store_id AND prior.sku = proposed_product->>'sku' AND prior.applied_at IS NOT NULL
+                    AND ((prior.facts->>'recipeVersion' = proposed_recipe_version
+                        AND (prior.facts->'ingredients') IS DISTINCT FROM (proposed_product->'ingredients'))
+                      OR (prior.facts->>'allergenVersion' = proposed_allergen_version
+                        AND (prior.facts->'allergens') IS DISTINCT FROM (proposed_product->'allergens')))
+            ), format('Product %s cannot reuse a published recipe or allergen version with different facts', proposed_product->>'sku'));
+
+            UPDATE public.catalog_recipe_approvals approval SET applied_at = clock_timestamp()
+            WHERE approval.store_id = target_store_id AND approval.expected_version = current_version
+                AND approval.catalog_version = location->>'version' AND approval.sku = proposed_product->>'sku'
+                AND approval.applied_at IS NULL
+                AND approval.facts = jsonb_build_object(
+                    'recipeVersion', proposed_recipe_version, 'allergenVersion', proposed_allergen_version,
+                    'ingredients', proposed_product->'ingredients', 'allergens', proposed_product->'allergens')
+                AND EXISTS (
+                    SELECT FROM public.operator_accounts approver
+                    WHERE approver.id = approval.operator_id AND approver.store_id = target_store_id
+                        AND approver.role = 'manager' AND approver.enabled AND approver.username NOT LIKE 'demo-%'
+                );
+            PERFORM pg_temp.catalog_assert(FOUND,
+                format('Product %s requires an unused exact recipe approval from an enabled named manager at this store', proposed_product->>'sku'));
+        END IF;
+    END LOOP;
 
     IF jsonb_array_length(payload->'slots') > 0 THEN
         PERFORM pg_temp.catalog_assert(NOT EXISTS (
@@ -222,11 +278,14 @@ BEGIN
         open = excluded.open, tax_basis_points = excluded.tax_basis_points, version = excluded.version,
         updated_at = excluded.updated_at, support_url = excluded.support_url, directions_url = excluded.directions_url;
 
-    INSERT INTO public.menu_products (store_id, sku, position, product)
-    SELECT target_store_id, entry.value->>'sku', entry.position::integer, entry.value
+    INSERT INTO public.menu_products AS saved (store_id, sku, position, product, recipe_version, allergen_version)
+    SELECT target_store_id, entry.value->>'sku', entry.position::integer,
+        entry.value - ARRAY['recipeVersion','allergenVersion'], entry.value->>'recipeVersion', entry.value->>'allergenVersion'
     FROM jsonb_array_elements(payload->'products') WITH ORDINALITY AS entry(value, position)
     ON CONFLICT ON CONSTRAINT menu_products_pkey DO UPDATE
-        SET position = excluded.position, product = excluded.product;
+        SET position = excluded.position, product = excluded.product,
+            recipe_version = COALESCE(excluded.recipe_version, saved.recipe_version),
+            allergen_version = COALESCE(excluded.allergen_version, saved.allergen_version);
 
     INSERT INTO public.pickup_slots (store_id, id, starts_at, ends_at, capacity)
     SELECT target_store_id, entry.value->>'id', (entry.value->>'startsAt')::timestamptz,
