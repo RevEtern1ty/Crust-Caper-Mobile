@@ -663,6 +663,96 @@ test('open Orders reconciles a declined checkout after its pickup hold expires',
   assert.deepEqual(writes, [...initialWrites, orderPath + '/reorder']);
 });
 
+test('a saved Orders action error follows the chosen language and keeps its support ID', { timeout: 25_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, serviceWorkers: 'block' });
+  page.setDefaultTimeout(6500);
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const apiUrl = new URL(api);
+  const journalKey = `crustcaper.checkout.v1.local.${apiUrl.hostname}.${apiUrl.port}.kigali`;
+  const orderId = '3099a83d-a8ae-4632-9306-32ebea343135';
+  const requestId = 'ba8b8f93-4a07-4711-82d6-189a3cfe5747';
+  const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+  const guest = { accessToken: 'orders_locale_fixture_access_token', refreshToken: 'orders_locale_fixture_refresh_token',
+    expiresAt, refreshExpiresAt: expiresAt };
+  await page.addInitScript(({ origin, journalKey, orderId, guest }) => {
+    if (location.origin !== origin) return;
+    sessionStorage.setItem(journalKey, JSON.stringify({ version: 1, active: null, orderIds: [orderId] }));
+    sessionStorage.setItem(journalKey + '.guest', JSON.stringify(guest));
+  }, { origin, journalKey, orderId, guest });
+
+  const orderUrl = api + '/orders/' + orderId;
+  const menuUrl = api + '/stores/kigali/menu';
+  const label = { en: 'Fixture store', rw: 'Fixture store' };
+  const order = {
+    id: orderId, storeId: 'kigali', slotId: 'fixture-slot',
+    lines: [{ sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: 9_200 }],
+    total: 9_200, tax: 1_400, currency: 'RWF', status: 'collected', paymentStatus: 'paid',
+    pickupCode: null, receiptStatus: 'pending', receiptUrl: null, paymentAttempt: null,
+    createdAt: '2026-11-24T10:00:00Z', reservationExpiresAt: '2026-11-24T10:10:00Z',
+    pickupStartsAt: '2026-11-24T10:10:00Z', pickupEndsAt: '2026-11-24T10:20:00Z',
+  };
+  const cors = {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Expose-Headers': 'X-Request-ID',
+  };
+  let reorderCalls = 0;
+  await page.route('**/*', route => {
+    const { origin: requestOrigin } = new URL(route.request().url());
+    if (requestOrigin === origin) return route.continue();
+    if (requestOrigin !== apiUrl.origin) return route.abort();
+    const url = route.request().url();
+    const method = route.request().method();
+    if (method === 'OPTIONS') return route.fulfill({ status: 204, headers: cors });
+    if (method === 'GET' && url === orderUrl) return route.fulfill({ headers: cors, json: order });
+    if (method === 'GET' && (url === menuUrl || url.startsWith(menuUrl + '?'))) {
+      return route.fulfill({ headers: cors, json: { version: 'fixture', updatedAt: new Date().toISOString(),
+        store: { id: 'kigali', name: label, area: label, open: true, hours: label }, products: [], slots: [] } });
+    }
+    if (method === 'POST' && url === orderUrl + '/reorder') {
+      reorderCalls++;
+      return route.fulfill({ status: 503, headers: { ...cors, 'X-Request-ID': requestId },
+        json: { code: 'service_unavailable', detail: 'fixture error details' } });
+    }
+    return route.abort();
+  });
+
+  await page.goto(origin);
+  await page.getByRole('tab', { name: /^Orders(?:,|$)/ }).click();
+  await page.waitForURL(origin + '/orders');
+  const documentStartedAt = await page.evaluate(() => performance.timeOrigin);
+  await button(page, 'Review reorder').click();
+  const previous = page.getByRole('alert').filter({ hasText: requestId, visible: true });
+  await previous.waitFor();
+  assert.equal(await previous.textContent(), `The order service is temporarily unavailable. Try again shortly.\nSupport ID ${requestId}`);
+  await button(page, 'Settings').click();
+  await button(page, 'Kinyarwanda').click();
+  await shown(page, 'Amagenamiterere');
+  await page.getByLabel(/(?:, back|Go back)$/i).click();
+  await page.waitForURL(origin + '/orders');
+  const reorder = button(page, 'Reba komande nshya isa n’iyi');
+  await reorder.waitFor();
+  assert.equal(await page.evaluate(() => performance.timeOrigin), documentStartedAt, 'Settings must preserve the Orders document');
+  assert.equal(await page.locator('html').getAttribute('lang'), 'rw');
+  assert.equal(reorderCalls, 1, 'Changing the language must preserve the action failure without replaying it');
+  assert.equal(await previous.count(), 1, 'Orders must retain one visible support ID after returning from Settings');
+  await reorder.focus();
+  assert.equal(await reorder.evaluate(element => element === document.activeElement), true);
+  assert.equal(await previous.textContent(),
+    `Serivisi ya komande ntiboneka by’akanya gato. Ongera ugerageze nyuma.\nNomero y’ubufasha ${requestId}`);
+  await capture(page, 'connected-orders-error-language');
+});
+
 test('a shared order previews the mobile cart limit before saving it', { timeout: 40_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const buyer = { ...contact, email: 'reorder-fixture@example.test' };
