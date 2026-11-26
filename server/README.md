@@ -89,20 +89,15 @@ Run the [connected release checks](../docs/runbooks/CONNECTED_RELEASE.md) agains
 
 ### Browser storefront
 
-Build the storefront from the repository root with Node 24 using the same HTTPS origin configured on the API. Replace the example hostname and store ID with the approved values for the environment.
+Build the storefront from the repository root with Node 24 using the same HTTPS origin configured on the API. Replace the example hostname and store ID with the approved values for the environment. The command uses one public origin for both the API and the return route and excludes the builder's local Expo environment settings.
 
 ```sh
 npm ci
-CRUSTCAPER_BUILD_PROFILE=stage \
-CRUSTCAPER_WEB_CHECKOUT=true \
-CRUSTCAPER_API_BASE_URL=https://stage.example.test/api/v1 \
-CRUSTCAPER_APP_LINK_ORIGIN=https://stage.example.test \
-CRUSTCAPER_STORE_ID=kigali \
-CRUSTCAPER_PSP_HOSTS=checkout.flutterwave.com \
-npm run build:web
+npm run build:storefront -- --origin https://stage.example.test --profile stage \
+  --store-id kigali --psp-hosts checkout.flutterwave.com
 ```
 
-Set `CRUSTCAPER_STOREFRONT_DIR` in the Compose environment file to the absolute path of the exported `dist` directory. Mount only the build output. Add `-f server/deploy/compose.storefront.yml` to the existing HTTPS Compose command and keep the same project name. Run the validation and health checks above using all three files. For a different ingress, serve the storefront export and API on a single origin and set `CRUSTCAPER_WEB_ORIGIN` directly in the API environment. Serve `/web-payment-return` as a storefront route with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Keep the native association and `/payment-return` routes on the API. [Caddy static file routing](https://caddyserver.com/docs/caddyfile/directives/file_server)
+For a production web export, use `--profile production` and provide the registered app identifiers with `--android-package` and `--ios-bundle-id`. Keep staging and production exports in separate directories using `--output-dir dist-storefront-<label>`. Set `CRUSTCAPER_STOREFRONT_DIR` in the Compose environment file to the absolute path of the exported `dist-storefront` directory or the selected output. Mount only the build output. Add `-f server/deploy/compose.storefront.yml` to the existing HTTPS Compose command and keep the same project name. Run the validation and health checks above using all three files. For a different ingress, serve the storefront export and API on a single origin and set `CRUSTCAPER_WEB_ORIGIN` directly in the API environment. Serve `/web-payment-return` as a storefront route with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Keep the native association and `/payment-return` routes on the API. [Caddy static file routing](https://caddyserver.com/docs/caddyfile/directives/file_server)
 
 Browser guest credentials are set through a first-party HttpOnly cookie. Checkout and recovery use the browser session, the server-confirmed order and the payment provider's verified result. Test the hosted flow in the same tab over HTTPS, including a failed payment and recovery after reopening the browser, with Flutterwave Test before admitting recipients to the storefront.
 
@@ -122,4 +117,32 @@ Set `CRUSTCAPER_CATALOG_IMAGE` to the verified catalog image and `CRUSTCAPER_STO
 
 The default `CRUSTCAPER_STOREFRONT_PROFILE=stage` prevents indexing. Enable `production` only when the domain, published store data, imagery and customer-facing content have been approved. Verify localized deep links, robots and sitemap on the target hostname. If the API cannot confirm the menu, the catalog returns an unavailable page and preserves the checkout client's separate order routes. [Next.js self-hosting](https://nextjs.org/docs/pages/guides/self-hosting)
 
-The internal catalog health check returns 503 when the storefront profile, public origin, API origin or store ID is invalid. Temporary API outages surface on menu requests while the catalog process stays available for recovery. After importing the catalog, run `node server/tooling/check-live-catalog.mjs https://stage.example.com/api/v1 kigali catalog-001 --storefront` against the public origin. Use the approved store and version. The check covers the orderable public API, both rendered locales and advertised photos. Mount approved photo files separately from the checkout export through the [catalog photo overlay](docs/CATALOG.md#публикация-фотографий). Use `npm run monitor:storefront -- https://stage.example.com/api/v1 kigali --watch` from outside the deployment host for ongoing incident and recovery events. [Connected release procedure](../docs/runbooks/CONNECTED_RELEASE.md) · [Availability monitoring](docs/OPERATIONS.md#проверка-доступности-снаружи)
+The internal catalog health check returns 503 when the storefront profile, public origin, API origin or store ID is invalid. Temporary API outages surface on menu requests while the catalog process stays available for recovery. After importing the catalog and opening the store, run `node server/tooling/check-live-catalog.mjs https://stage.example.com/api/v1 kigali catalog-001 --checkout` against the public origin. Use the approved store and version. The check covers the orderable public API, both rendered locales, advertised photos, the checkout build and the guest session requirement at the storefront's origin. Mount approved photo files separately from the checkout export through the [catalog photo overlay](docs/CATALOG.md#публикация-фотографий). Use `npm run monitor:storefront -- https://stage.example.com/api/v1 kigali --watch` from outside the deployment host for ongoing incident and recovery events. [Connected release procedure](../docs/runbooks/CONNECTED_RELEASE.md) · [Availability monitoring](docs/OPERATIONS.md#проверка-доступности-снаружи)
+
+### Transfer verified Linux images
+
+Use a Docker daemon that supports API 1.49 or later and has the verified `linux/amd64` image variants in its local store. On the builder, export the API, catalog and pinned Caddy image alongside a lock file. Save a SHA-256 of the lock file with the release record.
+
+```sh
+node server/tooling/package-deployment.mjs export /secure/crustcaper-images \
+  "$(git rev-parse HEAD)" crustcaper-api:stage crustcaper-catalog:stage
+```
+
+On the target, use Node 24 and `tar`. Transfer the image directory and the matching source archive. Verify the lock file against the release record before importing. The loader checks the image archive against the lock and emits local immutable image references for Compose.
+
+```sh
+node server/tooling/package-deployment.mjs load /secure/crustcaper-images > /etc/crustcaper/stage/images.env
+
+portable_compose() (
+  unset CRUSTCAPER_API_IMAGE CRUSTCAPER_CATALOG_IMAGE CRUSTCAPER_EDGE_IMAGE
+  docker compose --env-file /etc/crustcaper/stage/compose.env \
+    --env-file /etc/crustcaper/stage/images.env --project-name crustcaper-stage \
+    -f server/deploy/compose.yml -f server/deploy/compose.https.yml \
+    -f server/deploy/compose.storefront.yml -f server/deploy/compose.catalog.yml \
+    -f server/deploy/compose.portable.yml "$@"
+)
+portable_compose config --quiet
+portable_compose up -d --wait --wait-timeout 90
+```
+
+Give the Compose file the host-specific storefront export, external PostgreSQL CA and API secret file described above. Use the optional catalog photo overlay before the portable overlay when photos are published. Keep the previous verified image archive and the previous Compose configuration as the inputs for an approved rollback. [Docker image archives](https://docs.docker.com/reference/cli/docker/image/save/)
