@@ -1030,6 +1030,23 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/operations/signals:
+    get:
+      operationId: getOperatorOperationsSignals
+      security: [{ operatorBearer: [] }]
+      description: Read-only operational counts for the authenticated manager's assigned store. Both counts use one database snapshot.
+      responses:
+        '200':
+          description: A snapshot of overdue handoffs and missing receipts for direct orders.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorOperationsSignals' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/reconciliation:
     get:
       operationId: getOperatorDailyReconciliation
@@ -1559,6 +1576,23 @@ components:
           type: string
           pattern: '^(0|[1-9][0-9]*)$'
           description: Exact nominal amount, in whole RWF.
+    OperatorOperationsSignals:
+      type: object
+      additionalProperties: false
+      required: [observedAt, paymentWithoutKitchen, fiscalReceiptsOverdue, fiscalReceiptOverdueAfterMinutes]
+      properties:
+        observedAt: { $ref: '#/components/schemas/Timestamp' }
+        paymentWithoutKitchen:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Orders absent from the active kitchen queue with a provider charge verified more than 60 seconds ago. Collected orders, refund states and charges recorded as exceptions are excluded.
+        fiscalReceiptsOverdue:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Paid direct orders with a recorded handoff older than the receipt deadline and a pending fiscal receipt.
+        fiscalReceiptOverdueAfterMinutes: { type: integer, minimum: 1 }
     OperatorDailyReconciliation:
       type: object
       required: [date, timeZone, currency, from, until, asOf, acceptedPayments, exceptionPayments, verifiedRefunds, attachedReceipts, unattachedReceipts, openExceptions, undatedAcceptedPayments]

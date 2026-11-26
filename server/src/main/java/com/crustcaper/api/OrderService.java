@@ -414,7 +414,8 @@ public class OrderService {
 
             boolean acceptable = current && attempt.status().equals("processing") && reservationStillValid(order);
             jdbc.sql("""
-                UPDATE payment_attempts SET status = 'paid', provider_transaction_id = ?, checkout_url = NULL
+                UPDATE payment_attempts SET status = 'paid', provider_transaction_id = ?, checkout_url = NULL,
+                    verified_at = clock_timestamp()
                 WHERE id = ?
                 """).params(payment.transactionId(), attemptId).update();
             if (acceptable) {

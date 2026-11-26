@@ -21,6 +21,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Clock;
+import java.time.OffsetDateTime;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
@@ -224,16 +225,21 @@ class FlutterwaveCheckoutIntegrationTest {
         api.perform(get(API + "/operator/orders").header(HttpHeaders.AUTHORIZATION, "Bearer " + kitchen))
             .andExpect(status().isOk()).andExpect(jsonPath("$.orders").isEmpty());
         assertThat(VERIFICATIONS.get()).isEqualTo(2);
+        UUID attemptId = UUID.fromString(reference);
+        assertThat(verificationTime(attemptId)).isNull();
 
         CHARGED.set(TOTAL + 25);
         api.perform(post(webhook).header("verif-hash", WEBHOOK_SECRET).contentType(MediaType.APPLICATION_JSON).content(event))
             .andExpect(status().isOk());
+        OffsetDateTime verifiedAt = verificationTime(attemptId);
+        assertThat(verifiedAt).isNotNull();
         String pickupCode = json.readTree(api.perform(get(orderPath).header(HttpHeaders.AUTHORIZATION, "Bearer " + guest))
             .andExpect(status().isOk()).andExpect(jsonPath("$.paymentStatus").value("paid"))
             .andReturn().getResponse().getContentAsByteArray()).path("pickupCode").asString();
         assertThat(pickupCode).matches("[0-9]{6}");
         api.perform(post(webhook).header("verif-hash", WEBHOOK_SECRET).contentType(MediaType.APPLICATION_JSON).content(event))
             .andExpect(status().isOk());
+        assertThat(verificationTime(attemptId)).isEqualTo(verifiedAt);
         api.perform(get(orderPath).header(HttpHeaders.AUTHORIZATION, "Bearer " + guest))
             .andExpect(status().isOk()).andExpect(jsonPath("$.pickupCode").value(pickupCode));
         api.perform(get(API + "/operator/orders").header(HttpHeaders.AUTHORIZATION, "Bearer " + kitchen))
@@ -244,6 +250,12 @@ class FlutterwaveCheckoutIntegrationTest {
         assertThat(jdbc.sql("SELECT count(*) FROM payment_attempts WHERE order_id = ?")
             .param(UUID.fromString(order)).query(Integer.class).single()).isEqualTo(1);
         assertThat(OPENS.get()).isEqualTo(1);
+    }
+
+    private OffsetDateTime verificationTime(UUID attemptId) {
+        return jdbc.sql("SELECT verified_at FROM payment_attempts WHERE id = ?")
+            .param(attemptId).query((row, index) -> row.getObject("verified_at", OffsetDateTime.class))
+            .list().getFirst();
     }
 
     private String seedStoreAndKitchen() throws Exception {
