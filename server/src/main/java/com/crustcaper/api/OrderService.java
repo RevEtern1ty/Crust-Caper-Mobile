@@ -44,7 +44,8 @@ public class OrderService {
     private static final TypeReference<List<CartLine>> CART_LINES = new TypeReference<>() {};
     private static final String ORDER = "SELECT * FROM orders WHERE id = ?";
     private static final String CHECKOUT_GUEST = """
-        AND (orders.guest_session_id = ? OR orders.web_checkout_guest_session_id = ?)
+        AND (orders.guest_session_id = ?
+            OR COALESCE(orders.mobile_checkout_guest_session_id, orders.web_checkout_guest_session_id) = ?)
         """;
     private static final String VISIBLE_TO_GUEST = """
         AND (orders.guest_session_id = ? OR EXISTS (
@@ -98,7 +99,7 @@ public class OrderService {
     }
 
     private record PaymentStart(Attempt attempt, StoredOrder order, boolean openGateway) {}
-    record WebCheckoutLookup(UUID orderId, Instant retryAt) {}
+    record CheckoutLookup(UUID orderId, Instant retryAt) {}
 
     OrderService(JdbcClient jdbc, Catalog catalog, CommerceJson json, PaymentGateway gateway,
                  TransactionTemplate transactions, @Value("${crustcaper.payment.provider}") String provider) {
@@ -228,26 +229,26 @@ public class OrderService {
     }
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
-    public WebCheckoutLookup lookupWebCheckout(String quote, String key) {
+    public CheckoutLookup lookupCheckout(String quote, String key, CheckoutChannel channel) {
         validateKey(key);
         UUID quoteId = ApiFailure.uuid(quote, ApiFailure.invalid());
         if (!quoteId.toString().equalsIgnoreCase(quote)) throw ApiFailure.invalid();
         // Order creation locks this same guest before checking quote expiry and inserting.
         jdbc.sql("""
             SELECT g.id FROM quotes q JOIN guest_sessions g ON g.id = q.guest_session_id
-            WHERE q.id = ? AND q.web_checkout
+            WHERE q.id = ? AND q.web_checkout = ?
             FOR UPDATE OF g
-            """).param(quoteId).query(UUID.class).optional().orElseThrow(ApiFailure::notFound);
+            """).params(quoteId, channel == CheckoutChannel.WEB).query(UUID.class).optional().orElseThrow(ApiFailure::notFound);
         // Use a new statement to see a commit made while waiting for the guest's lock.
         return jdbc.sql("""
             SELECT o.id, o.request_key, o.checkout_channel, q.expires_at, q.expires_at > clock_timestamp() AS active
             FROM quotes q LEFT JOIN orders o ON o.quote_id = q.id WHERE q.id = ?
             """).param(quoteId).query((rs, row) -> {
                 UUID orderId = rs.getObject("id", UUID.class);
-                if (orderId != null && (!"web".equals(rs.getString("checkout_channel"))
+                if (orderId != null && (!channel.name().equalsIgnoreCase(rs.getString("checkout_channel"))
                     || !key.equals(rs.getString("request_key")))) throw ApiFailure.notFound();
                 Instant retryAt = orderId == null && rs.getBoolean("active") ? readTime(rs, "expires_at") : null;
-                return new WebCheckoutLookup(orderId, retryAt);
+                return new CheckoutLookup(orderId, retryAt);
             }).optional().orElseThrow(ApiFailure::notFound);
     }
 
@@ -515,6 +516,8 @@ public class OrderService {
     }
 
     private StoredOrder orderRow(ResultSet rs, int row) throws SQLException {
+        CheckoutChannel channel = CheckoutChannel.valueOf(rs.getString("checkout_channel").toUpperCase(Locale.ROOT));
+        String recoveredGuest = channel == CheckoutChannel.MOBILE ? "mobile_checkout_guest_session_id" : "web_checkout_guest_session_id";
         return new StoredOrder(rs.getObject("id", UUID.class), rs.getObject("quote_id", UUID.class),
             rs.getObject("guest_session_id", UUID.class), rs.getString("store_id"), rs.getString("slot_id"),
             rs.getString("phone"), rs.getString("email"), json.read(rs.getString("lines"), CART_LINES),
@@ -522,8 +525,7 @@ public class OrderService {
             rs.getString("pickup_code"), rs.getString("receipt_status"), rs.getString("receipt_url"),
             readTime(rs, "created_at"), readTime(rs, "reservation_expires_at"),
             readTime(rs, "pickup_starts_at"), readTime(rs, "pickup_ends_at"),
-            CheckoutChannel.valueOf(rs.getString("checkout_channel").toUpperCase(Locale.ROOT)),
-            rs.getObject("web_checkout_guest_session_id", UUID.class));
+            channel, rs.getObject(recoveredGuest, UUID.class));
     }
 
     private OrderSnapshot snapshotRow(ResultSet rs, int row) throws SQLException {

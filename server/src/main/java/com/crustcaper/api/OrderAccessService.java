@@ -1,5 +1,6 @@
 package com.crustcaper.api;
 
+import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import com.crustcaper.api.recovery.PhoneVerificationException;
 import com.crustcaper.api.recovery.PhoneVerificationGateway;
 import com.crustcaper.api.recovery.PhoneVerificationGateway.VerificationCheck;
@@ -34,7 +35,7 @@ final class OrderAccessService {
 
     record ChallengeReceipt(UUID challengeId) {}
     record VerifiedOrder(UUID orderId) {}
-    private record Pending(UUID id, String orderCode, byte[] phoneDigest, UUID checkoutOrder) {}
+    private record Pending(UUID id, String orderCode, byte[] phoneDigest, UUID checkoutOrder, CheckoutChannel channel) {}
     private record Candidate(UUID orderId, String phone) {
         @Override
         public String toString() { return "RecoveryCandidate[redacted]"; }
@@ -43,7 +44,7 @@ final class OrderAccessService {
         @Override
         public String toString() { return "RecoveryDelivery[redacted]"; }
     }
-    private record Verification(UUID orderId, String providerReference, int attempts, String state, boolean checkoutRecovery) {
+    private record Verification(UUID orderId, String providerReference, int attempts, String state, CheckoutChannel channel) {
         @Override
         public String toString() { return "RecoveryVerification[redacted]"; }
     }
@@ -59,20 +60,20 @@ final class OrderAccessService {
         validatePhone(phone);
         if (orderCode == null || !ORDER_CODE.matcher(orderCode).matches()) throw ApiFailure.invalid();
         String reference = orderCode.substring(orderCode.length() - 8).toLowerCase(Locale.ROOT);
-        return enqueue(guest, reference, null, phone);
+        return enqueue(guest, reference, null, null, phone);
     }
 
-    ChallengeReceipt startCheckoutRecovery(UUID guest, UUID orderId, String phone) {
+    ChallengeReceipt startCheckoutRecovery(UUID guest, UUID orderId, String phone, CheckoutChannel channel) {
         requireGateway();
         validatePhone(phone);
-        return enqueue(guest, null, orderId, phone);
+        return enqueue(guest, null, orderId, channel, phone);
     }
 
     static void validatePhone(String phone) {
         if (phone == null || !PHONE.matcher(phone).matches()) throw ApiFailure.invalid();
     }
 
-    private ChallengeReceipt enqueue(UUID guest, String reference, UUID checkoutOrder, String phone) {
+    private ChallengeReceipt enqueue(UUID guest, String reference, UUID checkoutOrder, CheckoutChannel channel, String phone) {
         UUID challenge = UUID.randomUUID();
         UUID acknowledged = transactions.execute(tx -> {
             jdbc.sql("""
@@ -83,7 +84,7 @@ final class OrderAccessService {
                 """)
                 .param(guest).query(UUID.class).optional().orElseThrow(ApiFailure::unauthenticated);
             if (checkoutOrder != null) {
-                UUID sent = findCheckoutChallenge(guest, checkoutOrder, phone);
+                UUID sent = findCheckoutChallenge(guest, checkoutOrder, channel, phone);
                 if (sent != null) return sent;
             }
             long recent = jdbc.sql("""
@@ -94,21 +95,24 @@ final class OrderAccessService {
                 // The worker validates the contact and sends the challenge asynchronously.
                 jdbc.sql("""
                     INSERT INTO order_access_challenges
-                        (id, guest_session_id, order_code, phone_digest, order_id, checkout_recovery, state, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'queued', clock_timestamp() + interval '10 minutes')
-                    """).params(challenge, guest, reference, digest(challenge, phone), checkoutOrder, checkoutOrder != null).update();
+                        (id, guest_session_id, order_code, phone_digest, order_id, checkout_recovery,
+                         mobile_checkout_recovery, state, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', clock_timestamp() + interval '10 minutes')
+                    """).params(challenge, guest, reference, digest(challenge, phone), checkoutOrder,
+                        channel != null, channel == CheckoutChannel.MOBILE).update();
             }
             return challenge;
         });
         return new ChallengeReceipt(acknowledged);
     }
 
-    private UUID findCheckoutChallenge(UUID guest, UUID order, String phone) {
+    private UUID findCheckoutChallenge(UUID guest, UUID order, CheckoutChannel channel, String phone) {
         return jdbc.sql("""
             SELECT id, phone_digest FROM order_access_challenges
-            WHERE guest_session_id = ? AND checkout_recovery AND order_id = ? AND expires_at > clock_timestamp()
+            WHERE guest_session_id = ? AND checkout_recovery AND order_id = ?
+                AND mobile_checkout_recovery = ? AND expires_at > clock_timestamp()
             ORDER BY created_at DESC LIMIT ?
-            """).params(guest, order, MAX_CHALLENGES)
+            """).params(guest, order, channel == CheckoutChannel.MOBILE, MAX_CHALLENGES)
             .query((rs, row) -> {
                 UUID id = rs.getObject("id", UUID.class);
                 return MessageDigest.isEqual(rs.getBytes("phone_digest"), digest(id, phone)) ? id : null;
@@ -149,13 +153,18 @@ final class OrderAccessService {
 
     private Verification claimVerification(UUID guest, UUID challenge) {
         Verification stored = jdbc.sql("""
-            SELECT order_id, provider_reference, attempts, state, checkout_recovery FROM order_access_challenges
-            WHERE id = ? AND guest_session_id = ?
-              AND (state = 'verified' OR expires_at > clock_timestamp())
+            SELECT order_id, provider_reference, attempts, state, checkout_recovery, mobile_checkout_recovery
+            FROM order_access_challenges c
+            WHERE c.id = ? AND c.guest_session_id = ?
+              AND (c.state = 'verified' OR c.expires_at > clock_timestamp())
+              AND (c.state <> 'verified' OR NOT c.mobile_checkout_recovery OR EXISTS (
+                  SELECT FROM orders o WHERE o.id = c.order_id AND o.mobile_checkout_guest_session_id = c.guest_session_id
+              ))
             FOR UPDATE
             """).params(challenge, guest)
             .query((rs, row) -> new Verification(rs.getObject("order_id", UUID.class), rs.getString("provider_reference"),
-                rs.getInt("attempts"), rs.getString("state"), rs.getBoolean("checkout_recovery")))
+                rs.getInt("attempts"), rs.getString("state"),
+                recoveryChannel(rs.getBoolean("checkout_recovery"), rs.getBoolean("mobile_checkout_recovery"))))
             .optional().orElseThrow(ApiFailure::notFound);
         if (stored.state().equals("verified")) return stored;
         if (!stored.state().equals("sent") || stored.attempts() >= MAX_ATTEMPTS || stored.providerReference() == null) {
@@ -164,7 +173,7 @@ final class OrderAccessService {
         jdbc.sql("UPDATE order_access_challenges SET attempts = attempts + 1, state = 'checking' WHERE id = ?")
             .param(challenge).update();
         return new Verification(stored.orderId(), stored.providerReference(), stored.attempts() + 1, "checking",
-            stored.checkoutRecovery());
+            stored.channel());
     }
 
     private void finishUnsuccessfulVerification(UUID challenge, Verification claimed, boolean expired) {
@@ -176,6 +185,9 @@ final class OrderAccessService {
     }
 
     private VerifiedOrder grant(UUID guest, UUID challenge, Verification claimed) {
+        // Hold the recovering guest through the grant so revocation cannot replace an existing checkout guest mid-write.
+        jdbc.sql("SELECT id FROM guest_sessions WHERE id = ? AND expires_at > clock_timestamp() FOR SHARE")
+            .param(guest).query(UUID.class).optional().orElseThrow(ApiFailure::notFound);
         int completed = jdbc.sql("""
             UPDATE order_access_challenges c SET state = 'verified'
             WHERE c.id = ? AND c.guest_session_id = ? AND c.order_id = ? AND c.provider_reference = ?
@@ -184,11 +196,13 @@ final class OrderAccessService {
             """).params(challenge, guest, claimed.orderId(), claimed.providerReference(), claimed.attempts()).update();
         if (completed != 1) throw ApiFailure.notFound();
 
-        if (claimed.checkoutRecovery()) {
+        if (claimed.channel() != null) {
+            String checkoutGuest = claimed.channel() == CheckoutChannel.MOBILE
+                ? "mobile_checkout_guest_session_id" : "web_checkout_guest_session_id";
             int changed = jdbc.sql("""
-                UPDATE orders SET web_checkout_guest_session_id = ?
-                WHERE id = ? AND checkout_channel = 'web'
-                """).params(guest, claimed.orderId()).update();
+                UPDATE orders SET %s = ?
+                WHERE id = ? AND checkout_channel = ?
+                """.formatted(checkoutGuest)).params(guest, claimed.orderId(), channelValue(claimed.channel())).update();
             if (changed != 1) throw ApiFailure.notFound();
         }
         // Only a newly approved ordinary OTP can establish or refresh privacy access.
@@ -198,7 +212,7 @@ final class OrderAccessService {
             ON CONFLICT (guest_session_id, order_id) DO UPDATE
                 SET privacy_verified_at = GREATEST(order_read_grants.privacy_verified_at, EXCLUDED.privacy_verified_at)
                 WHERE EXCLUDED.privacy_verified_at IS NOT NULL
-            """).params(guest, claimed.orderId(), claimed.checkoutRecovery()).update();
+            """).params(guest, claimed.orderId(), claimed.channel() != null).update();
         return new VerifiedOrder(claimed.orderId());
     }
 
@@ -233,17 +247,20 @@ final class OrderAccessService {
 
     private Delivery claimDelivery() {
         Pending next = jdbc.sql("""
-            SELECT c.id, c.order_code, c.phone_digest, CASE WHEN c.checkout_recovery THEN c.order_id END AS checkout_order
+            SELECT c.id, c.order_code, c.phone_digest, c.order_id, c.checkout_recovery, c.mobile_checkout_recovery
             FROM order_access_challenges c
             WHERE c.state = 'queued' AND c.expires_at > clock_timestamp()
               AND EXISTS (SELECT FROM guest_sessions g WHERE g.id = c.guest_session_id AND g.expires_at > clock_timestamp())
             ORDER BY c.created_at, c.id LIMIT 1 FOR UPDATE OF c SKIP LOCKED
             """).query((rs, row) -> new Pending(rs.getObject("id", UUID.class), rs.getString("order_code"),
-                rs.getBytes("phone_digest"), rs.getObject("checkout_order", UUID.class))).optional().orElse(null);
+                rs.getBytes("phone_digest"), rs.getObject("order_id", UUID.class),
+                recoveryChannel(rs.getBoolean("checkout_recovery"), rs.getBoolean("mobile_checkout_recovery"))))
+            .optional().orElse(null);
         if (next == null) return null;
-        List<Candidate> matches = (next.checkoutOrder() == null
+        List<Candidate> matches = (next.channel() == null
             ? jdbc.sql("SELECT id, phone FROM orders WHERE right(id::text, 8) = ? LIMIT 2").param(next.orderCode())
-            : jdbc.sql("SELECT id, phone FROM orders WHERE id = ? AND checkout_channel = 'web'").param(next.checkoutOrder()))
+            : jdbc.sql("SELECT id, phone FROM orders WHERE id = ? AND checkout_channel = ?")
+                .params(next.checkoutOrder(), channelValue(next.channel())))
                 .query((rs, row) -> new Candidate(rs.getObject("id", UUID.class), rs.getString("phone"))).list();
         if (matches.size() != 1
             || !MessageDigest.isEqual(next.phoneDigest(), digest(next.id(), matches.getFirst().phone()))) {
@@ -269,6 +286,15 @@ final class OrderAccessService {
             WHERE id = ?
             """).params(recipient.orderId(), next.id()).update();
         return new Delivery(next.id(), recipient.phone());
+    }
+
+    private static CheckoutChannel recoveryChannel(boolean checkoutRecovery, boolean mobileCheckoutRecovery) {
+        if (!checkoutRecovery) return null;
+        return mobileCheckoutRecovery ? CheckoutChannel.MOBILE : CheckoutChannel.WEB;
+    }
+
+    private static String channelValue(CheckoutChannel channel) {
+        return channel.name().toLowerCase(Locale.ROOT);
     }
 
     private void close(UUID challenge) {

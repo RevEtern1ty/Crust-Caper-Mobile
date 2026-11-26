@@ -31,6 +31,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -65,6 +67,7 @@ class WebCommerceIntegrationTest {
     private static final String ORDERS = WEB + "/orders";
     private static final String CHALLENGES = WEB + "/order-access/challenges";
     private static final String CHECKOUT_RECOVERY = WEB + "/checkout-recovery";
+    private static final String NATIVE_CHECKOUT_RECOVERY = API + "/checkout-recovery";
     private static final String WEB_HEADER = "X-CrustCaper-Web";
     private static final String SESSION_HEADER = "X-CrustCaper-Session";
     private static final String COOKIE = "__Host-crustcaper-web";
@@ -430,6 +433,159 @@ class WebCommerceIntegrationTest {
     }
 
     @Test
+    void nativeCheckoutRecoveryClearsOnlyAnExpiredUnusedNativeQuote() throws Exception {
+        stockFixture();
+        var owner = issueNative();
+        var replacement = issueNative();
+        var browser = issueBrowser();
+        String quote = quote(nativeRequest(POST, API + "/quotes", owner));
+        String key = UUID.randomUUID().toString();
+        var waiting = body(recoverNativeCheckout(replacement, quote, key, PHONE).andExpect(status().isOk())
+            .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store")));
+        assertThat(waiting.path("state").asString()).isEqualTo("waiting");
+        assertThat(Instant.parse(waiting.path("retryAt").asString())).isAfter(Instant.now());
+        assertThat(waiting.size()).isEqualTo(2);
+
+        var data = Map.of("quoteId", quote, "key", key, "phone", PHONE);
+        api.perform(asJson(web(POST, NATIVE_CHECKOUT_RECOVERY).cookie(browser.cookie()), data))
+            .andExpect(status().isUnauthorized());
+        api.perform(asJson(guarded(POST, CHECKOUT_RECOVERY).header(HttpHeaders.AUTHORIZATION, replacement.bearer()), data))
+            .andExpect(status().isUnauthorized());
+        recoverNativeCheckout(replacement, "invalid-quote", key, PHONE).andExpect(status().isBadRequest());
+        recoverNativeCheckout(replacement, quote, "invalid key", PHONE).andExpect(status().isBadRequest());
+        recoverNativeCheckout(replacement, quote, key, "invalid-phone").andExpect(status().isBadRequest());
+        recoverNativeCheckout(replacement, UUID.randomUUID().toString(), key, PHONE).andExpect(status().isNotFound());
+
+        String webQuote = quote(authorized(POST, QUOTES, browser));
+        recoverNativeCheckout(replacement, webQuote, key, PHONE).andExpect(status().isNotFound());
+        expireQuote(webQuote);
+        recoverNativeCheckout(replacement, webQuote, key, PHONE).andExpect(status().isNotFound());
+        String placedWebQuote = quote(authorized(POST, QUOTES, browser));
+        submitOrder(authorized(POST, ORDERS, browser), placedWebQuote, key).andExpect(status().isOk());
+        jdbc.sql("UPDATE quotes SET web_checkout = false WHERE id = ?").param(UUID.fromString(placedWebQuote)).update();
+        recoverNativeCheckout(replacement, placedWebQuote, key, PHONE).andExpect(status().isNotFound());
+
+        expireQuote(quote);
+        var unused = body(recoverNativeCheckout(replacement, quote, key, PHONE).andExpect(status().isOk())
+            .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store")));
+        assertThat(unused.path("state").asString()).isEqualTo("not_placed");
+        assertThat(unused.size()).isEqualTo(1);
+        submitOrder(nativeRequest(POST, API + "/orders", owner), quote, key).andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("quote_expired"));
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE quote_id = ?").param(UUID.fromString(quote))
+            .query(Long.class).single()).isZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void nativeCheckoutRecoveryRecoversTheSameOrderAfterOwnerExpiryOrRevocation(boolean revoke) throws Exception {
+        stockFixture();
+        when(gateway.open(any())).thenReturn(new PaymentGateway.HostedPayment(CHECKOUT));
+        var owner = issueNative();
+        var replacement = issueNative();
+        var browser = issueBrowser();
+        String nativeOrders = API + "/orders";
+        String quote = quote(nativeRequest(POST, API + "/quotes", owner));
+        String key = UUID.randomUUID().toString();
+        String order = body(submitOrder(nativeRequest(POST, nativeOrders, owner), quote, key).andExpect(status().isOk()))
+            .path("id").asString();
+        UUID otherOrder = createNativeOrder(owner, UUID.randomUUID().toString());
+        expireQuote(quote);
+        if (revoke) {
+            api.perform(asJson(web(POST, API + "/guest-sessions/revoke"), Map.of("refreshToken", owner.refresh())))
+                .andExpect(status().isNoContent());
+        } else {
+            jdbc.sql("UPDATE guest_sessions SET expires_at = clock_timestamp() - interval '1 second' WHERE id = ?")
+                .param(owner.id()).update();
+        }
+
+        String orderPath = nativeOrders + "/" + order;
+        api.perform(nativeRequest(GET, nativeOrders + "/recovery", owner).header(KEY, key)).andExpect(status().isUnauthorized());
+        recoverNativeCheckout(owner, quote, key, PHONE).andExpect(status().isUnauthorized());
+        recoverNativeCheckout(replacement, quote, UUID.randomUUID().toString(), PHONE).andExpect(status().isNotFound());
+        recoverCheckout(browser, quote, key, PHONE).andExpect(status().isNotFound());
+
+        UUID wrongPhone = nativeCheckoutChallenge(replacement, quote, key, "+250700000001");
+        awaitChallengeState(wrongPhone, "closed");
+        verifyNativeChallenge(replacement, wrongPhone, OTP).andExpect(status().isNotFound());
+        UUID challenge = nativeCheckoutChallenge(replacement, quote, key, PHONE);
+        assertThat(nativeCheckoutChallenge(replacement, quote, key, PHONE)).isEqualTo(challenge);
+        awaitDelivery(challenge);
+
+        api.perform(nativeRequest(GET, orderPath, replacement)).andExpect(status().isNotFound());
+        api.perform(nativeRequest(POST, orderPath + "/payments", replacement).header(KEY, "before-verification"))
+            .andExpect(status().isNotFound());
+        verifyChallenge(browser, challenge).andExpect(status().isNotFound());
+        verifyNativeChallenge(replacement, challenge, "000000").andExpect(status().isNotFound());
+        verifyNativeChallenge(replacement, challenge, OTP).andExpect(status().isOk())
+            .andExpect(jsonPath("$.orderId").value(order));
+        verifyNativeChallenge(replacement, challenge, OTP).andExpect(status().isOk())
+            .andExpect(jsonPath("$.orderId").value(order));
+
+        api.perform(nativeRequest(GET, orderPath, replacement)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.status").value("awaiting_payment"));
+        api.perform(nativeRequest(GET, orderPath + "/data-export", replacement)).andExpect(status().isNotFound());
+        api.perform(nativeRequest(GET, nativeOrders + "/recovery", replacement).header(KEY, key)).andExpect(status().isNotFound());
+        api.perform(nativeRequest(GET, nativeOrders + "/" + otherOrder, replacement)).andExpect(status().isNotFound());
+        api.perform(authorized(POST, ORDERS + "/" + order + "/payments", browser).header(KEY, "web-writes"))
+            .andExpect(status().isNotFound());
+
+        var attempt = body(api.perform(nativeRequest(POST, orderPath + "/payments", replacement).header(KEY, "native-payment"))
+            .andExpect(status().isOk())).path("id").asString();
+        api.perform(nativeRequest(POST, orderPath + "/payments", replacement).header(KEY, "native-payment"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(attempt));
+        api.perform(nativeRequest(POST, orderPath + "/payments", replacement).header(KEY, "extra-attempt"))
+            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("payment_pending"));
+        verify(gateway).open(argThat(input -> input.checkoutChannel() == PaymentGateway.CheckoutChannel.MOBILE
+            && input.reference().equals(attempt)));
+        assertThat(jdbc.sql("SELECT id FROM payment_attempts WHERE order_id = ?").param(UUID.fromString(order))
+            .query(UUID.class).list()).containsExactly(UUID.fromString(attempt));
+        assertThat(jdbc.sql("""
+            SELECT EXISTS (SELECT FROM orders WHERE id = ? AND quote_id = ? AND guest_session_id = ? AND request_key = ?
+                AND mobile_checkout_guest_session_id = ? AND web_checkout_guest_session_id IS NULL)
+            """).params(UUID.fromString(order), UUID.fromString(quote), owner.id(), key, replacement.id())
+            .query(Boolean.class).single()).isTrue();
+    }
+
+    @Test
+    void olderVerifiedNativeChallengeCannotRestoreAReplacedCheckoutGrant() throws Exception {
+        stockFixture();
+        when(gateway.open(any())).thenReturn(new PaymentGateway.HostedPayment(CHECKOUT));
+        var owner = issueNative();
+        var firstGuest = issueNative();
+        var nextGuest = issueNative();
+        String nativeOrders = API + "/orders";
+        String quote = quote(nativeRequest(POST, API + "/quotes", owner));
+        String key = UUID.randomUUID().toString();
+        String order = body(submitOrder(nativeRequest(POST, nativeOrders, owner), quote, key).andExpect(status().isOk()))
+            .path("id").asString();
+        String orderPath = nativeOrders + "/" + order;
+
+        UUID first = nativeCheckoutChallenge(firstGuest, quote, key, PHONE);
+        awaitDelivery(first);
+        verifyNativeChallenge(firstGuest, first, OTP).andExpect(status().isOk());
+        var attempt = body(api.perform(nativeRequest(POST, orderPath + "/payments", firstGuest).header(KEY, "first-guest"))
+            .andExpect(status().isOk())).path("id").asString();
+        jdbc.sql("UPDATE order_access_challenges SET reserved_at = clock_timestamp() - interval '12 minutes' WHERE id = ?")
+            .param(first).update();
+
+        UUID next = nativeCheckoutChallenge(nextGuest, quote, key, PHONE);
+        awaitDelivery(next);
+        verifyNativeChallenge(nextGuest, next, OTP).andExpect(status().isOk());
+        verifyNativeChallenge(firstGuest, first, OTP).andExpect(status().isNotFound());
+        api.perform(nativeRequest(GET, orderPath, firstGuest)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").isEmpty());
+        api.perform(nativeRequest(POST, orderPath + "/payments", firstGuest).header(KEY, "first-guest"))
+            .andExpect(status().isNotFound());
+        api.perform(nativeRequest(POST, orderPath + "/payments", nextGuest).header(KEY, "first-guest"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(attempt));
+        assertThat(jdbc.sql("SELECT mobile_checkout_guest_session_id FROM orders WHERE id = ?").param(UUID.fromString(order))
+            .query(UUID.class).single()).isEqualTo(nextGuest.id());
+        verify(gateway).open(argThat(input -> input.checkoutChannel() == PaymentGateway.CheckoutChannel.MOBILE
+            && input.reference().equals(attempt)));
+    }
+
+    @Test
     void checkoutRecoveryWaitsForTheOriginalCreateTransactionBeforeResolvingAnExpiredQuote() throws Exception {
         stockFixture();
         var owner = issueBrowser();
@@ -477,6 +633,61 @@ class WebCommerceIntegrationTest {
                 .andExpect(jsonPath("$.orderId").value(staged.id().toString()));
             api.perform(authorized(GET, ORDERS + "/" + staged.id(), replacement)).andExpect(status().isOk())
                 .andExpect(jsonPath("$.recoveryReadOnly").doesNotExist());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void nativeCheckoutRecoveryWaitsForTheCreateTransactionAcrossQuoteExpiry(boolean commit) throws Exception {
+        stockFixture();
+        var owner = issueNative();
+        var replacement = issueNative();
+        String quote = quote(nativeRequest(POST, API + "/quotes", owner));
+        String key = UUID.randomUUID().toString();
+        var insertion = new CompletableFuture<StagedCreate>();
+        var finishCreate = new CountDownLatch(1);
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var creator = executor.submit(() -> transactions.executeWithoutResult(status -> {
+                try {
+                    var order = orders.createOrder(owner.id(), key, new ApiModels.OrderInput(quote, PHONE, null));
+                    int pid = jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single();
+                    insertion.complete(new StagedCreate(order.id(), pid));
+                    assertThat(finishCreate.await(10, TimeUnit.SECONDS)).isTrue();
+                    if (!commit) status.setRollbackOnly();
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted before finishing the fixture order", error);
+                } catch (RuntimeException | Error failure) {
+                    insertion.completeExceptionally(failure);
+                    throw failure;
+                }
+            }));
+            var staged = insertion.get(5, TimeUnit.SECONDS);
+            var recovery = executor.submit(() -> {
+                expireQuote(quote);
+                return body(recoverNativeCheckout(replacement, quote, key, PHONE).andExpect(status().isOk()));
+            });
+            try {
+                awaitGuestLock(staged.transactionPid());
+                assertThat(recovery.isDone()).isFalse();
+            } finally {
+                finishCreate.countDown();
+            }
+            creator.get(5, TimeUnit.SECONDS);
+            var recovered = recovery.get(5, TimeUnit.SECONDS);
+            var persisted = jdbc.sql("SELECT id FROM orders WHERE quote_id = ?").param(UUID.fromString(quote))
+                .query(UUID.class).list();
+            if (commit) {
+                assertThat(recovered.path("state").asString()).isEqualTo("verify");
+                assertThat(persisted).containsExactly(staged.id());
+                UUID challenge = UUID.fromString(recovered.path("challengeId").asString());
+                awaitDelivery(challenge);
+                verifyNativeChallenge(replacement, challenge, OTP).andExpect(status().isOk())
+                    .andExpect(jsonPath("$.orderId").value(staged.id().toString()));
+            } else {
+                assertThat(recovered.path("state").asString()).isEqualTo("not_placed");
+                assertThat(persisted).isEmpty();
+            }
         }
     }
 
@@ -551,6 +762,19 @@ class WebCommerceIntegrationTest {
             Map.of("quoteId", quote, "key", key, "phone", phone)));
     }
 
+    private ResultActions recoverNativeCheckout(NativeGuest guest, String quote, String key, String phone) throws Exception {
+        return api.perform(asJson(nativeRequest(POST, NATIVE_CHECKOUT_RECOVERY, guest),
+            Map.of("quoteId", quote, "key", key, "phone", phone)));
+    }
+
+    private UUID nativeCheckoutChallenge(NativeGuest guest, String quote, String key, String phone) throws Exception {
+        var response = body(recoverNativeCheckout(guest, quote, key, phone).andExpect(status().isOk())
+            .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store")));
+        assertThat(response.path("state").asString()).isEqualTo("verify");
+        assertThat(response.size()).isEqualTo(2);
+        return UUID.fromString(response.path("challengeId").asString());
+    }
+
     private UUID checkoutChallenge(Browser browser, String quote, String key, String phone) throws Exception {
         var result = body(recoverCheckout(browser, quote, key, phone).andExpect(status().isOk())
             .andExpect(header().string(HttpHeaders.CACHE_CONTROL, containsString("no-store"))));
@@ -570,6 +794,13 @@ class WebCommerceIntegrationTest {
 
     private ResultActions verifyChallenge(Browser browser, UUID challenge, String code) throws Exception {
         var result = api.perform(asJson(authorized(POST, CHALLENGES + "/" + challenge + "/verify", browser),
+            new OrderAccessController.VerifyInput(code)));
+        var initial = result.andReturn();
+        return initial.getRequest().isAsyncStarted() ? api.perform(asyncDispatch(initial)) : result;
+    }
+
+    private ResultActions verifyNativeChallenge(NativeGuest guest, UUID challenge, String code) throws Exception {
+        var result = api.perform(asJson(nativeRequest(POST, API + "/order-access/challenges/" + challenge + "/verify", guest),
             new OrderAccessController.VerifyInput(code)));
         var initial = result.andReturn();
         return initial.getRequest().isAsyncStarted() ? api.perform(asyncDispatch(initial)) : result;
