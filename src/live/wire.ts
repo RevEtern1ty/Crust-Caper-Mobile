@@ -100,7 +100,7 @@ function validOrderTotals(value: Pick<z.infer<typeof orderFields>, 'tax' | 'tota
     && Date.parse(value.pickupStartsAt) < Date.parse(value.pickupEndsAt);
 }
 
-export const orderResponse = orderFields.refine(validOrderTotals);
+export const orderResponse = orderFields.extend({ recoveryReadOnly: z.literal(true).optional() }).refine(validOrderTotals);
 
 const canonicalId = z.guid().refine(value => value === value.toLowerCase());
 export const orderDataExportResponse = z.strictObject({
@@ -133,7 +133,7 @@ export const webSessionResponse = z.strictObject({
   sessionId: z.guid().refine(value => value === value.toLowerCase()),
   expiresAt: timestamp,
 });
-export const webOrderResponse = orderResponse.safeExtend({ recoveryReadOnly: z.literal(true).optional() });
+export const webOrderResponse = orderResponse;
 
 export const orderAccessChallenge = z.object({ challengeId: z.guid() });
 export const orderAccessGrant = z.object({ orderId: z.guid().refine((id) => id === id.toLowerCase()) });

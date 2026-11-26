@@ -2033,6 +2033,10 @@ components:
         pickupCode: { type: ['string', 'null'] }
         receiptStatus: { type: string, enum: [pending, issued, corrected] }
         receiptUrl: { type: ['string', 'null'], format: uri-reference }
+        recoveryReadOnly:
+          type: boolean
+          const: true
+          description: Present when the current guest can read this order but has no checkout authority for it.
         paymentAttempt:
           anyOf:
             - $ref: '#/components/schemas/PaymentAttempt'

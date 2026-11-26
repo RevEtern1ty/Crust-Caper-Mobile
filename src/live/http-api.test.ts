@@ -440,6 +440,49 @@ test('native recovery cannot substitute a still-valid primary checkout identity'
   assert.equal(data.get(journalKey + '.guest'), JSON.stringify(session));
 });
 
+test('a proven unplaced checkout can get a new quote when the recovery guest has expired or been revoked', async () => {
+  for (const revoked of [false, true]) {
+    const { data, storage } = memory();
+    const temporary = revoked ? recoveryGuest : {
+      ...recoveryGuest, expiresAt: expiredGuest.expiresAt, refreshExpiresAt: expiredGuest.refreshExpiresAt,
+    };
+    const original = JSON.stringify(expiredGuest);
+    const journal = { version: 1, active: null, orderIds: [pickupOrderId] };
+    data.set(journalKey, JSON.stringify(journal));
+    data.set(journalKey + '.guest', revoked ? JSON.stringify(temporary) : original);
+    data.set(journalKey + '.pending-checkout-guest', JSON.stringify({
+      state: 'not_placed', quoteId: '35ec0f83-629a-45e7-bff4-e445cc1e0739', key: 'previous-attempt',
+      previous: original, guest: temporary,
+    }));
+    const input = { storeId: config.storeId, slotId: order.slotId, lines: [cartLine] };
+    const { calls, fetcher } = transport(call => {
+      if (call.url.endsWith('/guest-sessions/refresh')) return new Response(null, { status: 401 });
+      if (call.url.endsWith('/guest-sessions')) return Response.json(session);
+      assert.equal(call.url, config.apiBaseUrl + '/quotes');
+      if (call.token === 'Bearer ' + temporary.accessToken) return new Response(null, { status: 401 });
+      assert.equal(call.token, 'Bearer ' + accessToken);
+      return Response.json({
+        ...input, quoteId: 'fresh-quote', subtotal: order.total, tax: 0, total: order.total, currency: 'RWF',
+        expiresAt, pickupStartsAt: order.pickupStartsAt, pickupEndsAt: order.pickupEndsAt, changes: [],
+      });
+    });
+    const options = { config, storage, journalKey, fetcher, now };
+    if (revoked) await assert.rejects(createLiveApi(options).createQuote(input), { code: 'unauthenticated' });
+    assert.equal((await createLiveApi(options).createQuote(input)).id, 'fresh-quote');
+    assert.deepEqual(JSON.parse(data.get(journalKey)!), journal);
+    assert.equal(calls.filter(call => call.url.endsWith('/guest-sessions')).length, 1);
+  }
+});
+
+test('native reads retain the server read-only flag and hide the payment link', async () => {
+  const { data, storage } = memory();
+  data.set(journalKey + '.guest', JSON.stringify(session));
+  const { fetcher } = transport(() => Response.json({ ...order, recoveryReadOnly: true }));
+  const observed = await createLiveApi({ config, storage, journalKey, fetcher, now }).getOrder(order.id);
+  assert.equal(observed.recoveryReadOnly, true);
+  assert.equal(observed.paymentAttempt?.checkoutUrl, null);
+});
+
 test('verified recovery of the expired tracked order promotes once and preserves the saved journal', async () => {
   const { data, storage } = memory();
   const oldJournal = JSON.stringify({

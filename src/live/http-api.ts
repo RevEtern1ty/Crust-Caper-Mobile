@@ -148,7 +148,9 @@ export function createLiveApi({
       ...order,
       receiptUrl: order.receiptStatus !== 'pending' && paymentReturnOrderId(order.id)
         && order.receiptUrl === '/api/v1' + receiptPath(order.id) ? order.receiptUrl : null,
-      paymentAttempt: order.paymentAttempt ? checkedPayment(order.paymentAttempt) : null,
+      paymentAttempt: order.paymentAttempt
+        ? (order.recoveryReadOnly ? { ...order.paymentAttempt, checkoutUrl: null } : checkedPayment(order.paymentAttempt))
+        : null,
     };
   };
 
@@ -277,19 +279,39 @@ export function createLiveApi({
         || !matchesGuestSnapshot(await readSaved(sessionKey), scope.previous)))) throw new GuestRejected();
   }
 
-  async function adoptCheckoutRecovery(rawGuest: string | null): Promise<Session | null> {
+  async function adoptCheckoutRecovery(
+    rawGuest: string | null, rejectedAccessToken: string | undefined, allowNewGuest: boolean,
+  ): Promise<Session | null> {
     // An unreadable recovery record must never replace an existing authenticated guest.
     const scope = await loadCheckoutRecovery().catch(() => null);
-    if (!scope || (scope.state !== 'confirmed' && scope.state !== 'not_placed')
-      || !matchesGuestSnapshot(rawGuest, scope.previous)) return null;
+    if (!scope || (scope.state !== 'confirmed' && scope.state !== 'not_placed')) return null;
+    const current = rawGuest === null ? null : decodeSaved(rawGuest, savedSession);
+    const alreadyAdopted = scope.state === 'not_placed' && current && sameGuest(current, scope.guest);
+    if (!alreadyAdopted && !matchesGuestSnapshot(rawGuest, scope.previous)) return null;
     const rawJournal = await readSaved(journalKey);
     const { active } = parseJournal(rawJournal);
     // The journal transition must outlive a restart before this guest can become the write identity.
     if (scope.state === 'not_placed' ? active !== null
       : !active || active.phase === 'creating' || active.orderId !== scope.orderId) return null;
-    if (Date.parse(scope.guest.refreshExpiresAt) <= now()) throw new GuestRejected();
-    const guest = scope.guest.rotationKey || Date.parse(scope.guest.expiresAt) <= now()
-      ? await renewGuest(scope.guest, next => saveCheckoutRecovery({ ...scope, guest: next })) : scope.guest;
+    const saved = alreadyAdopted ? current : scope.guest;
+    const expired = Date.parse(saved.refreshExpiresAt) <= now();
+    const needsRefresh = saved.rotationKey || saved.accessToken === rejectedAccessToken
+      || Date.parse(saved.expiresAt) <= now();
+    if (alreadyAdopted && !expired && !needsRefresh) return null;
+    let guest: Session | null = saved;
+    if (expired) {
+      guest = null;
+    } else if (needsRefresh) {
+      guest = await renewGuest(saved, next => saveCheckoutRecovery({ ...scope, guest: next })).catch(error => {
+        if (!(error instanceof GuestRejected) || scope.state !== 'not_placed') throw error;
+        return null;
+      });
+    }
+    if (!guest) {
+      if (scope.state !== 'not_placed' || !allowNewGuest) throw new GuestRejected();
+      guest = await request({ path: '/guest-sessions', method: 'POST', schema: sessionResponse });
+      await saveCheckoutRecovery({ ...scope, previous: guestSnapshot(rawGuest), guest });
+    }
     if (await readSaved(journalKey) !== rawJournal || await readSaved(sessionKey) !== rawGuest) throw new GuestRejected();
     return durableSession(guest);
   }
@@ -299,7 +321,7 @@ export function createLiveApi({
     if (sessionPromise) return sessionPromise;
     sessionPromise = (async () => {
       const raw = await readSaved(sessionKey);
-      const recovered = await adoptCheckoutRecovery(raw);
+      const recovered = await adoptCheckoutRecovery(raw, rejectedAccessToken, allowNewGuest);
       if (recovered) return recovered;
       if (raw !== null) {
         const existing = decodeSaved(raw, savedSession);
