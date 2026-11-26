@@ -2,6 +2,7 @@ package com.crustcaper.api;
 
 import static com.crustcaper.api.ApiModels.Problem;
 
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
@@ -33,7 +34,14 @@ final class CommerceProblems {
     }
 
     @ExceptionHandler({DataAccessException.class, TransactionException.class, ArithmeticException.class})
-    ResponseEntity<Problem> unavailable() {
+    ResponseEntity<Problem> unavailable(Exception failure, HttpServletRequest request) {
+        String category = switch (failure) {
+            case DataAccessException ignored -> "database";
+            case TransactionException ignored -> "transaction";
+            case ArithmeticException ignored -> "arithmetic";
+            default -> "unavailable";
+        };
+        ApiRequestDiagnostics.markFailure(request, category);
         return problem(ApiFailure.unavailable());
     }
 }

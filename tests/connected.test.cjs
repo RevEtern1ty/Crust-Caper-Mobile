@@ -711,6 +711,62 @@ test('a paid order appears on the kitchen screen within ten seconds and is ackno
   }
 });
 
+test('a queue refresh failure hides stale emptiness and only shows a valid support ID', { timeout: 25_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.setDefaultTimeout(6500);
+
+  const supportId = 'ba8b8f93-4a07-4711-82d6-189a3cfe5747';
+  const problem = 'The order queue could not be refreshed. Try again.';
+  let unavailable = false;
+  let responseId = supportId;
+  const order = {
+    id: '7868ff38-8501-4ea7-a7cb-4d2d52e4fe7a', status: 'accepted', paymentStatus: 'paid',
+    acceptedAt: '2031-01-01T12:00:00Z', pickupStartsAt: '2031-01-01T12:10:00Z', pickupEndsAt: '2031-01-01T12:20:00Z',
+    lines: [{ sku: 'double-smash', modifierIds: [], quantity: 1 }],
+  };
+  let orders = [];
+  await page.route(api + '/operator/orders', route => unavailable
+    ? route.fulfill({ status: 503, headers: { 'X-Request-ID': responseId }, json: { detail: 'private fixture detail' } })
+    : route.fulfill({ json: { orders, serverTime: '2031-01-01T12:00:05Z' } }));
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-kitchen');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(page, 'Sign in').click();
+  await shown(page, 'No paid orders are waiting.');
+
+  unavailable = true;
+  await button(page, 'Refresh').click();
+  await shown(page, `${problem} Support ID ${supportId}.`);
+  assert.equal(await page.locator('#empty-state').isVisible(), false);
+  assert.equal(await page.locator('#queue-stale').isVisible(), true);
+  assert.doesNotMatch(await page.locator('#queue-problem').textContent(), /private fixture detail/);
+  await capture(page, 'operator-queue-refresh-failure');
+
+  unavailable = false;
+  orders = [order];
+  await button(page, 'Refresh').click();
+  await button(page, 'Start preparing').waitFor();
+  assert.equal(await page.locator('#queue-problem').isVisible(), false);
+  assert.equal(await button(page, 'Start preparing').isEnabled(), true);
+
+  unavailable = true;
+  responseId = 'fixture-not-a-request-id';
+  await button(page, 'Refresh').click();
+  await shown(page, problem);
+  assert.equal(await button(page, 'Start preparing').isDisabled(), true);
+  assert.equal(await page.locator('#queue-problem').textContent(), problem);
+
+  unavailable = false;
+  orders = [];
+  await button(page, 'Refresh').click();
+  await shown(page, 'No paid orders are waiting.');
+  assert.equal(await page.locator('#queue-problem').isVisible(), false);
+  assert.equal(await page.locator('#queue-stale').isVisible(), false);
+});
+
 test('kitchen sound follows a fresh paid queue, stops offline and clears after server acknowledgment', { timeout: 30_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const browser = await chromium.launch({ channel: 'chrome' });

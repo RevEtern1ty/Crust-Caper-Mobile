@@ -97,10 +97,11 @@ const orderSound = createOrderSound((state) => {
 });
 
 class ApiError extends Error {
-  constructor(status, code) {
+  constructor(status, code, requestId) {
     super('An operator request failed');
     this.status = status;
     this.code = code;
+    this.requestId = typeof requestId === 'string' && uuid.test(requestId) ? requestId : null;
   }
 }
 
@@ -127,7 +128,7 @@ async function request(path, { method = 'GET', token, body, receipt, timeoutMs =
       signal: abort.signal,
     });
     const data = response.status === 204 ? null : await response.json().catch(() => null);
-    if (!response.ok) throw new ApiError(response.status, data?.code);
+    if (!response.ok) throw new ApiError(response.status, data?.code, response.headers.get('X-Request-ID'));
     return data;
   } finally {
     clearTimeout(deadline);
@@ -139,13 +140,16 @@ function showMessage(target, message = '') {
   target.hidden = !message;
 }
 
-function messageFor(error) {
+function messageFor(error, unavailable = 'The server could not complete this request. Try again.') {
   if (!(error instanceof ApiError)) return 'The server could not be reached. Try again.';
+  if (error.status >= 500) {
+    const message = error.code === 'refund_verification_unavailable' ? 'Refund verification is temporarily unavailable.' : unavailable;
+    return error.requestId ? `${message} Support ID ${error.requestId}.` : message;
+  }
   if (error.code === 'pickup_code_mismatch') return 'The pickup code did not match. Ask the guest for the code shown in their order.';
   if (error.code === 'refund_unconfirmed') return 'Flutterwave did not confirm a completed full refund for this payment.';
   if (error.code === 'payment_reference_unavailable') return 'The paid transaction could not be identified. Check Payment review before cancelling this order.';
   if (error.code === 'refund_already_recorded') return 'This payment already has a recorded refund. Refresh payment review.';
-  if (error.code === 'refund_verification_unavailable') return 'Refund verification is temporarily unavailable.';
   if (error.code === 'receipt_already_issued') return 'A receipt is already attached to this order. Refresh fiscal receipts.';
   if (error.code === 'receipt_reference_in_use') return 'This receipt reference is already attached to another order.';
   if (error.code === 'receipt_total_mismatch') return 'The total printed on the receipt must match the paid order.';
@@ -157,7 +161,7 @@ function messageFor(error) {
   if (error.status === 403) return 'Your staff role does not allow this action.';
   if (error.status === 429) return 'Too many requests. Wait a moment and try again.';
   if (error.status === 400) return 'Check the information you entered and try again.';
-  return 'The server could not complete this request. Try again.';
+  return unavailable;
 }
 
 function label(value) {
@@ -194,6 +198,7 @@ function syncKitchenSignal() {
   changeText(queueStale, offline ? 'You are offline. Reconnect to refresh the kitchen queue.'
     : 'The kitchen queue may be out of date. Refresh before starting an order.');
   queueStale.hidden = !offline && !stale;
+  emptyState.hidden = !fresh || orders.length !== 0;
   kitchenSignal.hidden = !kitchen;
   let waiting = 0;
   for (const { card, order } of cards.values()) {
@@ -214,8 +219,9 @@ function syncKitchenSignal() {
   }
 
   if (kitchen) {
-    kitchenSignal.dataset.waiting = String(waiting > 0);
-    changeText(kitchenNewOrders, waiting === 1 ? '1 order awaiting preparation.' : `${waiting} orders awaiting preparation.`);
+    kitchenSignal.dataset.waiting = String(fresh && waiting > 0);
+    const waitingMessage = waiting === 1 ? '1 order awaiting preparation.' : `${waiting} orders awaiting preparation.`;
+    changeText(kitchenNewOrders, fresh ? waitingMessage : stale ? 'Waiting orders could not be confirmed.' : '');
     changeText(kitchenSoundToggle, kitchenSoundState === 'on' ? 'Mute order sound' : 'Enable order sound');
     kitchenSoundToggle.disabled = kitchenSoundState === 'starting';
     changeText(kitchenSoundStatus, kitchenSoundState === 'on' ? (fresh ? 'Order sound is on.' : 'Order sound is paused until the queue is refreshed.')
@@ -384,7 +390,6 @@ function renderOrders() {
     }
     if (orderList.children[index] !== card) orderList.insertBefore(card, orderList.children[index] ?? null);
   });
-  emptyState.hidden = display.length !== 0;
   syncKitchenSignal();
   if (cancellation && !cancellation.submitting && !isCurrentCancellation(cancellation)) {
     closeCancellation(`Order ${orderNumber(cancellation.id)} changed. Review the updated queue.`);
@@ -659,7 +664,8 @@ async function refreshQueue(force = false) {
     else {
       needsQueueRefresh = true;
       syncKitchenSignal();
-      showMessage(queueProblem, messageFor(error));
+      if (!queueSnapshot) updateTime.textContent = '';
+      showMessage(queueProblem, messageFor(error, 'The order queue could not be refreshed. Try again.'));
     }
   } finally {
     if (session === current && refreshVersion === version) {

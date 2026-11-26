@@ -797,6 +797,10 @@ components:
                     enum: [quote_expired, quote_changed, slot_unavailable, conflict, reservation_expired, payment_pending, payment_mismatch]
     ServiceUnavailable:
       description: The service or upstream provider is temporarily unavailable.
+      headers:
+        X-Request-ID:
+          description: Opaque request ID for errors returned by the API. Infrastructure errors may omit it.
+          schema: { type: string, format: uuid }
       content:
         application/problem+json:
           schema:
