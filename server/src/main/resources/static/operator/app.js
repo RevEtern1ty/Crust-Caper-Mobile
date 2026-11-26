@@ -1,4 +1,5 @@
 import { mountAvailability } from './availability.js';
+import { mountExternalOrders, readExternalOrder } from './external-orders.js';
 import { createOrderSound } from './order-sound.js';
 import { mountReconciliation } from './reconciliation.js';
 
@@ -14,6 +15,7 @@ const refreshButton = element('refresh-button');
 const queueProblem = element('queue-problem');
 const queueStale = element('queue-stale');
 const kitchenSignal = element('kitchen-signal');
+const kitchenSignalTitle = element('kitchen-signal-title');
 const kitchenNewOrders = element('kitchen-new-orders');
 const kitchenSoundToggle = element('kitchen-sound-toggle');
 const kitchenSoundStatus = element('kitchen-sound-status');
@@ -93,6 +95,8 @@ const pickupChecks = new Map();
 
 let session = null;
 let orders = [];
+let externalOrders = [];
+let sawExternalOrders = false;
 let receipts = [];
 let timer;
 let kitchenTimer;
@@ -118,6 +122,11 @@ let authVersion = 0;
 let cancellation = null;
 const availability = mountAvailability({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
 const reconciliation = mountReconciliation({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
+const delivery = mountExternalOrders({
+  currentSession: availableSession, request, showMessage, messageFor, closeSession, queueFresh, syncQueue: syncKitchenSignal,
+  isCurrent: (order) => externalOrders.some((item) => item.id === order.id && item.status === order.status),
+  onOrder: updateExternalOrder,
+});
 let kitchenSoundState = 'off';
 const orderSound = createOrderSound((state) => {
   kitchenSoundState = state;
@@ -231,12 +240,17 @@ function syncKitchenSignal() {
   changeText(queueStale, offline ? 'You are offline. Reconnect to refresh the kitchen queue.'
     : 'The kitchen queue may be out of date. Refresh before starting an order.');
   queueStale.hidden = !offline && !stale;
-  emptyState.hidden = !fresh || orders.length !== 0;
+  emptyState.hidden = !fresh || orders.length !== 0 || externalOrders.length !== 0;
+  changeText(emptyState, sawExternalOrders ? 'No orders are waiting.' : 'No paid orders are waiting.');
+  changeText(kitchenSignalTitle, sawExternalOrders ? 'New orders' : 'New paid orders');
   kitchenSignal.hidden = !kitchen;
   let waiting = 0;
   for (const { card, order } of cards.values()) {
-    const action = card.querySelector('[data-kitchen-action]');
-    if (action) action.disabled = !fresh || kitchenTransitions.has(order.id);
+    if (order.external) delivery.syncCard(card, order, fresh);
+    else {
+      const action = card.querySelector('[data-kitchen-action]');
+      if (action) action.disabled = !fresh || kitchenTransitions.has(order.id);
+    }
     if (!kitchen || order.status !== 'accepted') continue;
     waiting++;
     const wait = card.querySelector('.kitchen-wait');
@@ -318,12 +332,13 @@ function renderedLine(line) {
   const details = document.createElement('div');
   const name = document.createElement('span');
   name.className = 'name';
-  name.textContent = label(line.sku);
+  name.textContent = line.name ?? label(line.sku);
   details.append(name);
-  if (line.modifierIds.length) {
+  const options = line.modifiers ?? line.modifierIds.map(label);
+  if (options.length) {
     const modifiers = document.createElement('span');
     modifiers.className = 'modifiers';
-    modifiers.textContent = line.modifierIds.map(label).join(' · ');
+    modifiers.textContent = options.join(' · ');
     details.append(modifiers);
   }
   row.append(quantity, details);
@@ -395,9 +410,11 @@ function addCancellation(card, order) {
 }
 
 function renderOrders() {
-  const display = [...orders].sort((left, right) => Date.parse(left.pickupStartsAt) - Date.parse(right.pickupStartsAt)
+  const display = [...orders, ...externalOrders].sort((left, right) =>
+    Date.parse(left.pickupStartsAt ?? left.scheduledAt) - Date.parse(right.pickupStartsAt ?? right.scheduledAt)
     || left.id.localeCompare(right.id));
-  const visible = new Set(display.map(({ id }) => id));
+  const cardKey = (order) => order.external ? `external-${order.id}` : order.id;
+  const visible = new Set(display.map(cardKey));
   for (const [id, { card }] of cards) {
     if (!visible.has(id)) {
       card.remove();
@@ -406,19 +423,30 @@ function renderOrders() {
   }
   display.forEach((order, index) => {
     const signature = JSON.stringify(order);
-    const current = cards.get(order.id);
+    const key = cardKey(order);
+    const current = cards.get(key);
     let card = current?.card;
     if (current?.signature !== signature) {
       card = orderTemplate.content.firstElementChild.cloneNode(true);
-      card.querySelector('.order-title').textContent = `Order ${orderNumber(order.id)}`;
+      card.querySelector('.order-title').textContent = `Order ${order.external ? order.externalReference : orderNumber(order.id)}`;
       const badge = card.querySelector('.order-status');
       badge.dataset.status = order.status;
-      badge.textContent = statuses[order.status];
-      card.querySelector('.pickup-window').textContent = pickupWindow(order.pickupStartsAt, order.pickupEndsAt);
+      badge.textContent = order.external && order.status === 'ready' ? 'Ready for handoff' : statuses[order.status];
+      const time = card.querySelector('.pickup-window');
       card.querySelector('.order-lines').append(...order.lines.map(renderedLine));
-      addAction(card, order);
-      addCancellation(card, order);
-      cards.set(order.id, { card, signature, order });
+      if (order.external) {
+        const platform = document.createElement('p');
+        platform.className = 'external-channel';
+        platform.textContent = order.channelLabel;
+        time.before(platform);
+        time.textContent = `Handoff ${reviewTimeFormat.format(new Date(order.scheduledAt))} Kigali time`;
+        delivery.addCardActions(card, order, session);
+      } else {
+        time.textContent = pickupWindow(order.pickupStartsAt, order.pickupEndsAt);
+        addAction(card, order);
+        addCancellation(card, order);
+      }
+      cards.set(key, { card, signature, order });
       current?.card.replaceWith(card);
     }
     if (orderList.children[index] !== card) orderList.insertBefore(card, orderList.children[index] ?? null);
@@ -427,6 +455,18 @@ function renderOrders() {
   if (cancellation && !cancellation.submitting && !isCurrentCancellation(cancellation)) {
     closeCancellation(`Order ${orderNumber(cancellation.id)} changed. Review the updated queue.`);
   }
+}
+
+function updateExternalOrder(order) {
+  // Discard a queue read that started before a write or a separately confirmed status.
+  refreshVersion++;
+  refreshing = false;
+  refreshButton.disabled = false;
+  externalOrders = externalOrders.filter(({ id }) => id !== order.id);
+  if (Object.hasOwn(statuses, order.status)) externalOrders.push(order);
+  sawExternalOrders = true;
+  renderOrders();
+  void refreshQueue(true);
 }
 
 function isCurrentCancellation(selection) {
@@ -783,6 +823,8 @@ function closeSession(message = '') {
   pickupChecks.clear();
   orderSound.mute();
   orders = [];
+  externalOrders = [];
+  sawExternalOrders = false;
   cards.clear();
   orderList.replaceChildren();
   paymentReview.hidden = true;
@@ -818,6 +860,7 @@ function closeSession(message = '') {
   showMessage(fiscalReceiptsEmpty);
   availability.reset();
   reconciliation.reset();
+  delivery.reset();
   workstation.hidden = true;
   signIn.hidden = false;
   loginForm.reset();
@@ -840,12 +883,19 @@ async function refreshQueue(force = false) {
   try {
     const data = await request('/orders', { token: current.accessToken });
     if (session !== current || refreshVersion !== version) return;
-    if (!Array.isArray(data?.orders)) throw new ApiError(502, 'invalid_response');
+    if (!Array.isArray(data?.orders) || (data.externalOrders !== undefined && !Array.isArray(data.externalOrders))) {
+      throw new ApiError(502, 'invalid_response');
+    }
     const serverTime = data.serverTime === undefined ? null : Date.parse(data.serverTime);
     if (serverTime !== null && (typeof data.serverTime !== 'string' || !Number.isFinite(serverTime))) {
       throw new ApiError(502, 'invalid_response');
     }
-    orders = data.orders.map((order) => checkedOrder(order));
+    const nextOrders = data.orders.map((order) => checkedOrder(order));
+    const nextExternal = (data.externalOrders ?? []).map((order) => readExternalOrder(order, true));
+    if (new Set(nextExternal.map(({ id }) => id)).size !== nextExternal.length) throw new ApiError(502, 'invalid_response');
+    orders = nextOrders;
+    externalOrders = nextExternal;
+    sawExternalOrders ||= externalOrders.length !== 0;
     queueSnapshot = { serverTime, receivedAt: performance.now() };
     needsQueueRefresh = false;
     renderOrders();
@@ -1107,6 +1157,8 @@ async function checkPickup(id, current) {
 async function refreshPickupChecks() {
   const current = availableSession();
   if (!current) return;
+  await delivery.checkUnconfirmed();
+  if (session !== current) return;
   const uncertain = [...pickupChecks].filter(([, check]) => check.state === 'uncertain');
   for (const [id, check] of uncertain) {
     if (session !== current) return;
@@ -1294,6 +1346,7 @@ loginForm.addEventListener('submit', async (event) => {
     paymentReviewJump.hidden = paymentReview.hidden;
     fiscalReceipts.hidden = paymentReview.hidden;
     fiscalReceiptsJump.hidden = fiscalReceipts.hidden;
+    delivery.show(session);
     workstationTitle.focus();
     timer = setInterval(() => { void refreshQueue(); }, queuePollMs);
     kitchenTimer = setInterval(() => {

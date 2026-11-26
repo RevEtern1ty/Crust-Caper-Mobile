@@ -11,7 +11,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 @RestControllerAdvice(assignableTypes = {
         OperatorController.class, OperatorRefundController.class, OperatorPaymentAttemptsController.class,
-        OperatorReconciliationController.class
+        OperatorReconciliationController.class, OperatorExternalOrderController.class
 })
 final class OperatorProblems {
     @ExceptionHandler(OperatorFailure.class)

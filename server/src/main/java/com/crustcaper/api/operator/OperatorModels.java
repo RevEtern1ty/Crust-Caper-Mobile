@@ -35,7 +35,8 @@ final class OperatorModels {
                      Instant pickupStartsAt, Instant pickupEndsAt,
                      @JsonInclude(JsonInclude.Include.ALWAYS) Instant acceptedAt) { }
 
-    record Queue(List<OrderView> orders, Instant serverTime) { }
+    record Queue(List<OrderView> orders, Instant serverTime,
+                 @JsonInclude(JsonInclude.Include.NON_EMPTY) List<OperatorExternalOrders.Order> externalOrders) { }
 
     record PickupStatus(UUID id, String status, boolean confirmedByCurrentOperator) { }
 

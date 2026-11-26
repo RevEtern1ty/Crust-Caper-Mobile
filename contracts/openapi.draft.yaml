@@ -382,7 +382,7 @@ paths:
       security: [{ operatorBearer: [] }]
       responses:
         '200':
-          description: Paid orders ready for kitchen or pickup work in the session's assigned store.
+          description: Active CrustCaper and manually registered delivery orders for the session's assigned store.
           headers:
             Cache-Control:
               schema: { type: string, const: no-store }
@@ -395,10 +395,154 @@ paths:
                   orders:
                     type: array
                     items: { $ref: '#/components/schemas/OperatorOrder' }
+                  externalOrders:
+                    type: array
+                    items: { $ref: '#/components/schemas/ExternalOperatorOrder' }
+                    description: Active delivery platform orders. Omitted when the store has no active delivery platform orders.
                   serverTime:
                     $ref: '#/components/schemas/Timestamp'
                     description: Database clock sampled after reading the queue. Used to calculate elapsed time without relying on the browser's wall clock.
         '401': { $ref: '#/components/responses/Unauthenticated' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/external-order-channels:
+    get:
+      operationId: listExternalOrderChannels
+      description: Enabled delivery platforms in the assigned store. Requires a pickup operator or manager.
+      security: [{ operatorBearer: [] }]
+      responses:
+        '200':
+          description: Platforms available for manual entry.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [channels]
+                properties:
+                  channels:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, label]
+                      properties:
+                        id: { $ref: '#/components/schemas/ExternalOrderChannelId' }
+                        label: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/external-orders:
+    post:
+      operationId: registerExternalOrder
+      description: A pickup operator or manager registers an existing platform order for preparation and handoff. The store comes from the staff session. Request JSON is limited to 64 KiB.
+      security: [{ operatorBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [channel, externalReference, scheduledAt, lines]
+              properties:
+                channel: { $ref: '#/components/schemas/ExternalOrderChannelId' }
+                externalReference: { $ref: '#/components/schemas/ExternalOrderReference' }
+                scheduledAt:
+                  type: string
+                  format: date-time
+                  pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z$'
+                  description: Handoff time in UTC with at most six fractional digits.
+                lines:
+                  type: array
+                  minItems: 1
+                  maxItems: 30
+                  items: { $ref: '#/components/schemas/ExternalOrderLine' }
+      responses:
+        '200':
+          description: The same order was already registered with these details. Returns its current state, including if it has since been collected or cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExternalOperatorOrder' }
+        '201':
+          description: Order registered in the store's kitchen queue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExternalOperatorOrder' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '409':
+          description: Platform disabled or unknown in this store, or the reference is already registered with different details.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetails'
+                  - properties:
+                      status: { const: 409 }
+                      code: { enum: [external_channel_unavailable, external_reference_conflict] }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/external-orders/{id}:
+    get:
+      operationId: readExternalOrder
+      description: Check the current status of a platform order from the session's assigned store after an uncertain response.
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Current order state and attribution of successful handoff to the authenticated operator.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExternalOperatorOrder' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/external-orders/{id}/status:
+    post:
+      operationId: updateExternalOrderStatus
+      description: Kitchen and manager can prepare and mark orders ready. Pickup and manager can confirm handoff against the platform reference. A manager can cancel an active delivery order in the kitchen queue.
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [status]
+              properties:
+                status: { type: string, enum: [preparing, ready, collected, cancelled] }
+                externalReference: { $ref: '#/components/schemas/ExternalOrderReference' }
+              if:
+                properties:
+                  status: { const: collected }
+              then:
+                required: [externalReference]
+      responses:
+        '200':
+          description: The recorded order state after applying the authorized transition.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExternalOperatorOrder' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '409':
+          description: The transition is unavailable or the presented platform reference did not match.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetails'
+                  - properties:
+                      status: { const: 409 }
+                      code: { enum: [external_reference_mismatch, invalid_transition] }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/orders/{id}/pickup-status:
     get:
@@ -1067,6 +1211,45 @@ components:
           properties:
             status: { type: string, enum: [accepted, preparing, ready, collected] }
             paymentStatus: { type: string, const: paid }
+    ExternalOrderChannelId:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9._-]{0,31}$'
+    ExternalOrderReference:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$'
+      description: Use the complete platform reference. Case and leading zeroes are significant.
+    ExternalOrderLine:
+      type: object
+      additionalProperties: false
+      required: [name, quantity]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        quantity: { type: integer, minimum: 1, maximum: 99 }
+        modifiers:
+          type: array
+          maxItems: 12
+          items: { type: string, minLength: 1, maxLength: 120 }
+    ExternalOperatorOrder:
+      type: object
+      additionalProperties: false
+      required: [id, channel, channelLabel, externalReference, scheduledAt, acceptedAt, status, lines, confirmedByCurrentOperator]
+      properties:
+        id: { type: string, format: uuid }
+        channel: { $ref: '#/components/schemas/ExternalOrderChannelId' }
+        channelLabel: { type: string }
+        externalReference: { $ref: '#/components/schemas/ExternalOrderReference' }
+        scheduledAt: { $ref: '#/components/schemas/Timestamp' }
+        acceptedAt: { $ref: '#/components/schemas/Timestamp' }
+        status: { type: string, enum: [accepted, preparing, ready, collected, cancelled] }
+        lines:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/ExternalOrderLine'
+              - required: [modifiers]
+        confirmedByCurrentOperator:
+          type: boolean
+          description: True only when the order was handed off by the authenticated operator.
     OperatorCancelledOrder:
       allOf:
         - $ref: '#/components/schemas/OperatorOrderDetails'

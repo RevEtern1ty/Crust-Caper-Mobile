@@ -24,6 +24,11 @@ final class LocalOperators {
         seed("kitchen");
         seed("pickup");
         seed("manager");
+        jdbc.sql("""
+                INSERT INTO operator_external_order_channels (store_id, id, label)
+                VALUES ('kigali', 'test-platform', 'Test delivery')
+                ON CONFLICT (store_id, id) DO NOTHING
+                """).update();
     }
 
     private void seed(String role) {

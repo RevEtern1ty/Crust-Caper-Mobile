@@ -82,6 +82,160 @@ async function readyForPickup(kitchen, { buyer = contact, guestToken, quantity =
   return { id, token, pickupCode, number: '#' + id.slice(-8).toUpperCase() };
 }
 
+test('delivery intake and handoff recover lost replies alongside a paid direct order', { timeout: 35_000 }, async t => {
+  const kitchen = await operator('demo-kitchen');
+  const pickup = await operator('demo-pickup');
+  const manager = await operator('demo-manager');
+  const direct = await readyForPickup(kitchen);
+  t.after(async () => {
+    await send(`/operator/orders/${direct.id}/status`, {
+      method: 'POST', token: pickup, data: { status: 'collected', pickupCode: direct.pickupCode },
+    });
+    for (const token of [kitchen, pickup, manager]) await send('/operator/sessions/current', { method: 'DELETE', token });
+  });
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const reference = `00A-${randomUUID().slice(0, 8)}`;
+  const orderUrl = api + '/operator/external-orders';
+  const card = page => page.locator('#order-list > li').filter({ hasText: reference });
+  async function signIn(page, username) {
+    page.setDefaultTimeout(8_000);
+    await page.goto(new URL('/operator/index.html', api).href);
+    await page.getByLabel('Username', { exact: true }).fill(username);
+    await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+    await button(page, 'Sign in').click();
+    await page.locator('#workstation-title').waitFor();
+  }
+  const staffPage = await browser.newPage({ viewport: { width: 390, height: 844 }, timezoneId: 'Pacific/Honolulu' });
+  await signIn(staffPage, 'demo-pickup');
+  await button(staffPage, 'Add delivery order').click();
+  const platform = staffPage.getByLabel('Delivery platform', { exact: true });
+  await platform.selectOption('test-platform');
+  await staffPage.getByLabel('External order reference', { exact: true }).fill(reference);
+  await staffPage.getByLabel('Scheduled time (Kigali)', { exact: true }).fill('2026-11-26T12:40');
+  await staffPage.getByLabel('Item name', { exact: true }).first().fill('Platform sandwich');
+  await staffPage.getByLabel('Quantity', { exact: true }).first().fill('2');
+  await button(staffPage, 'Add modifier').first().click();
+  await staffPage.getByLabel('Modifier name', { exact: true }).first().fill('No onion');
+  const intake = staffPage.getByRole('region', { name: 'Delivery order intake' });
+  for (const width of [320, 390, 430]) {
+    await staffPage.setViewportSize({ width, height: 844 });
+    for (const scale of [100, 200]) {
+      await staffPage.evaluate(value => { document.documentElement.style.fontSize = `${value}%`; }, scale);
+      await intake.getByRole('heading').evaluate(element => element.scrollIntoView({ block: 'start' }));
+      assert.equal(await staffPage.evaluate(() => document.documentElement.scrollWidth), width);
+      await capture(staffPage, `delivery-intake-${width}-${scale}`);
+    }
+  }
+  await staffPage.evaluate(() => document.documentElement.style.removeProperty('font-size'));
+  await staffPage.setViewportSize({ width: 390, height: 844 });
+
+  const registrations = [];
+  let registered;
+  await staffPage.route(orderUrl, async route => {
+    const request = route.request();
+    if (request.method() !== 'POST') return route.continue();
+    registrations.push(request.postDataJSON());
+    const result = await route.fetch();
+    if (registrations.length === 1) {
+      assert.equal(result.status(), 201);
+      registered = await result.json();
+      return route.abort();
+    }
+    assert.equal(result.status(), 200);
+    assert.equal((await result.json()).id, registered.id);
+    return route.fulfill({ response: result });
+  });
+
+  const save = button(staffPage, 'Save delivery order');
+  await save.click();
+  await button(staffPage, 'Retry delivery order').click();
+  await card(staffPage).waitFor();
+  assert.deepEqual(registrations[0], registrations[1], 'retry must submit the same intake');
+  assert.equal(registered.scheduledAt, '2026-11-26T10:40:00Z');
+  assert.equal(registered.lines[0].quantity, 2);
+  assert.deepEqual(registered.lines[0].modifiers, ['No onion']);
+
+  const kitchenPage = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  await signIn(kitchenPage, 'demo-kitchen');
+  const external = card(kitchenPage);
+  await external.waitFor();
+  await shown(kitchenPage, `Order ${direct.number}`);
+  assert.equal(await button(kitchenPage, 'Add delivery order').isVisible(), false);
+  assert.match(await external.innerText(), /Test delivery/);
+  assert.match(await external.innerText(), /Platform sandwich/);
+  assert.match(await external.innerText(), /No onion/);
+  await capture(kitchenPage, 'delivery-kitchen-mixed-390');
+  await button(external, 'Start preparing').click();
+  await button(external, 'Mark ready').click();
+
+  const staffCard = card(staffPage);
+  await button(staffPage, 'Refresh').click();
+  const handedOff = button(staffCard, 'Confirm handoff');
+  const externalReference = staffCard.getByLabel('External reference', { exact: true });
+  await externalReference.fill(`1${reference}`);
+  const change = orderUrl + `/${registered.id}/status`;
+  const rejected = staffPage.waitForResponse(response => response.url() === change && response.status() === 409);
+  await handedOff.click();
+  await rejected;
+  await externalReference.fill(reference);
+
+  const consumed = [];
+  await staffPage.route(change, async route => {
+    const response = await route.fetch();
+    assert.equal(response.status(), 200);
+    consumed.push(await response.json());
+    await route.abort();
+  });
+  const checked = staffPage.waitForResponse(response => response.url() === `${orderUrl}/${registered.id}` && response.status() === 200);
+  await handedOff.click();
+  const recovered = await (await checked).json();
+  assert.equal(recovered.status, 'collected');
+  assert.equal(recovered.confirmedByCurrentOperator, true);
+  assert.deepEqual(consumed, [recovered]);
+  await staffCard.waitFor({ state: 'hidden' });
+
+  const queue = await send('/operator/orders', { token: kitchen }).then(response => response.json());
+  assert.ok(queue.orders.some(order => order.id === direct.id && order.paymentStatus === 'paid'));
+  assert.ok(!queue.externalOrders?.some(order => order.id === registered.id));
+  assert.equal((await send(`/orders/${registered.id}`, { token: direct.token })).status, 404);
+  assert.equal((await send(`/operator/orders/${registered.id}/pickup-status`, { token: pickup })).status, 404);
+
+  const nonBmpName = '🥗'.repeat(61);
+  const unicodeOrder = await send('/operator/external-orders', { method: 'POST', token: pickup, data: {
+    ...registrations[0], externalReference: `U-${reference}`, lines: [{ name: nonBmpName, quantity: 1 }],
+  } });
+  assert.equal(unicodeOrder.status, 201);
+  const unicodeId = (await unicodeOrder.json()).id;
+  try {
+    await button(kitchenPage, 'Refresh').click();
+    await shown(kitchenPage, nonBmpName);
+    await shown(kitchenPage, `Order ${direct.number}`);
+    assert.equal(await kitchenPage.evaluate(() => document.documentElement.scrollWidth), 390);
+  } finally {
+    assert.equal((await send(`/operator/external-orders/${unicodeId}/status`, {
+      method: 'POST', token: manager, data: { status: 'cancelled' },
+    })).status, 200);
+  }
+
+  await staffPage.unroute(orderUrl);
+  const unavailableReference = staffPage.getByLabel('External order reference', { exact: true });
+  await platform.selectOption('test-platform');
+  await unavailableReference.fill('UNAVAILABLE-' + reference);
+  await staffPage.getByLabel('Scheduled time (Kigali)', { exact: true }).fill('2026-11-26T12:45');
+  await staffPage.getByLabel('Item name', { exact: true }).first().fill('Saved delivery draft');
+  let attempts = 0;
+  await staffPage.route(orderUrl, route => ++attempts === 1 ? route.abort() : route.fulfill({
+    status: 409,
+    json: { status: 409, code: 'external_channel_unavailable' },
+  }));
+  await save.click();
+  await button(staffPage, 'Retry delivery order').click();
+  await button(staffPage, 'Reload delivery platforms').waitFor();
+  assert.equal(await unavailableReference.isEditable(), true);
+  assert.equal(await unavailableReference.inputValue(), 'UNAVAILABLE-' + reference);
+});
+
 test('pickup is checked against the server after a lost reply or a concurrent cancellation', { timeout: 35_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const kitchen = await operator('demo-kitchen');
@@ -98,7 +252,7 @@ test('pickup is checked against the server after a lost reply or a concurrent ca
   await button(page, 'Sign in').click();
   await shown(page, 'Pickup queue');
 
-  const card = order => page.getByRole('list', { name: 'Paid orders' }).getByRole('listitem')
+  const card = order => page.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem')
     .filter({ has: page.getByRole('heading', { name: 'Order ' + order.number, exact: true }) });
   const notice = page.locator('#queue-notice');
   const pickupStatus = order => api + `/operator/orders/${order.id}/pickup-status`;
@@ -1002,7 +1156,7 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   await button(manager, 'Verified history').click();
   await button(manager, 'Refresh').click();
   const cancelledShortId = newerOrder.id.slice(-8).toUpperCase();
-  const paidCard = manager.getByRole('list', { name: 'Paid orders' }).getByRole('listitem')
+  const paidCard = manager.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem')
     .filter({ has: manager.getByRole('heading', { name: `Order #${cancelledShortId}`, exact: true }) });
   const modal = manager.getByRole('dialog', { name: `Cancel order #${cancelledShortId}?` });
   const cancelPath = `/operator/orders/${newerOrder.id}/cancel`;
@@ -1687,7 +1841,7 @@ test('a paid order appears on the kitchen screen within ten seconds and is ackno
   const started = await send('/orders/' + orderId + '/payments', { method: 'POST', token: accessToken, key: randomUUID() });
   assert.equal(started.status, 200);
   const { id: attemptId } = await started.json();
-  const card = page.getByRole('list', { name: 'Paid orders' }).getByRole('listitem')
+  const card = page.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem')
     .filter({ has: page.getByRole('heading', { name: 'Order #' + orderId.slice(-8).toUpperCase(), exact: true }) });
   assert.equal(await card.count(), 0);
   const observed = page.waitForResponse(async response => {

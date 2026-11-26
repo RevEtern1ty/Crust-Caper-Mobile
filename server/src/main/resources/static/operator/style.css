@@ -25,7 +25,7 @@ button, input { font: inherit; }
 .frame { width: min(100%, 76rem); margin-inline: auto; padding-inline: clamp(1rem, 3vw, 2rem); }
 .site-header { background: var(--plum); color: var(--cream); border-bottom: .2rem solid var(--mustard); }
 .header-inner { min-height: 4.75rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: .4rem 1rem; padding-block: .85rem; }
-.brand { display: inline-flex; align-items: center; gap: .75rem; font-size: 1.32rem; font-weight: 850; letter-spacing: -.03em; }
+.brand { display: inline-flex; align-items: center; gap: .75rem; max-width: 100%; font-size: 1.32rem; font-weight: 850; letter-spacing: -.03em; overflow-wrap: anywhere; }
 .brand-mark { position: relative; flex: 0 0 1.9rem; width: 1.9rem; height: 1.9rem; color: var(--mustard); }
 .brand-mark::before, .brand-mark::after { content: ''; position: absolute; border: .15rem solid currentcolor; border-right-color: transparent; border-radius: 50%; transform: rotate(-14deg); }
 .brand-mark::before { inset: .08rem; }
@@ -59,7 +59,7 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .session-label { margin-bottom: .45rem; font-size: .875rem; font-weight: 780; color: var(--green); overflow-wrap: anywhere; }
 .update-time { min-height: 1.35rem; margin-top: .6rem; color: var(--muted); font-size: .9rem; }
 .toolbar { display: flex; flex-wrap: wrap; gap: .55rem; }
-.toolbar > .button { flex: 1 0 auto; }
+.toolbar > .button { flex: 1 0 auto; max-width: 100%; overflow-wrap: anywhere; }
 .empty-state { padding: 1.2rem; border: 1px dashed var(--border); border-radius: .85rem; color: var(--muted); }
 .problem { font-weight: 680; color: var(--red); overflow-wrap: anywhere; }
 #queue-problem { margin-bottom: 1rem; }
@@ -95,6 +95,26 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .pickup-form input { display: block; margin-top: .3rem; }
 .pickup-form button { flex: 1 0 8rem; }
 .order-problem { margin-top: .75rem; font-size: .9rem; }
+.external-intake, .external-channel { overflow-wrap: anywhere; }
+.external-intake-form, .external-form-fields, .external-fields, .external-item, .external-items, .external-modifiers, .external-modifier {
+  display: grid; gap: .75rem; min-width: 0;
+}
+.external-intake-form { max-width: 42rem; margin-top: 1rem; }
+.external-form-fields { margin: 0; padding: 0; border: 0; }
+.external-fields { grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr)); }
+.external-intake label, .external-field { display: grid; gap: .3rem; min-width: 0; }
+.external-intake .button, #external-order-jump { max-width: 100%; overflow-wrap: anywhere; }
+.external-intake select {
+  min-height: 3rem; min-width: 0; width: 100%; border: 1px solid var(--border); border-radius: .65rem;
+  padding: .62rem .88rem; background: var(--white); color: var(--ink); font: inherit;
+}
+.external-intake select:focus-visible { outline: .19rem solid var(--green); outline-offset: .15rem; }
+.external-intake select[aria-invalid="true"] { border-color: var(--red); }
+.external-item { margin: 0; }
+.external-item legend { font-weight: 740; }
+.external-modifier { grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr)); align-items: end; }
+.external-modifiers:empty { display: none; }
+.external-handoff label { overflow-wrap: anywhere; }
 
 .cancellation-dialog { width: min(30rem, calc(100% - 24px)); max-height: calc(100dvh - 24px); border: 1px solid var(--border); border-radius: 1rem; padding: clamp(12px, 5vw, 24px); background: var(--white); color: var(--ink); overflow-wrap: anywhere; }
 .cancellation-dialog::backdrop { background: rgb(36 22 32 / 65%); }

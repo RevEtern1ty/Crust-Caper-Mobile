@@ -57,12 +57,15 @@ final class OperatorOrders {
             """;
     private final JdbcClient jdbc;
     private final OperatorSessions sessions;
+    private final OperatorExternalOrders externalOrders;
     private final TransactionTemplate transactions;
     private final ObjectReader lineReader;
 
-    OperatorOrders(JdbcClient jdbc, OperatorSessions sessions, TransactionTemplate transactions, ObjectMapper mapper) {
+    OperatorOrders(JdbcClient jdbc, OperatorSessions sessions, OperatorExternalOrders externalOrders,
+                   TransactionTemplate transactions, ObjectMapper mapper) {
         this.jdbc = jdbc;
         this.sessions = sessions;
+        this.externalOrders = externalOrders;
         this.transactions = transactions;
         this.lineReader = mapper.readerForListOf(OrderLine.class);
     }
@@ -74,7 +77,8 @@ final class OperatorOrders {
                  WHERE store_id = ? AND payment_status = 'paid' AND status IN ('accepted', 'preparing', 'ready')
                  ORDER BY pickup_starts_at, id
                 """).param(actor.storeId()).query(this::orderRow).list();
-        return new Queue(active, jdbc.sql("SELECT clock_timestamp()").query(OffsetDateTime.class).single().toInstant());
+        List<OperatorExternalOrders.Order> external = externalOrders.active(actor);
+        return new Queue(active, jdbc.sql("SELECT clock_timestamp()").query(OffsetDateTime.class).single().toInstant(), external);
     }
 
     PickupStatus pickupStatus(String authorization, String rawId) {
