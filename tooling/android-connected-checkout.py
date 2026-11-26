@@ -205,8 +205,9 @@ class Emulator:
     def connect_loopback(self, port):
         require(not self.reverse_mappings(), "Expected an emulator with no preexisting ADB reverse mappings")
         endpoint = f"tcp:{port}"
-        self.adb_run("reverse", "--no-rebind", endpoint, endpoint)
+        # ADB can apply the route before the host command receives its reply.
         self.reverse_port = endpoint
+        self.adb_run("reverse", "--no-rebind", endpoint, endpoint)
         require(self.reverse_mappings() == [(endpoint, endpoint)], "Could not verify the checkout ADB reverse mapping")
 
     def disconnect_loopback(self):
