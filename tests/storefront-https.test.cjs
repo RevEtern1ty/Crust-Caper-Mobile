@@ -3,7 +3,7 @@ const { Buffer } = require('node:buffer');
 const { spawnSync } = require('node:child_process');
 const { createHash, X509Certificate } = require('node:crypto');
 const { readFileSync } = require('node:fs');
-const { mkdir, readFile } = require('node:fs/promises');
+const { mkdir, readFile, writeFile } = require('node:fs/promises');
 const { setTimeout: delay } = require('node:timers/promises');
 const https = require('node:https');
 const { dirname, resolve } = require('node:path');
@@ -113,6 +113,25 @@ async function checkPublicCatalog(ca) {
   assert.equal((await request(ca, '/api/catalog-health')).status, 404);
   assert.equal((await request(ca, '/api/v1/local/orders')).status, 404);
   assert.equal((await request(ca, '/actuator/paymentreconciliation')).status, 404);
+}
+
+async function checkCheckoutPreflight(caPath) {
+  const testDirectory = dirname(module.filename);
+  const result = spawnSync(process.execPath, [
+    '--require', resolve(testDirectory, 'storefront-loopback.cjs'),
+    resolve(testDirectory, '../server/tooling/check-live-catalog.mjs'),
+    origin + '/api/v1', 'kigali', 'catalog-001', '--checkout',
+  ], {
+    env: { ...(process.platform === 'win32' && { SystemRoot: process.env.SystemRoot }), NODE_EXTRA_CA_CERTS: caPath },
+    encoding: 'utf8', timeout: 25000, maxBuffer: 32 * 1024, windowsHide: true,
+  });
+  assert.ifError(result.error);
+  if (evidence) {
+    await mkdir(evidence, { recursive: true });
+    await writeFile(resolve(evidence, 'storefront-checkout-preflight.log'), result.stdout + result.stderr);
+  }
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Checkout EN and RW handoffs and Expo entry verified\./);
 }
 
 function verifyPaymentRow(orderId) {
@@ -486,7 +505,10 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   const caPath = process.env.CRUSTCAPER_HTTPS_TEST_CA;
   assert.ok(caPath, 'the HTTPS storefront launcher must provide a fixture CA');
   const ca = readFileSync(caPath);
-  if (!webPerf) await checkPublicCatalog(ca);
+  if (!webPerf) {
+    await checkPublicCatalog(ca);
+    await checkCheckoutPreflight(caPath);
+  }
   if (catalogPhotos) await checkPhotoTransport(ca);
   const pins = await Promise.all([fixturePin(ca, storefront), fixturePin(ca, provider)]);
   const browser = await chromium.launch({
