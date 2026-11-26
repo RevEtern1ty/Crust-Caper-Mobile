@@ -357,6 +357,19 @@ async function checkVerifiedOrderPrivacy(browser, page, ca, order, orderPath, st
   await page.getByLabel('Phone number', { exact: true }).fill('+250700000000');
   await button(page, 'Request verification code').click();
   await shown(page, 'Verify your phone');
+  const verificationInput = page.getByLabel('Verification code', { exact: true });
+  await verificationInput.fill('123');
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await verificationInput.waitFor({ state: 'hidden' });
+  await page.evaluate(() => {
+    delete document.visibilityState;
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await verificationInput.waitFor();
+  assert.equal(await verificationInput.inputValue(), '');
   await page.getByLabel('Verification code', { exact: true }).fill('418263');
   let verification;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -411,6 +424,9 @@ async function checkVerifiedOrderPrivacy(browser, page, ca, order, orderPath, st
   } });
   assert.deepEqual(JSON.parse(repeat.body), { request: accepted });
   await checkPrivacyStaff(browser, order.id, accepted);
+  await page.bringToFront();
+  await button(page, 'Check request status').click();
+  await shown(page, 'In review');
   const reviewed = await request(ca, statusPath, { headers: scope });
   assert.equal(reviewed.status, 200);
   assert.equal(JSON.parse(reviewed.body).request.status, 'in_review');

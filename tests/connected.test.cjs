@@ -1256,6 +1256,12 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
     method: 'POST', token: recoveredToken, key: 'recovered-device-payment',
   });
   assert.equal(disallowedPayment.status, 404);
+  const localPrivacy = await secondDevice.evaluate(async ({ endpoint, proof }) => {
+    const response = await fetch(endpoint, { method: 'PUT', headers: { Authorization: proof } });
+    const payload = await response.json();
+    return { status: response.status, requestState: payload.request?.status };
+  }, { endpoint: api + '/orders/' + order.id + '/erasure-request', proof: recoveredAuthorization });
+  assert.deepEqual(localPrivacy, { status: 200, requestState: 'pending' });
   assert.ok((await downloadedReceipt(secondDevice)).equals(pdf));
   await button(secondDevice, 'Restore saved checkout').click();
   await button(secondDevice, 'Restore saved checkout').waitFor({ state: 'detached' });
