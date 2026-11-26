@@ -178,10 +178,33 @@ class CheckoutQuotaIntegrationTest {
         assertThat(activeOrders()).containsExactlyInAnyOrder(firstOrder, winner, recovered);
     }
 
+    @Test
+    void aQuoteExpiringDuringAdmissionLeavesNoOrderOrQuotaCharge() throws Exception {
+        var buyer = nativeGuest();
+        var quote = body(createQuote(nativePost("/quotes", buyer), store, EARLY).andExpect(status().isOk()));
+        OffsetDateTime quoteExpiresAt = OffsetDateTime.parse(quote.path("expiresAt").asString());
+        checkoutClock(quoteExpiresAt.minusSeconds(1), quoteExpiresAt.plusSeconds(1));
+
+        submit(nativePost("/orders", buyer), quote.path("quoteId").asString(), "quota-expiring-quote")
+            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("quote_expired"));
+
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?").param(store).query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("""
+            SELECT count(*) FROM checkout_quota_windows WHERE operation = 'order'
+              AND ((scope = 'store' AND subject = ?) OR (scope = 'session' AND subject = ?))
+            """).params(store, guests.getLast().toString()).query(Long.class).single()).isZero();
+        assertThat(quoteCount(store)).isOne();
+    }
+
     private void checkoutClock(long minutes) {
-        // PostgreSQL still executes every business statement, including quota writes, using the pinned request clock.
+        OffsetDateTime pinned = initialClock.plusMinutes(minutes);
+        checkoutClock(pinned, pinned);
+    }
+
+    private void checkoutClock(OffsetDateTime firstRead, OffsetDateTime laterRead) {
+        // PostgreSQL still executes the business statements and quota writes.
         var clock = mock(JdbcClient.StatementSpec.class, RETURNS_DEEP_STUBS);
-        when(clock.query(OffsetDateTime.class).single()).thenReturn(initialClock.plusMinutes(minutes));
+        when(clock.query(OffsetDateTime.class).single()).thenReturn(firstRead, laterRead);
         doReturn(clock).when(jdbc).sql("SELECT clock_timestamp()");
     }
 
