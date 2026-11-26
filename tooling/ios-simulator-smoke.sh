@@ -1,8 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $# -lt 1 || $# -gt 2 || ( ${2:-demo} != demo && ${2:-demo} != local ) ]]; then
+  printf 'Usage: bash tooling/ios-simulator-smoke.sh EVIDENCE_DIR [demo|local]\n' >&2
+  exit 2
+fi
+
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 evidence_dir=$1
+profile=${2:-demo}
+export CRUSTCAPER_BUILD_PROFILE="$profile"
+simulator_hint=''
+if [[ "$profile" == local ]]; then
+  export CRUSTCAPER_API_BASE_URL=${CRUSTCAPER_API_BASE_URL:-http://127.0.0.1:18080/api/v1}
+  if [[ ! "$CRUSTCAPER_API_BASE_URL" =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})/api/v1$ ]] || (( BASH_REMATCH[1] > 65535 )); then
+    printf 'Local iOS smoke requires CRUSTCAPER_API_BASE_URL=http://127.0.0.1:PORT/api/v1.\n' >&2
+    exit 2
+  fi
+  simulator_hint=${CRUSTCAPER_IOS_SIMULATOR_UDID:-}
+  if [[ -n "$simulator_hint" && ! "$simulator_hint" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+    printf 'CRUSTCAPER_IOS_SIMULATOR_UDID must be the UUID of an available iPhone simulator.\n' >&2
+    exit 2
+  fi
+  export CRUSTCAPER_STORE_ID=${CRUSTCAPER_STORE_ID:-kigali}
+  export CRUSTCAPER_WEB_CHECKOUT=false EXPO_NO_DOTENV=1 EXPO_NO_TELEMETRY=1
+fi
 mkdir -p "$evidence_dir"
 
 phase='Verify runner tools'
@@ -29,12 +51,38 @@ finish_smoke() {
 trap 'failure_command="Line $LINENO: $BASH_COMMAND"' ERR
 trap finish_smoke EXIT
 start_phase "$phase"
-if [[ $(uname -m) != arm64 ]]; then
+if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
   printf 'An Apple silicon runner is required for this smoke test.\n' >&2
   exit 1
 fi
-xcodebuild -version
+xcode_version=$(xcodebuild -version)
+printf '%s\n' "$xcode_version"
 pod --version
+
+if [[ "$profile" == local ]]; then
+  start_phase 'Verify the connected local iOS configuration'
+  source_sha=$(git rev-parse HEAD)
+  source_state=clean
+  if [[ -n $(git status --porcelain) ]]; then source_state=dirty; fi
+  local_config=$(npx --no-install expo config --type public --json | node -e '
+    const config = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+    const restaurant = config.extra?.restaurant;
+    const ios = config.ios;
+    const ats = ios?.infoPlist?.NSAppTransportSecurity;
+    if (restaurant?.profile !== "local" || restaurant.apiBaseUrl !== process.env.CRUSTCAPER_API_BASE_URL
+      || restaurant.storeId !== process.env.CRUSTCAPER_STORE_ID || restaurant.webCheckout === true
+      || ios?.bundleIdentifier !== "com.crustcaper.mobile.local"
+      || ats?.NSAllowsArbitraryLoads !== false || ats.NSAllowsLocalNetworking !== true) {
+      console.error("Unexpected connected local iOS configuration.");
+      process.exit(1);
+    }
+    console.log([ios.bundleIdentifier, ats.NSAllowsArbitraryLoads, ats.NSAllowsLocalNetworking].join("\t"));
+  ')
+  IFS=$'\t' read -r expected_id expected_arbitrary_http expected_local_networking <<< "$local_config"
+else
+  expected_id=$(node -p 'require("./app.json").expo.ios.bundleIdentifier')
+  expected_arbitrary_http=false
+fi
 
 start_phase 'Generate Expo iOS project'
 npx --no-install expo prebuild --platform ios --no-install
@@ -75,7 +123,6 @@ if [[ ${#apps[@]} != 1 ]]; then
 fi
 app=${apps[0]}
 plist="$app/Info.plist"
-expected_id=$(node -p 'require("./app.json").expo.ios.bundleIdentifier')
 expected_minimum=$(node -p 'require("./app.json").expo.plugins.find(p => Array.isArray(p) && p[0] === "expo-build-properties")[1].ios.deploymentTarget')
 bundle_id=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$plist")
 minimum_os=$(/usr/libexec/PlistBuddy -c 'Print MinimumOSVersion' "$plist")
@@ -85,27 +132,33 @@ arch=$(xcrun lipo -archs "$app/$executable")
 test "$bundle_id" = "$expected_id"
 test "$minimum_os" = "$expected_minimum"
 test "$arch" = arm64
-test "$arbitrary_http" = false
+test "$arbitrary_http" = "$expected_arbitrary_http"
+if [[ "$profile" == local ]]; then
+  local_networking=$(/usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsLocalNetworking' "$plist")
+  test "$local_networking" = "$expected_local_networking"
+fi
 test -s "$app/main.jsbundle"
 bundle_bytes=$(wc -c < "$app/main.jsbundle" | tr -d '[:space:]')
 
 start_phase 'Select an available iPhone simulator'
 selected_device=$(xcrun simctl list devices available --json | node -e '
   const { devices } = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+  const requested = process.argv[1]?.toLowerCase();
   const runtimePrefix = "com.apple.CoreSimulator.SimRuntime.iOS-";
   const runtimes = Object.keys(devices)
     .filter(runtime => runtime.startsWith(runtimePrefix))
     .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
   for (const runtime of runtimes) {
     const phones = devices[runtime].filter(device => device.isAvailable && /^iPhone\b/.test(device.name));
-    const phone = phones.find(device => /^iPhone \d+$/.test(device.name)) ?? phones[0];
+    const phone = requested ? phones.find(device => device.udid.toLowerCase() === requested)
+      : phones.find(device => /^iPhone \d+$/.test(device.name)) ?? phones[0];
     if (!phone) continue;
     console.log([phone.udid, phone.name, runtime.slice(runtimePrefix.length), phone.state].join("\t"));
     process.exit(0);
   }
-  console.error("No available iPhone simulator is installed.");
+  console.error(requested ? "The chosen iPhone simulator is unavailable." : "No available iPhone simulator is installed.");
   process.exitCode = 1;
-')
+' "$simulator_hint")
 IFS=$'\t' read -r simulator device runtime state <<< "$selected_device"
 printf 'Using %s on iOS %s (%s), state %s.\n' "$device" "$runtime" "$simulator" "$state"
 start_phase 'Boot the iPhone simulator'
@@ -116,6 +169,12 @@ fi
 xcrun simctl bootstatus "$simulator" -b
 start_phase 'Install the Release app'
 xcrun simctl install "$simulator" "$app"
+if [[ "$profile" == local ]]; then
+  start_phase 'Verify the installed local Release matches the build'
+  installed_app=$(xcrun simctl get_app_container "$simulator" "$bundle_id" app)
+  cmp -s "$app/$executable" "$installed_app/$executable"
+  cmp -s "$app/main.jsbundle" "$installed_app/main.jsbundle"
+fi
 start_phase 'Launch the Release app'
 launch=$(xcrun simctl launch --terminate-running-process "$simulator" "$bundle_id")
 printf '%s\n' "$launch"
@@ -140,3 +199,11 @@ kill -0 "$pid"
 printf 'Release: %s\nMinimum OS: %s\nArchitecture: %s\nEmbedded JS: %s bytes\nSimulator: %s on iOS %s\nStable process: PID %s for 10 seconds and through screenshot\n' \
   "$bundle_id" "$minimum_os" "$arch" "$bundle_bytes" "$device" "$runtime" "$pid" \
   | tee "$evidence_dir/evidence.txt"
+if [[ "$profile" == local ]]; then
+  executable_sha=$(shasum -a 256 "$app/$executable" | cut -d ' ' -f 1)
+  bundle_sha=$(shasum -a 256 "$app/main.jsbundle" | cut -d ' ' -f 1)
+  printf 'Profile: local\nSource SHA: %s\nCheckout: %s\nConfigured API: %s\nConfigured store: %s\nSimulator UUID: %s\nATS arbitrary loads: %s\nATS local networking: %s\nExecutable SHA-256: %s\nEmbedded JS SHA-256: %s\n%s\nInstalled executable and embedded JS match the build.\nScope: Release simulator build, install and launch.\n' \
+    "$source_sha" "$source_state" "$CRUSTCAPER_API_BASE_URL" "$CRUSTCAPER_STORE_ID" "$simulator" \
+    "$arbitrary_http" "$local_networking" "$executable_sha" "$bundle_sha" "$xcode_version" \
+    | tee -a "$evidence_dir/evidence.txt"
+fi
