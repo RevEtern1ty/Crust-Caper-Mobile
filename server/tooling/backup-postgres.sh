@@ -8,6 +8,8 @@ fi
 : "${PGHOST:?Set the PostgreSQL source host}"
 : "${PGUSER:?Set the PostgreSQL backup role}"
 : "${PGDATABASE:?Set the PostgreSQL source database}"
+source "$(dirname -- "${BASH_SOURCE[0]}")/postgres-connection.sh"
+require_postgres_connection "$PGDATABASE"
 
 archive=$1
 if [[ -e "$archive" || -L "$archive" ]]; then

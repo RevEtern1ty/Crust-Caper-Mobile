@@ -106,7 +106,7 @@ async function prepareFixture(directory, testClasses, env, { load, paymentRestar
       environment: { CRUSTCAPER_DB_URL: fixtureDatabaseUrl(recoveredDatabase) },
       command: ['--recovery-api'],
     } } }));
-    for (const name of ['backup-postgres.sh', 'restore-postgres.sh']) {
+    for (const name of ['backup-postgres.sh', 'restore-postgres.sh', 'postgres-connection.sh']) {
       const source = join(root, 'server', 'tooling', name);
       const copy = join(directory, name);
       await writeFile(copy, (await readFile(source, 'utf8')).replaceAll('\r\n', '\n'));

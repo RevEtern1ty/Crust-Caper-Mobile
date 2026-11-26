@@ -12,11 +12,12 @@ archive=$1
 database=$2
 expected_checksum=$3
 maintenance_db=${PGDATABASE:-postgres}
-if [[ ! $maintenance_db =~ ^[a-z_][a-z0-9_]{0,62}$ ||
-  -n ${PGSERVICE:-} || "$PGHOST${PGHOSTADDR:-}${PGPORT:-}" == *,* ]]; then
-  printf 'Use a plain maintenance database name and a single PostgreSQL endpoint for recovery.\n' >&2
+if [[ ! $maintenance_db =~ ^[a-z_][a-z0-9_]{0,62}$ ]]; then
+  printf 'Use a plain maintenance database name for recovery.\n' >&2
   exit 2
 fi
+source "$(dirname -- "${BASH_SOURCE[0]}")/postgres-connection.sh"
+require_postgres_connection "$maintenance_db"
 if [[ ! -f "$archive" || ! -s "$archive" ]]; then
   printf 'Provide a nonempty PostgreSQL archive file.\n' >&2
   exit 1
