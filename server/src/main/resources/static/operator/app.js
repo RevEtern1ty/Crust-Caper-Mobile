@@ -231,6 +231,7 @@ function messageFor(error, unavailable = 'The server could not complete this req
   if (error.code === 'receipt_already_issued') return 'A receipt is already attached to this order. Refresh fiscal receipts.';
   if (error.code === 'receipt_reference_in_use') return 'This receipt reference is already attached to another order.';
   if (error.code === 'receipt_total_mismatch') return 'The total printed on the receipt must match the paid order.';
+  if (error.code === 'invalid_receipt_pdf') return 'This PDF could not be opened. Choose the original PDF exported by the EBM.';
   if (error.status === 413) return 'Choose a PDF file up to 1 MB.';
   if (error.status === 415) return 'Choose a PDF file issued by the EBM.';
   if (error.code === 'invalid_transition' || error.status === 404 || error.status === 409) {

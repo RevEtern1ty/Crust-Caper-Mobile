@@ -1116,7 +1116,17 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OperatorReceipt' }
-        '400': { $ref: '#/components/responses/InvalidInput' }
+        '400':
+          description: Invalid upload metadata or an unreadable new PDF. The pending order keeps its receipt state.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetails'
+                  - type: object
+                    properties:
+                      status: { const: 400 }
+                      code: { enum: [invalid_input, invalid_receipt_pdf] }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }

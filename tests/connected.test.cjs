@@ -1933,6 +1933,18 @@ test('manager finds and attaches a fiscal receipt beyond the rolling queue', { t
   const pdf = testReceipt();
   await card.getByLabel('EBM receipt reference').fill(reference);
   await card.getByLabel('Total printed on receipt (RWF)').fill(String(total));
+  await card.getByLabel('EBM receipt PDF').setInputFiles({
+    name: 'unreadable-receipt.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.7\nNo pages\n%%EOF\n'),
+  });
+  const rejected = page.waitForResponse(response => response.request().method() === 'PUT'
+    && response.url() === api + `/operator/orders/${order.id}/receipt`);
+  await button(card, 'Attach receipt').click();
+  const rejectedUpload = await rejected;
+  assert.equal(rejectedUpload.status(), 400);
+  assert.equal((await rejectedUpload.json()).code, 'invalid_receipt_pdf');
+  await card.getByText('This PDF could not be opened. Choose the original PDF exported by the EBM.', { exact: true }).waitFor();
+  await card.getByText('Awaiting receipt', { exact: true }).waitFor();
+  await capture(page, 'connected-fiscal-invalid-document');
   await card.getByLabel('EBM receipt PDF').setInputFiles({ name: 'synthetic-ebm-lookup.pdf', mimeType: 'application/pdf', buffer: pdf });
   await button(card, 'Attach receipt').click();
   await card.getByText('Attached', { exact: true }).waitFor();
@@ -1945,7 +1957,7 @@ test('manager finds and attaches a fiscal receipt beyond the rolling queue', { t
   assert.deepEqual((await (await full).json()).map(row => row.receiptReference), [reference]);
   await card.getByText('Attached', { exact: true }).waitFor();
   assert.equal(lookups.length, 3, 'Exact requests belong to two submits and one explicit refresh');
-  assert.equal(uploads.length, 1);
+  assert.equal(uploads.length, 2);
   const persisted = await send(`/orders/${order.id}/receipt`, { token: order.token });
   assert.equal(persisted.status, 200);
   assert.ok(Buffer.from(await persisted.arrayBuffer()).equals(pdf));
