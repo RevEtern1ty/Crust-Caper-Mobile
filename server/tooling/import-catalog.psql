@@ -91,6 +91,7 @@ DECLARE
     target_slot_id text;
     old_start timestamptz;
     old_end timestamptz;
+    checked_at timestamptz;
     occupied bigint;
     unit_max numeric;
 BEGIN
@@ -177,9 +178,10 @@ BEGIN
         WHERE saved.store_id = target_store_id AND saved.id = target_slot_id FOR UPDATE;
         IF FOUND THEN
             -- Payment capture holds the same slot lock. Evaluate live holds after acquiring the lock.
+            checked_at := clock_timestamp();
             SELECT count(*) INTO occupied FROM public.orders saved
-            WHERE saved.store_id = target_store_id AND saved.slot_id = target_slot_id AND saved.status <> 'cancelled'
-                AND (saved.status <> 'awaiting_payment' OR saved.reservation_expires_at > clock_timestamp());
+            WHERE saved.store_id = target_store_id AND saved.slot_id = target_slot_id
+                AND public.pickup_reservation_occupies_slot(saved.status, saved.reservation_expires_at, checked_at);
             PERFORM pg_temp.catalog_assert((slot->>'capacity')::numeric >= occupied,
                 format('Slot %s capacity is below the occupied places', target_slot_id));
             PERFORM pg_temp.catalog_assert(occupied = 0 OR (

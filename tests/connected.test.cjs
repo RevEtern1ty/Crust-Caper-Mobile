@@ -664,3 +664,111 @@ test('manager stop list and pause apply to new orders and preserve the paid kitc
   assert.equal(reopened.products.find(item => item.sku === initialItem.sku).available, true);
   assert.deepEqual(errors, []);
 });
+
+test('pickup limits protect existing holds, block additional checkout and open the window again', { timeout: 45_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const path = '/operator/availability';
+  const staff = await operator('demo-manager');
+  const menu = () => send('/stores/kigali/menu').then(response => response.json());
+  const getLimits = () => send(path, { token: staff }).then(response => response.json());
+  const patch = (version, slotId, capacity, token = staff) => send(path, { method: 'PATCH', token,
+    data: { expectedVersion: version, slotId, capacity } });
+  const liveMenu = await menu();
+  const original = await getLimits();
+  const product = liveMenu.products.find(item => item.name.en === 'Double Smash' && item.available);
+  const publicSlots = new Set(liveMenu.slots.filter(slot => slot.available).map(slot => slot.id));
+  const slot = original.slots.findLast(item => publicSlots.has(item.id) && item.capacity >= 2 && item.reserved === 0);
+  assert.ok(product && slot, 'The integration restaurant needs a future empty window with at least two places');
+
+  t.after(async () => {
+    const current = await getLimits();
+    if (current.slots.find(item => item.id === slot.id)?.capacity !== slot.capacity) {
+      const restored = await patch(current.version, slot.id, slot.capacity);
+      assert.ok(restored.ok, 'Restore the fixture window limit');
+    }
+  });
+  const denied = await patch(original.version, slot.id, 0, await operator('demo-kitchen'));
+  assert.equal(denied.status, 403);
+
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 844 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(8500);
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-manager');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(page, 'Sign in').click();
+  await button(page, 'Menu availability').click();
+  const windowInput = page.getByLabel('Pickup window', { exact: true });
+  const limit = page.getByLabel('Pickup limit', { exact: true });
+  await windowInput.selectOption(slot.id);
+  await shown(page, 'Active reservations: 0');
+
+  const selection = { storeId: 'kigali', slotId: slot.id,
+    lines: [{ sku: product.sku, modifierIds: [], quantity: 1, unitPrice: product.price }] };
+  const prepare = async () => {
+    const { accessToken: token } = await send('/guest-sessions', { method: 'POST' }).then(response => response.json());
+    const quote = await send('/quotes', { method: 'POST', token, data: selection });
+    assert.equal(quote.status, 200);
+    const { quoteId } = await quote.json();
+    return { token, place: () => send('/orders', { method: 'POST', token, key: randomUUID(), data: { quoteId, ...contact } }) };
+  };
+  const first = await prepare();
+  const second = await prepare();
+  const held = await first.place();
+  assert.equal(held.status, 200);
+  const pending = await held.json();
+
+  async function save(value) {
+    const response = page.waitForResponse(reply => reply.url() === api + path && reply.request().method() === 'PATCH');
+    await limit.fill(String(value));
+    await button(page, 'Save pickup limit').click();
+    return response;
+  }
+  const rejected = await save(0);
+  assert.equal(rejected.status(), 409);
+  assert.equal((await rejected.json()).code, 'slot_capacity_below_reserved');
+  await shown(page, 'Active reservations: 1');
+
+  const accepted = await save(1);
+  assert.equal(accepted.status(), 200);
+  const reduced = await accepted.json();
+  assert.notEqual(reduced.version, original.version);
+  assert.deepEqual(reduced.slots.find(item => item.id === slot.id), { ...slot, capacity: 1, reserved: 1 });
+  await shown(page, 'Pickup limit saved.');
+  await shown(page, 'Current limit: 1');
+  assert.equal(await windowInput.inputValue(), slot.id);
+  await capture(page, 'operator-pickup-limit');
+
+  assert.equal((await menu()).slots.find(item => item.id === slot.id).available, false);
+  const blocked = await second.place();
+  assert.equal(blocked.status, 409);
+  assert.equal((await blocked.json()).code, 'slot_unavailable');
+  const start = await send('/orders/' + pending.id + '/payments', { method: 'POST', token: first.token, key: randomUUID() });
+  assert.equal(start.status, 200);
+  const attempt = await start.json();
+  const settled = await send('/local/orders/' + pending.id + '/payments/' + attempt.id + '/result', {
+    method: 'POST', token: first.token, data: { status: 'paid' },
+  });
+  assert.equal(settled.status, 200);
+  assert.equal((await settled.json()).paymentStatus, 'paid');
+
+  const reopenedWrites = [];
+  await page.route(api + path, async route => {
+    if (route.request().method() !== 'PATCH') return route.continue();
+    const result = await route.fetch();
+    reopenedWrites.push(result.status());
+    // The restaurant saved the new limit, but the manager did not receive the response.
+    await route.abort('connectionreset');
+  });
+  await limit.fill(String(slot.capacity));
+  await button(page, 'Save pickup limit').click();
+  await shown(page, 'The current pickup limit matches your request.');
+  assert.deepEqual(reopenedWrites, [200]);
+  await shown(page, 'Current limit: ' + slot.capacity);
+  assert.equal((await menu()).slots.find(item => item.id === slot.id).available, true);
+  assert.equal((await second.place()).status, 200);
+  assert.deepEqual(errors, []);
+});

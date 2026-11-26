@@ -6,6 +6,8 @@ import jakarta.servlet.http.HttpServletRequest;
 import java.io.IOException;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -13,6 +15,9 @@ import java.util.regex.Pattern;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.DeserializationFeature;
@@ -21,7 +26,7 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.ObjectReader;
 
 @Service
-final class OperatorCatalogAvailability {
+class OperatorCatalogAvailability {
     private static final Pattern CATALOG_ID = Pattern.compile("[A-Za-z0-9._:-]{1,100}");
     private static final int MAX_PATCH_BYTES = 2048;
     private final JdbcClient jdbc;
@@ -30,19 +35,27 @@ final class OperatorCatalogAvailability {
     private final ObjectReader patchReader;
 
     record ProductAvailability(String sku, Localized name, boolean available) {}
-    record Snapshot(String version, boolean open, List<ProductAvailability> products) {}
+    record SlotAvailability(String id, Instant startsAt, Instant endsAt, int capacity, int reserved) {}
+    record Snapshot(String version, boolean open, List<ProductAvailability> products, List<SlotAvailability> slots) {}
     private record CatalogState(String version, boolean open) {}
     private record SnapshotRow(String version, boolean open, ProductAvailability product) {}
-    private record Change(String expectedVersion, String sku, boolean newValue) {}
+    private record LockedSlot(OffsetDateTime startsAt, int capacity) {}
+    private sealed interface Change permits AvailabilityChange, CapacityChange {
+        String expectedVersion();
+    }
+    private record AvailabilityChange(String expectedVersion, String sku, boolean newValue) implements Change {}
+    private record CapacityChange(String expectedVersion, String slotId, int capacity) implements Change {}
 
     OperatorCatalogAvailability(JdbcClient jdbc, OperatorSessions sessions, TransactionTemplate transactions, ObjectMapper mapper) {
         this.jdbc = jdbc;
         this.sessions = sessions;
-        this.transactions = transactions;
+        this.transactions = new TransactionTemplate(Objects.requireNonNull(transactions.getTransactionManager()), transactions);
+        this.transactions.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
         this.patchReader = mapper.readerFor(JsonNode.class)
             .with(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY, DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     }
 
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     Snapshot get(String authorization) {
         return snapshot(manager(authorization, false).storeId());
     }
@@ -65,9 +78,17 @@ final class OperatorCatalogAvailability {
             throw OperatorFailure.conflict("catalog_version_conflict");
         }
 
+        switch (requested) {
+            case AvailabilityChange availability -> applyAvailabilityLocked(manager, current, availability);
+            case CapacityChange capacity -> applyCapacityLocked(manager, current, capacity);
+        }
+        return snapshot(manager.storeId());
+    }
+
+    private void applyAvailabilityLocked(Principal manager, CatalogState current, AvailabilityChange requested) {
         boolean storeChange = requested.sku() == null;
         boolean previous = storeChange ? current.open() : productAvailable(manager.storeId(), requested.sku());
-        if (previous == requested.newValue()) return snapshot(manager.storeId());
+        if (previous == requested.newValue()) return;
 
         if (!storeChange) {
             jdbc.sql("""
@@ -76,16 +97,46 @@ final class OperatorCatalogAvailability {
                 """).params(requested.newValue(), manager.storeId(), requested.sku()).update();
         }
 
-        String revision = "runtime-" + UUID.randomUUID();
-        jdbc.sql("UPDATE stores SET open = ?, version = ?, updated_at = clock_timestamp() WHERE id = ?")
-            .params(storeChange ? requested.newValue() : current.open(), revision, manager.storeId()).update();
+        String revision = publish(manager.storeId(), storeChange ? requested.newValue() : current.open());
         jdbc.sql("""
             INSERT INTO operator_availability_events
                 (store_id, operator_id, operator_username, action, sku, previous_value, new_value, previous_version, new_version)
             SELECT ?, a.id, a.username, ?, ?, ?, ?, ?, ? FROM operator_accounts a WHERE a.id = ?
             """).params(manager.storeId(), storeChange ? "store_open" : "product_available",
                 requested.sku(), previous, requested.newValue(), current.version(), revision, manager.id()).update();
-        return snapshot(manager.storeId());
+    }
+
+    private void applyCapacityLocked(Principal manager, CatalogState current, CapacityChange requested) {
+        String store = manager.storeId();
+        String slot = requested.slotId();
+        LockedSlot saved = jdbc.sql("SELECT starts_at, capacity FROM pickup_slots WHERE store_id = ? AND id = ? FOR UPDATE")
+            .params(store, slot).query((rs, row) -> new LockedSlot(rs.getObject("starts_at", OffsetDateTime.class),
+                rs.getInt("capacity"))).optional().orElseThrow(OperatorFailure::notFound);
+        // Settlement can commit while this transaction waits for the slot. Count from a fresh snapshot after the lock.
+        OffsetDateTime now = jdbc.sql("SELECT clock_timestamp()").query(OffsetDateTime.class).single();
+        if (!saved.startsAt().isAfter(now)) throw OperatorFailure.conflict("slot_update_closed");
+        if (saved.capacity() == requested.capacity()) return;
+        long reserved = jdbc.sql("""
+            SELECT count(*) FROM orders WHERE store_id = ? AND slot_id = ?
+                AND pickup_reservation_occupies_slot(status, reservation_expires_at, ?)
+            """).params(store, slot, now).query(Long.class).single();
+        if (requested.capacity() < reserved) throw OperatorFailure.conflict("slot_capacity_below_reserved");
+
+        jdbc.sql("UPDATE pickup_slots SET capacity = ? WHERE store_id = ? AND id = ?")
+            .params(requested.capacity(), store, slot).update();
+        String revision = publish(store, current.open());
+        jdbc.sql("""
+            INSERT INTO operator_availability_events (store_id, operator_id, operator_username, action,
+                slot_id, previous_capacity, new_capacity, previous_version, new_version)
+            SELECT ?, a.id, a.username, 'slot_capacity', ?, ?, ?, ?, ? FROM operator_accounts a WHERE a.id = ?
+            """).params(store, slot, saved.capacity(), requested.capacity(), current.version(), revision, manager.id()).update();
+    }
+
+    private String publish(String store, boolean open) {
+        String revision = "runtime-" + UUID.randomUUID();
+        jdbc.sql("UPDATE stores SET open = ?, version = ?, updated_at = clock_timestamp() WHERE id = ?")
+            .params(open, revision, store).update();
+        return revision;
     }
 
     private boolean productAvailable(String store, String sku) {
@@ -103,7 +154,27 @@ final class OperatorCatalogAvailability {
         if (rows.isEmpty()) throw OperatorFailure.notFound();
         SnapshotRow state = rows.getFirst();
         return new Snapshot(state.version(), state.open(), rows.stream().map(SnapshotRow::product)
-            .filter(Objects::nonNull).toList());
+            .filter(Objects::nonNull).toList(), upcomingSlots(store));
+    }
+
+    private List<SlotAvailability> upcomingSlots(String store) {
+        return jdbc.sql("""
+            WITH checked_at AS MATERIALIZED (SELECT clock_timestamp() AS value),
+            upcoming AS (
+                SELECT p.store_id, p.id, p.starts_at, p.ends_at, p.capacity, checked_at.value
+                FROM pickup_slots p CROSS JOIN checked_at
+                WHERE p.store_id = ? AND p.starts_at > checked_at.value
+                ORDER BY p.starts_at, p.id LIMIT 36
+            )
+            SELECT p.id, p.starts_at, p.ends_at, p.capacity, count(o.id) AS reserved
+            FROM upcoming p
+            LEFT JOIN orders o ON o.store_id = p.store_id AND o.slot_id = p.id
+                AND pickup_reservation_occupies_slot(o.status, o.reservation_expires_at, p.value)
+            GROUP BY p.id, p.starts_at, p.ends_at, p.capacity
+            ORDER BY p.starts_at, p.id
+            """).param(store).query((rs, row) -> new SlotAvailability(rs.getString("id"),
+                rs.getObject("starts_at", OffsetDateTime.class).toInstant(), rs.getObject("ends_at", OffsetDateTime.class).toInstant(),
+                rs.getInt("capacity"), rs.getInt("reserved"))).list();
     }
 
     private static SnapshotRow snapshotRow(ResultSet rs, int number) throws SQLException {
@@ -142,11 +213,15 @@ final class OperatorCatalogAvailability {
         if (body == null || !body.isObject()) throw OperatorFailure.invalid();
         String version = identifier(body.path("expectedVersion"));
         JsonNode open = body.path("open");
-        if (body.size() == 2 && open.isBoolean()) return new Change(version, null, open.booleanValue());
+        if (body.size() == 2 && open.isBoolean()) return new AvailabilityChange(version, null, open.booleanValue());
 
         JsonNode available = body.path("available");
         if (body.size() == 3 && available.isBoolean()) {
-            return new Change(version, identifier(body.path("sku")), available.booleanValue());
+            return new AvailabilityChange(version, identifier(body.path("sku")), available.booleanValue());
+        }
+        JsonNode capacity = body.path("capacity");
+        if (body.size() == 3 && capacity.isIntegralNumber() && capacity.canConvertToInt() && capacity.intValue() >= 0) {
+            return new CapacityChange(version, identifier(body.path("slotId")), capacity.intValue());
         }
         throw OperatorFailure.invalid();
     }

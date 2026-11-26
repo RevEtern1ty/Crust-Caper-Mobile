@@ -647,6 +647,127 @@ class OperatorIntegrationTest {
     }
 
     @Test
+    void managerSlotSnapshotsAreBoundedAndEditsAreVersionedAndScoped() throws Exception {
+        Staff manager = newStaff(store, "manager");
+        String bearer = login(manager);
+        String kitchen = login(newStaff(store, "kitchen"));
+        String foreignStore = newStore();
+        jdbc.sql("""
+            INSERT INTO pickup_slots (store_id, id, starts_at, ends_at, capacity) VALUES
+                (?, 'expired', now() - interval '1 minute', now() + interval '5 minutes', 3),
+                (?, 'foreign-only', now() + interval '5 minutes', now() + interval '10 minutes', 3)
+            """).params(store, foreignStore).update();
+        jdbc.sql("""
+            INSERT INTO pickup_slots (store_id, id, starts_at, ends_at, capacity)
+            SELECT ?, 'future-' || lpad(n::text, 2, '0'), now() + (n + 60) * interval '1 minute',
+                now() + (n + 70) * interval '1 minute', 5 FROM generate_series(1, 38) AS seq(n)
+            """).param(store).update();
+
+        JsonNode initial = availability(bearer);
+        String version = initial.path("version").asString();
+        JsonNode slots = initial.path("slots");
+        assertThat(slots.size()).isEqualTo(36);
+        assertThat(slots.get(0).path("id").asString()).isEqualTo(SLOT);
+        assertThat(slots.get(35).path("id").asString()).isEqualTo("future-35");
+        assertThat(keys(slots.get(0))).containsExactlyInAnyOrder("id", "startsAt", "endsAt", "capacity", "reserved");
+        assertThat(slots.get(0).path("reserved").asInt()).isZero();
+        assertThat(Instant.parse(slots.get(0).path("startsAt").asString()))
+                .isBefore(Instant.parse(slots.get(0).path("endsAt").asString()));
+
+        updateAvailability(kitchen, slotChange(version, SLOT, 1)).andExpect(status().isForbidden());
+        updateAvailability(bearer, slotChange(version, "foreign-only", 1)).andExpect(status().isNotFound());
+        updateAvailability(bearer, slotChange(version, "expired", 3)).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("slot_update_closed"));
+        for (String malformed : List.of("-1", "2147483648", "1.5", "\"1\"", "true")) {
+            updateAvailability(bearer, """
+                {"expectedVersion":"%s","slotId":"%s","capacity":%s}
+                """.formatted(version, SLOT, malformed)).andExpect(status().isBadRequest());
+        }
+        updateAvailability(bearer, """
+            {"expectedVersion":"%s","slotId":"%s","capacity":1,"open":true}
+            """.formatted(version, SLOT)).andExpect(status().isBadRequest());
+        updateAvailability(bearer, slotChange(version, SLOT, 4)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(version));
+        assertThat(auditCount(store)).isZero();
+
+        JsonNode published = body(updateAvailability(bearer, slotChange(version, SLOT, Integer.MAX_VALUE))
+                .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.slots[0].capacity").value(Integer.MAX_VALUE)));
+        String revision = published.path("version").asString();
+        assertThat(revision).isNotEqualTo(version);
+        updateAvailability(bearer, slotChange(version, SLOT, 1)).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("catalog_version_conflict"));
+        updateAvailability(bearer, slotChange(revision, SLOT, Integer.MAX_VALUE)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(revision));
+        api.perform(get(API + "/stores/" + store + "/menu")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(revision));
+        assertThat(jdbc.sql("""
+            SELECT operator_username || ':' || previous_capacity || ':' || new_capacity FROM operator_availability_events
+            WHERE store_id = ? AND operator_id = ? AND action = 'slot_capacity' AND slot_id = ?
+                AND previous_version = ? AND new_version = ? AND occurred_at <= clock_timestamp()
+            """).params(store, manager.id(), SLOT, version, revision).query(String.class).single())
+                .isEqualTo(manager.username() + ":4:" + Integer.MAX_VALUE);
+        assertThat(auditCount(store)).isOne();
+    }
+
+    @Test
+    void slotCapacityIncludesPaidOrdersAndActiveHoldsThenReleasesExpiredAndCancelledPlaces() throws Exception {
+        String manager = login(newStaff(store, "manager"));
+        OrderFixture paid = newOrder(store, true);
+        OrderFixture held = newOrder(store, false);
+        JsonNode initial = availability(manager);
+        String version = initial.path("version").asString();
+        assertThat(initial.path("slots").get(0).path("reserved").asInt()).isEqualTo(2);
+        updateAvailability(manager, slotChange(version, SLOT, 1)).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("slot_capacity_below_reserved"));
+        assertThat(auditCount(store)).isZero();
+        jdbc.sql("UPDATE orders SET reservation_expires_at = now() - interval '1 second' WHERE id = ?")
+                .param(UUID.fromString(held.orderId())).update();
+
+        JsonNode reduced = body(updateAvailability(manager, slotChange(version, SLOT, 1))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.slots[0].reserved").value(1)));
+        String reducedVersion = reduced.path("version").asString();
+        quote(newGuest(), store).andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("slot_unavailable"));
+        updateAvailability(manager, slotChange(reducedVersion, SLOT, 0)).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("slot_capacity_below_reserved"));
+
+        cancel(manager, paid.orderId()).andExpect(status().isOk()).andExpect(jsonPath("$.paymentStatus").value("refund_pending"));
+        updateAvailability(manager, slotChange(reducedVersion, SLOT, 0)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.slots[0].capacity").value(0)).andExpect(jsonPath("$.slots[0].reserved").value(0));
+        assertThat(auditCount(store)).isEqualTo(2);
+    }
+
+    @Test
+    void lastSlotReservationAndCapacityReductionCannotBothSucceed() throws Exception {
+        String manager = login(newStaff(store, "manager"));
+        jdbc.sql("UPDATE pickup_slots SET capacity = 1 WHERE store_id = ? AND id = ?").params(store, SLOT).update();
+        String version = availability(manager).path("version").asString();
+        String guest = newGuest();
+        String quoteId = body(quote(guest, store).andExpect(status().isOk())).path("quoteId").asString();
+        var start = new CountDownLatch(1);
+        int edited;
+        int booked;
+        try (var threads = Executors.newFixedThreadPool(2)) {
+            var edit = threads.submit(() -> {
+                if (!start.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("Capacity edit barrier timed out");
+                return updateAvailability(manager, slotChange(version, SLOT, 0)).andReturn().getResponse().getStatus();
+            });
+            var book = threads.submit(() -> {
+                if (!start.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("Reservation barrier timed out");
+                return createOrder(guest, quoteId, "last-slot").andReturn().getResponse().getStatus();
+            });
+            start.countDown();
+            edited = edit.get(10, TimeUnit.SECONDS);
+            booked = book.get(10, TimeUnit.SECONDS);
+        }
+        JsonNode saved = availability(manager).path("slots").get(0);
+        assertThat(List.of(edited, booked)).containsExactlyInAnyOrder(200, 409);
+        assertThat(saved.path("capacity").asInt()).isEqualTo(booked == 200 ? 1 : 0);
+        assertThat(saved.path("reserved").asInt()).isEqualTo(booked == 200 ? 1 : 0);
+        assertThat(auditCount(store)).isEqualTo(edited == 200 ? 1 : 0);
+    }
+
+    @Test
     void concurrentAvailabilityEditsWithOneCatalogVersionCannotOverwriteEachOther() throws Exception {
         String first = login(newStaff(store, "manager"));
         String second = login(newStaff(store, "manager"));
@@ -691,6 +812,10 @@ class OperatorIntegrationTest {
 
     private String productChange(String version, String sku, boolean available) {
         return json.writeValueAsString(Map.of("expectedVersion", version, "sku", sku, "available", available));
+    }
+
+    private String slotChange(String version, String slot, int capacity) {
+        return json.writeValueAsString(Map.of("expectedVersion", version, "slotId", slot, "capacity", capacity));
     }
 
     private String newStore() {

@@ -21,8 +21,8 @@ class Catalog {
         SELECT id, starts_at, ends_at, capacity FROM pickup_slots WHERE store_id = ?
         """;
     private static final String RESERVED_QUERY = """
-        SELECT count(*) FROM orders WHERE store_id = ? AND slot_id = ? AND status <> 'cancelled'
-          AND (status <> 'awaiting_payment' OR reservation_expires_at > ?)
+        SELECT count(*) FROM orders WHERE store_id = ? AND slot_id = ?
+          AND pickup_reservation_occupies_slot(status, reservation_expires_at, ?)
         """;
 
     record StoreData(Store store, String version, Instant updatedAt, int taxBasisPoints) {}

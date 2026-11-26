@@ -111,6 +111,26 @@
           </div>
           <p class="problem" id="availability-problem" role="alert" hidden></p>
           <p class="availability-note" id="availability-note" role="status" hidden></p>
+          <section class="order-card pickup-limits" id="pickup-limits" aria-labelledby="pickup-limits-title" hidden>
+            <h3 class="order-title" id="pickup-limits-title">Pickup limits</h3>
+            <p id="pickup-limits-empty" role="status" hidden>No upcoming pickup windows.</p>
+            <form class="pickup-limit-form" id="pickup-limit-form" method="post" novalidate hidden>
+              <label for="pickup-window">Pickup window</label>
+              <select id="pickup-window" aria-describedby="pickup-limit-window"></select>
+              <div class="pickup-limit-summary" aria-live="polite">
+                <p id="pickup-limit-window"></p>
+                <p id="pickup-limit-current"></p>
+                <p id="pickup-limit-reserved"></p>
+              </div>
+              <label for="pickup-limit">Pickup limit</label>
+              <input id="pickup-limit" type="number" inputmode="numeric" min="0" max="2147483647" step="1" required
+                aria-describedby="pickup-limit-help pickup-limit-problem">
+              <p class="payment-review-help" id="pickup-limit-help">A limit of 0 closes the window when there are no active reservations.</p>
+              <button class="button button-primary" type="submit" id="save-pickup-limit">Save pickup limit</button>
+            </form>
+            <p class="problem pickup-limit-problem" id="pickup-limit-problem" role="alert" tabindex="-1" hidden></p>
+            <p class="availability-note pickup-limit-note" id="pickup-limit-note" role="status" tabindex="-1" hidden></p>
+          </section>
           <ul class="order-list" id="availability-list" aria-label="Item availability"></ul>
         </section>
       </section>

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: CrustCaper Shared API
-  version: 0.8.0
+  version: 0.9.0
   description: Implemented HTTP contract for the Spring Boot commerce service.
 servers:
   - url: /api/v1
@@ -426,7 +426,7 @@ paths:
         '403': { $ref: '#/components/responses/OperatorForbidden' }
     patch:
       operationId: setMenuAvailability
-      description: Modify the manager's own restaurant or one of its items, using the current version. The request body is limited to 2 KiB.
+      description: Modify the manager's own restaurant, one of its menu items or a future pickup window, using the current catalog version. A pickup limit must cover active reservations. The request body is limited to 2 KiB.
       security: [{ operatorBearer: [] }]
       requestBody:
         required: true
@@ -447,15 +447,22 @@ paths:
                     expectedVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
                     sku: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
                     available: { type: boolean }
+                - type: object
+                  additionalProperties: false
+                  required: [expectedVersion, slotId, capacity]
+                  properties:
+                    expectedVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    slotId: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    capacity: { type: integer, minimum: 0, maximum: 2147483647 }
       responses:
         '200': { $ref: '#/components/responses/OperatorAvailability' }
         '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
-        '404': { description: No item with this SKU exists in the assigned restaurant. }
+        '404': { description: The item or pickup window does not exist in the assigned restaurant. }
         '415': { description: The request body must be sent as application/json. }
         '409':
-          description: The caller must reload the current menu before changing availability.
+          description: The catalog version changed, the window has started, or the new limit is below its active reservations.
           content:
             application/problem+json:
               schema:
@@ -463,7 +470,7 @@ paths:
                   - $ref: '#/components/schemas/ProblemDetails'
                   - properties:
                       status: { const: 409 }
-                      code: { const: catalog_version_conflict }
+                      code: { enum: [catalog_version_conflict, slot_update_closed, slot_capacity_below_reserved] }
   /operator/receipts:
     get:
       operationId: listOperatorReceipts
@@ -797,7 +804,7 @@ components:
         locale: { type: string, enum: [en, rw] }
     OperatorAvailability:
       type: object
-      required: [version, open, products]
+      required: [version, open, products, slots]
       properties:
         version: { type: string }
         open: { type: boolean }
@@ -810,6 +817,19 @@ components:
               sku: { type: string }
               name: { $ref: '#/components/schemas/Localized' }
               available: { type: boolean }
+        slots:
+          type: array
+          maxItems: 36
+          description: Upcoming pickup windows, ordered by start time and ID. Reservation counts reflect this snapshot.
+          items:
+            type: object
+            required: [id, startsAt, endsAt, capacity, reserved]
+            properties:
+              id: { type: string }
+              startsAt: { $ref: '#/components/schemas/Timestamp' }
+              endsAt: { $ref: '#/components/schemas/Timestamp' }
+              capacity: { type: integer, minimum: 0, maximum: 2147483647 }
+              reserved: { type: integer, minimum: 0 }
     OperatorReceipt:
       type: object
       required: [orderId, status, total, currency, receiptStatus]

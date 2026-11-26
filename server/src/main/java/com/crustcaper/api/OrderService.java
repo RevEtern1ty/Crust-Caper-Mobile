@@ -25,6 +25,8 @@ import java.util.regex.Pattern;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -79,7 +81,8 @@ public class OrderService {
         this.catalog = catalog;
         this.json = json;
         this.gateway = gateway;
-        this.transactions = transactions;
+        this.transactions = new TransactionTemplate(Objects.requireNonNull(transactions.getTransactionManager()), transactions);
+        this.transactions.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
         this.localPayments = provider.equals("local");
     }
 
@@ -109,7 +112,7 @@ public class OrderService {
             expiresAt, current.changes(), slot.startsAt(), slot.endsAt());
     }
 
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public Order createOrder(UUID guest, String key, OrderInput input) {
         validateKey(key);
         if (input == null) throw ApiFailure.invalid();

@@ -119,3 +119,12 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .availability-store .button { flex: 0 1 auto; }
 .availability-item { display: grid; gap: .75rem; }
 .availability-note { color: var(--green); font-weight: 720; margin-bottom: .85rem; }
+.pickup-limits { display: grid; gap: .8rem; margin-bottom: 1rem; }
+.pickup-limit-form { display: grid; gap: .55rem; max-width: 30rem; }
+.pickup-limit-form select { width: 100%; min-width: 0; min-height: 3rem; padding: .62rem .6rem; border: 1px solid var(--border); border-radius: .65rem; background: var(--white); color: var(--ink); font: inherit; text-overflow: ellipsis; }
+.pickup-limit-form select:focus-visible { outline: .19rem solid var(--green); outline-offset: .15rem; }
+.pickup-limit-summary { display: flex; flex-wrap: wrap; gap: .2rem 1rem; color: var(--muted); }
+.pickup-limit-summary p { overflow-wrap: anywhere; }
+#pickup-limit-window { flex-basis: 100%; color: var(--ink); }
+.pickup-limit-form .payment-review-help, .pickup-limits .pickup-limit-problem, .pickup-limits .pickup-limit-note { margin: 0; }
+.pickup-limit-form button { white-space: normal; overflow-wrap: anywhere; }
