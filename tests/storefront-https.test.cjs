@@ -362,14 +362,14 @@ async function checkGuestCheckout(browser, ca) {
     if (project) verifyPaymentRow(order.id);
     await capture(page, 'catalog-to-paid');
     if (catalogPhotos) await checkOrderPrivacy(browser, ca, order, session.sessionId, cookie);
-    else await checkSettledOrderRecovery(page, context, order, session.sessionId);
+    else await checkSettledOrderRecovery(page, context, ca, order, session.sessionId);
     assert.deepEqual(failures, []);
   } finally {
     await context.close();
   }
 }
 
-async function checkSettledOrderRecovery(page, context, order, oldSessionId) {
+async function checkSettledOrderRecovery(page, context, ca, order, oldSessionId) {
   const responseFor = (path, method) => page.waitForResponse(response =>
     response.request().method() === method && new URL(response.url()).pathname === path);
   // Model expiry of only the HttpOnly cookie. Keep the original tab and its checkout journal.
@@ -405,6 +405,7 @@ async function checkSettledOrderRecovery(page, context, order, oldSessionId) {
   assert.ok(uuid.test(recoveredSessionId) && recoveredSessionId !== oldSessionId);
   await page.waitForURL(origin + '/orders');
   await shown(page, 'Paid');
+  await checkSettledOrderPresentation(page, context, ca, order.id, recoveredSessionId);
 
   await page.goto(origin + '/product/double-smash?storefrontLocale=en');
   await button(page, /Add to cart/).click();
@@ -427,6 +428,38 @@ async function checkSettledOrderRecovery(page, context, order, oldSessionId) {
   const replacement = await created.json();
   assert.ok(uuid.test(replacement.id) && replacement.id !== order.id);
   verifyPaymentRow(order.id);
+}
+
+async function checkSettledOrderPresentation(page, context, ca, orderId, recoveredSessionId) {
+  const reorder = button(page, 'Review reorder');
+  await reorder.waitFor();
+  const recoveredCookie = (await context.cookies(origin)).find(cookie => cookie.name === guestCookie);
+  assert.ok(recoveredCookie?.httpOnly, 'the recovered order has a browser guest cookie');
+  const orderPath = '/api/v1/web/orders/' + orderId;
+  await page.route(origin + orderPath, async route => {
+    const original = route.request();
+    assert.equal(original.method(), 'GET');
+    assert.ok((await original.headerValue('x-crustcaper-session')) === recoveredSessionId);
+    const loaded = await request(ca, orderPath, { headers: {
+      'X-CrustCaper-Session': recoveredSessionId, Cookie: guestCookie + '=' + recoveredCookie.value,
+    } });
+    assert.equal(loaded.status, 200, 'the original order read must authenticate before cookie loss');
+    const previous = JSON.parse(loaded.body);
+    assert.ok(previous.id === orderId && previous.paymentStatus === 'paid' && previous.recoveryReadOnly);
+    await context.clearCookies({ name: guestCookie });
+    await route.fulfill({ status: loaded.status, contentType: 'application/json', body: loaded.body });
+  }, { times: 1 });
+  const checkedSession = page.waitForResponse(response => response.url() === origin + '/api/v1/web/session'
+    && response.request().method() === 'GET');
+  void checkedSession.catch(() => undefined);
+  try {
+    await page.reload();
+    await shown(page, 'Paid');
+    assert.equal(await reorder.count(), 0, 'a stale read cannot enable reorder after its browser cookie ends');
+    assert.equal((await checkedSession).status(), 401);
+  } finally {
+    await context.addCookies([recoveredCookie]);
+  }
 }
 
 async function checkOrderPrivacy(browser, ca, order, sessionId, cookie) {
