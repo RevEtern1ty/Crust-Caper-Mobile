@@ -1593,7 +1593,7 @@ test('manager finds and attaches a fiscal receipt beyond the rolling queue', { t
   await card.getByText(`EBM reference ${reference}`, { exact: true }).waitFor();
 
   await search.fill(order.id);
-  assert.equal(await card.count(), 0);
+  assert.equal(lookups.length, 2, 'Editing the input must not submit another exact query');
   const full = match(order.id);
   await search.press('Enter');
   assert.deepEqual((await (await full).json()).map(row => row.receiptReference), [reference]);
