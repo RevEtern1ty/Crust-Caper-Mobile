@@ -11,7 +11,8 @@ const unpaidHoldCheckIntervalMs = 60_000;
 const overdueHoldCheckIntervalMs = 15_000;
 const holdDeadlineGraceMs = 1000;
 const receiptCheckIntervalMs = 15_000;
-export const receiptChecksPerVisit = 8;
+const slowReceiptCheckIntervalMs = 60_000;
+export const initialReceiptChecksPerVisit = 8;
 export const delayedPaymentThresholdMs = 18_000;
 
 export function isWaitingForReceipt(order: PolledOrder): boolean {
@@ -53,15 +54,15 @@ export function nextOrderStatusDelay(
   consecutiveFailures: number,
   now = Date.now(),
   uncertainForMs: number | null = null,
-  receiptChecksRemaining: number | null = null,
+  initialReceiptChecksRemaining: number | null = null,
 ): number | null {
+  const receiptDelay = initialReceiptChecksRemaining === 0 ? slowReceiptCheckIntervalMs : receiptCheckIntervalMs;
   if ('error' in result) {
     const code = result.error instanceof ApiError ? result.error.code : null;
     if (code === 'unauthenticated' || code === 'not_found') return null;
     if (mode === 'demo') return attempts < 9 ? 3000 : null;
-    if (receiptChecksRemaining === 0) return null;
     const paymentDelay = uncertainForMs === null ? 0 : paymentCheckDelay(uncertainForMs);
-    const minDelay = Math.max(paymentDelay, receiptChecksRemaining === null ? 0 : receiptCheckIntervalMs);
+    const minDelay = Math.max(paymentDelay, initialReceiptChecksRemaining === null ? 0 : receiptDelay);
     if (code === 'rate_limited') return Math.max(15_000, minDelay);
     if (code === 'network_unavailable' || code === 'service_unavailable' || code === 'invalid_response') {
       return Math.max(5000 * Math.min(consecutiveFailures, 3), minDelay);
@@ -86,6 +87,6 @@ export function nextOrderStatusDelay(
   if (uncertain) return paymentCheckDelay(uncertainForMs ?? 0);
   if (inKitchen || status === 'ready') return 5000;
   if (paymentStatus === 'refund_pending') return 15_000;
-  if (receiptChecksRemaining && isWaitingForReceipt(result.order)) return receiptCheckIntervalMs;
+  if (initialReceiptChecksRemaining !== null && isWaitingForReceipt(result.order)) return receiptDelay;
   return null;
 }

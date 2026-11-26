@@ -1205,6 +1205,17 @@ test('an open picked-up order shows a later fiscal receipt without manual refres
   assert.equal((await (await resumed).json()).receiptStatus, 'pending');
   await page.getByRole('button', { name: 'Refresh order status', exact: true, disabled: false }).waitFor();
 
+  const beforeInitialChecks = readCount();
+  for (let check = 0; check < 8; check++) {
+    const checked = waitForRead();
+    await page.clock.fastForward(15_100);
+    assert.equal((await (await checked).json()).receiptStatus, 'pending');
+    await page.clock.runFor(100);
+  }
+  assert.equal(readCount(), beforeInitialChecks + 8);
+  await page.clock.fastForward(45_000);
+  assert.equal(readCount(), beforeInitialChecks + 8, 'later outstanding receipts are checked once per minute');
+
   const pdf = testReceipt();
   const attached = await fetch(api + '/operator' + orderPath + '/receipt', {
     method: 'PUT', redirect: 'error', signal: AbortSignal.timeout(10_000), body: pdf,
@@ -1214,12 +1225,12 @@ test('an open picked-up order shows a later fiscal receipt without manual refres
   assert.equal(attached.status, 200);
   assert.equal((await attached.json()).receiptStatus, 'issued');
   const beforeReceipt = readCount();
-  await page.clock.fastForward(15_100);
+  await page.clock.fastForward(15_500);
   await button(page, 'Download receipt').waitFor();
   assert.equal(readCount(), beforeReceipt + 1);
   await capture(page, 'receipt-after-pickup-issued');
   assert.ok((await downloadedReceipt(page)).equals(pdf));
-  await page.clock.fastForward(31_000);
+  await page.clock.fastForward(61_000);
   assert.equal(readCount(), beforeReceipt + 1, 'issued receipts do not need further status reads');
 });
 
