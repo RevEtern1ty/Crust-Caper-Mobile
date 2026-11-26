@@ -100,7 +100,7 @@ export function safeHttps(value: string | null | undefined, allow?: (url: URL) =
   return null;
 }
 
-export function errorCode(status: number, problem: unknown): ApiErrorCode {
+function errorCode(status: number, problem: unknown): ApiErrorCode {
   if (status === 400 || status === 422) return 'invalid_input';
   if (status === 401 || status === 403) return 'unauthenticated';
   if (status === 404) return 'not_found';
@@ -110,6 +110,14 @@ export function errorCode(status: number, problem: unknown): ApiErrorCode {
     return code.success && knownConflicts.has(code.data.code) ? code.data.code as ApiErrorCode : 'conflict';
   }
   return 'service_unavailable';
+}
+
+export function apiResponseError(response: Pick<Response, 'status' | 'url' | 'headers' | 'redirected'>,
+  expectedUrl: string, problem: unknown): ApiError {
+  const { status } = response;
+  const requestId = status >= 500 && status < 600 && !response.redirected && response.url === expectedUrl
+    ? response.headers.get('X-Request-ID') : null;
+  return new ApiError(errorCode(status, problem), { requestId });
 }
 
 export function createLiveApi({
@@ -187,11 +195,11 @@ export function createLiveApi({
       });
       if (response.redirected || (response.url && response.url !== url)) invalidResponse();
       if (response.status === 401 && (token || path === '/guest-sessions/refresh')) throw new GuestRejected();
-      if (pdf && !response.ok) throw new ApiError(errorCode(response.status, null));
+      if (pdf && !response.ok) throw apiResponseError(response, url, null);
       if (pdf && response.status !== 200) invalidResponse();
       if ((method === 'DELETE' || path === '/guest-sessions/revoke') && response.ok && response.status !== 204) invalidResponse();
       const payload: unknown = pdf ? await readReceiptPdf(response) : response.status === 204 ? null : await response.json().catch(() => null);
-      if (!response.ok) throw new ApiError(errorCode(response.status, payload));
+      if (!response.ok) throw apiResponseError(response, url, payload);
       const parsed = schema.safeParse(payload);
       if (!parsed.success) invalidResponse();
       onHeaders?.(response.headers);

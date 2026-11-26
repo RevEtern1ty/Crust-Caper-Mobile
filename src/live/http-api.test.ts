@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { CheckoutController } from '../checkout/controller';
-import type { Storage } from '../domain/types';
+import { ApiError, type Storage } from '../domain/types';
 import { createLiveApi, type ConnectedConfig } from './http-api';
 import { MAX_RECEIPT_BYTES, PDF_MIME_TYPE } from './receipt';
 
@@ -792,6 +792,51 @@ test('the customer receipt uses an authenticated fixed GET without putting crede
   assert.match(request?.accept ?? '', /^application\/pdf/);
   assert.equal(request?.body, undefined);
   assert.doesNotMatch(JSON.stringify([...data.values()]), /%PDF|test receipt/);
+});
+
+test('native order and receipt failures expose only a valid ID from the expected API response', async () => {
+  const { data, storage } = memory();
+  data.set(journalKey + '.guest', JSON.stringify(session));
+  const requestId = 'ba8b8f93-4a07-4711-82d6-189a3cfe5747';
+  const spoofedId = '45f49818-3083-480e-89ce-0352cae33337';
+  const cases = [
+    { status: 500, header: requestId, expected: requestId, code: 'service_unavailable' },
+    { status: 503, header: requestId, expected: requestId, code: 'service_unavailable', receipt: true },
+    { status: 503, code: 'service_unavailable' },
+    { status: 503, header: requestId.toUpperCase(), code: 'service_unavailable' },
+    { status: 503, header: `${requestId}, ${spoofedId}`, code: 'service_unavailable' },
+    { status: 503, header: 'arbitrary error content', code: 'service_unavailable', receipt: true },
+    { status: 429, header: requestId, code: 'rate_limited' },
+    { status: 503, header: requestId, code: 'invalid_response', redirected: true },
+    { status: 503, header: requestId, code: 'invalid_response', url: config.apiBaseUrl + '/different' },
+    { status: 503, header: requestId, code: 'service_unavailable', url: '' },
+  ];
+  for (const scenario of cases) {
+    const { fetcher } = transport(call => {
+      const expectedUrl = config.apiBaseUrl + `/orders/${receiptOrderId}` + (scenario.receipt ? '/receipt' : '');
+      assert.equal(call.url, expectedUrl);
+      assert.equal(call.token, 'Bearer ' + accessToken);
+      const body = scenario.receipt ? null : JSON.stringify({ code: 'unavailable', requestId: spoofedId });
+      const headers = scenario.header ? { 'X-Request-ID': scenario.header } : undefined;
+      const response = new Response(body, { status: scenario.status, headers });
+      Object.defineProperties(response, {
+        url: { value: scenario.url ?? expectedUrl },
+        redirected: { value: scenario.redirected ?? false },
+      });
+      return response;
+    });
+    const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+    await assert.rejects(
+      () => scenario.receipt ? api.getReceiptPdf!(receiptOrderId) : api.getOrder(receiptOrderId),
+      (error: unknown) => {
+        assert.ok(error instanceof ApiError);
+        assert.equal(error.code, scenario.code);
+        assert.equal(error.requestId, scenario.expected);
+        return true;
+      },
+    );
+  }
+  assert.deepEqual([...data.entries()], [[journalKey + '.guest', JSON.stringify(session)]]);
 });
 
 test('the receipt reader rejects unexpected media, partial content, truncation and oversized streams', async () => {

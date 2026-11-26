@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { ApiError } from '../domain/types';
 import { createWebLiveApi } from './web-api';
 
 const config = {
@@ -118,6 +119,50 @@ test('first quotes in independent tabs attach the same confirmed cookie and save
       [journalKey + '.context', first], [journalKey + '.quote', JSON.stringify({ quoteId: 'quote-1', sessionId: first })],
     ]);
   }
+});
+
+test('web order and receipt failures expose only a valid ID from the expected API response', async () => {
+  const context = [journalKey + '.context', first] as [string, string];
+  const { storage, saved } = memory([context]);
+  const requestId = 'ba8b8f93-4a07-4711-82d6-189a3cfe5747';
+  const spoofedId = '45f49818-3083-480e-89ce-0352cae33337';
+  const cases = [
+    { status: 503, header: requestId, expected: requestId, code: 'service_unavailable' },
+    { status: 502, header: requestId, expected: requestId, code: 'service_unavailable', receipt: true },
+    { status: 503, code: 'service_unavailable' },
+    { status: 503, header: 'private data', code: 'service_unavailable' },
+    { status: 503, header: requestId.toUpperCase(), code: 'service_unavailable' },
+    { status: 429, header: requestId, code: 'rate_limited', receipt: true },
+    { status: 503, header: requestId, code: 'invalid_response', redirected: true },
+    { status: 503, header: requestId, code: 'invalid_response', url: 'https://foreign.example.test/api/v1/order' },
+    { status: 503, header: requestId, code: 'service_unavailable', url: '' },
+  ];
+  for (const scenario of cases) {
+    const expectedPath = `/web/orders/${orderId}` + (scenario.receipt ? '/receipt' : '');
+    const transport = fixture(first, ({ path }) => {
+      assert.equal(path, expectedPath);
+      const body = scenario.receipt ? null : JSON.stringify({ code: 'unavailable', requestId: spoofedId });
+      const headers = scenario.header ? { 'X-Request-ID': scenario.header } : undefined;
+      const response = new Response(body, { status: scenario.status, headers });
+      Object.defineProperties(response, {
+        url: { value: scenario.url ?? config.apiBaseUrl + expectedPath },
+        redirected: { value: scenario.redirected ?? false },
+      });
+      return response;
+    });
+    const api = createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+    await assert.rejects(
+      () => scenario.receipt ? api.getReceiptPdf!(orderId) : api.getOrder(orderId),
+      (error: unknown) => {
+        assert.ok(error instanceof ApiError);
+        assert.equal(error.code, scenario.code);
+        assert.equal(error.requestId, scenario.expected);
+        return true;
+      },
+    );
+    assert.equal(transport.calls.length, 1);
+  }
+  assert.deepEqual([...saved.entries()], [context]);
 });
 
 test('pending journal and denied cookies block guest startup and checkout calls', async () => {

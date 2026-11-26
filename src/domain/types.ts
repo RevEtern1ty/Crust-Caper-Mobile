@@ -167,13 +167,18 @@ export type ApiErrorCode =
   | 'service_unavailable'
   | 'rate_limited'
 
+const supportRequestIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
 export class ApiError extends Error {
   readonly code: ApiErrorCode
+  declare readonly requestId?: string
 
-  constructor(code: ApiErrorCode, options?: ErrorOptions) {
+  constructor(code: ApiErrorCode, options?: ErrorOptions & { requestId?: string | null }) {
     super(code, options)
     this.name = 'ApiError'
     this.code = code
+    const requestId = options?.requestId
+    if (typeof requestId === 'string' && requestId.length === 36 && supportRequestIdPattern.test(requestId)) this.requestId = requestId
   }
 }
 

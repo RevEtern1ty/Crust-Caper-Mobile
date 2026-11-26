@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { hasSavedCheckout, parseJournal } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError, type Order, type PaymentAttempt, type PendingCheckoutIntent, type Storage } from '../domain/types';
-import { errorCode, invalidResponse, rememberVerifiedOrder, safeHttps, type ConnectedConfig, type LiveShopApi } from './http-api';
+import { apiResponseError, invalidResponse, rememberVerifiedOrder, safeHttps, type ConnectedConfig, type LiveShopApi } from './http-api';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import {
   menuResponse, orderAccessChallenge, orderAccessGrant, orderDataExportResponse, orderErasureRequestResponse, paymentResponse,
@@ -137,10 +137,10 @@ export function createWebLiveApi({
       });
       if (response.redirected || (response.url && response.url !== url)) invalidResponse();
       if (path === sessionPath && method === 'GET' && response.status === 401) throw new NoWebSession();
-      if (pdf && !response.ok) throw new ApiError(errorCode(response.status, null));
+      if (pdf && !response.ok) throw apiResponseError(response, url, null);
       if ((pdf && response.status !== 200) || (method === 'DELETE' && response.ok && response.status !== 204)) invalidResponse();
       const payload: unknown = pdf ? await readReceiptPdf(response) : response.status === 204 ? null : await response.json().catch(() => null);
-      if (!response.ok) throw new ApiError(errorCode(response.status, payload));
+      if (!response.ok) throw apiResponseError(response, url, payload);
       const parsed = schema.safeParse(payload);
       if (!parsed.success) invalidResponse();
       onHeaders?.(response.headers);
