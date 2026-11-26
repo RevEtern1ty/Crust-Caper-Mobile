@@ -9,40 +9,69 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
+import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
+import org.springframework.beans.factory.support.BeanDefinitionRegistry;
 import org.springframework.boot.SpringApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.core.env.Environment;
 import tools.jackson.databind.ObjectMapper;
 
 /** Entry point loaded explicitly from test classes by the isolated storefront stack. */
 public final class WebCheckoutFixture {
     private static final String WEB_ORIGIN = "https://crustcaper.test";
     private static final String FIXTURE_KEY = "fixture-only";
+    private static final String FIXTURE_DATABASE_URL = "jdbc:postgresql://postgres:5432/storefront_fixture";
+    private static final String FIXTURE_DATABASE_USER = "storefront_fixture";
+    private static final String RESTART_WEBHOOK_SECRET = "fixture-restart-webhook-v1";
+    private static final String RETURN_URL = WEB_ORIGIN + "/payment-return";
     private static final int PROVIDER_PORT = 18432;
 
     private WebCheckoutFixture() {}
 
-    public static void main(String[] args) {
-        if (args.length != 0
+    public static void main(String[] args) throws IOException {
+        if (args.length == 1 && "--provider".equals(args[0])) {
+            if (!"1".equals(System.getenv("CRUSTCAPER_STOREFRONT_RESTART_PROVIDER"))) throw wrongFixture();
+            var provider = new Provider(new ObjectMapper(), true);
+            Runtime.getRuntime().addShutdownHook(new Thread(provider::close, "fixture-provider-shutdown"));
+            return;
+        }
+
+        boolean restartApi = args.length == 1 && "--restart-api".equals(args[0]);
+        if ((args.length != 0 && !restartApi)
             || !"stage".equals(System.getenv("SPRING_PROFILES_ACTIVE"))
-            || !"fixture".equals(System.getenv("CRUSTCAPER_PAYMENT_PROVIDER"))
+            || !(restartApi ? "flutterwave" : "fixture").equals(System.getenv("CRUSTCAPER_PAYMENT_PROVIDER"))
             || !"disabled".equals(System.getenv("CRUSTCAPER_ORDER_ACCESS_PROVIDER"))
             || !WEB_ORIGIN.equals(System.getenv("CRUSTCAPER_WEB_ORIGIN"))
-            || !"jdbc:postgresql://postgres:5432/storefront_fixture".equals(System.getenv("CRUSTCAPER_DB_URL"))
-            || !"storefront_fixture".equals(System.getenv("CRUSTCAPER_DB_USER"))) {
-            throw new IllegalStateException("WebCheckoutFixture requires the isolated storefront test stack");
+            || !FIXTURE_DATABASE_URL.equals(System.getenv("CRUSTCAPER_DB_URL"))
+            || !FIXTURE_DATABASE_USER.equals(System.getenv("CRUSTCAPER_DB_USER"))) {
+            throw wrongFixture();
         }
-        new SpringApplication(CrustCaperApplication.class, FixtureBeans.class).run();
+        if (restartApi && (System.getenv("FLUTTERWAVE_SECRET_KEY") != null
+            || !RESTART_WEBHOOK_SECRET.equals(System.getenv("FLUTTERWAVE_WEBHOOK_SECRET"))
+            || !RETURN_URL.equals(System.getenv("CRUST_PAYMENT_RETURN_URL")))) {
+            throw wrongFixture();
+        }
+        new SpringApplication(CrustCaperApplication.class, FixturePhoneBeans.class,
+            restartApi ? RestartApiBeans.class : FixtureBeans.class).run();
+    }
+
+    private static IllegalStateException wrongFixture() {
+        return new IllegalStateException("WebCheckoutFixture requires the isolated storefront test stack");
     }
 
     // The explicit Spring source registers these beans without making them discoverable by component scans.
-    static class FixtureBeans {
+    static class FixturePhoneBeans {
         @Bean
         PhoneVerificationGateway fixturePhoneVerification() {
             return new PhoneVerificationGateway() {
@@ -62,17 +91,46 @@ public final class WebCheckoutFixture {
                 }
             };
         }
+    }
 
+    static class FixtureBeans {
         @Bean
         FlutterwavePaymentGateway fixtureGateway(ObjectMapper mapper, Provider provider) {
             return new FlutterwavePaymentGateway(URI.create("http://127.0.0.1:" + provider.port()),
-                URI.create(WEB_ORIGIN + "/payment-return"), URI.create(WEB_ORIGIN + "/web-payment-return"),
+                URI.create(RETURN_URL), URI.create(WEB_ORIGIN + "/web-payment-return"),
                 FIXTURE_KEY, mapper, Clock.systemUTC(), 2000, 2000);
         }
 
         @Bean(destroyMethod = "close")
         Provider fixtureProvider(ObjectMapper mapper) throws IOException {
-            return new Provider(mapper);
+            return new Provider(mapper, false);
+        }
+    }
+
+    static class RestartApiBeans {
+        @Bean
+        static BeanFactoryPostProcessor removeConfiguredFlutterwaveGateway(Environment environment) {
+            return factory -> {
+                if (!(factory instanceof BeanDefinitionRegistry registry)
+                    || !Arrays.equals(environment.getActiveProfiles(), new String[] {"stage"})
+                    || !FIXTURE_DATABASE_URL.equals(environment.getProperty("spring.datasource.url"))
+                    || !FIXTURE_DATABASE_USER.equals(environment.getProperty("spring.datasource.username"))
+                    || !WEB_ORIGIN.equals(environment.getProperty("crustcaper.web.origin"))
+                    || !"disabled".equals(environment.getProperty("crustcaper.order-access.provider", "disabled"))
+                    || !registry.containsBeanDefinition("flutterwaveGateway")
+                    || !registry.containsBeanDefinition("paymentReconciliation")) {
+                    throw wrongFixture();
+                }
+                // Retain production reconciliation and its scheduler while eliminating the real PSP endpoint.
+                registry.removeBeanDefinition("flutterwaveGateway");
+            };
+        }
+
+        @Bean
+        FlutterwavePaymentGateway fixtureRestartGateway(ObjectMapper mapper) {
+            return new FlutterwavePaymentGateway(URI.create("http://provider:" + PROVIDER_PORT),
+                URI.create(RETURN_URL), URI.create(WEB_ORIGIN + "/web-payment-return"),
+                FIXTURE_KEY, mapper, Clock.systemUTC(), 2_000, 20_000);
         }
     }
 
@@ -80,21 +138,34 @@ public final class WebCheckoutFixture {
 
     static final class Provider implements AutoCloseable {
         private static final String HOSTED_PATH = "/v3/hosted/pay/";
+        private static final String STATE_PATH = "/fixture/state";
         private static final Pattern UUID_PATH = Pattern.compile("[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}");
         private static final Pattern RETURN_URL = Pattern.compile(Pattern.quote(WEB_ORIGIN)
             + "/(?:web-)?payment-return\\?orderId=" + UUID_PATH.pattern());
         private static final int MAX_CHECKOUT_BODY = 16 * 1024;
+        private static final Duration VERIFY_HOLD = Duration.ofSeconds(15);
         private final ObjectMapper mapper;
         private final HttpServer server;
+        private final ExecutorService workers;
         private final Map<String, Charge> charges = new ConcurrentHashMap<>();
         private final AtomicLong sequences = new AtomicLong(7000);
+        private final AtomicLong openCalls = new AtomicLong();
+        private final AtomicLong verifyCalls = new AtomicLong();
+        private final AtomicBoolean firstPaidVerificationStarted = new AtomicBoolean();
+        private final AtomicBoolean firstPaidVerificationHeld = new AtomicBoolean();
 
-        Provider(ObjectMapper mapper) throws IOException {
+        Provider(ObjectMapper mapper, boolean restart) throws IOException {
             this.mapper = mapper;
             server = HttpServer.create(new InetSocketAddress("0.0.0.0", PROVIDER_PORT), 0);
+            workers = restart ? Executors.newFixedThreadPool(4,
+                Thread.ofPlatform().name("fixture-provider-", 0).factory()) : null;
             server.createContext("/v3/payments", this::open);
             server.createContext("/v3/transactions/verify_by_reference", this::verify);
             server.createContext(HOSTED_PATH, this::hosted);
+            if (workers != null) {
+                server.setExecutor(workers);
+                server.createContext(STATE_PATH, this::state);
+            }
             server.start();
         }
 
@@ -108,6 +179,7 @@ public final class WebCheckoutFixture {
                     reply(exchange, 400, "", "text/plain");
                     return;
                 }
+                openCalls.incrementAndGet();
                 byte[] body = exchange.getRequestBody().readNBytes(MAX_CHECKOUT_BODY + 1);
                 if (body.length > MAX_CHECKOUT_BODY) {
                     reply(exchange, 413, "", "text/plain");
@@ -138,6 +210,7 @@ public final class WebCheckoutFixture {
                     reply(exchange, 400, "", "text/plain");
                     return;
                 }
+                verifyCalls.incrementAndGet();
                 String query = exchange.getRequestURI().getRawQuery();
                 String reference = query != null && query.startsWith("tx_ref=") ? query.substring(7) : "";
                 Charge charge = charges.get(reference);
@@ -145,9 +218,35 @@ public final class WebCheckoutFixture {
                     reply(exchange, 404, "{}", "application/json");
                     return;
                 }
+                if (workers != null && firstPaidVerificationStarted.compareAndSet(false, true)) {
+                    firstPaidVerificationHeld.set(true);
+                    try {
+                        Thread.sleep(VERIFY_HOLD);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    } finally {
+                        firstPaidVerificationHeld.set(false);
+                    }
+                }
                 var payment = Map.of("id", charge.transactionId(), "tx_ref", reference, "amount", charge.amount(),
                     "charged_amount", charge.amount(), "currency", "RWF", "status", "successful");
                 reply(exchange, 200, mapper.writeValueAsString(Map.of("status", "success", "data", payment)), "application/json");
+            }
+        }
+
+        private void state(HttpExchange exchange) throws IOException {
+            try (exchange) {
+                if (!"GET".equals(exchange.getRequestMethod()) || !STATE_PATH.equals(exchange.getRequestURI().getRawPath())
+                    || exchange.getRequestURI().getRawQuery() != null) {
+                    reply(exchange, 404, "", "text/plain");
+                    return;
+                }
+                reply(exchange, 200, mapper.writeValueAsString(Map.of(
+                    "openCalls", openCalls.get(),
+                    "paidCharges", charges.values().stream().filter(charge -> charge.paid().get()).count(),
+                    "verifyCalls", verifyCalls.get(),
+                    "firstPaidVerificationHeld", firstPaidVerificationHeld.get())), "application/json");
             }
         }
 
@@ -200,6 +299,7 @@ public final class WebCheckoutFixture {
         @Override
         public void close() {
             server.stop(0);
+            if (workers != null) workers.shutdownNow();
         }
     }
 }
