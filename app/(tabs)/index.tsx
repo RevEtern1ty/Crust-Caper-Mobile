@@ -4,8 +4,9 @@ import { ActivityIndicator, Image, Platform, Pressable, StyleSheet, useWindowDim
 import type { Category, Product } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
-import { copy, kigaliTime, money, nextPickupSlot, slotLabel } from '../../src/ui/format';
+import { copy, kigaliTime, money, slotLabel } from '../../src/ui/format';
 import { menuPhoto } from '../../src/ui/menu-photos';
+import { useNextPickupSlot } from '../../src/ui/use-next-pickup-slot';
 
 const categories = [
   { id: 'burgers', en: 'Burgers', rw: 'Burgeri' },
@@ -56,12 +57,12 @@ export default function MenuScreen() {
   const products = menu?.products.filter(product => product.category === category) ?? [];
   const featured = products.find(product => product.sku === 'double-smash');
   const rest = products.filter(product => product !== featured);
-  const next = status === 'ready' ? nextPickupSlot(menu, pickupNow()) : undefined;
+  const next = useNextPickupSlot(status === 'ready' ? menu : null, pickupNow, refreshMenu);
   let pickupAvailability = copy(locale, 'Pickup availability unconfirmed', 'Igihe cyo gufata komande ntikiramenyekana');
   if (status === 'ready' && menu) {
     if (!menu.store.open) pickupAvailability = copy(locale, 'Closed', 'Hafunze');
     else if (next) pickupAvailability = slotLabel(next, locale);
-    else pickupAvailability = copy(locale, 'No slots available', 'Nta mwanya uhari');
+    else if (!refreshing) pickupAvailability = copy(locale, 'No slots available', 'Nta mwanya uhari');
   }
 
   return (

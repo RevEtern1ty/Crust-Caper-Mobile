@@ -1071,6 +1071,115 @@ test('the menu and Pickup show the checkout window when the device clock is a da
   }
 });
 
+test('open Menu and Pickup advance past expired windows without polling hidden tabs or empty menus', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const checkedAt = '2026-11-25T10:29:50Z';
+  const deviceTime = new Date(Date.parse(checkedAt) + 24 * 60 * 60 * 1000);
+  const menuUrl = api + '/stores/kigali/menu?channel=mobile';
+  const fixtureSlots = [
+    { id: 'first', startsAt: '2026-11-25T10:30:00Z', endsAt: '2026-11-25T10:40:00Z', available: true },
+    { id: 'second', startsAt: '2026-11-25T10:40:00Z', endsAt: '2026-11-25T10:50:00Z', available: true },
+    { id: 'third', startsAt: '2026-11-25T10:50:00Z', endsAt: '2026-11-25T11:00:00Z', available: true },
+  ];
+  const localized = value => ({ en: value, rw: value });
+  const copies = [
+    { locale: 'en', date: '25 Nov', next: 'Next pickup time', unavailable: 'No slots available',
+      pickup: /^Pickup(?:,|$)/, orders: /^Orders(?:,|$)/, width: 320 },
+    { locale: 'rw', date: 'Ugu. 25', next: 'Igihe gikurikira cyo kwakira', unavailable: 'Nta mwanya uhari',
+      pickup: /^Kwakira(?:,|$)/, orders: /^Komande(?:,|$)/, width: 430 },
+  ];
+
+  for (const copy of copies) {
+    const page = await browser.newPage({ viewport: { width: copy.width, height: 800 }, isMobile: true, hasTouch: true });
+    try {
+      page.setDefaultTimeout(6500);
+      await page.clock.install({ time: deviceTime });
+      let offeredSlots = fixtureSlots.slice(0, 2);
+      let reads = 0;
+      await page.route('**/*', route => {
+        const request = route.request();
+        if (new URL(request.url()).origin === origin) return route.continue();
+        if (request.method() !== 'GET' || request.url() !== menuUrl) return route.abort('blockedbyclient');
+        reads++;
+        return route.fulfill({
+          json: {
+            version: 'pickup-deadline-fixture', updatedAt: checkedAt, products: [], slots: offeredSlots,
+            store: { id: 'kigali', open: true, name: localized('Fixture Kigali'),
+              area: localized('Fixture district'), hours: localized('10:00–18:00') },
+          },
+          headers: { 'Access-Control-Allow-Origin': origin, 'Access-Control-Expose-Headers': 'X-Availability-Checked-At',
+            'X-Availability-Checked-At': checkedAt },
+        });
+      });
+      if (copy.locale === 'rw') {
+        await page.goto(origin + '/settings');
+        await button(page, 'Kinyarwanda').click();
+        await shown(page, 'Amagenamiterere');
+      }
+      await page.goto(origin);
+      const tab = name => page.getByRole('tab', { name });
+      const banner = button(page, /Fixture Kigali/);
+      const first = 'Fixture district · ' + copy.date + ' · 12:30–12:40';
+      const second = 'Fixture district · ' + copy.date + ' · 12:40–12:50';
+      const availability = banner.getByText(/^Fixture district · /);
+      await shown(page, first);
+      const initialReads = reads;
+
+      await page.clock.fastForward(20_000);
+      await page.clock.runFor(50);
+      assert.equal(await availability.textContent(), second,
+        'The open menu must replace the elapsed pickup window without refreshing the menu');
+      assert.equal(reads, initialReads);
+      await banner.click();
+      await shown(page, copy.next + ' · ' + copy.date + ' · 12:40–12:50');
+      offeredSlots = [fixtureSlots[2]];
+      await page.clock.fastForward(10 * 60_000);
+      await shown(page, copy.next + ' · ' + copy.date + ' · 12:50–13:00');
+      assert.equal(reads, initialReads + 1);
+      await capture(page, 'connected-pickup-deadline-next-' + copy.locale);
+
+      if (copy.locale === 'en') {
+        await tab(copy.orders).click();
+        offeredSlots = [];
+      } else {
+        await page.evaluate(() => {
+          Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+          document.dispatchEvent(new Event('visibilitychange'));
+        });
+      }
+      await page.clock.fastForward(10 * 60_000);
+      await delay(150);
+      assert.equal(reads, initialReads + 1, 'A hidden pickup screen must not request another menu');
+      if (copy.locale === 'en') {
+        await tab(copy.pickup).click();
+      } else {
+        // This response still lists only the elapsed third window.
+        await page.evaluate(() => {
+          Reflect.deleteProperty(document, 'visibilityState');
+          document.dispatchEvent(new Event('visibilitychange'));
+        });
+      }
+      await shown(page, copy.unavailable);
+      await page.waitForFunction(expected => !document.body.innerText.includes(expected), copy.date + ' · 12:50–13:00');
+      await page.clock.fastForward(30 * 60_000);
+      await delay(150);
+      assert.equal(reads, initialReads + 2, 'The empty or elapsed horizon must be checked once on return');
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), copy.width);
+    } finally {
+      await page.close();
+    }
+  }
+});
+
 test('an open checkout clears an expired pickup window and waits for an explicit replacement', { timeout: 35_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const menuPath = '/stores/kigali/menu?channel=mobile';

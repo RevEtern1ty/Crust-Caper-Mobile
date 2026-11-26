@@ -3,7 +3,8 @@ import { Linking, StyleSheet, View } from 'react-native';
 import { useState } from 'react';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
-import { copy, nextPickupSlot, slotLabel } from '../../src/ui/format';
+import { copy, slotLabel } from '../../src/ui/format';
+import { useNextPickupSlot } from '../../src/ui/use-next-pickup-slot';
 
 type LinkAction = 'directions' | 'support';
 
@@ -12,7 +13,7 @@ export default function PickupScreen() {
   const router = useRouter();
   const [linkErrors, setLinkErrors] = useState({ directions: false, support: false });
   const store = menu?.store;
-  const next = status === 'ready' ? nextPickupSlot(menu, pickupNow()) : undefined;
+  const next = useNextPickupSlot(status === 'ready' ? menu : null, pickupNow, refreshMenu);
   const directionsUrl = store?.directionsUrl;
   const supportUrl = store?.supportUrl;
 
@@ -37,9 +38,11 @@ export default function PickupScreen() {
         {next && <Text variant="label" tone="green">{mode === 'demo'
           ? copy(locale, 'Next demo slot', 'Igihe gikurikira cy’igerageza')
           : copy(locale, 'Next pickup time', 'Igihe gikurikira cyo kwakira')} · {slotLabel(next, locale)}</Text>}
-        {status === 'ready' && !next && <Text variant="label" tone="muted">{store?.open
-          ? copy(locale, 'No slots available', 'Nta mwanya uhari')
-          : copy(locale, 'Closed', 'Hafunze')}</Text>}
+        {status === 'ready' && !next && <Text variant="label" tone="muted">{!store?.open
+          ? copy(locale, 'Closed', 'Hafunze')
+          : refreshing
+            ? copy(locale, 'Pickup availability unconfirmed.', 'Igihe cyo gufata komande ntikiramenyekana.')
+            : copy(locale, 'No slots available', 'Nta mwanya uhari')}</Text>}
         {(status === 'stale' || status === 'unavailable') && (
           <>
             <Text tone="muted" accessibilityLiveRegion="polite">{copy(locale, 'Pickup availability unconfirmed.', 'Igihe cyo gufata komande ntikiramenyekana.')}</Text>
