@@ -1,12 +1,19 @@
 import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { TextDecoder } from 'node:util';
+import { createScript } from 'node:vm';
 
 export const storeIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const versionPattern = /^[A-Za-z0-9._:-]{1,100}$/;
 const timestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const catalogPhotoPath = /^\/catalog-photos\/[a-z0-9][a-z0-9._-]{0,119}\.(?:avif|jpe?g|png|webp)$/;
 const existingPhotoPath = /^\/assets\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.(?:avif|gif|jpe?g|png|webp)$/i;
+const catalogSkuPattern = /^(?!\.{1,2}$)[A-Za-z0-9._:-]{1,100}$/;
+const expoEntryPath = /^\/_expo\/static\/js\/web\/entry-([a-f0-9]{32})\.js$/;
+const scriptMediaTypes = ['text/javascript', 'application/javascript'];
+const rawTextTags = new Set(['script', 'style', 'textarea', 'title', 'noscript', 'template']);
 const photoMediaTypes = { avif: 'image/avif', gif: 'image/gif', jpg: 'image/jpeg', jpeg: 'image/jpeg',
   png: 'image/png', webp: 'image/webp' };
 const pngSignature = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
@@ -99,12 +106,131 @@ async function checkStorefrontPage(origin, locale, storeId, expectedVersion) {
   if (!hasRenderedCatalogDocument(html, locale)) {
     throw new Error(`${label}: missing or incomplete localized catalog HTML.`);
   }
+  return html;
 }
 
 export function hasRenderedCatalogDocument(html, locale) {
   const language = new RegExp(`<html\\b[^>]*\\slang="${locale}"(?=\\s|>)`, 'i');
   return language.test(html) && /<main\b[^>]*\sid="main"(?=\s|>)/i.test(html)
     && html.includes('</main>') && html.trimEnd().endsWith('</html>');
+}
+
+function* elementAttributes(html, tag) {
+  // Skip comments and raw text areas, retaining script opening attributes for the Expo shell.
+  const tags = /<!--[\s\S]*?(?:-->|$)|<([a-z][a-z0-9-]*)(?=\s|\/?>)((?:[^<>"']|"[^"]*"|'[^']*')*)>/gi;
+  let match;
+  while ((match = tags.exec(html))) {
+    const [, element, attributes] = match;
+    const name = element?.toLowerCase();
+    if (rawTextTags.has(name)) {
+      const endTag = new RegExp(`</${name}\\s*>`, 'gi');
+      endTag.lastIndex = tags.lastIndex;
+      if (!endTag.exec(html)) return;
+      tags.lastIndex = endTag.lastIndex;
+    }
+    if (name !== tag) continue;
+    const parsed = new Map();
+    for (const [, attribute, doubleQuoted, singleQuoted, unquoted] of attributes
+      .matchAll(/([^\s/="'<>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g)) {
+      const key = attribute.toLowerCase();
+      if (!parsed.has(key)) parsed.set(key, doubleQuoted ?? singleQuoted ?? unquoted ?? '');
+    }
+    yield parsed;
+  }
+}
+
+function hasLink(html, origin, path) {
+  for (const attributes of elementAttributes(html, 'base')) if (attributes.has('href')) return false;
+  const absolute = new URL(path, origin).href;
+  for (const attributes of elementAttributes(html, 'a')) {
+    const href = attributes.get('href');
+    if (href === path || href === absolute) return true;
+  }
+  return false;
+}
+
+async function readCheckoutFile(url, label, accept, acceptedTypes, limitMiB) {
+  const response = await readPublicFile(url, label, accept);
+  let problem;
+  if (response.status !== 200) problem = `HTTP ${response.status}, expected 200`;
+  else if (!acceptedTypes.includes(mediaType(response))) {
+    problem = acceptedTypes.includes('text/html') ? 'expected HTML' : 'expected JavaScript';
+  }
+  if (problem) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`${label}: ${problem}.`);
+  }
+  return { response, bytes: await readPublicBody(response, label, limitMiB) };
+}
+
+function readExpoCheckoutConfig(source) {
+  // Expo SDK 55 embeds app.config.ts extra.restaurant in the public serialized manifest.
+  const manifests = source.matchAll(/\\"extra\\":\{\\"restaurant\\":(\{[^{}]{1,2048}\})/g);
+  const match = manifests.next().value;
+  if (!match || !manifests.next().done) return null;
+  try {
+    return JSON.parse(JSON.parse('"' + match[1] + '"'));
+  } catch {
+    return null;
+  }
+}
+
+async function checkExpoEntry(url, expectedDigest, storeId) {
+  const label = 'Expo checkout entry';
+  const { bytes } = await readCheckoutFile(url, label, scriptMediaTypes.join(', '), scriptMediaTypes, 12);
+  // Metro names its exported entry by content. This detects mixed or incomplete deploys.
+  if (createHash('md5').update(bytes).digest('hex') !== expectedDigest) {
+    throw new Error(`${label}: content does not match its published filename.`);
+  }
+  let source;
+  try {
+    source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    createScript(source);
+  } catch {
+    throw new Error(`${label}: invalid JavaScript.`);
+  }
+  const config = readExpoCheckoutConfig(source);
+  if (config?.webCheckout !== true || !['stage', 'production'].includes(config.profile)
+      || config.apiBaseUrl !== `${url.origin}/api/v1` || config.storeId !== storeId) {
+    throw new Error(`${label}: build is not configured for this same-origin store and web checkout.`);
+  }
+}
+
+async function checkCheckoutHandoff(origin, locale, menuDocument, product, storeId, checkedEntries) {
+  const sku = encodeURIComponent(product.sku);
+  const detailPath = `/menu/${locale}/${sku}`;
+  const language = locale.toUpperCase();
+  if (!hasLink(menuDocument, origin, detailPath)) {
+    throw new Error(`Storefront /menu/${locale}: missing the selected item link.`);
+  }
+  const detailLabel = `Storefront product ${language}`;
+  const detail = await readCheckoutFile(new URL(detailPath, origin), detailLabel, 'text/html', ['text/html'], 12);
+  const detailHtml = detail.bytes.toString('utf8');
+  if (detail.response.headers.get('content-language') !== locale || !hasRenderedCatalogDocument(detailHtml, locale)) {
+    throw new Error(`${detailLabel}: missing or incomplete localized product HTML.`);
+  }
+  const purchasePath = `/product/${sku}?storefrontLocale=${locale}`;
+  if (!hasLink(detailHtml, origin, purchasePath)) throw new Error(`${detailLabel}: missing the expected purchase link.`);
+  const label = `Checkout ${language}`;
+  const { bytes } = await readCheckoutFile(new URL(purchasePath, origin), label, 'text/html', ['text/html'], 1);
+  const html = bytes.toString('utf8');
+  if (!html.trimEnd().endsWith('</html>') || !/<\/body\s*>/i.test(html)
+      || [...elementAttributes(html, 'base')].some(attributes => attributes.has('href'))
+      || ![...elementAttributes(html, 'div')].some(attributes => attributes.get('id') === 'root')) {
+    throw new Error(`${label}: missing or incomplete Expo HTML.`);
+  }
+  const scripts = [...elementAttributes(html, 'script')].filter(attributes => attributes.has('src'));
+  const [entry] = scripts;
+  const type = entry?.get('type')?.trim().toLowerCase();
+  const src = (!type || type === 'module' || scriptMediaTypes.includes(type)) && !entry?.has('nomodule')
+    ? entry?.get('src') : undefined;
+  const assetPath = src?.startsWith(`${origin}/`) ? src.slice(origin.length) : src;
+  const digest = scripts.length === 1 && expoEntryPath.exec(assetPath ?? '')?.[1];
+  if (!digest) throw new Error(`${label}: expected one same-origin Expo entry script.`);
+  if (!checkedEntries.has(assetPath)) {
+    await checkExpoEntry(new URL(assetPath, origin), digest, storeId);
+    checkedEntries.add(assetPath);
+  }
 }
 
 function photoUrl(value, origin) {
@@ -215,8 +341,15 @@ async function readPublicBody(response, label, limitMiB) {
   return Buffer.concat(chunks, size);
 }
 
-async function checkStorefront(origin, menu, storeId, expectedVersion) {
-  for (const locale of ['en', 'rw']) await checkStorefrontPage(origin, locale, storeId, expectedVersion);
+async function checkStorefront(origin, menu, storeId, expectedVersion, checkout) {
+  const checkedEntries = new Set();
+  const product = checkout && menu.products.find(item => item?.available === true
+    && typeof item.sku === 'string' && catalogSkuPattern.test(item.sku));
+  if (checkout && !product) throw new Error('Menu has no available product with a storefront SKU.');
+  for (const locale of ['en', 'rw']) {
+    const html = await checkStorefrontPage(origin, locale, storeId, expectedVersion);
+    if (checkout) await checkCheckoutHandoff(origin, locale, html, product, storeId, checkedEntries);
+  }
   const verified = new Set();
   for (const [index, product] of menu.products.entries()) {
     if (product?.photoUrl == null) continue;
@@ -230,16 +363,19 @@ async function checkStorefront(origin, menu, storeId, expectedVersion) {
     }
   }
   console.log(`Storefront EN and RW pages and ${verified.size} catalog photo files verified.`);
+  if (checkout) console.log('Checkout EN and RW handoffs and Expo entry verified.');
 }
 
 async function checkCatalog(args) {
   const [baseUrl, storeId, expectedVersion, mode] = args;
-  const storefront = mode === '--storefront';
+  const checkout = mode === '--checkout';
+  const storefront = mode === '--storefront' || checkout;
   if ((args.length !== 3 && (args.length !== 4 || !storefront))
       || !storeIdPattern.test(storeId) || !versionPattern.test(expectedVersion)) {
-    throw new Error('Usage: node server/tooling/check-live-catalog.mjs <api-base-url> <store-id> <expected-version> [--storefront]');
+    throw new Error('Usage: node server/tooling/check-live-catalog.mjs <api-base-url> <store-id> <expected-version> [--storefront|--checkout]');
   }
   const url = menuUrl(baseUrl, storeId, storefront ? 'web' : 'mobile');
+  if (checkout && url.protocol !== 'https:') throw new Error('Web checkout preflight requires HTTPS.');
   // The menu API returns the same products and photo URLs for both locales.
   const menu = await readMenu(url);
   if (menu?.store?.id !== storeId) throw new Error(`Menu does not match the requested store ${storeId}.`);
@@ -257,7 +393,7 @@ async function checkCatalog(args) {
   })) {
     throw new Error('Menu has no available future pickup window.');
   }
-  if (storefront) await checkStorefront(url.origin, menu, storeId, expectedVersion);
+  if (storefront) await checkStorefront(url.origin, menu, storeId, expectedVersion, checkout);
   console.log(`Orderable catalog verified for ${storeId}, version ${expectedVersion}.`);
 }
 
