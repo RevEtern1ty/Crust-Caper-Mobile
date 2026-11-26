@@ -2,6 +2,7 @@ package com.crustcaper.api.operator;
 
 import com.crustcaper.api.ApiModels.Localized;
 import com.crustcaper.api.operator.OperatorSessions.Principal;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.servlet.http.HttpServletRequest;
 import java.io.IOException;
 import java.sql.ResultSet;
@@ -43,17 +44,20 @@ class OperatorCatalogAvailability {
     private final TransactionTemplate transactions;
     private final ObjectReader patchReader;
 
-    record ProductAvailability(String sku, Localized name, boolean available) {}
+    record ProductAvailability(String sku, Localized name, boolean available,
+                               @JsonInclude(JsonInclude.Include.NON_NULL) Inventory stock) {}
+    record Inventory(int onHand, long reserved, long revision) {}
     record SlotAvailability(String id, Instant startsAt, Instant endsAt, int capacity, int reserved) {}
     record Snapshot(String version, boolean open, List<ProductAvailability> products, List<SlotAvailability> slots) {}
     private record CatalogState(String version, boolean open) {}
     private record SnapshotRow(String version, boolean open, ProductAvailability product) {}
     private record LockedSlot(OffsetDateTime startsAt, int capacity) {}
-    private sealed interface Change permits AvailabilityChange, CapacityChange, ScheduleChange {
+    private sealed interface Change permits AvailabilityChange, CapacityChange, InventoryChange, ScheduleChange {
         String expectedVersion();
     }
     private record AvailabilityChange(String expectedVersion, String sku, boolean newValue) implements Change {}
     private record CapacityChange(String expectedVersion, String slotId, int capacity) implements Change {}
+    private record InventoryChange(String expectedVersion, String sku, int onHand, Long stockRevision) implements Change {}
     private record ScheduleChange(String expectedVersion, PickupSchedule schedule) implements Change {}
     private record PickupSchedule(UUID id, LocalDate date, LocalTime start, LocalTime end, int capacity) {}
 
@@ -95,6 +99,7 @@ class OperatorCatalogAvailability {
         switch (requested) {
             case AvailabilityChange availability -> applyAvailabilityLocked(manager, current, availability);
             case CapacityChange capacity -> applyCapacityLocked(manager, current, capacity);
+            case InventoryChange inventory -> applyInventoryLocked(manager, current, inventory);
             case ScheduleChange shift -> applyScheduleLocked(manager, current, shift.schedule());
         }
         return snapshot(manager.storeId());
@@ -159,6 +164,37 @@ class OperatorCatalogAvailability {
         return true;
     }
 
+    private void applyInventoryLocked(Principal manager, CatalogState current, InventoryChange requested) {
+        String store = manager.storeId();
+        String sku = requested.sku();
+        productAvailable(store, sku);
+        var saved = jdbc.sql("""
+            SELECT on_hand, revision FROM menu_product_inventory WHERE store_id = ? AND sku = ?
+            """).params(store, sku).query((row, number) -> new Inventory(row.getInt("on_hand"), 0,
+                row.getLong("revision"))).optional().orElse(null);
+        if (!Objects.equals(requested.stockRevision(), saved == null ? null : saved.revision())) {
+            throw OperatorFailure.conflict("stock_revision_conflict");
+        }
+        if (saved != null && saved.onHand() == requested.onHand()) return;
+        long reserved = jdbc.sql("SELECT catalog_reserved_product_units(?, ?, clock_timestamp())")
+            .params(store, sku).query(Long.class).single();
+        if (requested.onHand() < reserved) throw OperatorFailure.conflict("stock_below_reserved");
+
+        long inventoryRevision = jdbc.sql("""
+            INSERT INTO menu_product_inventory (store_id, sku, on_hand) VALUES (?, ?, ?)
+            ON CONFLICT (store_id, sku) DO UPDATE SET on_hand = EXCLUDED.on_hand,
+                revision = menu_product_inventory.revision + 1
+            RETURNING revision
+            """).params(store, sku, requested.onHand()).query(Long.class).single();
+        publish(store, current.open());
+        jdbc.sql("""
+            INSERT INTO operator_inventory_events
+                (store_id, sku, operator_id, previous_on_hand, new_on_hand, inventory_revision)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """).params(store, sku, manager.id(), saved == null ? null : saved.onHand(),
+                requested.onHand(), inventoryRevision).update();
+    }
+
     private void applyScheduleLocked(Principal manager, CatalogState current, PickupSchedule shift) {
         String store = manager.storeId();
         OffsetDateTime start = shift.date().atTime(shift.start()).atZone(KIGALI).toOffsetDateTime();
@@ -210,8 +246,11 @@ class OperatorCatalogAvailability {
     private Snapshot snapshot(String store) {
         List<SnapshotRow> rows = jdbc.sql("""
             SELECT s.version, s.open, p.sku, p.product#>>'{name,en}' AS name_en, p.product#>>'{name,rw}' AS name_rw,
-                (p.product->>'available')::boolean AS product_available
+                (p.product->>'available')::boolean AS product_available, i.on_hand, i.revision,
+                CASE WHEN i.sku IS NOT NULL THEN
+                    catalog_reserved_product_units(i.store_id, i.sku, statement_timestamp()) END AS reserved_units
             FROM stores s LEFT JOIN menu_products p ON p.store_id = s.id
+            LEFT JOIN menu_product_inventory i ON i.store_id = p.store_id AND i.sku = p.sku
             WHERE s.id = ? ORDER BY p.position, p.sku
             """).param(store).query(OperatorCatalogAvailability::snapshotRow).list();
         if (rows.isEmpty()) throw OperatorFailure.notFound();
@@ -250,7 +289,10 @@ class OperatorCatalogAvailability {
             if (en == null || rw == null || available == null) {
                 throw new OperatorFailure(HttpStatus.SERVICE_UNAVAILABLE, "service_unavailable");
             }
-            product = new ProductAvailability(sku, new Localized(en, rw), available);
+            Integer onHand = rs.getObject("on_hand", Integer.class);
+            Inventory stock = onHand == null ? null : new Inventory(onHand, rs.getLong("reserved_units"),
+                rs.getLong("revision"));
+            product = new ProductAvailability(sku, new Localized(en, rw), available, stock);
         }
         return new SnapshotRow(rs.getString("version"), rs.getBoolean("open"), product);
     }
@@ -285,6 +327,14 @@ class OperatorCatalogAvailability {
         JsonNode capacity = body.path("capacity");
         if (body.size() == 3 && capacity.isIntegralNumber() && capacity.canConvertToInt() && capacity.intValue() >= 0) {
             return new CapacityChange(version, identifier(body.path("slotId")), capacity.intValue());
+        }
+        JsonNode onHand = body.path("stockOnHand");
+        JsonNode stockRevision = body.path("stockRevision");
+        if (body.size() == 4 && onHand.isIntegralNumber() && onHand.canConvertToInt() && onHand.intValue() >= 0
+            && (stockRevision.isNull() || stockRevision.isIntegralNumber() && stockRevision.canConvertToLong()
+            && stockRevision.longValue() > 0)) {
+            return new InventoryChange(version, identifier(body.path("sku")), onHand.intValue(),
+                stockRevision.isNull() ? null : stockRevision.longValue());
         }
         JsonNode schedule = body.path("pickupSchedule");
         if (body.size() == 2 && schedule.isObject()) return new ScheduleChange(version, parseSchedule(schedule));

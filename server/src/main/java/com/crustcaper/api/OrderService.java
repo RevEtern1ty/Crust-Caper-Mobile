@@ -20,6 +20,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.security.SecureRandom;
@@ -133,7 +134,7 @@ public class OrderService {
         Catalog.StoreData store = quotedCatalog.store();
         Catalog.SlotData slot = catalog.slot(input.storeId(), input.slotId(), false);
         if (!catalog.available(store.store(), slot, now)) throw ApiFailure.conflict("slot_unavailable");
-        Reorder current = Catalog.reconcile(input.lines(), quotedCatalog.products(), store.version());
+        Reorder current = catalog.reconcile(input.storeId(), input.lines(), quotedCatalog.products(), store.version(), now);
         long total = total(current.lines());
         requireSupportedTotal(total);
         long divisor = 10_000L + store.taxBasisPoints();
@@ -198,13 +199,17 @@ public class OrderService {
         requireSupportedTotal(quote.total());
         Catalog.StoreData store = catalog.store(quote.storeId(), true);
         Catalog.SlotData slot = catalog.slot(quote.storeId(), quote.slotId(), true);
+        Map<String, Integer> quantities = Catalog.inventoryQuantities(quote.lines());
+        // Orders for different slots still compete for the same units of a product.
+        catalog.lockInventory(quote.storeId(), quantities.keySet());
         Instant now = catalog.databaseNow();
         if (!quote.expiresAt().isAfter(now)) throw ApiFailure.conflict("quote_expired");
         if (!slot.startsAt().equals(quote.startsAt()) || !slot.endsAt().equals(quote.endsAt())) {
             throw ApiFailure.conflict("quote_changed");
         }
         if (!catalog.available(store.store(), slot, now)) throw ApiFailure.conflict("slot_unavailable");
-        Reorder current = Catalog.reconcile(quote.lines(), catalog.products(quote.storeId(), channel, now, true), store.version());
+        Reorder current = catalog.reconcile(quote.storeId(), quote.lines(),
+            catalog.products(quote.storeId(), channel, now, true), store.version(), now);
         long divisor = 10_000L + store.taxBasisPoints();
         long tax = (quote.total() * store.taxBasisPoints() + divisor / 2) / divisor;
         if (quote.total() <= 0 || !current.changes().isEmpty() || tax != quote.tax()
@@ -310,7 +315,9 @@ public class OrderService {
 
     public Reorder reorder(UUID guest, UUID id, CheckoutChannel channel) {
         StoredOrder order = visible(guest, id);
-        return Catalog.reconcile(order.lines(), catalog.products(order.storeId(), channel, catalog.databaseNow(), false));
+        Instant now = catalog.databaseNow();
+        return catalog.reconcile(order.storeId(), order.lines(), catalog.products(order.storeId(), channel, now, false),
+            null, now);
     }
 
     byte[] receiptDocument(UUID guest, UUID id) {
@@ -456,13 +463,22 @@ public class OrderService {
                 return;
             }
 
-            boolean acceptable = current && attempt.status().equals("processing") && reservationStillValid(order);
+            Map<String, Integer> quantities = Catalog.inventoryQuantities(order.lines());
+            List<String> tracked = null;
+            if (current && attempt.status().equals("processing") && order.status().equals("awaiting_payment")) {
+                // Use the same store, slot and inventory lock order as checkout.
+                catalog.store(order.storeId(), true);
+                Catalog.SlotData slot = catalog.slot(order.storeId(), order.slotId(), true);
+                List<String> locked = catalog.lockInventory(order.storeId(), quantities.keySet());
+                if (reservationStillValid(order, slot)) tracked = locked;
+            }
             jdbc.sql("""
                 UPDATE payment_attempts SET status = 'paid', provider_transaction_id = ?, checkout_url = NULL,
                     verified_at = clock_timestamp()
                 WHERE id = ?
                 """).params(payment.transactionId(), attemptId).update();
-            if (acceptable) {
+            if (tracked != null) {
+                catalog.consumeInventory(order.storeId(), tracked, quantities);
                 jdbc.sql("""
                         UPDATE orders SET status = 'accepted', payment_status = 'paid', pickup_code = ?,
                             accepted_at = clock_timestamp() WHERE id = ?
@@ -479,9 +495,8 @@ public class OrderService {
         });
     }
 
-    private boolean reservationStillValid(StoredOrder order) {
-        // Check the hold with PostgreSQL's clock after acquiring the slot lock used by reservations and imports.
-        Catalog.SlotData slot = catalog.slot(order.storeId(), order.slotId(), true);
+    private boolean reservationStillValid(StoredOrder order, Catalog.SlotData slot) {
+        // Use the database clock after acquiring the slot and product locks.
         return order.startsAt().equals(slot.startsAt()) && order.endsAt().equals(slot.endsAt())
             && statusAt(order, catalog.databaseNow()).equals("awaiting_payment");
     }

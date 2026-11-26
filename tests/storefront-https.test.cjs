@@ -1244,6 +1244,72 @@ async function checkProductSaleRules(browser, ca) {
   }
 }
 
+async function checkProductInventory(browser, ca) {
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  try {
+    const staff = await context.newPage();
+    const routePath = '/api/v1/operator/availability';
+    const saves = [];
+    const isSave = request => request.method() === 'PATCH' && request.url() === origin + routePath;
+    staff.on('request', sent => { if (isSave(sent)) saves.push(sent.postDataJSON()); });
+    await staff.addInitScript(path => {
+      const fetchFromBrowser = window.fetch.bind(window);
+      let dropped = false;
+      window.fetch = async (url, init) => {
+        const response = await fetchFromBrowser(url, init);
+        if (!dropped && response.ok && init?.method === 'PATCH' && new URL(url, location.origin).pathname === path) {
+          dropped = true;
+          throw new TypeError('Synthetic lost reply');
+        }
+        return response;
+      };
+    }, routePath);
+    await signInManager(staff);
+    await staff.locator('#availability-jump').click();
+    const editor = staff.getByLabel('Physical portions on hand: Double Smash', { exact: true });
+    const save = button(staff, 'Save portions: Double Smash');
+    await editor.fill('0');
+    const committed = staff.waitForResponse(response => isSave(response.request()), { timeout: 5000 });
+    await save.click();
+    assert.equal((await committed).status(), 200);
+    await shown(staff, 'The current portion count matches your request.');
+    assert.equal(saves.length, 1);
+    assert.equal(saves[0].sku, 'double-smash');
+    assert.equal(saves[0].stockOnHand, 0);
+    assert.equal(saves[0].stockRevision, null);
+    await shown(staff, 'On hand: 0 · Reserved portions: 0 · Unreserved portions: 0');
+    for (const channel of ['mobile', 'web']) {
+      const menu = await request(ca, '/api/v1/stores/kigali/menu?channel=' + channel);
+      assert.equal(menu.status, 200);
+      assert.equal(JSON.parse(menu.body).products.find(({ sku }) => sku === 'double-smash')?.available, false);
+    }
+
+    for (const width of [320, 390, 430]) {
+      await staff.setViewportSize({ width, height: 844 });
+      await staff.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+      await editor.scrollIntoViewIfNeeded();
+      assert.ok(await editor.evaluate(input => {
+        const form = input.closest('form');
+        return form.scrollWidth <= form.clientWidth;
+      }));
+      await capture(staff, 'operator-portion-count-' + width);
+    }
+
+    await editor.fill('2');
+    await save.click();
+    await shown(staff, 'Physical portions saved.');
+    await shown(staff, 'On hand: 2 · Reserved portions: 0 · Unreserved portions: 2');
+    assert.equal(saves.length, 2);
+    for (const channel of ['mobile', 'web']) {
+      const menu = await request(ca, '/api/v1/stores/kigali/menu?channel=' + channel);
+      assert.equal(menu.status, 200);
+      assert.equal(JSON.parse(menu.body).products.find(({ sku }) => sku === 'double-smash')?.available, true);
+    }
+  } finally {
+    await context.close();
+  }
+}
+
 const scenario = webPerf ? 'HTTPS catalog captures cold mobile web performance'
   : catalogPhotos ? 'HTTPS storefront renders the approved photo and preserves a single verified guest payment'
     : 'HTTPS storefront renders public pages and preserves a single verified guest payment';
@@ -1284,6 +1350,8 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   if (catalogPhotos) {
     await t.test('a named manager with MFA confirms an exact recipe approval without publishing it',
       () => checkRecipeApproval(browser, ca));
+    await t.test('the manager can count portions once after a lost reply and restore both sales channels',
+      () => checkProductInventory(browser, ca));
     await t.test('published sale rules update channel visibility and localized availability over HTTPS',
       () => checkProductSaleRules(browser, ca));
   }

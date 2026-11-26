@@ -1,6 +1,5 @@
 import { mountPickupSchedule } from './pickup-schedule.js';
 
-const maxPickupLimit = 2_147_483_647;
 const kigaliDay = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kigali', day: 'numeric', month: 'short' });
 const kigaliTime = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kigali', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 
@@ -12,20 +11,29 @@ function pickupWindow(slot) {
   return `${day}, ${kigaliTime.format(start)}–${day === endDay ? '' : `${endDay}, `}${kigaliTime.format(end)} Kigali time`;
 }
 
-function isPickupLimit(value) {
-  return Number.isInteger(value) && value >= 0 && value <= maxPickupLimit;
+function isNonnegativeInt32(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 2_147_483_647;
 }
 
 function validPickupWindows(slots) {
   return Array.isArray(slots) && slots.length <= 36 && slots.every((slot) => slot && typeof slot.id === 'string'
     && slot.id && typeof slot.startsAt === 'string' && typeof slot.endsAt === 'string'
-    && Date.parse(slot.startsAt) < Date.parse(slot.endsAt) && isPickupLimit(slot.capacity) && isPickupLimit(slot.reserved))
+    && Date.parse(slot.startsAt) < Date.parse(slot.endsAt) && isNonnegativeInt32(slot.capacity) && isNonnegativeInt32(slot.reserved))
     && new Set(slots.map(({ id }) => id)).size === slots.length;
+}
+
+function validStock(stock) {
+  return stock == null || (isNonnegativeInt32(stock.onHand) && Number.isSafeInteger(stock.reserved) && stock.reserved >= 0
+    && Number.isSafeInteger(stock.revision) && stock.revision > 0);
 }
 
 function matchesChange(snapshot, change) {
   if (change.slotId !== undefined) {
     return snapshot.slots?.some(({ id, capacity }) => id === change.slotId && capacity === change.capacity);
+  }
+  if (change.stockOnHand !== undefined) {
+    const stock = snapshot.products.find(({ sku }) => sku === change.sku)?.stock;
+    return stock?.onHand === change.stockOnHand && stock.revision > (change.stockRevision ?? 0);
   }
   if (change.sku !== undefined) {
     return snapshot.products.some(({ sku, available }) => sku === change.sku && available === change.available);
@@ -60,6 +68,7 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
   const pickupLimitProblem = document.getElementById('pickup-limit-problem');
   const pickupLimitNote = document.getElementById('pickup-limit-note');
 
+  const stockRows = new Map();
   let snapshot = null;
   let busy = false;
   let verified = false;
@@ -82,6 +91,9 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
         badge.dataset.status = 'unverified';
         badge.textContent = 'Availability unknown';
       }
+      for (const row of stockRows.values()) {
+        row.summary.textContent = 'Portion counts could not be verified. Refresh availability.';
+      }
     }
     syncButtons();
   }
@@ -89,7 +101,8 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
   function syncButtons() {
     refresh.disabled = busy;
     storeToggle.disabled = busy || !verified;
-    list.querySelectorAll('button').forEach((button) => { button.disabled = busy || !verified; });
+    list.querySelectorAll('button, input').forEach((control) => { control.disabled = busy || !verified; });
+    for (const row of stockRows.values()) row.form.setAttribute('aria-busy', String(busy));
     pickupLimitForm.setAttribute('aria-busy', String(busy));
     const slotDisabled = busy || !verified || selectedSlotId === null;
     pickupWindowSelect.disabled = slotDisabled;
@@ -128,7 +141,51 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
     renderSelectedSlot();
   }
 
+  function bindStock(row, product, index) {
+    const form = row.querySelector('.availability-stock');
+    const summary = form.querySelector('.availability-stock-summary');
+    const input = form.querySelector('input');
+    const save = form.querySelector('button');
+    const problem = form.querySelector('.availability-stock-problem');
+    const note = form.querySelector('.availability-stock-note');
+    const stock = product.stock;
+    summary.id = `stock-counts-${index}`;
+    problem.id = `stock-problem-${index}`;
+    summary.textContent = stock
+      ? `On hand: ${stock.onHand} · Reserved portions: ${stock.reserved} · Unreserved portions: ${Math.max(0, stock.onHand - stock.reserved)}`
+      : 'Portion counts have not been configured.';
+    input.value = stock ? String(stock.onHand) : '';
+    input.setAttribute('aria-label', `Physical portions on hand: ${product.name.en}`);
+    input.setAttribute('aria-describedby', `${summary.id} ${problem.id}`);
+    save.setAttribute('aria-label', `Save portions: ${product.name.en}`);
+    stockRows.set(product.sku, { form, summary, problem, note });
+    input.addEventListener('input', () => {
+      input.removeAttribute('aria-invalid');
+      showMessage(problem);
+      showMessage(note);
+    });
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      if (busy || !verified || currentSession()?.role !== 'manager') return;
+      const value = Number(input.value);
+      const valid = /^\d+$/.test(input.value) && isNonnegativeInt32(value);
+      if (!valid || value < (stock?.reserved ?? 0)) {
+        showMessage(problem, valid ? 'Physical portions cannot be lower than active reservations.'
+          : 'Enter a whole number from 0 to 2,147,483,647.');
+        input.setAttribute('aria-invalid', 'true');
+        input.focus();
+        return;
+      }
+      if (value === stock?.onHand) {
+        showMessage(note, 'Physical portions already match this count.');
+        return;
+      }
+      void update({ sku: product.sku, stockOnHand: value, stockRevision: stock?.revision ?? null }, 'Physical portions saved.');
+    });
+  }
+
   function render() {
+    stockRows.clear();
     store.hidden = snapshot === null;
     renderPickupLimits();
     if (!snapshot) {
@@ -139,13 +196,13 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
 
     storeStatus.textContent = snapshot.open ? 'Accepting new orders' : 'New orders paused';
     storeToggle.textContent = snapshot.open ? 'Pause new orders' : 'Accept new orders';
-    list.replaceChildren(...snapshot.products.map((product) => {
+    list.replaceChildren(...snapshot.products.map((product, index) => {
       const row = template.content.firstElementChild.cloneNode(true);
       row.querySelector('.order-title').textContent = product.name.en;
       const badge = row.querySelector('.order-status');
       badge.dataset.status = product.available ? 'ready' : 'accepted';
       badge.textContent = product.available ? 'Available' : 'On stop list';
-      const button = row.querySelector('button');
+      const button = row.querySelector('.availability-item-toggle');
       const action = product.available ? 'Put on stop list' : 'Resume item';
       button.textContent = action;
       button.setAttribute('aria-label', `${action}: ${product.name.en}`);
@@ -154,6 +211,7 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
         const notice = product.available ? `${product.name.en} is on the stop list.` : `${product.name.en} is available.`;
         void update({ sku: product.sku, available: !product.available }, notice);
       });
+      bindStock(row, product, index);
       return row;
     }));
     syncButtons();
@@ -162,7 +220,8 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
   function accept(data, savedChange) {
     if (!data || typeof data.version !== 'string' || !data.version || typeof data.open !== 'boolean'
       || !Array.isArray(data.products) || data.products.some((product) => !product || typeof product.sku !== 'string'
-        || !product.sku || typeof product.name?.en !== 'string' || !product.name.en || typeof product.available !== 'boolean')
+        || !product.sku || typeof product.name?.en !== 'string' || !product.name.en || typeof product.available !== 'boolean'
+        || !validStock(product.stock))
       || (data.slots !== undefined && !validPickupWindows(data.slots))) {
       throw new Error('Invalid availability response');
     }
@@ -208,22 +267,35 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
     }
   }
 
-  async function refreshAfterLimitError(session, change, error) {
+  function quantityFeedback(change) {
+    if (change.stockOnHand !== undefined) return stockRows.get(change.sku) ?? { problem, note };
+    return { problem: pickupLimits.hidden ? problem : pickupLimitProblem, note: pickupLimitNote };
+  }
+
+  async function refreshAfterQuantityError(session, change, error) {
     if (error.status === 401) {
       report(error);
       return;
     }
 
     let message;
+    const stock = change.stockOnHand !== undefined;
+    const quantity = stock ? 'portion counts' : 'pickup limits';
     const uncertain = writeOutcomeUnknown(error);
-    if (error.code === 'slot_capacity_below_reserved') {
+    if (stock && error.code === 'stock_below_reserved') {
+      message = 'Physical portions cannot be lower than active reservations.';
+    } else if (stock && error.code === 'stock_revision_conflict') {
+      message = 'The portion count changed. Review the current count before saving again.';
+    } else if (stock && error.status === 404) {
+      message = 'This menu item can no longer be edited.';
+    } else if (!stock && error.code === 'slot_capacity_below_reserved') {
       message = 'The pickup limit cannot be lower than the number of active reservations.';
-    } else if (error.code === 'slot_update_closed' || error.status === 404) {
+    } else if (!stock && (error.code === 'slot_update_closed' || error.status === 404)) {
       message = 'This pickup window can no longer be edited.';
     } else if (error.code === 'catalog_version_conflict') {
-      message = 'Availability changed. Review the current pickup limits before saving again.';
+      message = `Availability changed. Review the current ${quantity} before saving again.`;
     } else if (uncertain) {
-      message = 'The save could not be confirmed. Review the current pickup limits before saving again.';
+      message = `The save could not be confirmed. Review the current ${quantity} before saving again.`;
     } else {
       message = messageFor(error);
     }
@@ -233,7 +305,8 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
       if (currentSession() !== session) return;
       accept(data);
       if (uncertain && matchesChange(data, change)) {
-        showMessage(pickupLimitNote, 'The current pickup limit matches your request.');
+        showMessage(quantityFeedback(change).note, stock
+          ? 'The current portion count matches your request.' : 'The current pickup limit matches your request.');
         return;
       }
     } catch (refreshError) {
@@ -245,7 +318,7 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
       message += ' Refresh availability before trying again.';
     }
 
-    showMessage(pickupLimits.hidden ? problem : pickupLimitProblem, message);
+    showMessage(quantityFeedback(change).problem, message);
   }
 
   async function reconcileAvailability(session, change, notice) {
@@ -274,10 +347,11 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
     syncButtons();
     showMessage(problem);
     showMessage(note);
-    const limitChange = change.slotId !== undefined;
-    if (limitChange) {
-      showMessage(pickupLimitProblem);
-      showMessage(pickupLimitNote);
+    const quantityChange = change.slotId !== undefined || change.stockOnHand !== undefined;
+    if (quantityChange) {
+      const feedback = quantityFeedback(change);
+      showMessage(feedback.problem);
+      showMessage(feedback.note);
     }
     let saved = false;
     try {
@@ -287,12 +361,12 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
       if (currentSession() !== session) return;
       accept(data, change);
       saved = true;
-      showMessage(limitChange ? pickupLimitNote : note, notice);
+      showMessage(quantityChange ? quantityFeedback(change).note : note, notice);
     } catch (error) {
       if (currentSession() !== session) return;
       markUnverified();
-      if (limitChange) {
-        await refreshAfterLimitError(session, change, error);
+      if (quantityChange) {
+        await refreshAfterQuantityError(session, change, error);
       } else if (writeOutcomeUnknown(error)) {
         saved = await reconcileAvailability(session, change, notice);
       } else if (error.code === 'catalog_version_conflict') {
@@ -304,9 +378,10 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
       if (currentSession() === session) {
         busy = false;
         syncButtons();
-        if (limitChange) {
-          if (!pickupLimitProblem.hidden) pickupLimitProblem.focus();
-          else if (!pickupLimitNote.hidden) pickupLimitNote.focus();
+        if (quantityChange) {
+          const feedback = quantityFeedback(change);
+          if (feedback.problem !== problem && !feedback.problem.hidden) feedback.problem.focus();
+          else if (feedback.note !== note && !feedback.note.hidden) feedback.note.focus();
           else refresh.focus();
         } else if (saved) {
           const target = change.sku
@@ -343,8 +418,8 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
     if (busy || !verified || !slot || currentSession()?.role !== 'manager') return;
     const raw = pickupLimitInput.value;
     const capacity = Number(raw);
-    if (!/^\d+$/.test(raw) || !isPickupLimit(capacity) || capacity < slot.reserved) {
-      const message = /^\d+$/.test(raw) && isPickupLimit(capacity)
+    if (!/^\d+$/.test(raw) || !isNonnegativeInt32(capacity) || capacity < slot.reserved) {
+      const message = /^\d+$/.test(raw) && isNonnegativeInt32(capacity)
         ? 'The pickup limit cannot be lower than the number of active reservations.'
         : 'Enter a whole number from 0 to 2,147,483,647.';
       pickupLimitInput.setAttribute('aria-invalid', 'true');

@@ -9,10 +9,13 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
@@ -22,11 +25,13 @@ import org.springframework.transaction.annotation.Transactional;
 class Catalog {
     private static final int MENU_SLOT_LIMIT = 12;
     private static final String SALE_PRODUCT = """
-        CASE WHEN catalog_sale_active(p.sale_hours, :soldAt) THEN p.product
+        CASE WHEN catalog_sale_active(p.sale_hours, :soldAt)
+            AND catalog_product_has_stock(p.store_id, p.sku, :soldAt) THEN p.product
             ELSE jsonb_set(p.product, '{available}', 'false'::jsonb) END AS product
         """;
     private static final String MENU_SALE_PRODUCT = SALE_PRODUCT + """
         , CASE WHEN p.product->'available' = 'true'::jsonb AND p.sale_hours <> '[]'::jsonb
+            AND catalog_product_has_stock(p.store_id, p.sku, :soldAt)
             THEN catalog_next_sale_change(p.sale_hours, :soldAt) END AS next_sale_change
         """;
     private static final String SLOT_QUERY = """
@@ -184,11 +189,48 @@ class Catalog {
         return reserved < slot.capacity();
     }
 
-    static Reorder reconcile(List<CartLine> lines, List<Product> products) {
-        return reconcile(lines, products, null);
+    static Map<String, Integer> inventoryQuantities(List<CartLine> lines) {
+        Map<String, Integer> quantities = new TreeMap<>();
+        for (CartLine line : lines) {
+            quantities.merge(line.sku(), line.quantity(), Math::addExact);
+        }
+        return quantities;
     }
 
-    static Reorder reconcile(List<CartLine> lines, List<Product> products, String catalogVersion) {
+    List<String> lockInventory(String store, Set<String> skus) {
+        if (skus.isEmpty()) return List.of();
+        return jdbc.sql("""
+            SELECT sku FROM menu_product_inventory WHERE store_id = :store AND sku IN (:skus)
+            ORDER BY sku FOR UPDATE
+            """).param("store", store).param("skus", skus).query(String.class).list();
+    }
+
+    private Set<String> insufficientInventory(String store, Map<String, Integer> quantities, Instant now) {
+        if (quantities.isEmpty()) return Set.of();
+        return jdbc.sql("""
+            SELECT sku, on_hand - catalog_reserved_product_units(store_id, sku, :checkedAt) AS remaining
+            FROM menu_product_inventory WHERE store_id = :store AND sku IN (:skus)
+            """).param("checkedAt", dbTime(now)).param("store", store).param("skus", quantities.keySet())
+            .query(rs -> {
+                Set<String> unavailable = new HashSet<>();
+                while (rs.next()) {
+                    String sku = rs.getString("sku");
+                    if (quantities.get(sku) > rs.getLong("remaining")) unavailable.add(sku);
+                }
+                return unavailable;
+            });
+    }
+
+    void consumeInventory(String store, List<String> tracked, Map<String, Integer> quantities) {
+        for (String sku : tracked) {
+            jdbc.sql("""
+                UPDATE menu_product_inventory SET on_hand = on_hand - ?, revision = revision + 1
+                WHERE store_id = ? AND sku = ?
+                """).params(quantities.get(sku), store, sku).update();
+        }
+    }
+
+    Reorder reconcile(String store, List<CartLine> lines, List<Product> products, String catalogVersion, Instant now) {
         List<CartLine> accepted = new ArrayList<>();
         List<QuoteChange> changes = new ArrayList<>();
         for (CartLine line : lines) {
@@ -211,6 +253,14 @@ class Catalog {
             SoldItem soldItem = catalogVersion == null ? null
                 : new SoldItem(catalogVersion, product.name(), product.ingredients(), product.allergens(), options);
             accepted.add(new CartLine(line.sku(), options.stream().map(Modifier::id).toList(), line.quantity(), unitPrice, soldItem));
+        }
+        Set<String> insufficient = insufficientInventory(store, inventoryQuantities(accepted), now);
+        if (!insufficient.isEmpty()) {
+            changes.removeIf(change -> change.kind().equals("price") && insufficient.contains(change.sku()));
+            for (CartLine line : accepted) {
+                if (insufficient.contains(line.sku())) changes.add(new QuoteChange("unavailable", line.sku(), null, null));
+            }
+            accepted.removeIf(line -> insufficient.contains(line.sku()));
         }
         return new Reorder(List.copyOf(accepted), List.copyOf(changes));
     }

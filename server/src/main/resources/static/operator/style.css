@@ -197,6 +197,13 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .availability-store .button { flex: 0 1 auto; }
 .availability-item { display: grid; gap: .75rem; }
 .availability-note { color: var(--green); font-weight: 720; margin-bottom: .85rem; }
+.availability-stock {
+  display: grid; gap: .55rem; min-width: 0; padding-top: .75rem; border-top: 1px solid var(--border);
+}
+.availability-stock label { display: grid; gap: .35rem; min-width: 0; }
+.availability-stock .button { justify-self: start; max-width: 100%; overflow-wrap: anywhere; }
+.availability-stock-summary { color: var(--muted); overflow-wrap: anywhere; }
+.availability-stock .problem, .availability-stock .availability-note { margin: 0; overflow-wrap: anywhere; }
 .pickup-schedule { display: grid; gap: .65rem; margin-bottom: 1rem; }
 .pickup-schedule-form { display: grid; gap: .45rem; max-width: 30rem; }
 .pickup-schedule-times { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr)); gap: .55rem; margin-block: .3rem; }

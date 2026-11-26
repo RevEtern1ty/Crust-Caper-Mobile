@@ -9,7 +9,7 @@ paths:
   /stores/{id}/menu:
     get:
       operationId: getMenu
-      description: Products are filtered by the selected sales channel. Products sold on that channel outside their Kigali sales hours remain listed as unavailable. The representation is evaluated at the server time returned in X-Availability-Checked-At.
+      description: Products are filtered by the selected sales channel. Products outside their Kigali sales hours or without available tracked units remain listed as unavailable. The representation is evaluated at the server time returned in X-Availability-Checked-At.
       parameters:
         - name: id
           in: path
@@ -1005,7 +1005,7 @@ paths:
         '403': { $ref: '#/components/responses/OperatorForbidden' }
     patch:
       operationId: setMenuAvailability
-      description: Modify availability for the manager's restaurant using the current catalog version. A pickup limit must cover active reservations. A pickup schedule adds future ten-minute windows without changing existing windows. An exact retry of a published schedule ID and values returns the latest snapshot even when the expected version is old. The request body is limited to 2 KiB.
+      description: Modify availability for the manager's restaurant using the current catalog version. A pickup or product limit must cover active reservations. A pickup schedule adds future ten-minute windows without changing existing windows. An exact retry of a published schedule ID and values returns the latest snapshot even when the expected version is old. The request body is limited to 2 KiB.
       security: [{ operatorBearer: [] }]
       requestBody:
         required: true
@@ -1026,6 +1026,14 @@ paths:
                     expectedVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
                     sku: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
                     available: { type: boolean }
+                - type: object
+                  additionalProperties: false
+                  required: [expectedVersion, sku, stockOnHand, stockRevision]
+                  properties:
+                    expectedVersion: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    sku: { type: string, pattern: '^[A-Za-z0-9._:-]{1,100}$' }
+                    stockOnHand: { type: integer, minimum: 0, maximum: 2147483647, description: Physical portions including active unpaid reservations. }
+                    stockRevision: { type: ['integer', 'null'], format: int64, minimum: 1, description: Current product inventory revision. Use null to begin tracking this product. }
                 - type: object
                   additionalProperties: false
                   required: [expectedVersion, slotId, capacity]
@@ -1056,7 +1064,7 @@ paths:
         '404': { description: The item or pickup window does not exist in the assigned restaurant. }
         '415': { description: The request body must be sent as application/json. }
         '409':
-          description: The catalog version changed, the window has started, the limit is below active reservations, or the new schedule overlaps existing windows or reuses an ID with different values.
+          description: The catalog or inventory revision changed, the window has started, the limit is below active reservations, or the new schedule overlaps existing windows or reuses an ID with different values.
           content:
             application/problem+json:
               schema:
@@ -1064,7 +1072,7 @@ paths:
                   - $ref: '#/components/schemas/ProblemDetails'
                   - properties:
                       status: { const: 409 }
-                      code: { enum: [catalog_version_conflict, slot_update_closed, slot_capacity_below_reserved, pickup_schedule_started, pickup_schedule_overlap, pickup_schedule_conflict] }
+                      code: { enum: [catalog_version_conflict, slot_update_closed, slot_capacity_below_reserved, stock_revision_conflict, stock_below_reserved, pickup_schedule_started, pickup_schedule_overlap, pickup_schedule_conflict] }
   /operator/catalog/recipe-approvals:
     post:
       operationId: approveCatalogRecipe
@@ -1832,7 +1840,15 @@ components:
             properties:
               sku: { type: string }
               name: { $ref: '#/components/schemas/Localized' }
-              available: { type: boolean }
+              available: { type: boolean, description: Manual availability flag for the stop list. }
+              stock:
+                type: object
+                description: Omitted before the manager configures portion tracking.
+                required: [onHand, reserved, revision]
+                properties:
+                  onHand: { type: integer, minimum: 0, maximum: 2147483647 }
+                  reserved: { type: integer, format: int64, minimum: 0 }
+                  revision: { type: integer, format: int64, minimum: 1 }
         slots:
           type: array
           maxItems: 36
