@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { CheckoutController } from '../checkout/controller';
 import type { Storage } from '../domain/types';
 import { createLiveApi, type ConnectedConfig } from './http-api';
 import { MAX_RECEIPT_BYTES, PDF_MIME_TYPE } from './receipt';
@@ -358,6 +359,70 @@ test('recovery stays read-only when the saved checkout cannot be transferred', a
     assert.equal(calls.length, delivered);
   }
 });
+
+for (const settledBeforeVerification of [true, false]) {
+  test(`verified recovery resumes saved payment without a repeat after settlement ${settledBeforeVerification ? 'before' : 'after'} phone verification`, async () => {
+    const { data, storage } = memory();
+    const saved = JSON.stringify({
+      version: 1,
+      active: { phase: 'paying', orderId: recoveryOrderId, key: 'old-attempt' },
+      orderIds: [recoveryOrderId],
+    });
+    data.set(journalKey, saved);
+    data.set(journalKey + '.guest', JSON.stringify(expiredGuest));
+    let settled = settledBeforeVerification;
+    let allowGuestWrite = true;
+    const storeValue = storage.setItem;
+    storage.setItem = async (key, value) => {
+      if (!allowGuestWrite && key === journalKey + '.guest') throw new Error('Guest storage unavailable');
+      await storeValue(key, value);
+    };
+    const { calls, fetcher } = transport(call => {
+      if (call.url.endsWith('/guest-sessions')) return Response.json(recoveryGuest, { status: 201 });
+      assert.equal(call.token, 'Bearer ' + recoveryGuest.accessToken);
+      if (call.url.endsWith('/order-access/challenges')) return Response.json({ challengeId: recoveryChallengeId }, { status: 202 });
+      if (call.url.endsWith('/verify')) return Response.json({ orderId: recoveryOrderId });
+      if (call.url.endsWith('/quotes')) return Response.json({
+        quoteId: 'fresh-quote', storeId: config.storeId, slotId: order.slotId, lines: [cartLine],
+        subtotal: order.total, tax: 0, total: order.total, currency: order.currency, expiresAt, changes: [],
+        pickupStartsAt: order.pickupStartsAt, pickupEndsAt: order.pickupEndsAt,
+      });
+      assert.equal(call.url, config.apiBaseUrl + '/orders/' + recoveryOrderId);
+      assert.equal(call.method, 'GET');
+      return Response.json(settled ? recoveredOrder : { ...order, id: recoveryOrderId, status: 'cancelled' });
+    });
+    const options = { config, storage, journalKey, fetcher, now };
+    const first = createLiveApi(options);
+    await first.requestOrderAccess!(recoveryContact);
+    assert.deepEqual(await first.verifyOrderAccess!(recoveryChallengeId, '418263'), { orderId: recoveryOrderId });
+    const restarted = createLiveApi(options);
+    if (!settledBeforeVerification) {
+      assert.equal((await restarted.getOrder(recoveryOrderId)).recoveryReadOnly, true);
+      assert.equal(data.get(journalKey + '.guest'), JSON.stringify(expiredGuest));
+      settled = true;
+      allowGuestWrite = false;
+      const readOnly = await restarted.getOrder(recoveryOrderId);
+      assert.equal(readOnly.paymentStatus, 'paid');
+      assert.equal(readOnly.recoveryReadOnly, true);
+      assert.equal(data.get(journalKey + '.guest'), JSON.stringify(expiredGuest));
+      allowGuestWrite = true;
+    } else {
+      assert.equal(data.get(journalKey + '.guest'), JSON.stringify(recoveryGuest));
+    }
+    assert.equal((await restarted.getOrder(recoveryOrderId)).recoveryReadOnly, undefined);
+    assert.equal(data.get(journalKey), saved);
+    const controller = new CheckoutController({
+      api: restarted, storage, storageKey: journalKey,
+      newKey: () => assert.fail('Restoring a settled payment must not allocate a new attempt key'),
+      onOrderCreated: async () => {},
+    });
+    assert.equal((await controller.resume()).paymentStatus, 'paid');
+    assert.deepEqual(controller.snapshot.active, { phase: 'tracking', orderId: recoveryOrderId, key: 'old-attempt' });
+    assert.equal((await restarted.createQuote({ storeId: config.storeId, slotId: order.slotId, lines: [cartLine] })).id, 'fresh-quote');
+    assert.equal(calls.filter(call => call.url.endsWith('/guest-sessions')).length, 1);
+    assert.equal(calls.filter(call => call.url.endsWith('/payments')).length, 0);
+  });
+}
 
 test('promotion write failure allows verification to retry with the same provisional identity', async () => {
   const { data, storage } = memory();

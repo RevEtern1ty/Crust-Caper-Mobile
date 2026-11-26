@@ -4,6 +4,7 @@ import com.crustcaper.api.operator.OperatorModels.OrderLine;
 import com.crustcaper.api.operator.OperatorModels.OrderView;
 import com.crustcaper.api.operator.OperatorModels.PaymentExceptionView;
 import com.crustcaper.api.operator.OperatorModels.PaymentReview;
+import com.crustcaper.api.operator.OperatorModels.PickupStatus;
 import com.crustcaper.api.operator.OperatorModels.Queue;
 import com.crustcaper.api.operator.OperatorModels.StatusInput;
 import com.crustcaper.api.operator.OperatorSessions.Principal;
@@ -50,6 +51,24 @@ final class OperatorOrders {
                  ORDER BY pickup_starts_at, id
                 """).param(actor.storeId()).query(this::orderRow).list();
         return new Queue(active, jdbc.sql("SELECT clock_timestamp()").query(OffsetDateTime.class).single().toInstant());
+    }
+
+    PickupStatus pickupStatus(String authorization, String rawId) {
+        Principal actor = sessions.requirePrincipal(authorization, false);
+        if (!actor.role().equals("pickup") && !actor.role().equals("manager")) {
+            throw OperatorFailure.forbidden();
+        }
+        return jdbc.sql("""
+                SELECT o.id, o.status, o.status = 'collected' AND EXISTS (
+                    SELECT 1 FROM operator_order_events e
+                    WHERE e.order_id = o.id AND e.store_id = o.store_id AND e.operator_id = ?
+                        AND e.requested_status = 'collected' AND e.outcome = 'changed'
+                ) AS confirmed_by_current_operator
+                FROM orders o WHERE o.id = ? AND o.store_id = ?
+                """).params(actor.id(), orderId(rawId), actor.storeId())
+                .query((row, number) -> new PickupStatus(row.getObject("id", UUID.class), row.getString("status"),
+                        row.getBoolean("confirmed_by_current_operator")))
+                .optional().orElseThrow(OperatorFailure::notFound);
     }
 
     PaymentReview paymentReview(String authorization) {

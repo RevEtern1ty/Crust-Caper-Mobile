@@ -3,6 +3,7 @@ package com.crustcaper.api.operator;
 import com.crustcaper.api.operator.OperatorModels.Login;
 import com.crustcaper.api.operator.OperatorModels.OrderView;
 import com.crustcaper.api.operator.OperatorModels.PaymentReview;
+import com.crustcaper.api.operator.OperatorModels.PickupStatus;
 import com.crustcaper.api.operator.OperatorModels.Queue;
 import com.crustcaper.api.operator.OperatorModels.Session;
 import com.crustcaper.api.operator.OperatorModels.StatusInput;
@@ -56,6 +57,13 @@ final class OperatorController {
     @GetMapping("/orders")
     ResponseEntity<Queue> queue(@RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.active(authorization));
+    }
+
+    @GetMapping("/orders/{id}/pickup-status")
+    ResponseEntity<PickupStatus> pickupStatus(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+            @PathVariable String id) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.pickupStatus(authorization, id));
     }
 
     @GetMapping("/payment-exceptions")

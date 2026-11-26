@@ -499,6 +499,49 @@ class OperatorIntegrationTest {
     }
 
     @Test
+    void pickupStatusDistinguishesReadyCancelledAndCollectionByTheSignedInOperator() throws Exception {
+        String kitchen = login(newStaff(store, "kitchen"));
+        String pickup = login(newStaff(store, "pickup"));
+        String manager = login(newStaff(store, "manager"));
+        OrderFixture collected = newOrder(store, true);
+        OrderFixture cancelled = newOrder(store, true);
+
+        change(kitchen, collected.orderId(), "preparing", null).andExpect(status().isOk());
+        change(kitchen, collected.orderId(), "ready", null).andExpect(status().isOk());
+        assertPickupStatus(pickup, collected.orderId(), "ready", false);
+
+        change(pickup, collected.orderId(), "collected", collected.code()).andExpect(status().isOk());
+        assertPickupStatus(pickup, collected.orderId(), "collected", true);
+        assertPickupStatus(manager, collected.orderId(), "collected", false);
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM operator_order_events
+                WHERE order_id = ? AND requested_status = 'collected' AND outcome = 'changed'
+                """).param(UUID.fromString(collected.orderId())).query(Long.class).single()).isOne();
+
+        cancel(manager, cancelled.orderId()).andExpect(status().isOk());
+        assertPickupStatus(pickup, cancelled.orderId(), "cancelled", false);
+    }
+
+    @Test
+    void pickupStatusRequiresAuthorizedStaffAndDoesNotExposeOrdersAtAnotherStore() throws Exception {
+        String kitchen = login(newStaff(store, "kitchen"));
+        String pickup = login(newStaff(store, "pickup"));
+        String manager = login(newStaff(store, "manager"));
+        OrderFixture homeOrder = newOrder(store, true);
+        OrderFixture foreignOrder = newOrder(newStore(), true);
+
+        api.perform(get(OPERATOR + "/orders/{id}/pickup-status", homeOrder.orderId()))
+                .andExpect(status().isUnauthorized()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"));
+        pickupStatus(homeOrder.guestBearer(), homeOrder.orderId()).andExpect(status().isUnauthorized());
+        pickupStatus(kitchen, homeOrder.orderId()).andExpect(status().isForbidden());
+        pickupStatus(pickup, foreignOrder.orderId()).andExpect(status().isNotFound())
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"));
+        pickupStatus(manager, foreignOrder.orderId()).andExpect(status().isNotFound());
+        pickupStatus(manager, UUID.randomUUID().toString()).andExpect(status().isNotFound());
+        pickupStatus(pickup, "invalid").andExpect(status().isNotFound());
+    }
+
+    @Test
     void wrongPickupCodeIsAuditedAndThrottledWithoutRecordingTheCode() throws Exception {
         Staff manager = newStaff(store, "manager");
         String bearer = login(manager);
@@ -909,6 +952,19 @@ class OperatorIntegrationTest {
 
     private ResultActions cancel(String bearer, String orderId) throws Exception {
         return api.perform(post(OPERATOR + "/orders/" + orderId + "/cancel").header(HttpHeaders.AUTHORIZATION, bearer));
+    }
+
+    private ResultActions pickupStatus(String bearer, String orderId) throws Exception {
+        return api.perform(get(OPERATOR + "/orders/{id}/pickup-status", orderId).header(HttpHeaders.AUTHORIZATION, bearer));
+    }
+
+    private void assertPickupStatus(String bearer, String orderId, String expectedStatus, boolean confirmed) throws Exception {
+        JsonNode result = body(pickupStatus(bearer, orderId).andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.id").value(orderId))
+                .andExpect(jsonPath("$.status").value(expectedStatus))
+                .andExpect(jsonPath("$.confirmedByCurrentOperator").value(confirmed)));
+        assertThat(keys(result)).containsExactlyInAnyOrder("id", "status", "confirmedByCurrentOperator");
     }
 
     private int collectAfterBarrier(CountDownLatch waiting, CountDownLatch start, String bearer, OrderFixture order) throws Exception {

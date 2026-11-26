@@ -33,6 +33,8 @@ final class OperatorModels {
 
     record Queue(List<OrderView> orders, Instant serverTime) { }
 
+    record PickupStatus(UUID id, String status, boolean confirmedByCurrentOperator) { }
+
     record PaymentExceptionView(UUID orderId, UUID merchantReference, String providerTransactionId,
                                 String reason, Instant createdAt,
                                 @JsonInclude(JsonInclude.Include.NON_NULL) RefundView refund) { }

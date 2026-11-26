@@ -373,6 +373,35 @@ paths:
                     description: Database clock sampled after reading the queue. Used to calculate elapsed time without relying on the browser's wall clock.
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/orders/{id}/pickup-status:
+    get:
+      operationId: getOperatorPickupStatus
+      description: A pickup operator or manager can check the current state of an order in the assigned store after an uncertain collection response.
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Current order status and whether the successful collection is recorded for the authenticated operator.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [id, status, confirmedByCurrentOperator]
+                properties:
+                  id: { type: string, format: uuid }
+                  status: { type: string, enum: [awaiting_payment, accepted, preparing, ready, collected, cancelled] }
+                  confirmedByCurrentOperator:
+                    type: boolean
+                    description: True only when a successful collection is recorded for this operator. The status can be collected when a different operator confirmed it.
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/orders/{id}/status:
     post:
       operationId: updateOperatorOrderStatus

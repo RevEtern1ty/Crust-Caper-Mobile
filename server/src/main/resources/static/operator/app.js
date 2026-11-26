@@ -16,6 +16,7 @@ const kitchenNewOrders = element('kitchen-new-orders');
 const kitchenSoundToggle = element('kitchen-sound-toggle');
 const kitchenSoundStatus = element('kitchen-sound-status');
 const queueNotice = element('queue-notice');
+const pickupUncertainNotice = element('pickup-uncertain-notice');
 const updateTime = element('update-time');
 const orderList = element('order-list');
 const emptyState = element('empty-state');
@@ -72,6 +73,7 @@ const queueFreshMs = 12_000;
 const overdueMs = 60_000;
 const cards = new Map();
 const kitchenTransitions = new Set();
+const pickupChecks = new Map();
 
 let session = null;
 let orders = [];
@@ -323,6 +325,7 @@ function addAction(card, order) {
   input.maxLength = 6;
   input.required = true;
   input.pattern = '[0-9]{6}';
+  button.disabled = input.disabled = pickupChecks.has(order.id);
   input.setAttribute('aria-describedby', problem.id);
   caption.htmlFor = input.id;
   caption.textContent = 'Pickup code';
@@ -591,11 +594,13 @@ function closeSession(message = '') {
   session = null;
   closeCancellation('', false);
   showMessage(queueNotice);
+  showMessage(pickupUncertainNotice);
   refreshing = false;
   refreshButton.disabled = false;
   queueSnapshot = null;
   needsQueueRefresh = false;
   kitchenTransitions.clear();
+  pickupChecks.clear();
   orderSound.mute();
   orders = [];
   cards.clear();
@@ -720,6 +725,80 @@ async function refreshReceipts() {
   }
 }
 
+function setPickupCheck(id, state) {
+  const check = state ? { state } : null;
+  if (check) pickupChecks.set(id, check);
+  else pickupChecks.delete(id);
+  const form = cards.get(id)?.card.querySelector('.pickup-form');
+  if (form) {
+    form.querySelector('button').disabled = !!state;
+    form.elements.namedItem('pickupCode').disabled = !!state;
+  }
+  const uncertain = [...pickupChecks].filter(([, value]) => value.state === 'uncertain').map(([orderId]) => orderNumber(orderId));
+  const target = uncertain.length === 1 ? `order ${uncertain[0]}` : `orders ${uncertain.join(', ')}`;
+  showMessage(pickupUncertainNotice, uncertain.length
+    ? `Pickup for ${target} could not be confirmed. Select Refresh to check the server before handing it out.` : '');
+  return check;
+}
+
+function showPickupOutcome(id, status, confirmedByCurrentOperator) {
+  const number = orderNumber(id);
+  if (status === 'collected' || status === 'cancelled') {
+    // A queue read started before the terminal outcome can still contain the ready card.
+    refreshVersion++;
+    refreshing = false;
+    refreshButton.disabled = false;
+    const focusWasOnOrder = cards.get(id)?.card.contains(document.activeElement);
+    orders = orders.filter(item => item.id !== id);
+    renderOrders();
+    const message = status === 'cancelled' ? `Order ${number} was cancelled. Do not hand it out.`
+      : confirmedByCurrentOperator ? `Pickup for order ${number} was confirmed by this account.`
+        : `Order ${number} was already collected.`;
+    showMessage(queueNotice, message);
+    if (focusWasOnOrder) queueNotice.focus();
+  } else {
+    showMessage(queueNotice, status === 'ready'
+      ? `Order ${number} is still ready for pickup. Check the code before confirming again.`
+      : `Order ${number} is no longer ready for pickup. Review the queue.`);
+  }
+}
+
+async function checkPickup(id, current) {
+  const number = orderNumber(id);
+  const checking = `Checking pickup for order ${number}…`;
+  const check = setPickupCheck(id, 'checking');
+  showMessage(queueNotice, checking);
+  try {
+    const result = await request(`/orders/${encodeURIComponent(id)}/pickup-status`, { token: current.accessToken });
+    if (session !== current || pickupChecks.get(id) !== check) return;
+    if (result?.id !== id || !['awaiting_payment', 'accepted', 'preparing', 'ready', 'collected', 'cancelled'].includes(result.status)
+      || typeof result.confirmedByCurrentOperator !== 'boolean'
+      || (result.confirmedByCurrentOperator && result.status !== 'collected')) {
+      throw new ApiError(502, 'invalid_response');
+    }
+    setPickupCheck(id);
+    showPickupOutcome(id, result.status, result.confirmedByCurrentOperator);
+  } catch (error) {
+    if (session !== current || pickupChecks.get(id) !== check) return;
+    if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
+    else {
+      setPickupCheck(id, 'uncertain');
+      if (queueNotice.textContent === checking) showMessage(queueNotice);
+    }
+  }
+}
+
+async function refreshPickupChecks() {
+  const current = availableSession();
+  if (!current) return;
+  const uncertain = [...pickupChecks].filter(([, check]) => check.state === 'uncertain');
+  for (const [id, check] of uncertain) {
+    if (session !== current) return;
+    if (pickupChecks.get(id) === check) await checkPickup(id, current);
+  }
+  if (session === current) await refreshQueue(uncertain.length > 0);
+}
+
 async function submitTransition(order, action, button, problem, input) {
   const current = availableSession();
   if (!current || button.disabled) return;
@@ -727,6 +806,7 @@ async function submitTransition(order, action, button, problem, input) {
   const epoch = queueEpoch;
   if (kitchenAction && (!staffKitchen(current) || !queueFresh() || kitchenTransitions.has(order.id)
     || !orders.some((item) => item.id === order.id && item.status === order.status))) return;
+  if (!kitchenAction && (pickupChecks.has(order.id) || !orders.some((item) => item.id === order.id && item.status === 'ready'))) return;
 
   const body = { status: action.status };
   if (input) {
@@ -740,6 +820,7 @@ async function submitTransition(order, action, button, problem, input) {
     input.disabled = true;
   }
   button.disabled = true;
+  const pickupWrite = kitchenAction ? null : setPickupCheck(order.id, 'sending');
   if (kitchenAction) kitchenTransitions.add(order.id);
   showMessage(problem);
   try {
@@ -748,17 +829,25 @@ async function submitTransition(order, action, button, problem, input) {
     const updated = checkedOrder(data, true);
     if (updated.id !== order.id || updated.status !== action.status) throw new ApiError(502, 'invalid_response');
 
-    if (input) input.value = '';
-    orders = orders.flatMap((item) => {
-      if (item.id !== updated.id || item.status !== order.status) return [item];
-      return updated.status === 'collected' ? [] : [updated];
-    });
+    if (!kitchenAction) {
+      input.value = '';
+      setPickupCheck(order.id);
+      showPickupOutcome(order.id, updated.status, true);
+      await refreshQueue(true);
+      return;
+    }
+    orders = orders.map(item => item.id === updated.id && item.status === order.status ? updated : item);
     renderOrders();
     await refreshQueue(true);
   } catch (error) {
     if (session !== current || (kitchenAction && queueEpoch !== epoch)) return;
     if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
-    else {
+    else if (!kitchenAction && (!(error instanceof ApiError) || error.status >= 500
+      || ([404, 409].includes(error.status) && error.code !== 'pickup_code_mismatch'))) {
+      input.value = '';
+      await checkPickup(order.id, current);
+      if (session === current) await refreshQueue(true);
+    } else {
       showMessage(problem, messageFor(error));
       if (kitchenAction) {
         needsQueueRefresh = true;
@@ -781,8 +870,10 @@ async function submitTransition(order, action, button, problem, input) {
           void refreshQueue(true);
         }
         syncKitchenSignal();
-      } else button.disabled = false;
-      if (input) input.disabled = false;
+      } else if (pickupChecks.get(order.id) === pickupWrite) {
+        setPickupCheck(order.id);
+      }
+      if (input && !pickupChecks.has(order.id)) input.disabled = false;
     }
   }
 }
@@ -906,7 +997,7 @@ loginForm.addEventListener('submit', async (event) => {
   }
 });
 
-refreshButton.addEventListener('click', () => { void refreshQueue(); });
+refreshButton.addEventListener('click', () => { void refreshPickupChecks(); });
 kitchenSoundToggle.addEventListener('click', () => {
   if (!staffKitchen(availableSession())) return;
   if (kitchenSoundState === 'on') orderSound.mute();

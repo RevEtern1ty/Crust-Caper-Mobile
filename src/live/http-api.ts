@@ -271,7 +271,7 @@ export function createLiveApi({
     });
   }
 
-  function activateRecovery(record: RecoverySession, orderId: string): Promise<boolean> {
+  function activateRecovery(record: RecoverySession, orderId: string, observedOrder?: Order): Promise<boolean> {
     const reading = sessionPromise;
     activation = (async () => {
       await reading?.catch(() => undefined);
@@ -284,32 +284,35 @@ export function createLiveApi({
       let active;
       try { ({ active } = parseJournal(raw)); }
       catch { return false; }
+      if (!active && observedOrder) return false;
       if (active) {
-        if (active.phase !== 'tracking' || active.orderId !== orderId) return false;
-        const snapshot = await sendRecovery({ path: orderPath(orderId), schema: orderResponse }, record)
+        if (active.phase === 'creating' || active.orderId !== orderId) return false;
+        const snapshot = observedOrder ?? await sendRecovery({ path: orderPath(orderId), schema: orderResponse }, record)
           .then(order => checkedOrder(order, orderId)).catch(() => null);
-        if (!snapshot || !canStartNewOrder(snapshot)) return false;
+        // A processing transaction may still settle after the pickup hold has expired.
+        if (!snapshot || snapshot.paymentStatus === 'processing' || !canStartNewOrder(snapshot)) return false;
       }
       if (await readSaved(journalKey) !== raw || await readSaved(sessionKey) !== current) return false;
       await durableSession(record.guest);
       return true;
-    })().finally(() => { activation = null; });
+    })().then(async (activated) => {
+      if (activated) {
+        if (record.challengeId) primaryChallenge = { id: record.challengeId, refreshToken: record.guest.refreshToken };
+        pendingRecovery = null;
+        await writeSaved(recoveryKey, 'null').catch(() => undefined);
+      }
+      return activated;
+    }).finally(() => { activation = null; });
     return activation;
   }
 
-  async function authorizedRead<T>(orderId: string, options: Parameters<typeof request<T>>[0]): Promise<{
-    payload: T; recoveryReadOnly?: true;
-  }> {
-    try {
-      return { payload: await authorized(options) };
-    } catch (error) {
-      if (!(error instanceof GuestRejected) && !(error instanceof ApiError && error.code === 'not_found')) throw error;
-      return queueRecovery(async () => {
-        const record = await loadRecovery();
-        if (!record?.grants.includes(orderId)) throw error;
-        return { payload: await sendRecovery(options, record), recoveryReadOnly: true };
-      });
-    }
+  function withVerifiedRecovery<T>(orderId: string, error: unknown, read: (record: RecoverySession) => Promise<T>): Promise<T> {
+    if (!(error instanceof GuestRejected) && !(error instanceof ApiError && error.code === 'not_found')) throw error;
+    return queueRecovery(async () => {
+      const record = await loadRecovery();
+      if (!record?.grants.includes(orderId)) throw error;
+      return read(record);
+    });
   }
 
   function pickupAlertPath(orderId: string) {
@@ -370,14 +373,26 @@ export function createLiveApi({
       return checkedPayment(attempt);
     },
     async getOrder(orderId) {
-      const result = await authorizedRead(orderId, { path: orderPath(orderId), schema: orderResponse });
-      const order = checkedOrder(result.payload, orderId);
-      return result.recoveryReadOnly ? { ...order, recoveryReadOnly: true } : order;
+      const options = { path: orderPath(orderId), schema: orderResponse };
+      try {
+        return checkedOrder(await authorized(options), orderId);
+      } catch (error) {
+        return withVerifiedRecovery(orderId, error, async (record) => {
+          const order = checkedOrder(await sendRecovery(options, record), orderId);
+          // An unavailable local session write must not hide an already verified order.
+          const activated = await activateRecovery(record, orderId, order).catch(() => false);
+          return activated ? order : { ...order, recoveryReadOnly: true };
+        });
+      }
     },
     async getReceiptPdf(orderId) {
       if (!paymentReturnOrderId(orderId)) throw new ApiError('invalid_input');
-      const result = await authorizedRead(orderId, { path: receiptPath(orderId), schema: z.instanceof(Uint8Array), pdf: true });
-      return result.payload;
+      const options = { path: receiptPath(orderId), schema: z.instanceof(Uint8Array), pdf: true };
+      try {
+        return await authorized(options);
+      } catch (error) {
+        return withVerifiedRecovery(orderId, error, (record) => sendRecovery(options, record));
+      }
     },
     async reorder(orderId) {
       return authorized({ path: orderPath(orderId) + '/reorder', method: 'POST', schema: reorderResponse });
@@ -425,11 +440,7 @@ export function createLiveApi({
         const grant = await sendRecovery(options, record);
         const granted = { ...record, grants: [grant.orderId, ...record.grants.filter(id => id !== grant.orderId)].slice(0, 10) };
         await saveRecovery(granted);
-        if (await activateRecovery(granted, grant.orderId)) {
-          primaryChallenge = { id: challengeId, refreshToken: granted.guest.refreshToken };
-          pendingRecovery = null;
-          await writeSaved(recoveryKey, 'null').catch(() => undefined);
-        }
+        await activateRecovery(granted, grant.orderId);
         return grant;
       });
     },

@@ -47,6 +47,92 @@ async function operator(username) {
   return (await response.json()).accessToken;
 }
 
+async function readyForPickup(kitchen) {
+  const { products, slots, store } = await send('/stores/kigali/menu').then(response => response.json());
+  const product = products.find(item => item.name.en === 'Double Smash' && item.available);
+  const slot = slots.findLast(item => item.available);
+  assert.ok(product && slot);
+  const { accessToken: token } = await send('/guest-sessions', { method: 'POST' }).then(response => response.json());
+  const quote = await send('/quotes', { method: 'POST', token, data: {
+    storeId: store.id, slotId: slot.id, lines: [{ sku: product.sku, modifierIds: [], quantity: 1, unitPrice: product.price }],
+  } });
+  assert.equal(quote.status, 200);
+  const { quoteId } = await quote.json();
+  const placed = await send('/orders', { method: 'POST', token, key: randomUUID(), data: { quoteId, ...contact } });
+  assert.equal(placed.status, 200);
+  const { id } = await placed.json();
+  const started = await send(`/orders/${id}/payments`, { method: 'POST', token, key: randomUUID() });
+  assert.equal(started.status, 200);
+  const { id: attemptId } = await started.json();
+  const settled = await send(`/local/orders/${id}/payments/${attemptId}/result`, { method: 'POST', token, data: { status: 'paid' } });
+  assert.equal(settled.status, 200);
+  for (const status of ['preparing', 'ready']) {
+    assert.equal((await send(`/operator/orders/${id}/status`, { method: 'POST', token: kitchen, data: { status } })).status, 200);
+  }
+  const { pickupCode } = await send(`/orders/${id}`, { token }).then(response => response.json());
+  assert.match(pickupCode, /^[0-9]{6}$/);
+  return { id, token, pickupCode, number: '#' + id.slice(-8).toUpperCase() };
+}
+
+test('pickup is checked against the server after a lost reply or a concurrent cancellation', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const kitchen = await operator('demo-kitchen');
+  const manager = await operator('demo-manager');
+  const handedOut = await readyForPickup(kitchen);
+  const cancelled = await readyForPickup(kitchen);
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.setDefaultTimeout(6500);
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-pickup');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(page, 'Sign in').click();
+  await shown(page, 'Pickup queue');
+
+  const card = order => page.getByRole('list', { name: 'Paid orders' }).getByRole('listitem')
+    .filter({ has: page.getByRole('heading', { name: 'Order ' + order.number, exact: true }) });
+  const notice = page.locator('#queue-notice');
+  const pickupStatus = order => api + `/operator/orders/${order.id}/pickup-status`;
+  const attempts = [];
+  await page.route(api + `/operator/orders/${handedOut.id}/status`, async route => {
+    const response = await route.fetch();
+    attempts.push(response.status());
+    await route.abort('connectionreset');
+  });
+  await page.route(pickupStatus(handedOut), route => route.abort('connectionreset'), { times: 1 });
+  await card(handedOut).getByLabel('Pickup code').fill(handedOut.pickupCode);
+  await button(card(handedOut), 'Confirm pickup').click();
+  await shown(page, `Pickup for order ${handedOut.number} could not be confirmed. Select Refresh to check the server before handing it out.`);
+  await capture(page, 'operator-pickup-unconfirmed');
+  const checked = page.waitForResponse(response => response.url() === pickupStatus(handedOut) && response.ok());
+  await button(page, 'Refresh').click();
+  assert.deepEqual(await (await checked).json(), {
+    id: handedOut.id, status: 'collected', confirmedByCurrentOperator: true,
+  });
+  assert.equal((await checked).headers()['cache-control'], 'no-store');
+  await shown(page, `Pickup for order ${handedOut.number} was confirmed by this account.`);
+  assert.ok((await notice.textContent()).includes(handedOut.number));
+  await card(handedOut).waitFor({ state: 'detached' });
+  assert.deepEqual(attempts, [200]);
+
+  await page.route(api + `/operator/orders/${cancelled.id}/status`, async route => {
+    const result = await send(`/operator/orders/${cancelled.id}/cancel`, { method: 'POST', token: manager });
+    assert.equal(result.status, 200);
+    await route.continue();
+  }, { times: 1 });
+  await card(cancelled).getByLabel('Pickup code').fill(cancelled.pickupCode);
+  const cancellationRead = page.waitForResponse(response => response.url() === pickupStatus(cancelled) && response.ok());
+  await button(card(cancelled), 'Confirm pickup').click();
+  assert.deepEqual(await (await cancellationRead).json(), {
+    id: cancelled.id, status: 'cancelled', confirmedByCurrentOperator: false,
+  });
+  await shown(page, `Order ${cancelled.number} was cancelled. Do not hand it out.`);
+  await card(cancelled).waitFor({ state: 'detached' });
+  assert.equal((await (await send(`/orders/${handedOut.id}`, { token: handedOut.token })).json()).status, 'collected');
+  assert.equal((await (await send(`/orders/${cancelled.id}`, { token: cancelled.token })).json()).paymentStatus, 'refund_pending');
+});
+
 function testReceipt() {
   const text = 'BT /F1 15 Tf 36 72 Td (CrustCaper synthetic test document) Tj ET';
   const objects = [
@@ -221,7 +307,11 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
     const journalKey = guestKey.slice(0, -'.guest'.length);
     const session = JSON.parse(sessionStorage.getItem(guestKey));
     session.expiresAt = session.refreshExpiresAt = '2020-01-01T00:00:00Z';
-    return { guestKey, session, journalKey, journal: sessionStorage.getItem(journalKey) };
+    const journal = JSON.parse(sessionStorage.getItem(journalKey));
+    if (journal.active?.phase !== 'tracking') throw new Error('Expected a paid fixture saved for tracking');
+    // Model a previous launch that lost the write from paying to tracking after the API accepted payment.
+    journal.active.phase = 'paying';
+    return { guestKey, session, journalKey, journal: JSON.stringify(journal) };
   });
   await secondDevice.evaluate(({ guestKey, session, journalKey, journal }) => {
     sessionStorage.setItem(guestKey, JSON.stringify(session));
@@ -272,6 +362,9 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   });
   assert.equal(disallowedPayment.status, 404);
   assert.ok((await downloadedReceipt(secondDevice)).equals(pdf));
+  await button(secondDevice, 'Restore saved checkout').click();
+  await button(secondDevice, 'Restore saved checkout').waitFor({ state: 'detached' });
+  assert.deepEqual(recoveryPaymentWrites, []);
   const { order: followUp } = await placeBrowserOrder(secondDevice, opened, contact);
   assert.notEqual(followUp.id, order.id);
   assert.deepEqual(recoveryPaymentWrites, [api + '/orders/' + followUp.id + '/payments']);
