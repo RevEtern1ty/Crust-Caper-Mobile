@@ -53,6 +53,7 @@ export default function OrdersScreen() {
   const active = journal?.active;
   const ongoingCreate = active?.phase === 'creating';
   const activeOrder = active && active.phase !== 'creating' && active.orderId === orderId;
+  const showRefundHelp = order?.paymentStatus === 'refund_pending' || order?.paymentStatus === 'refunded';
   const inconsistentPayment = !!order && hasInconsistentPayment(order);
   const canResume = checkoutAllowed && activeOrder && !!order && !order.recoveryReadOnly && isAwaitingUnpaidHold(order);
   const expiredHold = !!order && isExpiredUnpaidHold(order);
@@ -104,6 +105,10 @@ export default function OrdersScreen() {
       const pdf = await api.getReceiptPdf(id);
       if (shouldOpen()) await shareReceipt(pdf, `receipt-${id.slice(-8)}.pdf`, t('Receipt', 'Inyemezabwishyu'));
     });
+  }
+
+  function openPickupHelp() {
+    router.navigate('/(tabs)/pickup');
   }
 
   return (
@@ -243,10 +248,14 @@ export default function OrdersScreen() {
             : t('Your pickup hold ended. Review a new order to choose another time.',
               'Igihe cyabikiwe komande cyarangiye. Reba komande nshya uhitemo ikindi gihe.')}</Text></Card>}
 
-          {(order.paymentStatus === 'refund_pending' || order.paymentStatus === 'refunded') && (
-            <Card><Text>{order.paymentStatus === 'refunded'
-              ? t('Your refund has been confirmed. Contact the pickup team if you need help.', 'Gusubizwa amafaranga byemejwe. Saba ubufasha itsinda ritanga komande niba ubukeneye.')
-              : t('Your refund is being checked. Refresh this order later for an update.', 'Gusubizwa amafaranga biracyagenzurwa. Vugurura iyi komande nyuma urebe uko bihagaze.')}</Text></Card>
+          {showRefundHelp && (
+            <Card>
+              <Text>{order.paymentStatus === 'refunded'
+                ? t('Your refund has been confirmed.', 'Gusubizwa amafaranga byemejwe.')
+                : t('Your refund is being checked. Refresh this order later for an update.', 'Gusubizwa amafaranga biracyagenzurwa. Vugurura iyi komande nyuma urebe uko bihagaze.')}</Text>
+              <Button label={t('Get help with this refund', 'Saba ubufasha ku gusubizwa amafaranga')}
+                onPress={openPickupHelp} variant="secondary" />
+            </Card>
           )}
 
           <Card>
@@ -344,7 +353,8 @@ export default function OrdersScreen() {
         </Card>
       )}
 
-      <Button label={t('Pickup & help', 'Gufata komande n’ubufasha')} onPress={() => router.navigate('/(tabs)/pickup')} variant="ghost" />
+      {!showRefundHelp &&
+        <Button label={t('Pickup & help', 'Gufata komande n’ubufasha')} onPress={openPickupHelp} variant="ghost" />}
     </Screen>
   );
 }

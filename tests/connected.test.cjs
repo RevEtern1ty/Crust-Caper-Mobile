@@ -754,6 +754,123 @@ test('open Orders reconciles a declined checkout after its pickup hold expires',
   assert.deepEqual(writes, [...initialWrites, orderPath + '/reorder']);
 });
 
+test('a late payment refund offers localized help beside its status', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true,
+    hasTouch: true, serviceWorkers: 'block' });
+  page.setDefaultTimeout(6500);
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const apiUrl = new URL(api);
+  const journalKey = 'crustcaper.checkout.v1.local.' + apiUrl.hostname + '.' + apiUrl.port + '.kigali';
+  const orderId = 'b19f7ab9-0e04-490f-94c5-948cb1587f2d';
+  const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+  const guest = { accessToken: 'refund_help_fixture_access_token_01', refreshToken: 'refund_help_fixture_refresh_token_01',
+    expiresAt, refreshExpiresAt: expiresAt };
+  await page.addInitScript(({ origin, journalKey, orderId, guest }) => {
+    if (location.origin !== origin) return;
+    sessionStorage.setItem(journalKey, JSON.stringify({ version: 1, active: null, orderIds: [orderId] }));
+    sessionStorage.setItem(journalKey + '.guest', JSON.stringify(guest));
+  }, { origin, journalKey, orderId, guest });
+
+  const label = { en: 'Fixture store', rw: 'Fixture store' };
+  const menuUrl = api + '/stores/kigali/menu';
+  const orderUrl = api + '/orders/' + orderId;
+  const order = {
+    id: orderId, storeId: 'kigali', slotId: 'fixture-slot',
+    lines: [{ sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: 9_200 }],
+    total: 9_200, tax: 1_400, currency: 'RWF', status: 'cancelled', paymentStatus: 'refund_pending',
+    pickupCode: null, receiptStatus: 'pending', receiptUrl: null,
+    paymentAttempt: { id: '08b3862b-db3d-48c3-90e0-5d8636399f8d', status: 'paid', checkoutUrl: null },
+    createdAt: '2026-11-24T10:00:00Z', reservationExpiresAt: '2026-11-24T10:10:00Z',
+    pickupStartsAt: '2026-11-24T10:10:00Z', pickupEndsAt: '2026-11-24T10:20:00Z',
+  };
+  const cors = {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  };
+  const writes = [];
+  await page.route('**/*', route => {
+    const request = route.request();
+    const url = request.url();
+    const requestOrigin = new URL(url).origin;
+    const method = request.method();
+    if (requestOrigin === origin) return route.continue();
+    if (requestOrigin !== apiUrl.origin) return route.abort();
+    if (method === 'OPTIONS') return route.fulfill({ status: 204, headers: cors });
+    if (method !== 'GET') {
+      writes.push(method);
+      return route.abort();
+    }
+    if (url === orderUrl) return route.fulfill({ headers: cors, json: order });
+    if (url === menuUrl || url.startsWith(menuUrl + '?')) {
+      return route.fulfill({ headers: cors, json: { version: 'fixture', updatedAt: new Date().toISOString(),
+        store: { id: 'kigali', name: label, area: label, open: true, hours: label, supportUrl: 'https://support.example.test/help' },
+        products: [], slots: [] } });
+    }
+    return route.abort();
+  });
+
+  async function checkHelp({ notice, help, genericHelp, pickupHelp, contactSupport, widths, screenshot }) {
+    const copy = page.getByText(notice, { exact: true });
+    await copy.waitFor();
+    const action = copy.locator('..').getByRole('button', { name: help, exact: true });
+    await action.waitFor();
+    assert.equal(await button(page, help).count(), 1);
+    assert.equal(await button(page, genericHelp).count(), 0);
+    const actionText = action.getByText(help, { exact: true });
+    for (const text of [copy, actionText]) {
+      await text.evaluate(element => {
+        const style = getComputedStyle(element);
+        element.style.fontSize = (2 * parseFloat(style.fontSize)) + 'px';
+        element.style.lineHeight = (2 * parseFloat(style.lineHeight)) + 'px';
+      });
+    }
+    for (const width of widths) {
+      await page.setViewportSize({ width, height: 800 });
+      await action.scrollIntoViewIfNeeded();
+      const bounds = await action.boundingBox();
+      assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width + 1, 'Refund help stays within the viewport');
+      const label = await actionText.boundingBox();
+      assert.ok(label && label.x >= bounds.x && label.x + label.width <= bounds.x + bounds.width
+        && label.y >= bounds.y && label.y + label.height <= bounds.y + bounds.height, 'Enlarged label fits its button');
+    }
+    await capture(page, screenshot);
+    await action.click();
+    await page.waitForURL(origin + '/pickup');
+    const heading = page.getByRole('heading', { name: pickupHelp, exact: true });
+    await heading.locator('..').getByRole('button', { name: contactSupport, exact: true }).waitFor();
+  }
+
+  await page.goto(origin + '/orders');
+  await checkHelp({
+    notice: 'Your refund is being checked. Refresh this order later for an update.',
+    help: 'Get help with this refund', genericHelp: 'Pickup & help',
+    pickupHelp: 'Order help', contactSupport: 'Contact support',
+    widths: [390, 430, 320], screenshot: 'refund-help-en',
+  });
+  order.paymentStatus = 'refunded';
+  await button(page, 'Settings').click();
+  await button(page, 'Kinyarwanda').click();
+  await shown(page, 'Amagenamiterere');
+  await page.goto(origin + '/orders');
+  await checkHelp({
+    notice: 'Gusubizwa amafaranga byemejwe.',
+    help: 'Saba ubufasha ku gusubizwa amafaranga', genericHelp: 'Gufata komande n’ubufasha',
+    pickupHelp: 'Ubufasha kuri komande', contactSupport: 'Saba ubufasha',
+    widths: [390, 430, 320], screenshot: 'refund-help-rw',
+  });
+  assert.deepEqual(writes, []);
+});
+
 test('a saved Orders action error follows the chosen language and keeps its support ID', { timeout: 25_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const server = createPreviewServer(dist);
