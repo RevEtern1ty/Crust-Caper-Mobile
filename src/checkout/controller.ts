@@ -171,6 +171,7 @@ export class CheckoutController {
       const order = await verify(active, challengeId, code);
       if (!paymentReturnOrderId(order.id) || order.recoveryReadOnly) throw new ApiError('invalid_response');
       if (canStartNewOrder(order)) {
+        if (order.status !== 'cancelled') await this.dependencies.onOrderCreated(active.cartFingerprint);
         await this.save({ phase: 'tracking', orderId: order.id, key: this.dependencies.newKey() }, this.recentOrderIds(order.id));
       } else {
         await this.saveCreatedOrder(active, order);

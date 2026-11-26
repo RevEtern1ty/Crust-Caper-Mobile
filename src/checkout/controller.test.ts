@@ -624,6 +624,52 @@ test('waiting leaves the creating journal in place and not_placed retires only t
   deepEqual(f.cartClears, []);
 });
 
+for (const result of ['paid', 'cancelled'] as const) {
+  test(`recovery of an already ${result} order reconciles the saved cart before tracking`, async () => {
+    const f = fixture();
+    const quote = await f.quote();
+    const original = await f.api.createOrder({ quoteId: quote.id, phone: DEMO_PHONE }, 'initial');
+    const order: Order = {
+      ...original, id: recoveredOrderId,
+      status: result === 'paid' ? 'accepted' : 'cancelled',
+      paymentStatus: result === 'paid' ? 'paid' : 'unpaid',
+    };
+    let durable = JSON.stringify({
+      version: 1, orderIds: [],
+      active: { phase: 'creating', quoteId: quote.id, key: 'initial', cartFingerprint: 'saved-cart', recoveryChallengeId: pendingChallenge },
+    });
+    let failCartClear = result === 'paid';
+    const restart = () => new CheckoutController({
+      storage: {
+        async getItem() { return durable; },
+        async setItem(_name, value) { durable = value; },
+      },
+      api: {
+        ...f.api,
+        verifyPendingCheckoutRecovery: async () => order,
+        getOrder: async () => order,
+        startPayment: async () => { throw new Error('A closed checkout must not start a new charge'); },
+      },
+      newKey: () => 'saved-payment-key',
+      async onOrderCreated(hash) {
+        if (failCartClear) throw new Error('Cart clear failed');
+        f.cartClears.push(hash);
+      },
+    });
+
+    if (result === 'paid') {
+      await rejects(restart().confirmPendingOrderRecovery(pendingChallenge, '010101'), /Cart clear failed/);
+      const pending = (await restart().restore()).active;
+      ok(pending?.phase === 'creating');
+      equal(pending.recoveryChallengeId, pendingChallenge);
+      failCartClear = false;
+    }
+    await restart().confirmPendingOrderRecovery(pendingChallenge, '010101');
+    deepEqual((await restart().restore()).active, { phase: 'tracking', orderId: recoveredOrderId, key: 'saved-payment-key' });
+    deepEqual(f.cartClears, result === 'paid' ? ['saved-cart'] : []);
+  });
+}
+
 test('a proven order is appended once without replacing a pending checkout', async () => {
   const f = fixture();
   const active = { phase: 'creating', quoteId: 'old-quote', key: 'old-key', cartFingerprint: 'old-cart' };
