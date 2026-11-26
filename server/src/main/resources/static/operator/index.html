@@ -196,10 +196,13 @@
             </div>
             <button class="button button-secondary" id="fiscal-receipts-refresh" type="button">Refresh fiscal receipts</button>
           </div>
-          <div class="receipt-search">
+          <form class="receipt-search" id="fiscal-receipts-search">
             <label for="fiscal-receipts-filter">Filter by order number</label>
-            <input id="fiscal-receipts-filter" type="search" maxlength="9" autocomplete="off" spellcheck="false" placeholder="#1A2B3C4D">
-          </div>
+            <input id="fiscal-receipts-filter" type="search" maxlength="36" autocomplete="off" spellcheck="false" placeholder="#1A2B3C4D" aria-describedby="fiscal-receipts-search-help">
+            <p class="payment-review-help" id="fiscal-receipts-search-help">Enter the eight-character order number or full order ID to find a paid order outside this list.</p>
+            <button class="button button-secondary" id="fiscal-receipts-find" type="submit">Find order</button>
+          </form>
+          <p class="problem" id="fiscal-receipts-lookup-problem" role="alert" hidden></p>
           <p class="problem" id="fiscal-receipts-problem" role="alert" hidden></p>
           <p class="empty-state" id="fiscal-receipts-empty" role="status" hidden>No paid orders for fiscal receipts.</p>
           <ul class="order-list" id="fiscal-receipts-list" aria-label="Orders for fiscal receipts"></ul>

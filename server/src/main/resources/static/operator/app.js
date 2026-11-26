@@ -57,7 +57,10 @@ const pendingPaymentTemplate = element('pending-payment-template');
 const fiscalReceipts = element('fiscal-receipts');
 const fiscalReceiptsJump = element('fiscal-receipts-jump');
 const fiscalReceiptsRefresh = element('fiscal-receipts-refresh');
+const fiscalReceiptsSearch = element('fiscal-receipts-search');
 const fiscalReceiptsFilter = element('fiscal-receipts-filter');
+const fiscalReceiptsFind = element('fiscal-receipts-find');
+const fiscalReceiptsLookupProblem = element('fiscal-receipts-lookup-problem');
 const fiscalReceiptsProblem = element('fiscal-receipts-problem');
 const fiscalReceiptsEmpty = element('fiscal-receipts-empty');
 const fiscalReceiptsList = element('fiscal-receipts-list');
@@ -105,6 +108,8 @@ let externalOrders = [];
 let sawExternalOrders = false;
 let receipts = [];
 let receiptRefresh = null;
+let receiptLookup = null;
+let lastReceiptLookupId = null;
 let timer;
 let kitchenTimer;
 let refreshVersion = 0;
@@ -783,10 +788,13 @@ function receiptCard(entry) {
 
 function renderReceipts() {
   const orderCode = fiscalReceiptsFilter.value.trim().replace(/^#/, '').toLowerCase();
-  const visible = receipts.filter((entry) => entry.orderId.slice(-8).includes(orderCode));
+  const visible = receiptLookup ? [receiptLookup.entry].filter(Boolean) : receipts.filter((entry) =>
+    entry.orderId === orderCode || entry.orderId.slice(-8).includes(orderCode));
   const listedIds = new Set(receipts.map(({ orderId }) => orderId));
+  // Retain one out-of-list draft for another lookup, and keep any upload alive through refiltering.
+  if (lastReceiptLookupId) listedIds.add(lastReceiptLookupId);
   for (const id of receiptCards.keys()) {
-    if (!listedIds.has(id)) receiptCards.delete(id);
+    if (!listedIds.has(id) && !receiptUploads.has(id)) receiptCards.delete(id);
   }
   const focused = document.activeElement;
   const visibleCards = new Set(visible.map(receiptCard));
@@ -801,8 +809,80 @@ function renderReceipts() {
   if (document.activeElement === document.body && fiscalReceiptsList.contains(focused)) {
     focused.focus({ preventScroll: true });
   }
+  if (receiptLookup) {
+    if (receiptLookup.state === 'loading') showMessage(fiscalReceiptsEmpty, 'Finding order…');
+    else showMessage(fiscalReceiptsEmpty, receiptLookup.state === 'missing' ? 'No paid order matches that number.' : '');
+    return;
+  }
   showMessage(fiscalReceiptsEmpty, visible.length ? ''
     : orderCode ? 'No matching order in this list.' : 'No paid orders for fiscal receipts.');
+}
+
+function clearReceiptLookup() {
+  const lookup = receiptLookup;
+  receiptLookup = null;
+  lookup?.controller.abort();
+  fiscalReceiptsFind.removeAttribute('aria-disabled');
+  fiscalReceiptsFilter.removeAttribute('aria-invalid');
+  showMessage(fiscalReceiptsLookupProblem);
+}
+
+async function findReceipt() {
+  const current = availableSession();
+  if (current?.role !== 'manager' || receiptLookup?.state === 'loading') return;
+  const value = fiscalReceiptsFilter.value.trim().toLowerCase();
+  const code = value.replace(/^#(?=[0-9a-f]{8}$)/, '');
+  if (!/^[0-9a-f]{8}$/.test(code) && !uuid.test(code)) {
+    fiscalReceiptsFilter.setAttribute('aria-invalid', 'true');
+    showMessage(fiscalReceiptsLookupProblem, 'Enter the eight-character order number or the full order ID.');
+    fiscalReceiptsFilter.focus();
+    return;
+  }
+
+  const entry = receiptLookup?.code === code ? receiptLookup.entry : null;
+  const lookup = { code, entry, state: 'loading', controller: new AbortController(), attachments: new Map() };
+  receiptLookup = lookup;
+  fiscalReceiptsFind.setAttribute('aria-disabled', 'true');
+  fiscalReceiptsFilter.removeAttribute('aria-invalid');
+  showMessage(fiscalReceiptsLookupProblem);
+  renderReceipts();
+  try {
+    const data = await request('/receipts?' + new URLSearchParams({ orderCode: code }), {
+      token: current.accessToken, signal: lookup.controller.signal,
+    });
+    if (session !== current || receiptLookup !== lookup) return;
+    if (!Array.isArray(data) || data.length > 1) throw new ApiError(502, 'invalid_response');
+    if (data.length === 1) {
+      const found = checkedReceipt(data[0]);
+      if (found.orderId !== code && !(code.length === 8 && found.orderId.endsWith(code))) {
+        throw new ApiError(502, 'invalid_response');
+      }
+      lookup.entry = found.receiptStatus === 'pending' ? lookup.attachments.get(found.orderId) ?? found : found;
+      lastReceiptLookupId = found.orderId;
+      lookup.state = 'found';
+    } else {
+      lookup.entry = null;
+      lookup.state = 'missing';
+    }
+  } catch (error) {
+    if (session !== current || receiptLookup !== lookup) return;
+    if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
+    else {
+      lookup.state = 'failed';
+      if (error instanceof ApiError && error.status === 409 && error.code === 'receipt_order_code_ambiguous') {
+        lookup.entry = null;
+        showMessage(fiscalReceiptsLookupProblem, 'More than one order has that code. Enter the full order ID.');
+      } else {
+        showMessage(fiscalReceiptsLookupProblem, messageFor(error, 'The order could not be found right now. Try again.'));
+      }
+    }
+  } finally {
+    if (session === current && receiptLookup === lookup) {
+      lookup.attachments.clear();
+      fiscalReceiptsFind.removeAttribute('aria-disabled');
+      renderReceipts();
+    }
+  }
 }
 
 function setReceiptFormBusy(card, busy) {
@@ -844,6 +924,10 @@ async function attachReceipt(entry, card, form) {
       throw new ApiError(502, 'invalid_response');
     }
     receiptRefresh?.attachments.set(data.orderId, data);
+    if (receiptLookup?.state === 'loading') receiptLookup.attachments.set(data.orderId, data);
+    if (receiptLookup?.entry?.orderId === data.orderId && receiptLookup.entry.receiptStatus === 'pending') {
+      receiptLookup.entry = data;
+    }
     if (receipts.some(({ orderId }) => orderId === data.orderId)) {
       receipts = receipts.map((item) => item.orderId === data.orderId && item.receiptStatus === 'pending' ? data : item);
     } else {
@@ -922,6 +1006,8 @@ function closeSession(message = '') {
   showMessage(pendingPaymentsEmpty);
   receipts = [];
   receiptRefresh = null;
+  clearReceiptLookup();
+  lastReceiptLookupId = null;
   receiptUploads.clear();
   receiptCards.clear();
   fiscalReceipts.hidden = true;
@@ -1148,7 +1234,7 @@ async function refreshReceipts() {
   receiptRefresh = refresh;
   fiscalReceiptsRefresh.disabled = true;
   showMessage(fiscalReceiptsProblem);
-  showMessage(fiscalReceiptsEmpty, receipts.length ? '' : 'Loading fiscal receipts…');
+  if (!receiptLookup) showMessage(fiscalReceiptsEmpty, receipts.length ? '' : 'Loading fiscal receipts…');
   try {
     const data = await request('/receipts', { token: current.accessToken });
     if (session !== current) return;
@@ -1172,7 +1258,7 @@ async function refreshReceipts() {
     else {
       receipts = receipts.filter(({ orderId }) => refresh.attachments.has(orderId) || receiptUploads.has(orderId));
       renderReceipts();
-      showMessage(fiscalReceiptsEmpty);
+      if (!receiptLookup) showMessage(fiscalReceiptsEmpty);
       showMessage(fiscalReceiptsProblem, messageFor(error));
     }
   } finally {
@@ -1505,7 +1591,14 @@ pendingPaymentsNext.addEventListener('click', () => {
 });
 fiscalReceiptsJump.addEventListener('click', () => { element('fiscal-receipts-title').focus(); });
 fiscalReceiptsRefresh.addEventListener('click', () => { void refreshReceipts(); });
-fiscalReceiptsFilter.addEventListener('input', renderReceipts);
+fiscalReceiptsFilter.addEventListener('input', () => {
+  clearReceiptLookup();
+  renderReceipts();
+});
+fiscalReceiptsSearch.addEventListener('submit', (event) => {
+  event.preventDefault();
+  void findReceipt();
+});
 document.addEventListener('visibilitychange', recheckQueue);
 document.addEventListener('freeze', () => {
   pagePaused = true;
