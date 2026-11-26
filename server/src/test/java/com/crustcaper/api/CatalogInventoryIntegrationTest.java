@@ -1,8 +1,10 @@
 package com.crustcaper.api;
 
+import static com.crustcaper.api.ApiModels.NEXT_SALE_CHANGE_AT_HEADER;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -13,6 +15,7 @@ import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
 import jakarta.servlet.http.Cookie;
 import java.net.URI;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -181,7 +184,7 @@ class CatalogInventoryIntegrationTest {
         String replacementPayment = payment(webPost("/orders/" + replacement + "/payments", browser), "inventory-replacement-payment");
         settle(replacementPayment, "in-time", PaymentResult.PAID);
         assertThat(onHand()).isZero();
-        assertMenuAvailability(false);
+        assertMenuAvailability(false).andExpect(header().doesNotExist(NEXT_SALE_CHANGE_AT_HEADER));
         settle(replacementPayment, "in-time", PaymentResult.PAID);
         settle(replacementPayment, "duplicate", PaymentResult.PAID);
         assertThat(onHand()).isZero();
@@ -189,6 +192,48 @@ class CatalogInventoryIntegrationTest {
             .param(replacement).query(String.class).single()).isEqualTo("accepted:paid");
         assertThat(jdbc.sql("SELECT reason FROM payment_exceptions WHERE attempt_id = ?")
             .param(UUID.fromString(replacementPayment)).query(String.class).single()).isEqualTo("duplicate_transaction");
+    }
+
+    @Test
+    void exhaustedMenuPredictsTheFirstUnpaidExpiryAndRefreshesItsEtagWhenStockReturns() throws Exception {
+        trackUnits(2);
+        var mobile = nativeGuest();
+        var browser = browserGuest();
+        String nativeQuote = quote(nativePost("/quotes", mobile), EARLY_SLOT);
+        String webQuote = quote(webPost("/quotes", browser), LATE_SLOT);
+        UUID earlierHold = placedOrder(submit(nativePost("/orders", mobile), nativeQuote, "inventory-menu-first"));
+        String earlierExpiry = jdbc.sql("""
+            UPDATE orders SET reservation_expires_at = clock_timestamp() + interval '4 minutes'
+            WHERE id = ? RETURNING reservation_expires_at
+            """).param(earlierHold).query(OffsetDateTime.class).single().toInstant().toString();
+        assertMenuAvailability(true).andExpect(header().doesNotExist(NEXT_SALE_CHANGE_AT_HEADER));
+        UUID laterHold = placedOrder(submit(webPost("/orders", browser), webQuote, "inventory-menu-second"));
+
+        var exhausted = assertMenuAvailability(false)
+            .andExpect(header().string(NEXT_SALE_CHANGE_AT_HEADER, earlierExpiry)).andReturn().getResponse();
+        String exhaustedTag = exhausted.getHeader(HttpHeaders.ETAG);
+        assertThat(exhaustedTag).isNotBlank();
+        String menu = API + "/stores/" + store + "/menu";
+        api.perform(get(menu).header(HttpHeaders.IF_NONE_MATCH, exhaustedTag))
+            .andExpect(status().isNotModified())
+            .andExpect(header().string(HttpHeaders.ETAG, exhaustedTag))
+            .andExpect(header().string(NEXT_SALE_CHANGE_AT_HEADER, earlierExpiry));
+
+        jdbc.sql("UPDATE menu_products SET product = jsonb_set(product, '{available}', 'false') WHERE store_id = ? AND sku = ?")
+            .params(store, SKU).update();
+        assertMenuAvailability(false).andExpect(header().doesNotExist(NEXT_SALE_CHANGE_AT_HEADER));
+        jdbc.sql("UPDATE menu_products SET product = jsonb_set(product, '{available}', 'true') WHERE store_id = ? AND sku = ?")
+            .params(store, SKU).update();
+        jdbc.sql("UPDATE orders SET reservation_expires_at = clock_timestamp() - interval '1 second' WHERE id = ?")
+            .param(earlierHold).update();
+
+        var live = api.perform(get(menu).header(HttpHeaders.IF_NONE_MATCH, exhaustedTag))
+            .andExpect(status().isOk()).andExpect(header().doesNotExist(NEXT_SALE_CHANGE_AT_HEADER))
+            .andExpect(jsonPath("$.products[0].available").value(true)).andReturn().getResponse();
+        assertThat(live.getHeader(HttpHeaders.ETAG)).isNotBlank().isNotEqualTo(exhaustedTag);
+        assertThat(jdbc.sql("SELECT reservation_expires_at > clock_timestamp() FROM orders WHERE id = ?")
+            .param(laterHold).query(Boolean.class).single()).isTrue();
+        assertThat(onHand()).isEqualTo(2);
     }
 
     @Test
@@ -241,8 +286,8 @@ class CatalogInventoryIntegrationTest {
         assertThat(orderCount()).isEqualTo(2);
     }
 
-    private void assertMenuAvailability(boolean available) throws Exception {
-        api.perform(get(API + "/stores/{id}/menu", store))
+    private ResultActions assertMenuAvailability(boolean available) throws Exception {
+        return api.perform(get(API + "/stores/{id}/menu", store))
             .andExpect(status().isOk()).andExpect(jsonPath("$.products[0].sku").value(SKU))
             .andExpect(jsonPath("$.products[0].available").value(available));
     }
@@ -305,8 +350,12 @@ class CatalogInventoryIntegrationTest {
     }
 
     private void trackOneUnit() {
-        jdbc.sql("INSERT INTO menu_product_inventory (store_id, sku, on_hand) VALUES (?, ?, 1)")
-            .params(store, SKU).update();
+        trackUnits(1);
+    }
+
+    private void trackUnits(int units) {
+        jdbc.sql("INSERT INTO menu_product_inventory (store_id, sku, on_hand) VALUES (?, ?, ?)")
+            .params(store, SKU, units).update();
         tracked = true;
     }
 
