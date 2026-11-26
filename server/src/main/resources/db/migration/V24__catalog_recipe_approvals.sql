@@ -6,6 +6,7 @@ ALTER TABLE menu_products
 CREATE TABLE catalog_recipe_approvals (
     store_id text NOT NULL REFERENCES stores(id),
     expected_version text NOT NULL CHECK (expected_version ~ '^[A-Za-z0-9._:-]{1,100}$'),
+    expected_updated_at timestamptz NOT NULL,
     catalog_version text NOT NULL CHECK (catalog_version ~ '^[A-Za-z0-9._:-]{1,100}$'),
     sku text NOT NULL CHECK (sku ~ '^[A-Za-z0-9._:-]{1,100}$'),
     facts jsonb NOT NULL CHECK (

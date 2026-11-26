@@ -29,6 +29,7 @@ final class OperatorCatalogRecipeApprovals {
                     String recipeVersion, String allergenVersion, Instant approvedAt, Instant appliedAt) {}
 
     private record Review(String storeId, String expectedVersion, String catalogVersion, String sku, JsonNode facts) {}
+    private record CurrentCatalog(String version, OffsetDateTime updatedAt) {}
 
     private final JdbcClient jdbc;
     private final OperatorSessions sessions;
@@ -63,29 +64,35 @@ final class OperatorCatalogRecipeApprovals {
         if (!named) throw OperatorFailure.forbidden();
 
         // Catalog import and availability changes lock the store before changing its version.
-        String version = jdbc.sql("SELECT version FROM stores WHERE id = ? FOR UPDATE").param(manager.storeId())
-            .query(String.class).optional().orElseThrow(OperatorFailure::notFound);
+        CurrentCatalog current = jdbc.sql("SELECT version, updated_at FROM stores WHERE id = ? FOR UPDATE")
+            .param(manager.storeId())
+            .query((row, index) -> new CurrentCatalog(row.getString("version"), row.getObject("updated_at", OffsetDateTime.class)))
+            .optional().orElseThrow(OperatorFailure::notFound);
+        String version = current.version();
         if (!version.equals(review.expectedVersion()) && !version.equals(review.catalogVersion())) {
             throw OperatorFailure.conflict("catalog_version_conflict");
         }
         String facts = review.facts().toString();
         if (version.equals(review.expectedVersion())) {
             jdbc.sql("""
-                INSERT INTO catalog_recipe_approvals (store_id, expected_version, catalog_version, sku, facts, operator_id)
-                VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?)
+                INSERT INTO catalog_recipe_approvals
+                    (store_id, expected_version, expected_updated_at, catalog_version, sku, facts, operator_id)
+                VALUES (?, ?, ?, ?, ?, CAST(? AS jsonb), ?)
                 ON CONFLICT (store_id, expected_version, catalog_version, sku) DO NOTHING
-                """).params(manager.storeId(), review.expectedVersion(), review.catalogVersion(), review.sku(), facts,
-                    manager.id()).update();
+                """).params(manager.storeId(), review.expectedVersion(), current.updatedAt(), review.catalogVersion(),
+                    review.sku(), facts, manager.id()).update();
         }
         return jdbc.sql("""
-            SELECT approved_at, applied_at, facts = CAST(? AS jsonb) AS same_facts
+            SELECT approved_at, applied_at, expected_updated_at, facts = CAST(? AS jsonb) AS same_facts
             FROM catalog_recipe_approvals
             WHERE store_id = ? AND expected_version = ? AND catalog_version = ? AND sku = ?
             """).params(facts, manager.storeId(), review.expectedVersion(), review.catalogVersion(), review.sku())
             .query((row, index) -> {
                 if (!row.getBoolean("same_facts")) throw OperatorFailure.conflict("catalog_recipe_conflict");
                 OffsetDateTime applied = row.getObject("applied_at", OffsetDateTime.class);
-                if (version.equals(review.catalogVersion()) && applied == null) {
+                OffsetDateTime expectedAt = row.getObject("expected_updated_at", OffsetDateTime.class);
+                if ((version.equals(review.catalogVersion()) && applied == null)
+                    || (version.equals(review.expectedVersion()) && !expectedAt.isEqual(current.updatedAt()))) {
                     throw OperatorFailure.conflict("catalog_version_conflict");
                 }
                 return new Approval(manager.storeId(), review.sku(), review.expectedVersion(), review.catalogVersion(),
@@ -142,6 +149,7 @@ final class OperatorCatalogRecipeApprovals {
     private static boolean validText(JsonNode value) {
         if (!value.isString()) return false;
         String text = value.stringValue();
-        return !text.isBlank() && text.indexOf(0) < 0 && text.codePointCount(0, text.length()) <= 4096;
+        return !text.isBlank() && text.codePointCount(0, text.length()) <= 4096
+            && text.codePoints().noneMatch(codePoint -> codePoint == 0 || codePoint >= 0xD800 && codePoint <= 0xDFFF);
     }
 }

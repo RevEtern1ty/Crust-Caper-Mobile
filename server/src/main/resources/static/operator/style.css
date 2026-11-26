@@ -174,6 +174,24 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .manager-form label { display: grid; gap: .35rem; min-width: 0; }
 .manager-form input[type="file"] { max-width: 100%; }
 .manager-form .manager-problem { margin: 0; font-size: .9rem; }
+.recipe-approval-form, .recipe-approval-selection, .recipe-approval-review { display: grid; gap: .65rem; }
+.recipe-approval-form { max-width: 48rem; margin-block: 1rem; }
+.recipe-approval-form > input, .recipe-approval-form select { width: min(100%, 30rem); }
+.recipe-approval-form select {
+  min-height: 3rem; min-width: 0; padding: .62rem .6rem; border: 1px solid var(--border);
+  border-radius: .65rem; background: var(--white); color: var(--ink); font: inherit; text-overflow: ellipsis;
+}
+.recipe-approval-form select:focus-visible { outline: .19rem solid var(--green); outline-offset: .15rem; }
+.recipe-approval-form .button { justify-self: start; max-width: 100%; overflow-wrap: anywhere; }
+.recipe-approval-selection, .recipe-approval-review { overflow-wrap: anywhere; }
+.recipe-approval-facts { display: grid; gap: .8rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); }
+.recipe-approval-facts h4 { margin: .2rem 0 .3rem; }
+.recipe-approval-facts ul { margin-block: .35rem; padding-inline-start: 1.25rem; }
+.recipe-approval-facts li + li { margin-top: .4rem; }
+.recipe-approval-facts [lang] { display: block; white-space: pre-wrap; }
+.recipe-approval-confirmation { display: flex; align-items: flex-start; gap: .5rem; padding-block: .45rem; cursor: pointer; }
+.recipe-approval-confirmation input { width: 1.2rem; min-height: 1.2rem; flex: 0 0 auto; }
+#recipe-approval-status { overflow-wrap: anywhere; }
 .fiscal-result { margin-top: .9rem; padding: .65rem .8rem; background: var(--mint); color: var(--green); border-radius: .55rem; font-weight: 710; overflow-wrap: anywhere; }
 .availability-store { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .55rem 1rem; margin-bottom: 1rem; }
 .availability-store .button { flex: 0 1 auto; }

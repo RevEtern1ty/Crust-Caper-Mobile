@@ -1,4 +1,5 @@
 import { mountAvailability } from './availability.js';
+import { mountCatalogRecipeApprovals } from './catalog-recipe-approvals.js';
 import { mountExternalOrders, readExternalOrder } from './external-orders.js';
 import { mountOperationsSignals } from './operations-signals.js';
 import { mountErasureRequests } from './erasure-requests.js';
@@ -147,6 +148,9 @@ let pendingPaymentsNextCursor = null;
 let authVersion = 0;
 let cancellation = null;
 const availability = mountAvailability({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
+const catalogRecipeApprovals = mountCatalogRecipeApprovals({
+  currentSession: availableSession, request, messageFor, showMessage, closeSession,
+});
 const reconciliation = mountReconciliation({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
 const operationsSignals = mountOperationsSignals({
   currentSession: availableSession, request, messageFor, showMessage, closeSession, canRefresh: queueVisible,
@@ -1281,6 +1285,7 @@ function closeSession(message = '') {
   showMessage(fiscalReceiptsProblem);
   showMessage(fiscalReceiptsEmpty);
   availability.reset();
+  catalogRecipeApprovals.reset();
   reconciliation.reset();
   operationsSignals.reset();
   erasureRequests.reset();
@@ -1778,7 +1783,7 @@ loginForm.addEventListener('submit', async (event) => {
       || !Object.hasOwn(roles, data.role) || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
       throw new ApiError(502, 'invalid_response');
     }
-    session = { accessToken: data.accessToken, expiresAt, role: data.role };
+    session = { accessToken: data.accessToken, expiresAt, role: data.role, storeId: data.storeId };
     element('session-label').textContent = `${label(data.storeId)} · ${roles[data.role].name}`;
     workstationTitle.textContent = roles[data.role].heading;
     updateTime.textContent = 'Loading paid orders…';
@@ -1807,6 +1812,7 @@ loginForm.addEventListener('submit', async (event) => {
       void refreshPaymentReview();
       void refreshReceipts();
       availability.show();
+      catalogRecipeApprovals.show();
     }
   } catch (error) {
     if (authVersion !== version) return;

@@ -101,6 +101,19 @@ class OperatorCatalogRecipeApprovalsIntegrationTest {
             .param(store).query(UUID.class).single()).isEqualTo(author.id());
     }
 
+    @Test
+    void returningToAnOldCatalogLabelCannotReactivateASavedReview() throws Exception {
+        String store = store();
+        Staff manager = staff(store, "manager", true, false);
+        String proposal = PROPOSAL.formatted(store);
+        approve(manager, proposal).andExpect(status().isOk());
+        jdbc.sql("UPDATE stores SET updated_at = updated_at + interval '1 minute' WHERE id = ?").param(store).update();
+        approve(manager, proposal).andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("catalog_version_conflict"));
+        approve(manager, proposal.replace("catalog-2", "catalog-new")).andExpect(status().isOk());
+        assertThat(approvalCount(store)).isEqualTo(2);
+    }
+
     private ResultActions approve(Staff staff, String json) throws Exception {
         MockHttpServletRequestBuilder request = post(ENDPOINT).contentType(MediaType.APPLICATION_JSON).content(json);
         if (staff != null) request.header(HttpHeaders.AUTHORIZATION, "Bearer " + staff.token());

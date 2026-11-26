@@ -54,6 +54,7 @@
             <button class="button button-secondary" id="fiscal-receipts-jump" type="button" hidden>Fiscal receipts</button>
             <button class="button button-secondary" id="reconciliation-jump" type="button" hidden>Daily reconciliation</button>
             <button class="button button-secondary" id="availability-jump" type="button" hidden>Menu availability</button>
+            <button class="button button-secondary" id="recipe-approval-jump" type="button" hidden>Recipe approvals</button>
             <button class="button button-secondary" id="refresh-button" type="button">Refresh</button>
             <button class="button button-quiet" id="logout-button" type="button">Sign out</button>
           </div>
@@ -281,6 +282,42 @@
             </dl>
             <p class="queue-notice reconciliation-warning" id="reconciliation-undated" hidden></p>
           </div>
+        </section>
+
+        <section class="payment-review" id="recipe-approval" aria-labelledby="recipe-approval-title" hidden>
+          <h2 id="recipe-approval-title" tabindex="-1">Recipe approvals</h2>
+          <p class="payment-review-help">Review one item from a catalog proposal. Publish the approved catalog separately through the catalog importer.</p>
+          <form class="recipe-approval-form" id="recipe-approval-form" method="post">
+            <label for="recipe-approval-file">Catalog proposal (JSON)</label>
+            <input id="recipe-approval-file" type="file" accept=".json,application/json">
+            <button class="button button-secondary" id="recipe-approval-recheck" type="button" hidden>Check current catalog version</button>
+            <div class="recipe-approval-selection" id="recipe-approval-selection" hidden>
+              <p id="recipe-approval-versions"></p>
+              <label for="recipe-approval-item">Item to review</label>
+              <select id="recipe-approval-item" required></select>
+            </div>
+            <section class="order-card recipe-approval-review" id="recipe-approval-review" aria-labelledby="recipe-approval-review-title" hidden>
+              <h3 class="order-title" id="recipe-approval-review-title"></h3>
+              <p id="recipe-approval-revisions"></p>
+              <div class="recipe-approval-facts">
+                <div>
+                  <h4>Ingredients</h4>
+                  <div id="recipe-approval-ingredients"></div>
+                </div>
+                <div>
+                  <h4>Allergens</h4>
+                  <div id="recipe-approval-allergens"></div>
+                </div>
+              </div>
+              <label class="recipe-approval-confirmation">
+                <input id="recipe-approval-confirm" type="checkbox">
+                <span>I reviewed this item’s ingredients and allergens in English and Kinyarwanda, and checked the kitchen’s cross-contact information for this item.</span>
+              </label>
+              <button class="button button-primary" id="recipe-approval-submit" type="submit" disabled>Approve this item</button>
+            </section>
+          </form>
+          <p class="problem" id="recipe-approval-problem" role="alert" hidden></p>
+          <p class="queue-notice" id="recipe-approval-status" role="status" hidden></p>
         </section>
 
         <section class="payment-review" id="availability" aria-labelledby="availability-title" hidden>

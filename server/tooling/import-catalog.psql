@@ -87,6 +87,7 @@ DECLARE
     slot jsonb;
     target_store_id text;
     current_version text;
+    current_updated_at timestamptz;
     expected_version text;
     target_slot_id text;
     old_start timestamptz;
@@ -175,7 +176,8 @@ BEGIN
     expected_version := payload->>'expectedVersion';
     -- Store row lock coordinates with order creation. The advisory lock covers first creation by two imports.
     PERFORM pg_advisory_xact_lock(hashtextextended('crustcaper:catalog:' || target_store_id, 0));
-    SELECT saved.version INTO current_version FROM public.stores saved WHERE saved.id = target_store_id FOR UPDATE;
+    SELECT saved.version, saved.updated_at INTO current_version, current_updated_at
+    FROM public.stores saved WHERE saved.id = target_store_id FOR UPDATE;
     PERFORM pg_temp.catalog_assert(current_version IS NOT DISTINCT FROM expected_version,
         'Catalog version conflict. Read the current store version and review stale changes');
     PERFORM pg_temp.catalog_assert(current_version IS DISTINCT FROM (location->>'version'),
@@ -213,6 +215,7 @@ BEGIN
 
             UPDATE public.catalog_recipe_approvals approval SET applied_at = clock_timestamp()
             WHERE approval.store_id = target_store_id AND approval.expected_version = current_version
+                AND approval.expected_updated_at = current_updated_at
                 AND approval.catalog_version = location->>'version' AND approval.sku = proposed_product->>'sku'
                 AND approval.applied_at IS NULL
                 AND approval.facts = jsonb_build_object(
