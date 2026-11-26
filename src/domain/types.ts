@@ -200,14 +200,14 @@ export interface ShopApi {
   createOrder(input: OrderInput, key: string): Promise<Order>
   recoverOrder?(key: string): Promise<Order | null>
   startPayment(orderId: string, key: string): Promise<PaymentAttempt>
-  getOrder(orderId: string): Promise<Order>
+  getOrder(orderId: string, options?: { readOnly?: boolean }): Promise<Order>
   getReceiptPdf?(orderId: string): Promise<Uint8Array>
   getOrderDataExport?(orderId: string): Promise<OrderDataExport>
   getOrderErasureRequest?(orderId: string): Promise<OrderErasureRequestResponse>
   requestOrderErasure?(orderId: string): Promise<OrderErasureRequestResponse>
   reorder(orderId: string): Promise<ReorderResult>
   requestOrderAccess?(input: OrderAccessRequest): Promise<{ challengeId: string }>
-  verifyOrderAccess?(challengeId: string, code: string): Promise<{ orderId: string }>
+  verifyOrderAccess?(challengeId: string, code: string, expectedOrderId?: string): Promise<{ orderId: string }>
   requestPendingCheckoutRecovery?(intent: PendingCheckoutIntent, phone: string): Promise<PendingCheckoutRecovery>
   verifyPendingCheckoutRecovery?(intent: PendingCheckoutIntent, challengeId: string, code: string): Promise<Order>
   pickupAlerts?: {

@@ -262,6 +262,124 @@ async function newContext(browser, options, allowHostedPayment = true) {
   return context;
 }
 
+async function checkLinkedPaidOrder(page, orderId) {
+  const path = '/order/' + orderId;
+  const orderPath = '/api/v1/web/orders/' + orderId;
+  const navigation = await page.goto(origin + path);
+  assert.equal(navigation.status(), 200);
+  await shown(page, 'Paid');
+  const [loaded] = await Promise.all([
+    page.waitForResponse(response => response.ok() && response.request().method() === 'GET'
+      && new URL(response.url()).pathname === orderPath),
+    button(page, 'Refresh order status').click(),
+  ]);
+  assert.equal(loaded.status(), 200, 'the exact linked order must pass the server access check');
+  const order = await loaded.json();
+  assert.equal(order.id, orderId);
+  assert.equal(order.paymentStatus, 'paid');
+  assert.equal(new URL(page.url()).pathname, path);
+  await shown(page, '#' + orderId.slice(-8).toUpperCase());
+  await shown(page, 'Paid');
+  await shown(page, 'Order details');
+}
+
+async function checkLinkedPhoneLookup(page, orderId, query = '') {
+  const path = '/order/' + orderId;
+  const navigation = await page.goto(origin + path + query);
+  assert.equal(navigation.status(), 200);
+  const orderNumber = page.getByLabel('Order number', { exact: true });
+  await orderNumber.waitFor();
+  assert.equal(new URL(page.url()).pathname, path);
+  assert.equal(await orderNumber.inputValue(), orderId.slice(-8).toUpperCase());
+  assert.equal(await page.getByLabel('Phone number', { exact: true }).inputValue(), '');
+  await button(page, 'Request verification code').waitFor();
+  assert.equal(await page.getByText('Order details', { exact: true }).count(), 0);
+  assert.equal(await page.getByText('Paid', { exact: true }).count(), 0);
+  assert.equal(await page.getByText('Checking payment', { exact: true }).count(), 0);
+}
+
+async function checkOrderLinkLayout(page, orderId, authorized) {
+  const viewport = page.viewportSize();
+  const presentation = authorized ? 'owner' : 'verification';
+  for (const locale of ['rw', 'en']) {
+    await page.goto(origin + '/order/' + orderId + '?storefrontLocale=' + locale);
+    await page.locator('html[lang="' + locale + '"]').waitFor({ state: 'attached' });
+    const action = button(page, authorized
+      ? (locale === 'en' ? 'Pickup & help' : 'Gufata komande n’ubufasha')
+      : (locale === 'en' ? 'Request verification code' : 'Saba kode yo kwemeza'));
+    for (const width of [320, 390, 430]) {
+      await page.setViewportSize({ width, height: 844 });
+      await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+      await action.scrollIntoViewIfNeeded();
+      const bounds = await action.boundingBox();
+      const label = presentation + '-' + locale + '-' + width;
+      assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width + 0.5, label);
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), label);
+      await capture(page, 'order-link-' + label);
+    }
+  }
+  if (viewport) await page.setViewportSize(viewport);
+}
+
+async function checkAnonOrderLink(browser, ca, orderId) {
+  const document = await request(ca, '/order/' + orderId);
+  assert.equal(document.status, 200);
+  assert.match(document.headers['cache-control'], /no-store/);
+  assert.match(document.headers['x-robots-tag'], /noindex/);
+  assert.equal(document.headers['referrer-policy'], 'no-referrer');
+  assert.equal(document.headers['set-cookie'], undefined);
+  assert.doesNotMatch(document.body, /storefront-checkout@example\.test|\+250700000000/);
+
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  try {
+    const page = await context.newPage();
+    page.setDefaultTimeout(12000);
+    const authWrites = [];
+    page.on('request', req => {
+      if (new URL(req.url()).pathname.startsWith('/api/v1/web/') && req.method() !== 'GET') authWrites.push(req.method());
+    });
+    await checkLinkedPhoneLookup(page, orderId);
+    await checkOrderLinkLayout(page, orderId, false);
+    assert.equal((await context.cookies(origin)).some(cookie => cookie.name === guestCookie), false);
+    assert.deepEqual(authWrites, [], 'opening a shared link must wait for explicit phone verification');
+
+    const privateRequests = [];
+    page.on('request', req => {
+      const path = new URL(req.url()).pathname;
+      if (path.startsWith('/api/v1/web/')) privateRequests.push(path);
+    });
+    for (const path of ['/order/not-a-uuid', '/order/' + orderId.toUpperCase(), '/order/' + orderId + '/extra']) {
+      const navigation = await page.goto(origin + path);
+      assert.ok([200, 404].includes(navigation.status()), path);
+      if (navigation.ok()) await page.waitForLoadState('networkidle');
+      assert.equal(await page.getByLabel('Order number', { exact: true }).count(), 0);
+      assert.equal(await page.getByText('Order details', { exact: true }).count(), 0);
+    }
+    assert.deepEqual(privateRequests, [], 'malformed order links must not access the private API');
+  } finally {
+    await context.close();
+  }
+}
+
+async function checkOrderLinkWithoutGrant(browser, ca, orderId, earlier) {
+  assert.equal((await request(ca, '/api/v1/web/orders/' + orderId, { headers: {
+    'X-CrustCaper-Session': earlier.sessionId,
+    Cookie: guestCookie + '=' + earlier.cookie.value,
+  } })).status, 404, 'an existing unrelated order must remain private to the earlier owner');
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  try {
+    await context.addCookies([earlier.cookie]);
+    const page = await context.newPage();
+    await page.addInitScript(({ site, storageKey, sessionId }) => {
+      if (location.origin === site) sessionStorage.setItem(storageKey, sessionId);
+    }, { site: origin, storageKey: earlier.storageKey, sessionId: earlier.sessionId });
+    const query = new URLSearchParams({ orderId: earlier.orderId, publicId: earlier.orderId });
+    await checkLinkedPhoneLookup(page, orderId, '?' + query);
+  } finally {
+    await context.close();
+  }
+}
+
 async function checkNoJavaScript(browser) {
   const context = await newContext(browser, { javaScriptEnabled: false, viewport: { width: 390, height: 844 } });
   try {
@@ -506,15 +624,29 @@ async function checkGuestCheckout(browser, ca) {
     await shown(page, 'Paid');
     if (project) verifyPaymentRow(order.id);
     await capture(page, 'catalog-to-paid');
+    await checkAnonOrderLink(browser, ca, order.id);
+    const trackingLink = page.getByRole('link', { name: 'Order tracking link', exact: true });
+    assert.equal(await trackingLink.getAttribute('href'), '/order/' + order.id);
+    await trackingLink.click();
+    await page.waitForURL(origin + '/order/' + order.id);
+    await shown(page, 'Track order');
+    await checkLinkedPaidOrder(page, order.id);
+    await checkOrderLinkLayout(page, order.id, true);
+    const storageKey = await page.evaluate(sessionId => Object.keys(sessionStorage)
+      .find(key => key.endsWith('.web.context') && sessionStorage.getItem(key) === sessionId), session.sessionId);
+    assert.ok(storageKey, 'the owner link must leave its original browser session available');
+    await page.goto(origin + '/orders');
     if (catalogPhotos) await checkOrderPrivacy(browser, ca, order, session.sessionId, cookie);
-    else await checkSettledOrderRecovery(page, context, ca, order, session.sessionId);
+    else await checkSettledOrderRecovery(browser, page, context, ca, order, {
+      orderId: order.id, sessionId: session.sessionId, cookie, storageKey,
+    });
     assert.deepEqual(failures, []);
   } finally {
     await context.close();
   }
 }
 
-async function checkSettledOrderRecovery(page, context, ca, order, oldSessionId) {
+async function checkSettledOrderRecovery(browser, page, context, ca, order, earlier) {
   const responseFor = (path, method) => page.waitForResponse(response =>
     response.request().method() === method && new URL(response.url()).pathname === path);
   // Model expiry of only the HttpOnly cookie. Keep the original tab and its checkout journal.
@@ -522,6 +654,7 @@ async function checkSettledOrderRecovery(page, context, ca, order, oldSessionId)
   await page.reload();
   await button(page, 'Verify this order by phone').click();
   assert.equal(await page.getByLabel('Order number', { exact: true }).inputValue(), order.id.slice(-8).toUpperCase());
+  await checkLinkedPhoneLookup(page, order.id);
   await page.getByLabel('Phone number', { exact: true }).fill('+250700000000');
   const requested = responseFor('/api/v1/web/order-access/challenges', 'POST');
   await button(page, 'Request verification code').click();
@@ -547,9 +680,11 @@ async function checkSettledOrderRecovery(page, context, ca, order, oldSessionId)
   assert.ok(verified?.ok(), 'the returning browser must recover the paid order by phone');
   assert.equal((await verified.json()).orderId, order.id);
   const recoveredSessionId = (await verified.request().allHeaders())['x-crustcaper-session'];
-  assert.ok(uuid.test(recoveredSessionId) && recoveredSessionId !== oldSessionId);
-  await page.waitForURL(origin + '/orders');
+  assert.ok(uuid.test(recoveredSessionId) && recoveredSessionId !== earlier.sessionId);
+  assert.equal(new URL(page.url()).pathname, '/order/' + order.id);
   await shown(page, 'Paid');
+  await checkLinkedPaidOrder(page, order.id);
+  await page.goto(origin + '/orders');
   await checkSettledOrderPresentation(page, context, ca, order.id, recoveredSessionId);
 
   await page.goto(origin + '/product/double-smash?storefrontLocale=en');
@@ -572,6 +707,7 @@ async function checkSettledOrderRecovery(page, context, ca, order, oldSessionId)
   assert.equal((await created.request().allHeaders())['x-crustcaper-session'], recoveredSessionId);
   const replacement = await created.json();
   assert.ok(uuid.test(replacement.id) && replacement.id !== order.id);
+  await checkOrderLinkWithoutGrant(browser, ca, replacement.id, earlier);
   verifyPaymentRow(order.id);
 }
 

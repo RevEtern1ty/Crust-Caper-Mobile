@@ -191,7 +191,7 @@ type StatusPolling = {
   onResult: (result: OrderStatusResult) => void;
 };
 
-export function useOrderStatus(orderId: string | null, { watchPendingReceipt = false } = {}) {
+export function useOrderStatus(orderId: string | null, { readOnly = false, watchPendingReceipt = false } = {}) {
   const { api, mode, pickupNow } = useShop();
   const { finishExpiredHold, observePaymentUncertainty } = useCheckout();
   const [known, setKnown] = useState<Order | null>(null);
@@ -219,12 +219,12 @@ export function useOrderStatus(orderId: string | null, { watchPendingReceipt = f
       await earlierRequest;
       if (request !== version.current) return null;
       try {
-        const order = await api.getOrder(orderId);
+        const order = readOnly ? await api.getOrder(orderId, { readOnly }) : await api.getOrder(orderId);
         if (request !== version.current) return null;
         setKnown(order);
         setFailure(null);
         monitor.onResult({ order });
-        if (isExpiredUnpaidHold(order)) {
+        if (!readOnly && isExpiredUnpaidHold(order)) {
           // A reordered basket can retry the local journal transition if this best-effort write fails.
           void finishExpiredHold(order).catch(() => undefined);
         }
@@ -246,7 +246,7 @@ export function useOrderStatus(orderId: string | null, { watchPendingReceipt = f
     return latest.finally(() => {
       if (pending.current === latest) pending.current = null;
     });
-  }, [api, finishExpiredHold, orderId]);
+  }, [api, finishExpiredHold, orderId, readOnly]);
 
   useFocusEffect(useCallback(() => {
     if (!orderId) return;

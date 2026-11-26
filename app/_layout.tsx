@@ -21,7 +21,7 @@ function Routes() {
 
     const url = new URL(window.location.href);
     if (url.pathname !== '/cart' && url.pathname !== '/orders' && url.pathname !== '/privacy'
-      && url.pathname !== '/order-privacy' && !url.pathname.startsWith('/product/')) return;
+      && url.pathname !== '/order-privacy' && !url.pathname.startsWith('/product/') && !url.pathname.startsWith('/order/')) return;
     const handoff = url.searchParams.getAll('storefrontLocale');
     if (handoff.length !== 1) return;
     const next = handoff[0];
@@ -55,6 +55,7 @@ function Routes() {
         ? copy(locale, 'Test payment', 'Kwishyura by’igerageza') : copy(locale, 'Payment', 'Kwishyura') }} />
       <Stack.Screen name="payment-return" options={{ headerShown: false }} />
       <Stack.Screen name="web-payment-return" options={{ headerShown: false }} />
+      <Stack.Screen name="order/[publicId]" options={{ title: copy(locale, 'Pickup order', 'Komande yo gufata') }} />
       <Stack.Screen name="order-recovery" options={{ title: copy(locale, 'Find an order', 'Shaka komande') }} />
       {(['privacy', 'order-privacy'] as const).map(name => <Stack.Screen key={name} name={name} options={{
         title: privacyTitle,

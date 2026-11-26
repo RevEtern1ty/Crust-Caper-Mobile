@@ -13,11 +13,12 @@ type Step = { kind: 'details' } | { kind: 'code'; challengeId: string }
   | { kind: 'save'; orderId: string; sessionRevision: number } | { kind: 'notPlaced' };
 type Field = 'orderCode' | 'phone' | 'code';
 
-export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPrivacyVerified, notice, suspended = false }: {
+export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPrivacyVerified, linkedOrder, notice, suspended = false }: {
   from?: string;
   savedCode?: string;
   pendingOrder?: boolean;
   onPrivacyVerified?: (orderId: string, sessionRevision: number) => void;
+  linkedOrder?: { id: string; onVerified: () => void };
   notice?: string;
   suspended?: boolean;
 }) {
@@ -31,6 +32,7 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
   const [dismissedChallenge, setDismissedChallenge] = useState<string>();
   const [orderCode, setOrderCode] = useState(() =>
     typeof savedCode === 'string' && /^[0-9A-F]{8}$/.test(savedCode) ? savedCode : '');
+  const linkedCode = linkedOrder?.id.slice(-8).toUpperCase();
   const [phone, setPhone] = useState('');
   const [code, setCode] = useState('');
   const [pending, setPending] = useState(false);
@@ -88,7 +90,7 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
   async function submit() {
     if (!available || running.current) return;
 
-    const reference = orderCode.trim().replace(/^#/, '').toUpperCase();
+    const reference = linkedCode ?? orderCode.trim().replace(/^#/, '').toUpperCase();
     const normalizedPhone = normalizePhone(phone);
     if (step.kind === 'details') {
       if (!pendingOrder && !/^[0-9A-F]{8}$/.test(reference)) {
@@ -153,9 +155,10 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
       }
 
       const orderId = step.kind === 'code'
-        ? (await api.verifyOrderAccess(step.challengeId, code)).orderId
+        ? (await api.verifyOrderAccess(step.challengeId, code, linkedOrder?.id)).orderId
         : step.kind === 'save' ? step.orderId : null;
       if (!orderId || !shouldNavigate() || displayedRevision.current !== sessionRevision) return;
+      if (linkedOrder && linkedOrder.id !== orderId) throw new ApiError('not_found');
       setCode('');
       setPhone('');
       setOrderCode('');
@@ -167,8 +170,11 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
       setStep({ kind: 'save', orderId, sessionRevision });
       await rememberRecoveredOrder(orderId, sessionRevision);
       if (shouldNavigate() && displayedRevision.current === sessionRevision) {
-        setRequestedOrderId(orderId);
-        goToOrders();
+        if (linkedOrder) linkedOrder.onVerified();
+        else {
+          setRequestedOrderId(orderId);
+          goToOrders();
+        }
       }
     } catch (error) {
       if (!shouldNavigate() || displayedRevision.current !== sessionRevision) return;
@@ -249,16 +255,16 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
           {notice && <Text accessibilityRole="alert">{notice}</Text>}
           {privacy && <Text>{t('Verify a single order to download its data or request deletion.',
             'Emeza komande imwe kugira ngo ubike amakuru yayo cyangwa usabe ko asibwa.')}</Text>}
-          <Text>{pendingOrder
+          <Text>{pendingOrder || linkedOrder
             ? t('Enter the phone number you used at checkout.', 'Andika nimero ya telefoni wakoresheje igihe wayitumizaga.')
             : t('Enter the order number and the phone number used at checkout.', 'Andika nimero ya komande na nimero ya telefoni wakoresheje igihe wayitumizaga.')}</Text>
           {!pendingOrder && (
             <>
               <Text variant="label">{t('Order number', 'Nimero ya komande')}</Text>
               <TextInput ref={orderInput} accessibilityLabel={t('Order number', 'Nimero ya komande')}
-                value={orderCode} onChangeText={(value) => { setOrderCode(value); setInvalid(null); }}
+                value={linkedCode ?? orderCode} onChangeText={(value) => { setOrderCode(value); setInvalid(null); }}
                 placeholder="#1A2B3C4D" placeholderTextColor={colors.muted}
-                autoCapitalize="characters" autoComplete="off" autoCorrect={false} maxLength={12} editable={!pending}
+                autoCapitalize="characters" autoComplete="off" autoCorrect={false} maxLength={12} editable={!pending && !linkedCode}
                 style={[styles.input, invalid === 'orderCode' && styles.invalid]} />
             </>
           )}

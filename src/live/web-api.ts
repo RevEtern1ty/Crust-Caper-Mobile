@@ -411,10 +411,10 @@ export function createWebLiveApi({
         path: orderPath(orderId) + '/payments', method: 'POST', schema: paymentResponse, key,
       })));
     },
-    async getOrder(orderId) {
+    async getOrder(orderId, { readOnly = false } = {}) {
       const { payload, alternateContext } = await readOrder(orderId, { path: orderPath(orderId), schema: webOrderResponse });
       const order = checkedOrder(alternateContext ? { ...payload, recoveryReadOnly: true } : payload, orderId);
-      if (!order.recoveryReadOnly || !settledForNewCheckout(order)) return order;
+      if (readOnly || !order.recoveryReadOnly || !settledForNewCheckout(order)) return order;
 
       const canContinueCheckout = await withCookieLock(async () => {
         const saved = await savedContext();
@@ -505,7 +505,7 @@ export function createWebLiveApi({
         return result;
       });
     },
-    verifyOrderAccess(challengeId, code) {
+    verifyOrderAccess(challengeId, code, expectedOrderId) {
       return withWork(async () => {
         const context = challenge;
         if (!context || context.id !== challengeId) throw new ApiError('unauthenticated');
@@ -513,6 +513,10 @@ export function createWebLiveApi({
           path: '/order-access/challenges/' + encodeURIComponent(challengeId) + '/verify',
           method: 'POST', schema: orderAccessGrant, body: { code },
         }, context.sessionId);
+        if (expectedOrderId && grant.orderId !== expectedOrderId) {
+          challenge = null;
+          throw new ApiError('not_found');
+        }
         if (context.separateContext) {
           const before = await savedRecovery();
           const earlier = before?.sessionId === context.sessionId ? before.orderIds : [];

@@ -306,6 +306,55 @@ test('a settled recovery keeps read-only presentation unless the locked cookie c
   }
 });
 
+test('read-only order tracking leaves a promotable settled recovery and its checkout context untouched', async () => {
+  const entries: [string, string][] = [
+    [journalKey, trackedJournal], [journalKey + '.context', second],
+    [journalKey + '.verified', JSON.stringify({ sessionId: first, orderIds: [orderId], owned: true })],
+  ];
+  const { storage, saved } = memory(entries);
+  const path = '/web/orders/' + orderId;
+  const transport = fixture(first, call => {
+    assert.equal(call.path, path);
+    assert.equal(call.context, first);
+    return Response.json(collectedOrder);
+  });
+  const api = createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+
+  const observed = await api.getOrder(orderId, { readOnly: true });
+  assert.equal(observed.status, 'collected');
+  assert.equal(observed.recoveryReadOnly, true);
+  assert.deepEqual([...saved], entries);
+  assert.deepEqual(transport.calls.map(call => [call.method, call.path, call.context]),
+    [['GET', path, second], ['GET', path, first]]);
+
+  // The regular order flow can still promote this same verified recovery.
+  assert.equal((await api.getOrder(orderId)).recoveryReadOnly, undefined);
+  assert.equal(saved.get(journalKey + '.context'), first);
+});
+
+test('linked OTP rejects a different full order UUID before persisting a local grant', async () => {
+  const sameSuffixOrderId = 'ba24282f-9505-46d1-a957-' + orderId.slice(-12);
+  const entries: [string, string][] = [
+    [journalKey, trackedJournal], [journalKey + '.context', first],
+    [journalKey + '.verified', JSON.stringify({ sessionId: second, orderIds: [unknownOrderId], owned: false })],
+  ];
+  const { storage, saved } = memory(entries);
+  const verifyPath = '/web/order-access/challenges/' + challengeId + '/verify';
+  const transport = fixture(second, ({ path }) => {
+    if (path === '/web/order-access/challenges') return Response.json({ challengeId });
+    if (path === verifyPath) return Response.json({ orderId: sameSuffixOrderId });
+    assert.fail('unverified recovery must not use the replacement cookie for the other order');
+  });
+  const api = createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+
+  await api.requestOrderAccess!({ orderCode: orderId.slice(-8).toUpperCase(), phone });
+  await assert.rejects(api.verifyOrderAccess!(challengeId, '010101', orderId), { code: 'not_found' });
+  assert.deepEqual([...saved], entries);
+  await assert.rejects(api.getOrder(sameSuffixOrderId, { readOnly: true }), { code: 'unauthenticated' });
+  await assert.rejects(api.verifyOrderAccess!(challengeId, '010101', sameSuffixOrderId), { code: 'unauthenticated' });
+  assert.equal(transport.calls.filter(call => call.path === verifyPath).length, 1);
+});
+
 test('settled verification only promotes the same tracked checkout and its own unchanged cookie', async t => {
   const concurrentJournal = JSON.stringify(pendingCreation);
   const cases = [
