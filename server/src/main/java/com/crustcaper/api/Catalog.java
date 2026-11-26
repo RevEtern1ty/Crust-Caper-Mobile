@@ -20,6 +20,19 @@ class Catalog {
     private static final String SLOT_QUERY = """
         SELECT id, starts_at, ends_at, capacity FROM pickup_slots WHERE store_id = ?
         """;
+    private static final String UPCOMING_SLOTS_QUERY = """
+        SELECT upcoming.id, upcoming.starts_at, upcoming.ends_at,
+            CASE WHEN ? AND upcoming.capacity > 0 THEN (
+                SELECT count(*) FROM orders
+                WHERE store_id = upcoming.store_id AND slot_id = upcoming.id
+                  AND pickup_reservation_occupies_slot(status, reservation_expires_at, ?)
+            ) < upcoming.capacity ELSE false END AS available
+        FROM (
+            SELECT store_id, id, starts_at, ends_at, capacity FROM pickup_slots
+            WHERE store_id = ? AND starts_at > ? ORDER BY starts_at, id LIMIT 12
+        ) upcoming
+        ORDER BY upcoming.starts_at, upcoming.id
+        """;
     private static final String RESERVED_QUERY = """
         SELECT count(*) FROM orders WHERE store_id = ? AND slot_id = ?
           AND pickup_reservation_occupies_slot(status, reservation_expires_at, ?)
@@ -38,13 +51,13 @@ class Catalog {
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public Menu menu(String storeId) {
-        Instant now = Instant.now();
+        OffsetDateTime checkedAt = dbTime(Instant.now());
         StoreData store = store(storeId, false);
-        List<Slot> slots = jdbc.sql(SLOT_QUERY + " AND starts_at > ? ORDER BY starts_at, id LIMIT 12")
-            .params(storeId, dbTime(now))
-            .query(Catalog::slotRow).list()
-            .stream().map(slot -> new Slot(slot.id(), slot.startsAt(), slot.endsAt(), available(store.store(), slot, now)))
-            .toList();
+        List<Slot> slots = jdbc.sql(UPCOMING_SLOTS_QUERY)
+            .params(store.store().open(), checkedAt, storeId, checkedAt)
+            .query((rs, row) -> new Slot(rs.getString("id"), readTime(rs, "starts_at"), readTime(rs, "ends_at"),
+                rs.getBoolean("available")))
+            .list();
         return new Menu(store.version(), store.updatedAt(), store.store(), products(storeId, false), slots);
     }
 

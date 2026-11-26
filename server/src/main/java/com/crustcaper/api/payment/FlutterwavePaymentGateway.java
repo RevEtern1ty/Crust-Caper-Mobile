@@ -26,6 +26,7 @@ import java.util.regex.Pattern;
 final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory {
     static final URI API_ORIGIN = URI.create("https://api.flutterwave.com");
 
+    private static final String PAYMENT_RETURN_PATH = "/payment-return";
     private static final int MAX_RESPONSE_BYTES = 128 * 1024;
     private static final Pattern REFERENCE = Pattern.compile("[A-Za-z0-9_-]{1,128}");
     private static final Pattern TRANSACTION_ID = Pattern.compile("[1-9][0-9]{0,18}");
@@ -45,8 +46,9 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
 
     FlutterwavePaymentGateway(URI apiOrigin, URI returnUrl, String secretKey, ObjectMapper mapper,
                              Clock clock, int connectTimeoutMs, int readTimeoutMs) {
-        if (!isHttpsUrl(returnUrl) || returnUrl.getRawQuery() != null) {
-            throw new IllegalStateException("CRUST_PAYMENT_RETURN_URL must be an absolute HTTPS URL without a query or fragment");
+        if (!isHttpsUrl(returnUrl) || !PAYMENT_RETURN_PATH.equals(returnUrl.getRawPath()) || returnUrl.getRawQuery() != null) {
+            throw new IllegalStateException("CRUST_PAYMENT_RETURN_URL must be an absolute HTTPS URL at "
+                    + PAYMENT_RETURN_PATH + " without a query or fragment");
         }
         if (secretKey == null || !secretKey.matches("[!-~]{1,512}")) {
             throw new IllegalStateException("FLUTTERWAVE_SECRET_KEY is missing or invalid");

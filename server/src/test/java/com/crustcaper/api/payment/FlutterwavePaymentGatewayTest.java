@@ -77,6 +77,32 @@ class FlutterwavePaymentGatewayTest {
         assertThat(json.path("customer").path("phone_number").asString("")).isEqualTo("+250700000000");
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {
+        "https://example.test",
+        "https://example.test/",
+        "https://example.test/callback",
+        "https://example.test/checkout/payment-return",
+        "https://example.test/payment-return/extra",
+        "https://example.test/payment-return/",
+        "https://example.test/%70ayment-return",
+    })
+    void rejectsNoncanonicalPaymentReturnUrlAtStartup(String url) {
+        assertThrows(IllegalStateException.class, () -> gatewayWithReturnUrl(url, 1_000));
+        assertThat(requestCount.get()).isZero();
+    }
+
+    @Test
+    void allowsLocalHttpsRehearsalReturnUrl() throws IOException {
+        String url = "https://localhost/payment-return";
+        fixtureResponse(200, hostedLink(PAYMENT_LINK));
+
+        assertThat(gatewayWithReturnUrl(url, 1_000).open(paymentRequest(EMAIL, EXPIRY)).checkoutUrl())
+                .isEqualTo(PAYMENT_LINK);
+        assertThat(mapper.readTree(recorded.get().body()).path("redirect_url").asString(""))
+                .isEqualTo(url + "?orderId=order-1");
+    }
+
     @Test
     void rejectsMissingEmailAndElapsedHoldBeforeNetworkCall() {
         assertThat(assertThrows(PaymentGatewayException.class, () -> gateway.open(paymentRequest(null, EXPIRY))).kind())
@@ -220,7 +246,11 @@ class FlutterwavePaymentGatewayTest {
     }
 
     private PaymentGateway gatewayWithReadTimeout(int readTimeoutMs) {
-        return new FlutterwavePaymentGateway(fixtureOrigin(), URI.create(RETURN), KEY, mapper,
+        return gatewayWithReturnUrl(RETURN, readTimeoutMs);
+    }
+
+    private PaymentGateway gatewayWithReturnUrl(String returnUrl, int readTimeoutMs) {
+        return new FlutterwavePaymentGateway(fixtureOrigin(), URI.create(returnUrl), KEY, mapper,
                 Clock.fixed(NOW, ZoneOffset.UTC), 1_000, readTimeoutMs);
     }
 
