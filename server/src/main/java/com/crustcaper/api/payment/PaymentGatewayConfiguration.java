@@ -31,13 +31,14 @@ class PaymentGatewayConfiguration {
         List<String> active = List.of(environment.getActiveProfiles());
         boolean stage = active.contains("stage");
         boolean production = active.contains("prod") || active.contains("production");
-        if (stage == production || active.contains("local")) {
-            throw new IllegalStateException("Flutterwave requires an explicit stage or production profile without local");
+        if (stage == production || active.contains("local") || active.contains("demo") || active.contains("test")) {
+            throw new IllegalStateException("SPRING_PROFILES_ACTIVE must select Flutterwave stage or production "
+                    + "without local, demo or test profiles");
         }
         String secret = deploymentVariable.apply("FLUTTERWAVE_SECRET_KEY");
         String requiredPrefix = stage ? "FLWSECK_TEST-" : "FLWSECK-";
         if (secret != null && (!secret.startsWith(requiredPrefix) || secret.length() == requiredPrefix.length())) {
-            throw new IllegalStateException("Flutterwave requires a test key on stage and a live key outside stage");
+            throw new IllegalStateException("Flutterwave requires a test key on stage and a live key on production");
         }
         return new FlutterwavePaymentGateway(FlutterwavePaymentGateway.API_ORIGIN, configuredReturnUrl(),
                 configuredWebReturnUrl(environment), secret,

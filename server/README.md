@@ -30,10 +30,11 @@ Build the Linux container with `docker build -t crustcaper-api ./server` or depl
 
 | Variable | Value |
 | --- | --- |
-| `SPRING_PROFILES_ACTIVE` | `stage` for Flutterwave Test or `production` for Flutterwave Live. |
+| `SPRING_PROFILES_ACTIVE` | Explicitly select `stage` for Flutterwave Test or `production` (alias `prod`) for Flutterwave Live. |
 | `CRUSTCAPER_DB_URL`, `CRUSTCAPER_DB_USER`, `CRUSTCAPER_DB_PASSWORD` | Dedicated encrypted connection and application credentials from the deployment secret store. |
 | `CRUSTCAPER_OPERATOR_MFA_KEY` | Required staff authenticator encryption key. Base64-encode 32 random bytes, use a separate key for each environment, and store it with the deployment secrets. See [Staff access](docs/OPERATIONS.md#выдача-доступа). |
 | `CRUSTCAPER_PAYMENT_PROVIDER` | `flutterwave`. |
+| `CRUSTCAPER_FLUTTERWAVE_PAYMENT_OPTIONS` | Approved Flutterwave checkout methods for this environment. Use `card`, `mobilemoneyrwanda`, or both separated by a comma. |
 | `FLUTTERWAVE_SECRET_KEY`, `FLUTTERWAVE_WEBHOOK_SECRET`, `CRUST_PAYMENT_RETURN_URL` | Environment-specific provider configuration. See [Payments](docs/PAYMENTS.md). |
 | `CRUSTCAPER_WEB_ORIGIN` | Optional exact HTTPS origin for browser checkout. Empty disables browser commerce. The storefront Compose overlay sets this from the HTTPS hostname. |
 | `CRUSTCAPER_PORT` | Listener port behind the HTTPS ingress. Defaults to 8080. |
@@ -62,7 +63,7 @@ Create `/etc/crustcaper/stage/compose.env` with the following deployment values.
 | `CRUSTCAPER_API_ENV_FILE` | Absolute path to the API environment file. |
 | `CRUSTCAPER_POSTGRES_CA_FILE` | Absolute path to the CA PEM file, readable by the API container's UID `10001`. |
 
-Store the API variables from the Deployment configuration section in a separate host file with mode `0600`. Use raw `KEY=value` lines without shell quoting. Set `SPRING_PROFILES_ACTIVE=stage`, `CRUSTCAPER_PAYMENT_PROVIDER=flutterwave`, and `CRUST_PAYMENT_RETURN_URL=https://<staging-host>/payment-return`. Set the JDBC URL to `jdbc:postgresql://<db-host>:5432/<db>?sslmode=verify-full&sslrootcert=/run/crustcaper/postgres-ca.crt`; the database hostname must match its certificate. Keep API secrets out of Compose interpolation values and use `config --quiet` for validation. [pgJDBC TLS configuration](https://jdbc.postgresql.org/documentation/ssl/)
+Store the API variables from the Deployment configuration section in a separate host file with mode `0600`. Use raw `KEY=value` lines without shell quoting. Set `SPRING_PROFILES_ACTIVE=stage`, `CRUSTCAPER_PAYMENT_PROVIDER=flutterwave`, the approved `CRUSTCAPER_FLUTTERWAVE_PAYMENT_OPTIONS`, and `CRUST_PAYMENT_RETURN_URL=https://<staging-host>/payment-return`. Set the JDBC URL to `jdbc:postgresql://<db-host>:5432/<db>?sslmode=verify-full&sslrootcert=/run/crustcaper/postgres-ca.crt`. The database hostname must match its certificate. Keep API secrets out of Compose interpolation values and use `config --quiet` for validation. [pgJDBC TLS configuration](https://jdbc.postgresql.org/documentation/ssl/)
 
 Configure `CRUSTCAPER_APP_LINK_IOS_APP_ID` with the signed Apple application identifier and `CRUSTCAPER_APP_LINK_ANDROID_PACKAGE` with the signed Android package. Supply the comma-separated, colon-delimited SHA-256 signing certificate fingerprints in `CRUSTCAPER_APP_LINK_ANDROID_FINGERPRINTS`. An unconfigured platform's association URL returns 404. [Connected release checks](../docs/runbooks/CONNECTED_RELEASE.md)
 

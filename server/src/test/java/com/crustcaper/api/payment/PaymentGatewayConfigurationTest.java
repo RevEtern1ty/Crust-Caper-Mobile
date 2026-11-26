@@ -13,13 +13,15 @@ import tools.jackson.databind.ObjectMapper;
 class PaymentGatewayConfigurationTest {
     private static final String TEST_KEY = "FLWSECK_TEST-synthetic-context-test-v1";
     private static final String LIVE_KEY = "FLWSECK-synthetic-context-test-v1";
-    private static final String PROFILE_ERROR = "Flutterwave requires an explicit stage or production profile without local";
-    private static final String KEY_ERROR = "Flutterwave requires a test key on stage and a live key outside stage";
+    private static final String PROFILE_ERROR = "SPRING_PROFILES_ACTIVE must select Flutterwave stage or production "
+            + "without local, demo or test profiles";
+    private static final String KEY_ERROR = "Flutterwave requires a test key on stage and a live key on production";
     private final ApplicationContextRunner configuration = new ApplicationContextRunner()
             .withUserConfiguration(PaymentGatewayConfiguration.class);
 
     @ParameterizedTest
-    @ValueSource(strings = {"", "stgae", "local", "local,stage", "local,production", "stage,production", "stage,prod"})
+    @ValueSource(strings = {"", "stgae", "local", "local,stage", "local,production", "stage,production", "stage,prod",
+            "demo,production", "test,production"})
     void refusesMissingOrConflictingActivePaymentProfiles(String profiles) {
         application(LIVE_KEY).withPropertyValues("spring.profiles.active=" + profiles).run(context -> {
             assertThat(context).hasFailed();

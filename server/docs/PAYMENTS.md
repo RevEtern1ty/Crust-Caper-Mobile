@@ -10,9 +10,10 @@
 | Стенд | `stage` | `flutterwave` | Flutterwave Test с отдельными стендовыми адресом возврата, секретами и данными. |
 | Продакшен | `production` или `prod` | `flutterwave` | Flutterwave Live с отдельными адресом возврата, секретами и базой. |
 
-За пределами локального профиля сервер по умолчанию выбирает `flutterwave`. Неизвестный режим или пропущенные настройки Flutterwave останавливают запуск. Локальный адаптер недоступен при активном `stage`, `production` или `prod`. Параметр провайдера можно передать через `CRUSTCAPER_PAYMENT_PROVIDER`.
+За пределами локального профиля сервер по умолчанию выбирает `flutterwave`. Для запуска явно задайте `stage` или `production` (синоним `prod`) в `SPRING_PROFILES_ACTIVE`. Сервер отклоняет смешение стендового и боевого профилей, а также подключение Flutterwave при активном `local`, `demo` или `test`. Локальный адаптер недоступен при активном `stage`, `production` или `prod`. Параметр провайдера можно передать через `CRUSTCAPER_PAYMENT_PROVIDER`.
 
-- `FLUTTERWAVE_SECRET_KEY` поступает через окружение сервера. Для `stage` нужен ключ режима Test. Остальные профили Flutterwave используют ключ Live.
+- `FLUTTERWAVE_SECRET_KEY` поступает через окружение сервера. Для `stage` нужен ключ режима Test, для `production` или `prod` — ключ Live. [Аутентификация Flutterwave V3](https://developer.flutterwave.com/docs/authentication)
+- `CRUSTCAPER_FLUTTERWAVE_PAYMENT_OPTIONS` перечисляет разрешённые способы оплаты для этой среды. Укажите `card`, `mobilemoneyrwanda` или `card,mobilemoneyrwanda`. Сервер останавливает запуск при пустом списке, повторе или неизвестном значении. Отключите в кабинете Flutterwave **Enable Dashboard Payment Options**, чтобы применялся список из запроса. На подключённой проверке сверьте фактический набор способов оплаты на странице провайдера. [Способы оплаты Flutterwave V3](https://developer.flutterwave.com/docs/collections-inflow/payment-methods)
 - `FLUTTERWAVE_WEBHOOK_SECRET` совпадает со случайным секретом webhook в панели соответствующей среды. Секрет состоит из 24–256 печатных ASCII-символов без пробелов.
 - `CRUST_PAYMENT_RETURN_URL` содержит адрес HTTPS для возврата после оплаты без параметров или фрагмента. Сервер добавляет `orderId`, а Flutterwave добавляет параметры результата. Домен и публичный маршрут приложения назначает владелец среды.
 
