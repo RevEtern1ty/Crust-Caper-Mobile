@@ -212,6 +212,7 @@ async function measure({ durationMs, request, metrics, menu, runCheckout, kitche
 
   loop.enable();
   const start = performance.now();
+  const windowStartedAt = new Date().toISOString();
   const end = start + durationMs;
   let actualWindowMs;
   let drainMs;
@@ -269,7 +270,7 @@ async function measure({ durationMs, request, metrics, menu, runCheckout, kitche
   }
 
   return {
-    orders, activity, actualWindowMs: round(actualWindowMs), drainMs: round(drainMs),
+    orders, activity, windowStartedAt, actualWindowMs: round(actualWindowMs), drainMs: round(drainMs),
     schedulingLateness: stats(lateness),
     eventLoopDelay: loop.count ? {
       p50Ms: round(loop.percentile(50) / 1e6),
@@ -296,11 +297,6 @@ async function main() {
   const project = process.env.CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT;
   const caFile = process.env.CRUSTCAPER_HTTPS_TEST_CA;
   const directory = process.env.CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR;
-  requireCondition(caFile, 'fixture_ca_required');
-  requireFixture(project);
-  const ca = await readFile(caFile).catch(() => { throw new LoadFailure('fixture_ca_unreadable'); });
-  requireCondition(ca.includes('-----BEGIN CERTIFICATE-----'), 'fixture_ca_invalid');
-
   const { runCheckout, verifyPersisted, runCapacityWave } = require('./storefront-load-journey.cjs');
   const { openKitchenMonitor } = require('./storefront-load-kitchen.cjs');
   const controller = new AbortController();
@@ -311,7 +307,6 @@ async function main() {
     menu: { latencies: [], statuses: {}, statusLatencies: { 200: [], 304: [] } },
     order_create: { latencies: [], statuses: {} },
   };
-  const request = transport(ca, agent, controller.signal, metrics);
   const report = {
     mode: smoke ? 'smoke' : 'full', recordedAt: new Date().toISOString(), plannedWindowMs: durationMs,
     workload: { menuReaders: readerCount, menuReadIntervalMs: readIntervalMs, checkoutArrivalsPerMinute: 20 },
@@ -320,6 +315,11 @@ async function main() {
   };
   let kitchen;
   try {
+    requireCondition(caFile, 'fixture_ca_required');
+    requireFixture(project);
+    const ca = await readFile(caFile).catch(() => { throw new LoadFailure('fixture_ca_unreadable'); });
+    requireCondition(ca.includes('-----BEGIN CERTIFICATE-----'), 'fixture_ca_invalid');
+    const request = transport(ca, agent, controller.signal, metrics);
     const warm = await request(menuPath);
     const slotIds = ['fixture-capacity', ...Array.from({ length: 8 }, (_, i) => `fixture-load-${i}`)];
     requireCondition(validMenu(warm)
