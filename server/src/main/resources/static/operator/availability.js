@@ -23,6 +23,20 @@ function validPickupWindows(slots) {
     && new Set(slots.map(({ id }) => id)).size === slots.length;
 }
 
+function matchesChange(snapshot, change) {
+  if (change.slotId !== undefined) {
+    return snapshot.slots?.some(({ id, capacity }) => id === change.slotId && capacity === change.capacity);
+  }
+  if (change.sku !== undefined) {
+    return snapshot.products.some(({ sku, available }) => sku === change.sku && available === change.available);
+  }
+  return snapshot.open === change.open;
+}
+
+function writeOutcomeUnknown(error) {
+  return error.status === undefined || error.status === 408 || error.status >= 500;
+}
+
 export function mountAvailability({ currentSession, request, messageFor, showMessage, closeSession }) {
   const panel = document.getElementById('availability');
   const jump = document.getElementById('availability-jump');
@@ -57,11 +71,20 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
       busy = value;
       syncButtons();
     },
-    markUnverified() {
-      verified = false;
-      syncButtons();
-    },
+    markUnverified,
   });
+
+  function markUnverified() {
+    verified = false;
+    if (snapshot) {
+      storeStatus.textContent = 'Order intake status unknown';
+      for (const badge of list.querySelectorAll('.order-status')) {
+        badge.dataset.status = 'unverified';
+        badge.textContent = 'Availability unknown';
+      }
+    }
+    syncButtons();
+  }
 
   function syncButtons() {
     refresh.disabled = busy;
@@ -136,15 +159,15 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
     syncButtons();
   }
 
-  function accept(data, savedLimit) {
+  function accept(data, savedChange) {
     if (!data || typeof data.version !== 'string' || !data.version || typeof data.open !== 'boolean'
       || !Array.isArray(data.products) || data.products.some((product) => !product || typeof product.sku !== 'string'
         || !product.sku || typeof product.name?.en !== 'string' || !product.name.en || typeof product.available !== 'boolean')
       || (data.slots !== undefined && !validPickupWindows(data.slots))) {
       throw new Error('Invalid availability response');
     }
-    if (savedLimit && !data.slots?.some(({ id, capacity }) => id === savedLimit.slotId && capacity === savedLimit.capacity)) {
-      throw new Error('The updated pickup limit could not be verified');
+    if (savedChange && !matchesChange(data, savedChange)) {
+      throw new Error('The availability response did not confirm the requested change');
     }
     snapshot = data;
     verified = true;
@@ -174,7 +197,7 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
       }
     } catch (error) {
       if (currentSession() !== session) return;
-      verified = false;
+      markUnverified();
       showMessage(note);
       report(error);
     } finally {
@@ -192,7 +215,7 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
     }
 
     let message;
-    const uncertain = error.status === undefined || error.status >= 500;
+    const uncertain = writeOutcomeUnknown(error);
     if (error.code === 'slot_capacity_below_reserved') {
       message = 'The pickup limit cannot be lower than the number of active reservations.';
     } else if (error.code === 'slot_update_closed' || error.status === 404) {
@@ -209,7 +232,7 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
       const data = await request('/availability', { token: session.accessToken });
       if (currentSession() !== session) return;
       accept(data);
-      if (uncertain && data.slots?.some(({ id, capacity }) => id === change.slotId && capacity === change.capacity)) {
+      if (uncertain && matchesChange(data, change)) {
         showMessage(pickupLimitNote, 'The current pickup limit matches your request.');
         return;
       }
@@ -223,6 +246,24 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
     }
 
     showMessage(pickupLimits.hidden ? problem : pickupLimitProblem, message);
+  }
+
+  async function reconcileAvailability(session, change, notice) {
+    try {
+      const current = await request('/availability', { token: session.accessToken });
+      if (currentSession() !== session) return false;
+      accept(current);
+      if (matchesChange(current, change)) {
+        showMessage(note, notice);
+        return true;
+      }
+      showMessage(problem, 'The current availability differs from your request. Review it before trying again.');
+    } catch (error) {
+      if (currentSession() !== session) return false;
+      if (error.status === 401) report(error);
+      else showMessage(problem, 'The current availability could not be verified. Refresh availability before trying again.');
+    }
+    return false;
   }
 
   async function update(change, notice) {
@@ -244,14 +285,16 @@ export function mountAvailability({ currentSession, request, messageFor, showMes
         method: 'PATCH', token: session.accessToken, body: { expectedVersion: snapshot.version, ...change },
       });
       if (currentSession() !== session) return;
-      accept(data, limitChange ? change : undefined);
+      accept(data, change);
       saved = true;
       showMessage(limitChange ? pickupLimitNote : note, notice);
     } catch (error) {
       if (currentSession() !== session) return;
-      verified = false;
+      markUnverified();
       if (limitChange) {
         await refreshAfterLimitError(session, change, error);
+      } else if (writeOutcomeUnknown(error)) {
+        saved = await reconcileAvailability(session, change, notice);
       } else if (error.code === 'catalog_version_conflict') {
         showMessage(problem, 'Availability changed. Refresh the menu and review it before trying again.');
       } else {

@@ -3272,6 +3272,112 @@ test('kitchen sound follows a fresh paid queue, stops offline and clears after s
   assert.equal(await tones(), preparedTones);
 });
 
+test('manager reconciles an uncertain pause or stock change once and marks an unreadable snapshot unknown', { timeout: 45_000 }, async t => {
+  const manager = await operator('demo-manager');
+  const path = '/operator/availability';
+  const snapshot = () => send(path, { token: manager }).then(response => {
+    assert.equal(response.status, 200);
+    return response.json();
+  });
+  const original = await snapshot();
+  const item = original.products.find(product => product.name.en === 'Double Smash');
+  assert.ok(original.open && item?.available, 'The synthetic store and product must start open');
+  t.after(async () => {
+    let current = await snapshot();
+    async function restore(change) {
+      const response = await send(path, { token: manager, method: 'PATCH', data: { expectedVersion: current.version, ...change } });
+      assert.equal(response.status, 200);
+      current = await response.json();
+    }
+    if (current.open !== original.open) await restore({ open: original.open });
+    if (!current.products.find(product => product.sku === item.sku)?.available) await restore({ sku: item.sku, available: true });
+    assert.equal((await send('/operator/sessions/current', { token: manager, method: 'DELETE' })).status, 204);
+  });
+
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.setDefaultTimeout(6500);
+  const writes = [];
+  const reads = [];
+  const pauseCommitted = Promise.withResolvers();
+  let fault;
+  await page.route(api + path, async route => {
+    if (!fault) return route.continue();
+    if (route.request().method() === 'PATCH') {
+      writes.push(route.request().postDataJSON());
+      const result = await route.fetch();
+      assert.equal(result.status(), 200, 'Forward one authorized change to the synthetic API');
+      if (fault.label === 'pause') pauseCommitted.resolve();
+      if (fault.wrongSnapshot) return route.fulfill({ status: 200, json: fault.wrongSnapshot });
+      return route.abort('connectionreset');
+    }
+    reads.push(fault.label);
+    if (fault.failRead) return route.fulfill({ status: 503, json: { code: 'unavailable' } });
+    return route.continue();
+  });
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-manager');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(page, 'Sign in').click();
+  await shown(page, 'Accepting new orders');
+  const row = page.locator('#availability-list > li').filter({ hasText: 'Double Smash' });
+
+  fault = { label: 'pause' };
+  await button(page, 'Pause new orders').click();
+  await pauseCommitted.promise;
+  const paused = await snapshot();
+  assert.equal(paused.open, false);
+  assert.notEqual(paused.version, original.version);
+  await shown(page, 'New orders are paused.');
+  assert.deepEqual(reads, ['pause']);
+
+  fault = { label: 'stop list', wrongSnapshot: paused };
+  await button(page, 'Put on stop list: Double Smash').click();
+  await shown(page, 'Double Smash is on the stop list.');
+  await shown(row, 'On stop list');
+  const stopped = await snapshot();
+  assert.equal(stopped.products.find(product => product.sku === item.sku).available, false);
+  assert.notEqual(stopped.version, paused.version);
+  assert.deepEqual(reads, ['pause', 'stop list']);
+
+  fault = { label: 'reopen', failRead: true };
+  await button(page, 'Accept new orders').click();
+  await shown(page, 'Order intake status unknown');
+  await shown(row, 'Availability unknown');
+  await shown(page, 'The current availability could not be verified. Refresh availability before trying again.');
+  assert.equal(await button(page, 'Accept new orders').isDisabled(), true);
+  assert.equal(await page.getByText('New orders paused', { exact: true }).isVisible(), false);
+  const reopened = await snapshot();
+  assert.equal(reopened.open, true);
+  assert.notEqual(reopened.version, stopped.version);
+  assert.deepEqual(reads, ['pause', 'stop list', 'reopen']);
+  assert.deepEqual(writes, [
+    { expectedVersion: original.version, open: false },
+    { expectedVersion: paused.version, sku: item.sku, available: false },
+    { expectedVersion: stopped.version, open: true },
+  ]);
+
+  await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+  for (const width of [430, 390, 320]) {
+    await page.setViewportSize({ width, height: 844 });
+    await shown(page, 'Order intake status unknown');
+    assert.ok(await page.locator('#availability').evaluate(panel => panel.scrollWidth <= panel.clientWidth));
+  }
+  await page.locator('#availability-store').scrollIntoViewIfNeeded();
+  await capture(page, 'operator-availability-unknown');
+  await page.evaluate(() => { document.documentElement.style.removeProperty('font-size'); });
+  await page.setViewportSize({ width: 390, height: 844 });
+
+  fault = null;
+  await button(page, 'Refresh availability').click();
+  await shown(page, 'Accepting new orders');
+  await shown(row, 'On stop list');
+  assert.equal(await button(page, 'Pause new orders').isEnabled(), true);
+  assert.equal(writes.length, 3);
+  await capture(page, 'operator-availability-reconciled');
+});
+
 test('manager stop list and pause apply to new orders and preserve the paid kitchen queue', { timeout: 50_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const staff = await operator('demo-manager');
