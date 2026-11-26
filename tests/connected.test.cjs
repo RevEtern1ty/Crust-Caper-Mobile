@@ -2119,22 +2119,22 @@ test('an open checkout clears an expired pickup window and waits for an explicit
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolve);
   });
-  t.after(() => new Promise(resolve => server.close(resolve)));
-  const browser = await chromium.launch({ channel: 'chrome' });
-  t.after(() => browser.close());
+  let browser;
+  t.after(async () => {
+    try {
+      await browser?.close();
+    } finally {
+      await new Promise(resolve => {
+        server.close(resolve);
+        server.closeAllConnections();
+      });
+    }
+  }, { timeout: 10_000 });
+  browser = await chromium.launch({ channel: 'chrome' });
   const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   page.setDefaultTimeout(6500);
   await page.clock.install();
 
-  let clockAdvanced = false;
-  let refreshedMenus = 0;
-  await page.route(api + menuPath, async route => {
-    if (!clockAdvanced) return route.continue();
-    const response = await route.fetch();
-    // The real server clock has not advanced, as with a pre-cutoff snapshot arriving late.
-    refreshedMenus++;
-    await route.fulfill({ response });
-  });
   const quoteInputs = [];
   const orderWrites = [];
   page.on('request', request => {
@@ -2172,11 +2172,10 @@ test('an open checkout clears an expired pickup window and waits for an explicit
 
   const jump = expiredAt - await page.evaluate(() => Date.now());
   assert.ok(jump > 0, 'The window must expire as the test advances the browser clock');
-  clockAdvanced = true;
-  const refreshed = page.waitForResponse(response => response.url() === api + menuPath && response.ok());
+  // The live API still responds with its real clock while the browser crosses the pickup boundary.
+  const refreshed = page.waitForResponse(response => response.url() === api + menuPath && response.ok(), { timeout: 6500 });
   await page.clock.fastForward(jump);
   await Promise.all([shown(page, 'Your selected pickup time has passed. Choose another time.'), refreshed]);
-  assert.ok(refreshedMenus >= 1);
   assert.equal(await button(page, /^Confirm .*RWF/).count(), 0);
   assert.equal(await pickupTimes.getByRole('radio', { checked: true }).count(), 0);
   const expiredOption = pickupTimes.getByRole('radio', { disabled: false }).filter({ hasText: slotName(selected) });
