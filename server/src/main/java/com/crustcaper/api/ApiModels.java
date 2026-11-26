@@ -32,7 +32,14 @@ public final class ApiModels {
     public record GuestRefresh(String refreshToken, @JsonInclude(JsonInclude.Include.NON_NULL) String rotationKey) {
         public GuestRefresh(String refreshToken) { this(refreshToken, null); }
     }
-    public record CartLine(String sku, List<String> modifierIds, int quantity, long unitPrice) {}
+    public record SoldItem(String catalogVersion, Localized name, List<Localized> ingredients,
+                           List<Localized> allergens, List<Modifier> modifiers) {}
+    public record CartLine(String sku, List<String> modifierIds, int quantity, long unitPrice,
+                           @JsonInclude(JsonInclude.Include.NON_NULL) SoldItem soldItem) {
+        public CartLine(String sku, List<String> modifierIds, int quantity, long unitPrice) {
+            this(sku, modifierIds, quantity, unitPrice, null);
+        }
+    }
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record QuoteChange(String kind, String sku, Long previousPrice, Long currentPrice) {}
     public record Reorder(List<CartLine> lines, List<QuoteChange> changes) {}
