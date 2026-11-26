@@ -173,10 +173,11 @@ async function importCatalog(compose, load) {
 async function main() {
   const modes = process.argv.slice(2);
   const [mode] = modes;
-  if (modes.length > 1 || (mode !== undefined && mode !== '--load' && mode !== '--load-smoke')) {
-    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke]');
+  const load = mode === '--load' || mode === '--load-smoke';
+  const webPerf = mode === '--web-perf';
+  if (modes.length > 1 || (mode !== undefined && !load && !webPerf)) {
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf]');
   }
-  const load = mode !== undefined;
   const scenarios = load
     ? ['tooling/storefront-load.cjs', ...(mode === '--load-smoke' ? ['--smoke'] : [])]
     : ['--test', 'tests/storefront-https.test.cjs'];
@@ -235,6 +236,7 @@ async function main() {
         CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT: project,
         ...(evidence && { CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: evidence }),
         ...(load && { CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY: settings.fixtureMfaKey }),
+        ...(webPerf && { CRUSTCAPER_HTTPS_TEST_WEB_PERF: '1' }),
       },
       timeout: mode === '--load' ? 300000 : 180000,
     });

@@ -26,6 +26,7 @@
     "test:storefront": "node tooling/storefront-stack.cjs",
     "test:storefront:load": "node tooling/storefront-stack.cjs --load",
     "test:storefront:load-smoke": "node tooling/storefront-stack.cjs --load-smoke",
+    "test:storefront:web-perf": "node tooling/storefront-stack.cjs --web-perf",
     "start:local-stack": "node tooling/local-stack.cjs"
   },
   "dependencies": {

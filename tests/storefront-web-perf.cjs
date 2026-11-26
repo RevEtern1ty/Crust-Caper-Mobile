@@ -147,18 +147,27 @@ async function sample({ createContext, origin, locale }) {
     requireSample(rules.ruleIds?.length === 1 && typeof rules.ruleIds[0] === 'string'
       && rules.ruleIds[0].length > 0, 'network_rule_unconfirmed');
 
+    const expected = origin + '/menu/' + locale;
+    const documentRequests = new Set();
+    const throttledRequests = new Set();
+    cdp.on('Network.requestWillBeSent', ({ type, request, requestId }) => {
+      if (type === 'Document' && request.url === expected) documentRequests.add(requestId);
+    });
+    cdp.on('Network.requestWillBeSentExtraInfo', ({ requestId, appliedNetworkConditionsId }) => {
+      if (appliedNetworkConditionsId === rules.ruleIds[0]) throttledRequests.add(requestId);
+    });
     const assetFailures = new Set();
     page.on('requestfailed', () => assetFailures.add('request_failed'));
     page.on('response', response => {
       if (response.status() >= 400) assetFailures.add('http_error');
     });
     page.on('pageerror', () => assetFailures.add('page_error'));
-    const expected = origin + '/menu/' + locale;
     const document = await page.goto(expected, { waitUntil: 'load', timeout: navigationTimeoutMs });
     requireSample(document?.status() === 200 && page.url() === expected, 'invalid_catalog_navigation');
     const metrics = await stableMetrics(page);
+    requireSample([...documentRequests].some(id => throttledRequests.has(id)), 'navigation_network_rule_unconfirmed');
     requireSample(assetFailures.size === 0, 'catalog_resource_failure');
-    return normalize(metrics, origin, locale);
+    return { ...normalize(metrics, origin, locale), navigationThrottled: true };
   } finally {
     await context.close();
   }
