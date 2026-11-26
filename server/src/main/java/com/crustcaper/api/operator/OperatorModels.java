@@ -9,7 +9,11 @@ import java.util.UUID;
 final class OperatorModels {
     private OperatorModels() { }
 
-    record Login(String username, String password) {
+    record Login(String username, String password, String authenticatorCode) {
+        Login(String username, String password) {
+            this(username, password, null);
+        }
+
         @Override
         public String toString() { return "Login[redacted]"; }
     }

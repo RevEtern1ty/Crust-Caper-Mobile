@@ -12,6 +12,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.crustcaper.api.operator.OperatorMfaFixture;
 import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
 import java.nio.charset.StandardCharsets;
@@ -37,6 +38,8 @@ import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.convention.TestBean;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
@@ -52,6 +55,11 @@ import org.springframework.test.web.servlet.ResultActions;
 @ActiveProfiles("local")
 @DirtiesContext
 class OperatorPaymentRecheckIntegrationTest {
+    @DynamicPropertySource
+    static void operatorMfaKey(DynamicPropertyRegistry registry) {
+        OperatorMfaFixture.registerKey(registry);
+    }
+
     private static final String OPERATOR = "/api/v1/operator";
     private static final String ATTEMPTS = OPERATOR + "/payment-attempts";
     private static final String PROVIDER_TRANSACTION = "3456517";
@@ -299,9 +307,14 @@ class OperatorPaymentRecheckIntegrationTest {
     private String staff(Store store, String role) throws Exception {
         UUID operator = UUID.randomUUID();
         String token = fixtureToken(operator);
-        jdbc.sql("INSERT INTO operator_accounts (id, username, store_id, role, password_hash) VALUES (?, ?, ?, ?, 'fixture')")
-            .params(operator, "tester-" + operator, store.id(), role).update();
-        jdbc.sql("INSERT INTO operator_sessions (token_hash, operator_id, expires_at) VALUES (?, ?, now() + interval '15 minutes')")
+        jdbc.sql("""
+            INSERT INTO operator_accounts (id, username, store_id, role, password_hash, mfa_encrypted_secret)
+            VALUES (?, ?, ?, ?, 'fixture', ?)
+            """).params(operator, "tester-" + operator, store.id(), role, OperatorMfaFixture.encryptedSeed(operator)).update();
+        jdbc.sql("""
+            INSERT INTO operator_sessions (token_hash, operator_id, expires_at, mfa_verified)
+            VALUES (?, ?, now() + interval '15 minutes', true)
+            """)
             .params(tokenHash(token), operator).update();
         return "Bearer " + token;
     }

@@ -41,6 +41,8 @@ management:
         readiness:
           include: readinessState,db
 crustcaper:
+  operator:
+    mfa-key: ${CRUSTCAPER_OPERATOR_MFA_KEY:}
   app-links:
     ios-app-id: ${CRUSTCAPER_APP_LINK_IOS_APP_ID:}
     android-package: ${CRUSTCAPER_APP_LINK_ANDROID_PACKAGE:}

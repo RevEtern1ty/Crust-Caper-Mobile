@@ -12,6 +12,7 @@ import com.crustcaper.api.ApiModels.Localized;
 import com.crustcaper.api.ApiModels.OrderInput;
 import com.crustcaper.api.ApiModels.Product;
 import com.crustcaper.api.ApiModels.QuoteInput;
+import com.crustcaper.api.operator.OperatorMfaFixture;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
@@ -39,6 +40,8 @@ import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.convention.TestBean;
 import org.springframework.test.web.servlet.MockMvc;
 import tools.jackson.databind.JsonNode;
@@ -55,6 +58,11 @@ import tools.jackson.databind.json.JsonMapper;
 @AutoConfigureMockMvc
 @DirtiesContext
 class FlutterwaveCheckoutIntegrationTest {
+    @DynamicPropertySource
+    static void operatorMfaKey(DynamicPropertyRegistry registry) {
+        OperatorMfaFixture.registerKey(registry);
+    }
+
     private static final String API = "/api/v1";
     private static final String STORE_PREFIX = "provider-fixture-";
     private static final String SKU = "fixture-burger";
@@ -255,9 +263,14 @@ class FlutterwaveCheckoutIntegrationTest {
         String token = "x" + UUID.randomUUID().toString().replace("-", "") + "testAbCdEf";
         String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
             .digest(token.getBytes(StandardCharsets.US_ASCII)));
-        jdbc.sql("INSERT INTO operator_accounts (id, store_id, username, role, password_hash) VALUES (?, ?, ?, 'kitchen', 'fixture')")
-            .params(operator, store, store).update();
-        jdbc.sql("INSERT INTO operator_sessions (token_hash, operator_id, expires_at) VALUES (?, ?, now() + interval '15 minutes')")
+        jdbc.sql("""
+            INSERT INTO operator_accounts (id, store_id, username, role, password_hash, mfa_encrypted_secret)
+            VALUES (?, ?, ?, 'kitchen', 'fixture', ?)
+            """).params(operator, store, store, OperatorMfaFixture.encryptedSeed(operator)).update();
+        jdbc.sql("""
+            INSERT INTO operator_sessions (token_hash, operator_id, expires_at, mfa_verified)
+            VALUES (?, ?, now() + interval '15 minutes', true)
+            """)
             .params(hash, operator).update();
         return token;
     }

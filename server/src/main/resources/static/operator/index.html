@@ -29,6 +29,10 @@
           <input id="username" name="username" required maxlength="128" autocomplete="username" autocapitalize="none" spellcheck="false">
           <label for="password">Password</label>
           <input id="password" name="password" type="password" required maxlength="256" autocomplete="current-password">
+          <label for="authenticator-code">Authenticator code</label>
+          <input id="authenticator-code" name="authenticatorCode" type="text" inputmode="numeric" pattern="[0-9]{6}"
+            maxlength="6" autocomplete="one-time-code" spellcheck="false" aria-describedby="authenticator-code-help">
+          <p class="login-code-help" id="authenticator-code-help">Use the six-digit code from your authenticator if your account requires one.</p>
           <p class="problem" id="login-problem" role="alert" hidden></p>
           <button class="button button-primary" id="login-button" type="submit">Sign in</button>
         </form>

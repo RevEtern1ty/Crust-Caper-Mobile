@@ -7,6 +7,7 @@ const signIn = element('sign-in');
 const loginForm = element('login-form');
 const loginButton = element('login-button');
 const loginProblem = element('login-problem');
+const authenticatorCode = element('authenticator-code');
 const workstation = element('workstation');
 const workstationTitle = element('workstation-title');
 const refreshButton = element('refresh-button');
@@ -1261,7 +1262,10 @@ loginForm.addEventListener('submit', async (event) => {
   if (loginButton.disabled) return;
 
   const credentials = new FormData(loginForm);
+  const code = String(credentials.get('authenticatorCode') ?? '');
   element('password').value = '';
+  authenticatorCode.value = '';
+  authenticatorCode.disabled = true;
   showMessage(loginProblem);
   const version = ++authVersion;
   loginButton.disabled = true;
@@ -1270,6 +1274,7 @@ loginForm.addEventListener('submit', async (event) => {
     const data = await request('/sessions', { method: 'POST', body: {
       username: String(credentials.get('username') ?? '').trim(),
       password: String(credentials.get('password') ?? ''),
+      ...(code ? { authenticatorCode: code } : {}),
     } });
     if (authVersion !== version) return;
     const expiresAt = Date.parse(data?.expiresAt);
@@ -1306,9 +1311,11 @@ loginForm.addEventListener('submit', async (event) => {
   } catch (error) {
     if (authVersion !== version) return;
     showMessage(loginProblem, error instanceof ApiError && error.status === 401
-      ? 'The username or password was not accepted.' : messageFor(error));
+      ? 'The username, password or authenticator code was not accepted.' : messageFor(error));
     element('password').focus();
   } finally {
+    authenticatorCode.value = '';
+    authenticatorCode.disabled = false;
     loginButton.disabled = false;
     loginButton.textContent = 'Sign in';
   }

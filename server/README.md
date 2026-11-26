@@ -32,13 +32,14 @@ Build the Linux container with `docker build -t crustcaper-api ./server` or depl
 | --- | --- |
 | `SPRING_PROFILES_ACTIVE` | `stage` for Flutterwave Test or `production` for Flutterwave Live. |
 | `CRUSTCAPER_DB_URL`, `CRUSTCAPER_DB_USER`, `CRUSTCAPER_DB_PASSWORD` | Dedicated encrypted connection and application credentials from the deployment secret store. |
+| `CRUSTCAPER_OPERATOR_MFA_KEY` | Required staff authenticator encryption key. Base64-encode 32 random bytes, use a separate key for each environment, and store it with the deployment secrets. See [Staff access](docs/OPERATIONS.md#выдача-доступа). |
 | `CRUSTCAPER_PAYMENT_PROVIDER` | `flutterwave`. |
 | `FLUTTERWAVE_SECRET_KEY`, `FLUTTERWAVE_WEBHOOK_SECRET`, `CRUST_PAYMENT_RETURN_URL` | Environment-specific provider configuration. See [Payments](docs/PAYMENTS.md). |
 | `CRUSTCAPER_PORT` | Listener port behind the HTTPS ingress. Defaults to 8080. |
 
 Requests wait up to five seconds for a PostgreSQL connection from the runtime pool. Runtime pgJDBC connections default to a three-second socket connect timeout and a six-second socket read timeout. Parameters with the same names in the JDBC URL take precedence. Flyway opens a separate connection at startup using the same JDBC URL and credentials, so migrations can run beyond the runtime read timeout. Keep `sslmode=verify-full` and the CA configuration in the JDBC URL for deployments. [pgJDBC connection parameters](https://jdbc.postgresql.org/documentation/use/)
 
-Production uses the real catalog loaded for the restaurant and individual operator accounts provisioned for its store. See [Catalog](docs/CATALOG.md) and [Operations](docs/OPERATIONS.md). Configure public HTTPS routing, request limits, provider webhooks, backups and monitoring before admitting traffic. A readiness probe is available at `/actuator/health/readiness`; details and other management endpoints are withheld.
+Production uses the real catalog loaded for the restaurant and individual operator accounts provisioned with authenticators for its store. See [Catalog](docs/CATALOG.md) and [Operations](docs/OPERATIONS.md). Configure public HTTPS routing, request limits, provider webhooks, backups and monitoring before admitting traffic. A readiness probe is available at `/actuator/health/readiness`; details and other management endpoints are withheld.
 
 The operator queue shows confirmed orders by store and role. The release procedure accounts for late or duplicate payment exceptions and fiscal receipt integration. [Release checks](../docs/runbooks/MOBILE_RELEASE.md)
 

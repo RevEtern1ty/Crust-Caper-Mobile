@@ -1044,6 +1044,131 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   assert.deepEqual(errors, []);
 });
 
+test('staff sign-in submits a private authenticator code and permits blank local demo login', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 720 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+  const submissions = [];
+  const authorizedReads = [];
+  const sessionUrl = api + '/operator/sessions';
+  const code = page.getByLabel('Authenticator code', { exact: true });
+  const username = page.getByLabel('Username', { exact: true });
+  const password = page.getByLabel('Password', { exact: true });
+  const login = button(page, 'Sign in');
+  const deniedMessage = 'The username, password or authenticator code was not accepted.';
+  let releaseWrong;
+  const pendingWrong = new Promise(resolve => { releaseWrong = resolve; });
+  t.after(releaseWrong);
+  await restrictToOperatorAssets(page);
+  await page.route('**/api/v1/operator/**', async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname.endsWith('/sessions')) {
+      assert.equal(request.method(), 'POST');
+      assert.equal(url.search, '');
+      const credentials = request.postDataJSON();
+      submissions.push(credentials);
+      if (credentials.authenticatorCode === '123456') await pendingWrong;
+      const demo = credentials.username === 'fixture-demo' && !Object.hasOwn(credentials, 'authenticatorCode');
+      const approved = credentials.username === 'fixture-enrolled' && credentials.authenticatorCode === '012345';
+      if (credentials.password !== 'fixture-only' || (!demo && !approved)) {
+        return route.fulfill({ status: 401, json: { code: 'unauthenticated' } });
+      }
+      return route.fulfill({ status: 201, headers: { 'Cache-Control': 'no-store' }, json: {
+        accessToken: demo ? 'fixture-local-session' : 'fixture-mfa-session', role: 'kitchen', storeId: 'kigali',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      } });
+    }
+    if (url.pathname.endsWith('/sessions/current')) return route.fulfill({ status: 204, body: '' });
+    if (url.pathname.endsWith('/orders')) {
+      authorizedReads.push((await request.allHeaders()).authorization);
+      return route.fulfill({ json: { orders: [], serverTime: new Date().toISOString() } });
+    }
+    return route.abort();
+  });
+  await page.goto(new URL('/operator/index.html', api).href);
+  assert.equal(await code.getAttribute('autocomplete'), 'one-time-code');
+  assert.equal(await code.getAttribute('inputmode'), 'numeric');
+  assert.equal(await code.getAttribute('maxlength'), '6');
+  assert.equal(await code.getAttribute('required'), null);
+  for (const width of [320, 390, 430]) {
+    await page.setViewportSize({ width, height: 720 });
+    const inspect = async size => {
+      await code.scrollIntoViewIfNeeded();
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+      assert.ok(await code.evaluate(element => {
+        const { left, right, height } = element.getBoundingClientRect();
+        return left >= 0 && right <= innerWidth && height >= 48;
+      }));
+      await capture(page, `operator-staff-mfa-${width}-${size}`);
+    };
+    await inspect('normal');
+    await withLargeText(page, () => inspect('large'), 'div, span, p, h1, label, button');
+  }
+  await page.setViewportSize({ width: 320, height: 720 });
+
+  const fillEnrolled = async () => {
+    await username.fill('fixture-enrolled');
+    await password.fill('fixture-only');
+  };
+  await fillEnrolled();
+  await password.press('Tab');
+  assert.equal(await code.evaluate(element => element === document.activeElement), true);
+  const missing = page.waitForResponse(response => response.url() === sessionUrl);
+  await code.press('Enter');
+  const missingReply = await missing;
+  assert.equal(missingReply.status(), 401);
+  assert.deepEqual(await missingReply.json(), { code: 'unauthenticated' });
+  await shown(page, deniedMessage);
+  assert.deepEqual(submissions[0], { username: 'fixture-enrolled', password: 'fixture-only' });
+  assert.equal(await code.inputValue(), '');
+  assert.deepEqual(authorizedReads, []);
+
+  await fillEnrolled();
+  await code.fill('123456');
+  const sentWrong = page.waitForRequest(request => request.url() === sessionUrl);
+  const denied = page.waitForResponse(response => response.url() === sessionUrl);
+  await code.press('Enter');
+  await sentWrong;
+  assert.equal(await code.inputValue(), '');
+  assert.equal(await code.isDisabled(), true);
+  releaseWrong();
+  const deniedReply = await denied;
+  assert.equal(deniedReply.status(), 401);
+  assert.deepEqual(await deniedReply.json(), { code: 'unauthenticated' });
+  await shown(page, deniedMessage);
+  assert.equal(await code.inputValue(), '');
+  assert.equal(await code.isEnabled(), true);
+  assert.deepEqual(authorizedReads, []);
+
+  await fillEnrolled();
+  await code.fill('012345');
+  const accepted = page.waitForResponse(response => response.url() === sessionUrl);
+  await code.press('Enter');
+  const acceptedReply = await accepted;
+  assert.equal(acceptedReply.status(), 201);
+  assert.equal(acceptedReply.headers()['cache-control'], 'no-store');
+  await shown(page, 'Kitchen queue');
+  assert.deepEqual(submissions[2], { username: 'fixture-enrolled', password: 'fixture-only', authenticatorCode: '012345' });
+  assert.equal(new URL(page.url()).search, '');
+  assert.equal(await code.inputValue(), '');
+  assert.ok(await page.evaluate(() => ![...Object.values(localStorage), ...Object.values(sessionStorage)].some(value => value.includes('012345'))));
+  await button(page, 'Sign out').click();
+  await shown(page, 'Staff sign in');
+  assert.equal(await code.inputValue(), '');
+
+  await username.fill('fixture-demo');
+  await password.fill('fixture-only');
+  await login.click();
+  await shown(page, 'Kitchen queue');
+  await shown(page, 'No paid orders are waiting.');
+  assert.deepEqual(submissions[3], { username: 'fixture-demo', password: 'fixture-only' });
+  assert.ok(authorizedReads.includes('Bearer fixture-mfa-session'));
+  assert.ok(authorizedReads.includes('Bearer fixture-local-session'));
+});
+
 test('manager can reconcile a Kigali date and download its CSV without leaking stale requests', { timeout: 40_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const browser = await chromium.launch({ channel: 'chrome' });

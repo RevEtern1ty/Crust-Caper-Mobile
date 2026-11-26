@@ -334,6 +334,7 @@ paths:
   /operator/sessions:
     post:
       operationId: createOperatorSession
+      description: Verify the staff password and authenticator code together. Stage and production require both; the local synthetic accounts allow the password alone.
       requestBody:
         required: true
         content:
@@ -344,6 +345,11 @@ paths:
               properties:
                 username: { type: string, maxLength: 64 }
                 password: { type: string, minLength: 1, maxLength: 256, writeOnly: true }
+                authenticatorCode:
+                  type: string
+                  pattern: '^[0-9]{6}$'
+                  writeOnly: true
+                  description: Current six-digit code from the enrolled authenticator. Keep leading zeroes. A code can be accepted only once.
       responses:
         '201':
           description: Short-lived operator session and its authorized role and store.
