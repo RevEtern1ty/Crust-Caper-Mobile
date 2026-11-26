@@ -252,7 +252,8 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
       'database_recovery_api_not_replaced');
     await apiDatabase(active, target, recovered, '--recovery-api');
     await waitReady(active, edge, fixture.request);
-    report.recoveredApi = { readyAfterStartMs: elapsed(targetStartedAt), readyAfterRestoreStartedMs: elapsed(restoreStartedAt) };
+    report.recoveredApi = { readyAfterStartMs: elapsed(targetStartedAt), readyAfterRestoreStartedMs: elapsed(restoreStartedAt),
+      readyAfterSourceStopStartedMs: elapsed(sourceStopStartedAt) };
     const reconcileStartedAt = performance.now();
     const originalJourney = witness(await journey.verifyRecovered(), {
       restoredPaidOrders: 2, restoredGuestSessions: 2, restoredStaffSessions: 2, restoredReceiptByteIdentical: true,
@@ -276,14 +277,17 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
     const current = await inspect(active, project, 'api', target.id);
     requireCondition(current.status === 'running' && current.startedAt === target.startedAt
       && sameSnapshot(await databaseSnapshot(active, database, source), afterSnapshot), 'database_recovery_final_scope_changed');
-    report.isolatedNewOrder = { elapsedMs: elapsed(probeStartedAt), counts: counts(afterProbe), newOrderJourney };
-    report.providerUnchanged = true;
+    report.isolatedNewOrder = { elapsedMs: elapsed(probeStartedAt), verifiedAfterSourceStopStartedMs: elapsed(sourceStopStartedAt),
+      counts: counts(afterProbe), newOrderJourney };
+    report.providerProcessUnchanged = true;
     report.sourceWitnessCountsUnchangedAfterStop = true;
     report.manualReconciliationRequired = true;
     report.phase = 'complete';
   } catch (error) {
+    const code = typeof error?.code === 'string' && /^(?:recovery|checkout)_[a-z_]{2,48}$/.test(error.code)
+      ? error.code : 'database_recovery_journey_failed';
     report.errors.push(active.aborted ? 'database_recovery_interrupted'
-      : error instanceof RecoveryFailure ? error.message : 'database_recovery_journey_failed');
+      : error instanceof RecoveryFailure ? error.message : code);
   } finally {
     try {
       await journey?.close();
