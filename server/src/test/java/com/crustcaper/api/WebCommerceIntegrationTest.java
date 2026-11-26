@@ -22,7 +22,11 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -38,6 +42,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -58,6 +63,7 @@ class WebCommerceIntegrationTest {
     private static final String QUOTES = WEB + "/quotes";
     private static final String ORDERS = WEB + "/orders";
     private static final String CHALLENGES = WEB + "/order-access/challenges";
+    private static final String CHECKOUT_RECOVERY = WEB + "/checkout-recovery";
     private static final String WEB_HEADER = "X-CrustCaper-Web";
     private static final String SESSION_HEADER = "X-CrustCaper-Session";
     private static final String COOKIE = "__Host-crustcaper-web";
@@ -72,6 +78,7 @@ class WebCommerceIntegrationTest {
     @Autowired JdbcClient jdbc;
     @Autowired ObjectMapper json;
     @Autowired OrderService orders;
+    @Autowired TransactionTemplate transactions;
     @MockitoBean(name = "localGateway", enforceOverride = true) PaymentGateway gateway;
 
     private final String store = "web-fixture-" + UUID.randomUUID();
@@ -79,6 +86,7 @@ class WebCommerceIntegrationTest {
 
     private record Browser(UUID id, Cookie cookie) {}
     private record NativeGuest(UUID id, String bearer, String refresh) {}
+    private record StagedCreate(UUID id, int transactionPid) {}
 
     @AfterEach
     void removeOnlyFixtures() {
@@ -280,6 +288,205 @@ class WebCommerceIntegrationTest {
             .andExpect(status().isOk()).andExpect(jsonPath("$.receiptUrl").value(nativePath + "/receipt"));
     }
 
+    @Test
+    void verifiedCheckoutRecoveryRestoresOneWebOrderAndBothSessionsShareOnePaymentAttempt() throws Exception {
+        stockFixture();
+        var owner = issueBrowser();
+        var replacement = issueBrowser();
+        var stranger = issueBrowser();
+        String quote = quote(authorized(POST, QUOTES, owner));
+        String createKey = UUID.randomUUID().toString();
+        UUID order = UUID.fromString(body(submitOrder(authorized(POST, ORDERS, owner), quote, createKey)
+            .andExpect(status().isOk())).path("id").asString());
+        String orderPath = ORDERS + "/" + order;
+
+        String anotherQuote = quote(authorized(POST, QUOTES, owner));
+        String otherOrder = body(submitOrder(authorized(POST, ORDERS, owner), anotherQuote, UUID.randomUUID().toString())
+            .andExpect(status().isOk())).path("id").asString();
+        api.perform(authorized(GET, orderPath, replacement)).andExpect(status().isNotFound());
+        recoverCheckout(replacement, quote, UUID.randomUUID().toString(), PHONE).andExpect(status().isNotFound());
+        recoverCheckout(replacement, anotherQuote, createKey, PHONE).andExpect(status().isNotFound());
+
+        var wrongContact = checkoutChallenge(replacement, quote, createKey, "+250700000001");
+        awaitChallengeState(wrongContact, "closed");
+        verifyChallenge(replacement, wrongContact).andExpect(status().isNotFound());
+        api.perform(authorized(GET, orderPath, replacement)).andExpect(status().isNotFound());
+        api.perform(authorized(POST, orderPath + "/payments", replacement).header(KEY, "premature-payment"))
+            .andExpect(status().isNotFound());
+
+        var challenge = checkoutChallenge(replacement, quote, createKey, PHONE);
+        assertThat(challenge).isNotEqualTo(wrongContact);
+        awaitDelivery(challenge);
+        assertThat(checkoutChallenge(replacement, quote, createKey, PHONE)).isEqualTo(challenge);
+        verifyChallenge(stranger, challenge).andExpect(status().isNotFound());
+        verifyChallenge(replacement, challenge, "000000").andExpect(status().isNotFound());
+        api.perform(authorized(GET, orderPath, replacement)).andExpect(status().isNotFound());
+        for (int replay = 0; replay < 2; replay++) {
+            verifyChallenge(replacement, challenge).andExpect(status().isOk())
+                .andExpect(jsonPath("$.orderId").value(order.toString()));
+        }
+        api.perform(authorized(GET, orderPath, replacement)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.id").value(order.toString())).andExpect(jsonPath("$.recoveryReadOnly").doesNotExist())
+            .andExpect(jsonPath("$.paymentStatus").value("unpaid"));
+        api.perform(authorized(GET, ORDERS + "/" + otherOrder, replacement)).andExpect(status().isNotFound());
+        api.perform(authorized(GET, orderPath, stranger)).andExpect(status().isNotFound());
+        api.perform(authorized(GET, ORDERS + "/recovery", replacement).header(KEY, createKey))
+            .andExpect(status().isNotFound());
+        assertThat(jdbc.sql("SELECT guest_session_id FROM orders WHERE id = ?").param(order)
+            .query(UUID.class).single()).isEqualTo(owner.id());
+
+        String paymentPath = orderPath + "/payments";
+        String paymentKey = UUID.randomUUID().toString();
+        var providerEntered = new CountDownLatch(1);
+        var allowProvider = new CountDownLatch(1);
+        when(gateway.open(any())).thenAnswer(invocation -> {
+            providerEntered.countDown();
+            assertThat(allowProvider.await(10, TimeUnit.SECONDS)).isTrue();
+            return new PaymentGateway.HostedPayment(CHECKOUT);
+        });
+        String attempt;
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var recoveredPayment = executor.submit(() -> body(api.perform(authorized(POST, paymentPath, replacement)
+                .header(KEY, paymentKey)).andExpect(status().isOk())));
+            try {
+                assertThat(providerEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                api.perform(authorized(POST, paymentPath, owner).header(KEY, "concurrent-original-payment"))
+                    .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("payment_pending"));
+                var originalRetry = body(api.perform(authorized(POST, paymentPath, owner).header(KEY, paymentKey))
+                    .andExpect(status().isOk()));
+                attempt = originalRetry.path("id").asString();
+                assertThat(originalRetry.path("status").asString()).isEqualTo("processing");
+            } finally {
+                allowProvider.countDown();
+            }
+            assertThat(recoveredPayment.get(5, TimeUnit.SECONDS).path("id").asString()).isEqualTo(attempt);
+        }
+        verify(gateway).open(argThat(input -> input.checkoutChannel() == PaymentGateway.CheckoutChannel.WEB
+            && input.reference().equals(attempt)));
+        api.perform(authorized(GET, orderPath, replacement)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.paymentAttempt.id").value(attempt))
+            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").value(CHECKOUT));
+        assertThat(jdbc.sql("SELECT id FROM payment_attempts WHERE order_id = ?")
+            .param(order).query(UUID.class).list()).containsExactly(UUID.fromString(attempt));
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE quote_id = ?").param(UUID.fromString(quote))
+            .query(Long.class).single()).isEqualTo(1L);
+    }
+
+    @Test
+    void checkoutRecoveryClearsOnlyAnExpiredUnusedWebQuote() throws Exception {
+        stockFixture();
+        var owner = issueBrowser();
+        var replacement = issueBrowser();
+        String quote = quote(authorized(POST, QUOTES, owner));
+        String key = UUID.randomUUID().toString();
+        var data = Map.of("quoteId", quote, "key", key, "phone", PHONE);
+        api.perform(asJson(guarded(POST, CHECKOUT_RECOVERY), data)).andExpect(status().isUnauthorized());
+        api.perform(asJson(guarded(POST, CHECKOUT_RECOVERY).cookie(replacement.cookie())
+            .header(SESSION_HEADER, owner.id().toString()), data)).andExpect(status().isUnauthorized());
+        api.perform(asJson(web(POST, CHECKOUT_RECOVERY).cookie(replacement.cookie())
+            .header(HttpHeaders.ORIGIN, FOREIGN_ORIGIN).header(WEB_HEADER, "1")
+            .header(SESSION_HEADER, replacement.id().toString()), data)).andExpect(status().isForbidden());
+        recoverCheckout(replacement, "invalid-quote", key, PHONE).andExpect(status().isBadRequest());
+        recoverCheckout(replacement, UUID.randomUUID().toString(), key, PHONE).andExpect(status().isNotFound());
+
+        var waiting = body(recoverCheckout(replacement, quote, key, PHONE).andExpect(status().isOk())
+            .andExpect(header().string(HttpHeaders.CACHE_CONTROL, containsString("no-store"))));
+        assertThat(waiting.path("state").asString()).isEqualTo("waiting");
+        assertThat(Instant.parse(waiting.path("retryAt").asString())).isAfter(Instant.now());
+        assertThat(waiting.size()).isEqualTo(2);
+        expireQuote(quote);
+        var unused = body(recoverCheckout(replacement, quote, key, PHONE).andExpect(status().isOk())
+            .andExpect(header().string(HttpHeaders.CACHE_CONTROL, containsString("no-store"))));
+        assertThat(unused.path("state").asString()).isEqualTo("not_placed");
+        assertThat(unused.size()).isEqualTo(1);
+        submitOrder(authorized(POST, ORDERS, owner), quote, key).andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("quote_expired"));
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?").param(store)
+            .query(Long.class).single()).isZero();
+
+        var nativeGuest = issueNative();
+        String nativeQuote = quote(nativeRequest(POST, API + "/quotes", nativeGuest));
+        submitOrder(nativeRequest(POST, API + "/orders", nativeGuest), nativeQuote, key).andExpect(status().isOk());
+        expireQuote(nativeQuote);
+        recoverCheckout(replacement, nativeQuote, key, PHONE).andExpect(status().isNotFound());
+        String nativeUnused = quote(nativeRequest(POST, API + "/quotes", nativeGuest));
+        expireQuote(nativeUnused);
+        recoverCheckout(replacement, nativeUnused, key, PHONE).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void checkoutRecoveryWaitsForTheOriginalCreateTransactionBeforeResolvingAnExpiredQuote() throws Exception {
+        stockFixture();
+        var owner = issueBrowser();
+        var replacement = issueBrowser();
+        String quote = quote(authorized(POST, QUOTES, owner));
+        String key = UUID.randomUUID().toString();
+        var insertion = new CompletableFuture<StagedCreate>();
+        var allowCommit = new CountDownLatch(1);
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var creator = executor.submit(() -> transactions.executeWithoutResult(status -> {
+                try {
+                    var order = orders.createWebOrder(owner.id(), key,
+                        new ApiModels.OrderInput(quote, PHONE, "web-race@example.test"));
+                    int pid = jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single();
+                    insertion.complete(new StagedCreate(order.id(), pid));
+                    assertThat(allowCommit.await(10, TimeUnit.SECONDS)).isTrue();
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted before committing the fixture order", error);
+                } catch (RuntimeException | Error failure) {
+                    insertion.completeExceptionally(failure);
+                    throw failure;
+                }
+            }));
+            var staged = insertion.get(5, TimeUnit.SECONDS);
+            var recovery = executor.submit(() -> {
+                // The create transaction has read the quote and inserted the order but has not committed.
+                expireQuote(quote);
+                return body(recoverCheckout(replacement, quote, key, PHONE).andExpect(status().isOk()));
+            });
+            try {
+                awaitGuestLock(staged.transactionPid());
+                assertThat(recovery.isDone()).isFalse();
+            } finally {
+                allowCommit.countDown();
+            }
+            creator.get(5, TimeUnit.SECONDS);
+            var recovered = recovery.get(5, TimeUnit.SECONDS);
+            assertThat(recovered.path("state").asString()).isEqualTo("verify");
+            UUID challenge = UUID.fromString(recovered.path("challengeId").asString());
+            awaitDelivery(challenge);
+            api.perform(authorized(DELETE, SESSION, owner)).andExpect(status().isNoContent());
+            api.perform(authorized(GET, ORDERS + "/" + staged.id(), owner)).andExpect(status().isUnauthorized());
+            verifyChallenge(replacement, challenge).andExpect(status().isOk())
+                .andExpect(jsonPath("$.orderId").value(staged.id().toString()));
+            api.perform(authorized(GET, ORDERS + "/" + staged.id(), replacement)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.recoveryReadOnly").doesNotExist());
+        }
+    }
+
+    @Test
+    void ordinaryPhoneRecoveryOfAWebOrderStillCannotStartPayment() throws Exception {
+        stockFixture();
+        var owner = issueBrowser();
+        var recipient = issueBrowser();
+        String quote = quote(authorized(POST, QUOTES, owner));
+        String order = body(submitOrder(authorized(POST, ORDERS, owner), quote, UUID.randomUUID().toString())
+            .andExpect(status().isOk())).path("id").asString();
+        String code = order.substring(28).toUpperCase(Locale.ROOT);
+        var started = body(api.perform(asJson(authorized(POST, CHALLENGES, recipient),
+            new OrderAccessController.StartInput(code, PHONE))).andExpect(status().isAccepted()));
+        UUID challenge = UUID.fromString(started.path("challengeId").asString());
+        awaitDelivery(challenge);
+        verifyChallenge(recipient, challenge).andExpect(status().isOk()).andExpect(jsonPath("$.orderId").value(order));
+        api.perform(authorized(GET, ORDERS + "/" + order, recipient)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.recoveryReadOnly").value(true));
+        api.perform(authorized(POST, ORDERS + "/" + order + "/payments", recipient).header(KEY, "read-only"))
+            .andExpect(status().isNotFound());
+        assertThat(jdbc.sql("SELECT count(*) FROM payment_attempts WHERE order_id = ?").param(UUID.fromString(order))
+            .query(Long.class).single()).isZero();
+    }
+
     private Browser issueBrowser() throws Exception {
         var response = api.perform(guarded(POST, SESSION)).andExpect(status().isOk())
             .andExpect(header().string(HttpHeaders.CACHE_CONTROL, containsString("no-store")))
@@ -324,23 +531,63 @@ class WebCommerceIntegrationTest {
         return api.perform(asJson(request.header(KEY, key), new ApiModels.OrderInput(quote, PHONE, "web-fixture@example.test")));
     }
 
+    private ResultActions recoverCheckout(Browser browser, String quote, String key, String phone) throws Exception {
+        return api.perform(asJson(authorized(POST, CHECKOUT_RECOVERY, browser),
+            Map.of("quoteId", quote, "key", key, "phone", phone)));
+    }
+
+    private UUID checkoutChallenge(Browser browser, String quote, String key, String phone) throws Exception {
+        var result = body(recoverCheckout(browser, quote, key, phone).andExpect(status().isOk())
+            .andExpect(header().string(HttpHeaders.CACHE_CONTROL, containsString("no-store"))));
+        assertThat(result.path("state").asString()).isEqualTo("verify");
+        assertThat(result.size()).isEqualTo(2);
+        return UUID.fromString(result.path("challengeId").asString());
+    }
+
+    private void expireQuote(String quote) {
+        jdbc.sql("UPDATE quotes SET expires_at = clock_timestamp() - interval '1 second' WHERE id = ?")
+            .param(UUID.fromString(quote)).update();
+    }
+
     private ResultActions verifyChallenge(Browser browser, UUID challenge) throws Exception {
+        return verifyChallenge(browser, challenge, OTP);
+    }
+
+    private ResultActions verifyChallenge(Browser browser, UUID challenge, String code) throws Exception {
         var result = api.perform(asJson(authorized(POST, CHALLENGES + "/" + challenge + "/verify", browser),
-            new OrderAccessController.VerifyInput(OTP)));
+            new OrderAccessController.VerifyInput(code)));
         var initial = result.andReturn();
         return initial.getRequest().isAsyncStarted() ? api.perform(asyncDispatch(initial)) : result;
     }
 
     private void awaitDelivery(UUID challenge) throws InterruptedException {
+        awaitChallengeState(challenge, "sent");
+    }
+
+    private void awaitChallengeState(UUID challenge, String expected) throws InterruptedException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         String latest;
         do {
             latest = jdbc.sql("SELECT state FROM order_access_challenges WHERE id = ?")
                 .param(challenge).query(String.class).single();
-            if ("sent".equals(latest)) return;
+            if (expected.equals(latest)) return;
             Thread.sleep(20);
         } while (System.nanoTime() < deadline);
-        assertThat(latest).isEqualTo("sent");
+        assertThat(latest).isEqualTo(expected);
+    }
+
+    private void awaitGuestLock(int originalPid) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        do {
+            boolean waiting = jdbc.sql("""
+                SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database() AND wait_event_type = 'Lock'
+                      AND query LIKE '%guest_sessions%' AND ? = ANY(pg_blocking_pids(pid)))
+                """).param(originalPid).query(Boolean.class).single();
+            if (waiting) return;
+            Thread.sleep(25);
+        } while (System.nanoTime() < deadline);
+        throw new AssertionError("Checkout recovery did not wait for the original guest's create transaction");
     }
 
     private void stockFixture() {
