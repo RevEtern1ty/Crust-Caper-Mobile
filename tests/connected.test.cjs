@@ -192,6 +192,59 @@ test('an earlier order retains its sold names after the public menu is renamed',
   }
 });
 
+test('checkout shows the server-confirmed item names when the buyer menu is stale', { timeout: 30_000 }, async t => {
+  const menuPath = '/stores/kigali/menu?channel=mobile';
+  const menu = await send(menuPath).then(response => response.json());
+  const product = menu.products.find(item => item.sku === 'double-smash' && item.available);
+  const cheese = product?.modifiers.find(option => option.id === 'extra-cheese');
+  assert.ok(product && cheese);
+  const staleName = 'Old name in the cached menu';
+  const staleOption = 'Old name for the cheese';
+  const stale = {
+    ...menu,
+    products: menu.products.map(item => item !== product ? item : {
+      ...item, name: { ...item.name, en: staleName },
+      modifiers: item.modifiers.map(option => option !== cheese ? option : {
+        ...option, name: { ...option.name, en: staleOption },
+      }),
+    }),
+  };
+
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, serviceWorkers: 'block' });
+  page.setDefaultTimeout(6500);
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  await page.route(api + menuPath, route => route.fulfill({ json: stale, headers: { 'Access-Control-Allow-Origin': origin } }));
+
+  await page.goto(origin);
+  await button(page, new RegExp('^' + staleName + ',')).click();
+  await button(page, new RegExp(staleOption)).click();
+  await button(page, /^Add to cart/).click();
+  await button(page, /^View cart/).click();
+  await button(page, 'Choose pickup time').click();
+  await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { disabled: false }).nth(2).click();
+  await page.getByLabel('Phone number', { exact: true }).fill(contact.phone);
+  await page.getByLabel('Email address', { exact: true }).fill(contact.email);
+  const reply = page.waitForResponse(response => response.url() === api + '/quotes' && response.request().method() === 'POST');
+  await button(page, 'Review order').click();
+  const response = await reply;
+  assert.equal(response.status(), 200);
+  assert.deepEqual((await response.json()).lines[0].soldItem.name, product.name);
+  await shown(page, 'Included tax');
+  assert.equal(await page.getByText('1 × ' + product.name.en, { exact: true }).count(), 1,
+    'The buyer must confirm the name in the quote, even when prices match a stale menu');
+  await shown(page, cheese.name.en);
+  assert.equal(await page.getByText(staleOption, { exact: true }).count(), 0);
+  await button(page, /^Confirm .*RWF/).waitFor();
+});
+
 test('delivery intake and handoff recover lost replies alongside a paid direct order', { timeout: 35_000 }, async t => {
   const kitchen = await operator('demo-kitchen');
   const pickup = await operator('demo-pickup');

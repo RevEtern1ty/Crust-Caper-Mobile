@@ -1953,8 +1953,14 @@ components:
         sku: { type: string }
         name: { $ref: '#/components/schemas/Localized' }
         description: { $ref: '#/components/schemas/Localized' }
-        ingredients: { type: array, items: { $ref: '#/components/schemas/Localized' } }
-        allergens: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+        ingredients:
+          type: array
+          items: { $ref: '#/components/schemas/Localized' }
+          description: Published ingredients of the base recipe.
+        allergens:
+          type: array
+          items: { $ref: '#/components/schemas/Localized' }
+          description: Published allergen declarations of the base recipe.
         category: { type: string, enum: [burgers, combos, sides, drinks] }
         price: { $ref: '#/components/schemas/Amount' }
         available: { type: boolean }
