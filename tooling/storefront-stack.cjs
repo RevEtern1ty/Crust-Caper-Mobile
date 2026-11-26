@@ -29,8 +29,8 @@ function interrupt() {
   if (active && !active.cleanup) active.child.kill();
 }
 
-function run(action, command, args, { env, input, capture = false, cleanup = false, timeout = 30000 } = {}) {
-  if (interrupted && !cleanup) throw new Error('Storefront HTTPS verification interrupted');
+function run(action, command, args, { env, input, capture = false, cleanup = false, timeout = 30000, signal } = {}) {
+  if ((interrupted && !cleanup) || signal?.aborted) throw new Error('Storefront HTTPS verification interrupted');
 
   return new Promise((done, reject) => {
     const child = spawn(command, args, {
@@ -39,6 +39,7 @@ function run(action, command, args, { env, input, capture = false, cleanup = fal
       stdio: [input === undefined ? 'ignore' : 'pipe', capture ? 'pipe' : 'inherit',
         capture ? 'ignore' : 'inherit'],
       timeout,
+      signal,
       windowsHide: true,
     });
     active = { child, cleanup };
@@ -48,10 +49,10 @@ function run(action, command, args, { env, input, capture = false, cleanup = fal
     child.stdout?.on('data', chunk => { output += chunk; });
     child.stdin?.on('error', error => { failure ??= error; });
     child.on('error', error => { failure ??= error; });
-    child.on('close', (code, signal) => {
+    child.on('close', (code, exitSignal) => {
       active = undefined;
       if (failure || code !== 0) {
-        reject(new Error(`${action} failed (${failure?.code ?? signal ?? code})`));
+        reject(new Error(`${action} failed (${failure?.code ?? exitSignal ?? code})`));
       } else {
         done(output.trim());
       }
@@ -309,15 +310,16 @@ async function main() {
     if (evidence) await mkdir(evidence, { recursive: true });
     if (databaseRecovery) {
       const { runDatabaseRecovery } = require('./storefront-database-recovery.cjs');
+      const recoverySignal = AbortSignal.any([interruption.signal, AbortSignal.timeout(240000)]);
       await runDatabaseRecovery({
         project, caFile: browserCa, evidence, fixtureMfaKey: settings.fixtureMfaKey,
-        signal: AbortSignal.any([interruption.signal, AbortSignal.timeout(240000)]),
-        stopSource: () => compose('Stop only the primary fixture API',
-          ['stop', '--timeout', '10', 'api'], { timeout: 20000 }),
-        startRecovered: () => run('Start the restored fixture API', 'docker', [
+        signal: recoverySignal,
+        stopSource: (signal = recoverySignal) => compose('Stop only the primary fixture API',
+          ['stop', '--timeout', '10', 'api'], { timeout: 20000, signal }),
+        startRecovered: (signal = recoverySignal) => run('Start the restored fixture API', 'docker', [
           ...command, '-f', dockerPath(settings.recoveryOverlay),
           'up', '-d', '--no-deps', '--force-recreate', '--wait', '--wait-timeout', '35', 'api',
-        ], { env, timeout: 45000 }),
+        ], { env, timeout: 45000, signal }),
       });
       return;
     }
