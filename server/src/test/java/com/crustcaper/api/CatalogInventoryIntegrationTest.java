@@ -209,6 +209,28 @@ class CatalogInventoryIntegrationTest {
     }
 
     @Test
+    void aRetiredModifierDoesNotCountAgainstStockForTheRemainingLine() throws Exception {
+        trackOneUnit();
+        var buyer = nativeGuest();
+        var input = new QuoteInput(store, EARLY_SLOT, List.of(
+            new CartLine(SKU, List.of(), 1, PRICE),
+            new CartLine(SKU, List.of("retired-topping"), 1, PRICE)));
+        api.perform(nativePost("/quotes", buyer).contentType(MediaType.APPLICATION_JSON)
+            .content(json.writeValueAsBytes(input)))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.lines.length()").value(1))
+            .andExpect(jsonPath("$.lines[0].sku").value(SKU))
+            .andExpect(jsonPath("$.lines[0].modifierIds").isEmpty())
+            .andExpect(jsonPath("$.lines[0].quantity").value(1))
+            .andExpect(jsonPath("$.total").value(PRICE))
+            .andExpect(jsonPath("$.changes.length()").value(1))
+            .andExpect(jsonPath("$.changes[0].kind").value("unavailable"))
+            .andExpect(jsonPath("$.changes[0].sku").value(SKU));
+        assertThat(orderCount()).isZero();
+        assertThat(onHand()).isOne();
+    }
+
+    @Test
     void existingProductsWithoutAnInventoryRowStayOrderable() throws Exception {
         NativeGuest nativeGuest = nativeGuest();
         BrowserGuest browser = browserGuest();
