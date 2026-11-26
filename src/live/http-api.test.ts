@@ -275,6 +275,193 @@ test('order phone verification uses the same guest without saving the contact or
   assert.doesNotMatch(JSON.stringify([...data.values()]), /700000000|418263|502A8EF1/);
 });
 
+const recoveryChallengeId = '85e9eb23-9b52-4905-8c81-7d347d746db9';
+const recoveryOrderId = '1cf5ba6e-0584-45b5-bbc5-3a5ec90502c9';
+const recoveryContact = { orderCode: 'C90502C9', phone: '+250700000000' };
+const expiredGuest = {
+  ...session, expiresAt: '2026-11-25T09:00:00Z', refreshExpiresAt: '2026-11-25T09:30:00Z',
+};
+const recoveryGuest = {
+  ...session, accessToken: 'replacement_' + 'c'.repeat(40), refreshToken: 'replacement_refresh_' + 'd'.repeat(40),
+};
+const recoveredOrder = {
+  ...order, id: recoveryOrderId, status: 'collected', paymentStatus: 'paid', paymentAttempt: null,
+};
+
+test('verified recovery of the expired tracked order promotes once and preserves the saved journal', async () => {
+  const { data, storage } = memory();
+  const oldJournal = JSON.stringify({
+    version: 1, active: { phase: 'tracking', orderId: recoveryOrderId, key: 'old-attempt' }, orderIds: [recoveryOrderId],
+  });
+  data.set(journalKey, oldJournal);
+  data.set(journalKey + '.guest', JSON.stringify(expiredGuest));
+  const { calls, fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) return Response.json(recoveryGuest, { status: 201 });
+    assert.equal(call.token, 'Bearer ' + recoveryGuest.accessToken);
+    if (call.url.endsWith('/order-access/challenges')) return Response.json({ challengeId: recoveryChallengeId }, { status: 202 });
+    if (call.url.endsWith('/verify')) {
+      return (call.body as { code: string }).code === '418263'
+        ? Response.json({ orderId: recoveryOrderId }) : Response.json({}, { status: 404 });
+    }
+    assert.equal(call.url, config.apiBaseUrl + '/orders/' + recoveryOrderId);
+    return Response.json(recoveredOrder);
+  });
+  const options = { config, storage, journalKey, fetcher, now };
+  const first = createLiveApi(options);
+  assert.deepEqual(await first.requestOrderAccess!(recoveryContact), { challengeId: recoveryChallengeId });
+  assert.equal(data.get(journalKey + '.guest'), JSON.stringify(expiredGuest));
+  await assert.rejects(() => first.verifyOrderAccess!(recoveryChallengeId, '000000'), { code: 'not_found' });
+  assert.equal(data.get(journalKey + '.guest'), JSON.stringify(expiredGuest));
+  await assert.rejects(() => first.getOrder(recoveryOrderId), { code: 'unauthenticated' });
+
+  const restarted = createLiveApi(options);
+  assert.deepEqual(await restarted.verifyOrderAccess!(recoveryChallengeId, '418263'), { orderId: recoveryOrderId });
+  assert.deepEqual(JSON.parse(data.get(journalKey + '.guest')!), recoveryGuest);
+  assert.equal((await restarted.getOrder(recoveryOrderId)).recoveryReadOnly, undefined);
+  assert.equal(data.get(journalKey), oldJournal);
+  assert.equal(calls.filter(call => call.url.endsWith('/guest-sessions')).length, 1);
+  assert.doesNotMatch(JSON.stringify([...data.values()]), /700000000|418263/);
+});
+
+test('recovery stays read-only when the saved checkout cannot be transferred', async () => {
+  for (const active of [
+    { phase: 'creating', quoteId: 'pending-quote', key: 'pending-order', cartFingerprint: 'cart' },
+    { phase: 'paying', orderId: recoveryOrderId, key: 'pending-payment' },
+    { phase: 'tracking', orderId: recoveryOrderId, key: 'tracked-payment' },
+    { phase: 'tracking', orderId: order.id, key: 'different-order' },
+  ]) {
+    const { data, storage } = memory();
+    const oldJournal = JSON.stringify({ version: 1, active, orderIds: [order.id, recoveryOrderId] });
+    const pending = { ...order, id: recoveryOrderId };
+    data.set(journalKey, oldJournal);
+    data.set(journalKey + '.guest', JSON.stringify(expiredGuest));
+    const { calls, fetcher } = transport(call => {
+      if (call.url.endsWith('/guest-sessions')) return Response.json(recoveryGuest, { status: 201 });
+      assert.equal(call.token, 'Bearer ' + recoveryGuest.accessToken);
+      if (call.url.endsWith('/order-access/challenges')) return Response.json({ challengeId: recoveryChallengeId }, { status: 202 });
+      if (call.url.endsWith('/verify')) return Response.json({ orderId: recoveryOrderId });
+      assert.equal(call.url, config.apiBaseUrl + '/orders/' + recoveryOrderId);
+      assert.equal(call.method, 'GET');
+      return Response.json(pending);
+    });
+    const options = { config, storage, journalKey, fetcher, now };
+    const api = createLiveApi(options);
+    await api.requestOrderAccess!(recoveryContact);
+    assert.deepEqual(await api.verifyOrderAccess!(recoveryChallengeId, '418263'), { orderId: recoveryOrderId });
+    assert.equal(data.get(journalKey + '.guest'), JSON.stringify(expiredGuest));
+    assert.equal(data.get(journalKey), oldJournal);
+    assert.equal((await createLiveApi(options).getOrder(recoveryOrderId)).recoveryReadOnly, true);
+    const delivered = calls.length;
+    await assert.rejects(() => api.getOrder(order.id), { code: 'unauthenticated' });
+    await assert.rejects(() => api.recoverOrder!('pending-order'), { code: 'unauthenticated' });
+    await assert.rejects(() => api.startPayment(recoveryOrderId, 'pending-payment'), { code: 'unauthenticated' });
+    assert.equal(calls.length, delivered);
+  }
+});
+
+test('promotion write failure allows verification to retry with the same provisional identity', async () => {
+  const { data, storage } = memory();
+  const oldJournal = JSON.stringify({ version: 1, active: null, orderIds: [recoveryOrderId] });
+  data.set(journalKey, oldJournal);
+  data.set(journalKey + '.guest', JSON.stringify(expiredGuest));
+  let rejectMainWrite = true;
+  const unreliableStorage: Storage = {
+    getItem: storage.getItem,
+    async setItem(key, value) {
+      if (key === journalKey + '.guest' && rejectMainWrite) throw new Error('fixture write failed');
+      await storage.setItem(key, value);
+    },
+  };
+  const { calls, fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) return Response.json(recoveryGuest, { status: 201 });
+    assert.equal(call.token, 'Bearer ' + recoveryGuest.accessToken);
+    if (call.url.endsWith('/order-access/challenges')) return Response.json({ challengeId: recoveryChallengeId }, { status: 202 });
+    assert.ok(call.url.endsWith('/verify'));
+    return Response.json({ orderId: recoveryOrderId });
+  });
+  const api = createLiveApi({ config, storage: unreliableStorage, journalKey, fetcher, now });
+  await api.requestOrderAccess!(recoveryContact);
+  await assert.rejects(() => api.verifyOrderAccess!(recoveryChallengeId, '418263'), { code: 'storage_unavailable' });
+  assert.equal(data.get(journalKey + '.guest'), JSON.stringify(expiredGuest));
+  rejectMainWrite = false;
+  assert.deepEqual(await api.verifyOrderAccess!(recoveryChallengeId, '418263'), { orderId: recoveryOrderId });
+  assert.deepEqual(JSON.parse(data.get(journalKey + '.guest')!), recoveryGuest);
+  assert.equal(data.get(journalKey), oldJournal);
+  assert.equal(calls.filter(call => call.url.endsWith('/guest-sessions')).length, 1);
+});
+
+test('a newer primary identity stays active when a pending verified recovery can only be read', async () => {
+  const { data, storage } = memory();
+  const newer = { ...session, refreshToken: 'newer-guest_' + 'z'.repeat(40) };
+  const oldJournal = JSON.stringify({
+    version: 1, active: { phase: 'tracking', orderId: recoveryOrderId, key: 'paid' }, orderIds: [recoveryOrderId],
+  });
+  data.set(journalKey, oldJournal);
+  data.set(journalKey + '.guest', JSON.stringify(expiredGuest));
+  const { fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) return Response.json(recoveryGuest, { status: 201 });
+    if (call.url.endsWith('/order-access/challenges')) return Response.json({ challengeId: recoveryChallengeId }, { status: 202 });
+    if (call.url.endsWith('/verify')) return Response.json({ orderId: recoveryOrderId });
+    assert.equal(call.url, config.apiBaseUrl + '/orders/' + recoveryOrderId);
+    if (call.token === 'Bearer ' + newer.accessToken) return Response.json({}, { status: 404 });
+    data.set(journalKey + '.guest', JSON.stringify(newer));
+    return Response.json(recoveredOrder);
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  await api.requestOrderAccess!(recoveryContact);
+  assert.deepEqual(await api.verifyOrderAccess!(recoveryChallengeId, '418263'), { orderId: recoveryOrderId });
+  assert.deepEqual(JSON.parse(data.get(journalKey + '.guest')!), newer);
+  assert.equal((await api.getOrder(recoveryOrderId)).recoveryReadOnly, true);
+  assert.equal(data.get(journalKey), oldJournal);
+});
+
+test('a delayed unauthorized payment response is not replayed with the promoted guest', async () => {
+  const { data, storage } = memory();
+  data.set(journalKey, JSON.stringify({ version: 1, active: null, orderIds: [recoveryOrderId] }));
+  data.set(journalKey + '.guest', JSON.stringify(session));
+  const sent = Promise.withResolvers<void>();
+  const response = Promise.withResolvers<Response>();
+  const { calls, fetcher } = transport(call => {
+    if (call.url.endsWith('/payments')) {
+      assert.equal(call.token, 'Bearer ' + accessToken);
+      sent.resolve();
+      return response.promise;
+    }
+    if (call.url.endsWith('/guest-sessions/refresh')) return Response.json({}, { status: 401 });
+    if (call.url.endsWith('/guest-sessions')) return Response.json(recoveryGuest, { status: 201 });
+    if (call.url.endsWith('/order-access/challenges')) {
+      if (call.token === 'Bearer ' + accessToken) return Response.json({}, { status: 401 });
+      assert.equal(call.token, 'Bearer ' + recoveryGuest.accessToken);
+      return Response.json({ challengeId: recoveryChallengeId }, { status: 202 });
+    }
+    assert.equal(call.token, 'Bearer ' + recoveryGuest.accessToken);
+    assert.ok(call.url.endsWith('/verify'));
+    return Response.json({ orderId: recoveryOrderId });
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  const payment = assert.rejects(() => api.startPayment(recoveryOrderId, 'old-payment-key'), { code: 'unauthenticated' });
+  await sent.promise;
+  await api.requestOrderAccess!(recoveryContact);
+  await api.verifyOrderAccess!(recoveryChallengeId, '418263');
+  response.resolve(Response.json({}, { status: 401 }));
+  await payment;
+  assert.deepEqual(calls.filter(call => call.url.endsWith('/payments')).map(call => call.key), ['old-payment-key']);
+});
+
+test('phone recovery does not refresh or replace a guest when access is forbidden', async () => {
+  const { data, storage } = memory();
+  data.set(journalKey + '.guest', JSON.stringify(session));
+  const { calls, fetcher } = transport(call => {
+    assert.ok(call.url.endsWith('/order-access/challenges'));
+    return Response.json({}, { status: 403 });
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  await assert.rejects(() => api.requestOrderAccess!(recoveryContact), { code: 'unauthenticated' });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(data.get(journalKey + '.guest')!), session);
+  assert.equal(data.has(journalKey + '.recovery-guest'), false);
+});
+
 test('invalid challenge and grant identifiers do not pass wire validation', async () => {
   const { storage } = memory();
   const { fetcher } = transport(call => call.url.endsWith('/guest-sessions')

@@ -78,6 +78,33 @@ async function downloadedReceipt(page) {
   return Buffer.concat(chunks);
 }
 
+async function placeBrowserOrder(page, origin, buyer, screenshot) {
+  await page.goto(origin);
+  await shown(page, 'Double Smash');
+  if (screenshot) {
+    await page.evaluate(() => document.fonts.ready);
+    await capture(page, screenshot);
+  }
+  await button(page, /^Double Smash,/).click();
+  await button(page, /^Add to cart/).click();
+  await button(page, /^View cart/).click();
+  await button(page, 'Choose pickup time').click();
+  await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { disabled: false }).nth(2).click();
+  await page.getByLabel('Phone number', { exact: true }).fill(buyer.phone);
+  await page.getByLabel('Email address', { exact: true }).fill(buyer.email);
+  await button(page, 'Review order').click();
+  await shown(page, 'Included tax');
+  const successfulPost = url => page.waitForResponse(response =>
+    url.test(response.url()) && response.request().method() === 'POST' && response.ok());
+  const orderResponse = successfulPost(/\/api\/v1\/orders$/);
+  const attemptResponse = successfulPost(/\/api\/v1\/orders\/[^/]+\/payments$/);
+  await button(page, /^Confirm .*RWF/).click();
+  const order = await (await orderResponse).json();
+  const attempt = await (await attemptResponse).json();
+  await shown(page, 'Checking payment');
+  return { order, attempt };
+}
+
 test('connected checkout, receipt, pickup, recovery, payment return and restaurant cancellation', { timeout: 70_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/, 'Run only against a local integration API');
   const server = createPreviewServer(dist);
@@ -96,32 +123,7 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   const watch = (pattern, method = 'POST') => page.waitForResponse(response =>
     pattern.test(response.url()) && response.request().method() === method && response.ok());
   const opened = 'http://127.0.0.1:' + server.address().port;
-  async function openCheckout(screenshot) {
-    await page.goto(opened);
-    await shown(page, 'Double Smash');
-    if (screenshot) {
-      await page.evaluate(() => document.fonts.ready);
-      await capture(page, screenshot);
-    }
-    await button(page, /^Double Smash,/).click();
-    await button(page, /^Add to cart/).click();
-    await button(page, /^View cart/).click();
-    await button(page, 'Choose pickup time').click();
-    await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { disabled: false }).nth(2).click();
-    await page.getByLabel('Phone number', { exact: true }).fill(contact.phone);
-    await page.getByLabel('Email address', { exact: true }).fill(contact.email);
-    await button(page, 'Review order').click();
-    await shown(page, 'Included tax');
-    const orderResponse = watch(/\/api\/v1\/orders$/);
-    const attemptResponse = watch(/\/api\/v1\/orders\/[^/]+\/payments$/);
-    await button(page, /^Confirm .*RWF/).click();
-    const order = await (await orderResponse).json();
-    const attempt = await (await attemptResponse).json();
-    await shown(page, 'Checking payment');
-    return { order, attempt };
-  }
-
-  const { order, attempt } = await openCheckout('connected-menu');
+  const { order, attempt } = await placeBrowserOrder(page, opened, contact, 'connected-menu');
   assert.equal(order.total, 9200);
   assert.equal(attempt.status, 'processing');
   assert.equal(await button(page, 'Simulate successful payment').count(), 0);
@@ -213,12 +215,38 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   secondDevice.on('pageerror', error => errors.push(error.message));
   await secondDevice.goto(opened + '/orders');
   await shown(secondDevice, 'No orders yet');
-  await button(secondDevice, 'Find an order from another device').click();
-  await secondDevice.getByLabel('Order number', { exact: true }).fill('#' + order.id.slice(-8).toUpperCase());
+
+  const afterExpiry = await page.evaluate(() => {
+    const guestKey = Object.keys(sessionStorage).find(key => key.endsWith('.guest'));
+    const journalKey = guestKey.slice(0, -'.guest'.length);
+    const session = JSON.parse(sessionStorage.getItem(guestKey));
+    session.expiresAt = session.refreshExpiresAt = '2020-01-01T00:00:00Z';
+    return { guestKey, session, journalKey, journal: sessionStorage.getItem(journalKey) };
+  });
+  await secondDevice.evaluate(({ guestKey, session, journalKey, journal }) => {
+    sessionStorage.setItem(guestKey, JSON.stringify(session));
+    sessionStorage.setItem(journalKey, journal);
+  }, afterExpiry);
+  let freshGuests = 0;
+  const recoveryPaymentWrites = [];
+  secondDevice.on('request', request => {
+    if (request.method() !== 'POST') return;
+    if (request.url() === api + '/guest-sessions') freshGuests++;
+    if (request.url().includes('/payments')) recoveryPaymentWrites.push(request.url());
+  });
+  await secondDevice.reload();
+  await shown(secondDevice, 'Verify your phone number to open this saved order.');
+  assert.equal(freshGuests, 0, 'Opening saved orders must not replace an expired identity');
+  await capture(secondDevice, 'expired-guest-order');
+  await button(secondDevice, 'Verify this order by phone').click();
+  assert.equal(await secondDevice.getByLabel('Order number', { exact: true }).inputValue(), order.id.slice(-8).toUpperCase());
   await secondDevice.getByLabel('Phone number', { exact: true }).fill(contact.phone);
   await button(secondDevice, 'Request verification code').click();
   await shown(secondDevice, 'Verify your phone');
   await capture(secondDevice, 'connected-order-recovery');
+  assert.equal(freshGuests, 1);
+  assert.equal(await secondDevice.evaluate(key => JSON.parse(sessionStorage.getItem(key)).expiresAt, afterExpiry.guestKey),
+    '2020-01-01T00:00:00Z', 'The original session remains installed until verification succeeds');
   await secondDevice.getByLabel('Verification code', { exact: true }).fill('418263');
   let recovery;
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -234,6 +262,7 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   assert.deepEqual(await recovery.json(), { orderId: order.id });
   await shown(secondDevice, 'Ready for pickup');
   await shown(secondDevice, pickupCode);
+  assert.deepEqual(recoveryPaymentWrites, []);
   const recoveredAuthorization = (await recovery.request().allHeaders()).authorization;
   assert.ok(recoveredAuthorization?.startsWith('Bearer '));
   const recoveredToken = recoveredAuthorization.slice(7);
@@ -243,6 +272,9 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   });
   assert.equal(disallowedPayment.status, 404);
   assert.ok((await downloadedReceipt(secondDevice)).equals(pdf));
+  const { order: followUp } = await placeBrowserOrder(secondDevice, opened, contact);
+  assert.notEqual(followUp.id, order.id);
+  assert.deepEqual(recoveryPaymentWrites, [api + '/orders/' + followUp.id + '/payments']);
   await secondDevice.close();
 
   assert.equal((await advance(pickup, 'collected', pickupCode === '000000' ? '999999' : '000000')).status, 409);
@@ -268,7 +300,7 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   assert.equal(await page.getByText('Pickup code', { exact: true }).count(), 0);
   await capture(page, 'connected-order-collected');
 
-  const { order: newerOrder } = await openCheckout();
+  const { order: newerOrder } = await placeBrowserOrder(page, opened, contact);
   const views = [];
   page.on('request', request => {
     if (request.method() === 'GET' && request.url().startsWith(api + '/orders/')) views.push(request.url());

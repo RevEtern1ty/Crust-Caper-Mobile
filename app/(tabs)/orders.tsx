@@ -9,7 +9,7 @@ import { ReorderPanel } from '../../src/checkout/reorder-panel';
 import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
 import { PickupAlertPanel } from '../../src/checkout/pickup-alert';
 import { shareReceipt } from '../../src/checkout/receipt-sharing';
-import type { DemoKitchenStatus, ReorderResult } from '../../src/domain/types';
+import { ApiError, type DemoKitchenStatus, type ReorderResult } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
 import { copy, money, slotLabel } from '../../src/ui/format';
@@ -30,6 +30,8 @@ export default function OrdersScreen() {
   const orderId = linkedOrderId ?? (choice?.latest === latestId ? choice.id : latestId);
   const { order, loading, failed, error: statusError, refresh } = useOrderStatus(orderId);
   const t = (en: string, rw: string) => copy(locale, en, rw);
+  const needsPhoneVerification = mode === 'connected' && !!orderId
+    && statusError instanceof ApiError && statusError.code === 'unauthenticated';
 
   useEffect(() => {
     if (!journal || requestedOrderId === null) return;
@@ -45,7 +47,7 @@ export default function OrdersScreen() {
   const active = journal?.active;
   const ongoingCreate = active?.phase === 'creating';
   const activeOrder = active && active.phase !== 'creating' && active.orderId === orderId;
-  const canResume = checkoutAllowed && activeOrder && !!order && order.status === 'awaiting_payment'
+  const canResume = checkoutAllowed && activeOrder && !!order && !order.recoveryReadOnly && order.status === 'awaiting_payment'
     && (order.paymentStatus === 'unpaid' || order.paymentStatus === 'declined');
   const nextKitchen: DemoKitchenStatus | null = order?.status === 'accepted' ? 'preparing'
     : order?.status === 'preparing' ? 'ready' : order?.status === 'ready' ? 'collected' : null;
@@ -74,7 +76,8 @@ export default function OrdersScreen() {
     void run('resume', async () => {
       try {
         const resumed = await resumeCheckout(retryDeclined);
-        if (resumed.paymentStatus === 'processing' && (mode === 'demo' || resumed.status === 'awaiting_payment') && shouldNavigate()) {
+        if (!resumed.recoveryReadOnly && resumed.paymentStatus === 'processing'
+          && (mode === 'demo' || resumed.status === 'awaiting_payment') && shouldNavigate()) {
           router.push({ pathname: '/payment', params: { from: 'orders' } });
         } else await refresh();
       } catch (error) {
@@ -119,7 +122,7 @@ export default function OrdersScreen() {
         </Card>
       )}
       {!journal && !restoreFailed && <Text tone="muted">{t('Opening saved orders…', 'Turimo gufungura komande zabitswe…')}</Text>}
-      {checkoutAllowed && activeOrder && !order && failed && (
+      {checkoutAllowed && activeOrder && !order && failed && !needsPhoneVerification && (
         <Button
           label={t('Restore saved checkout', 'Ongera ufungure ubwishyu bwabitswe')}
           onPress={() => resume()} variant="secondary" busy={busy || action === 'resume'} disabled={!hydrated}
@@ -143,8 +146,13 @@ export default function OrdersScreen() {
       )}
 
       {mode === 'connected' && checkoutAllowed && api.requestOrderAccess && api.verifyOrderAccess && (
-        <Button label={t('Find an order from another device', 'Shaka komande yakozwe ku kindi gikoresho')} variant="secondary"
-          onPress={() => router.push({ pathname: '/order-recovery', params: { from: 'orders' } })} />
+        <Button label={needsPhoneVerification
+          ? t('Verify this order by phone', 'Emeza iyi komande ukoresheje telefoni')
+          : t('Find an order from another device', 'Shaka komande yakozwe ku kindi gikoresho')} variant="secondary"
+          onPress={() => router.push({
+            pathname: '/order-recovery',
+            params: { from: 'orders', ...(needsPhoneVerification && orderId ? { orderCode: orderId.slice(-8).toUpperCase() } : {}) },
+          })} />
       )}
 
       {order && (
@@ -171,18 +179,23 @@ export default function OrdersScreen() {
             </Card>
           )}
 
-          <PickupAlertPanel key={order.id} order={order} />
+          {!order.recoveryReadOnly && <PickupAlertPanel key={order.id} order={order} />}
 
           {activeOrder && order.paymentStatus === 'processing' && (
             <Card>
               <Text>{mode === 'connected' && order.status === 'cancelled'
                 ? t('The pickup hold ended. We’re checking this payment.', 'Igihe cyabikiwe komande cyarangiye. Turacyagenzura ubu bwishyu.')
                 : t('This payment is being checked. You can leave and come back here.', 'Ubu bwishyu buracyagenzurwa. Ushobora kugenda ukagaruka hano.')}</Text>
-              {checkoutAllowed && (mode === 'demo' || order.status === 'awaiting_payment') && <Button
+              {checkoutAllowed && !order.recoveryReadOnly && (mode === 'demo' || order.status === 'awaiting_payment') && <Button
                 label={mode === 'demo' ? t('Open existing demo payment', 'Fungura ubwishyu bw’igerageza busanzwe') : t('Open payment', 'Fungura aho kwishyurira')}
                 onPress={() => resume()} variant="secondary" busy={busy || action === 'resume'} disabled={!hydrated}
               />}
             </Card>
+          )}
+
+          {order.recoveryReadOnly && order.status === 'awaiting_payment' && (
+            <Card><Text>{t('You can view this order here. Contact the pickup team for help with payment.',
+              'Ushobora kureba iyi komande hano. Saba ubufasha mu kwishyura aho ufatira komande.')}</Text></Card>
           )}
 
           {canResume && (
@@ -195,7 +208,7 @@ export default function OrdersScreen() {
             />
           )}
 
-          {checkoutAllowed && activeOrder && active?.phase === 'paying' && !canResume
+          {checkoutAllowed && !order.recoveryReadOnly && activeOrder && active?.phase === 'paying' && !canResume
             && (order.paymentStatus !== 'processing' || (mode === 'connected' && order.status === 'cancelled')) && (
             <Button
               label={t('Restore saved checkout', 'Ongera ufungure ubwishyu bwabitswe')}
@@ -230,7 +243,7 @@ export default function OrdersScreen() {
             {mode === 'connected' && order.paymentStatus === 'paid' && order.receiptStatus === 'pending' && (
               <Text variant="small" tone="muted">{t('The receipt is pending.', 'Inyemezabwishyu iracyategerejwe.')}</Text>
             )}
-            {order.paymentStatus === 'paid' || order.status === 'cancelled' ? (
+            {!order.recoveryReadOnly && (order.paymentStatus === 'paid' || order.status === 'cancelled') ? (
               <Button label={t('Review reorder', 'Reba komande nshya isa n’iyi')} variant="secondary" busy={action === 'reorder'} disabled={!!action} onPress={() => {
                 void run('reorder', async () => {
                   setPreview({ orderId: order.id, result: await api.reorder(order.id) });
@@ -272,7 +285,9 @@ export default function OrdersScreen() {
         </>
       )}
 
-      {(problem || failed) && <Text accessibilityRole="alert" tone="red">{problem ?? checkoutError(statusError, locale)}</Text>}
+      {(problem || failed) && <Text accessibilityRole="alert" tone="red">{problem ?? (needsPhoneVerification
+        ? t('Verify your phone number to open this saved order.', 'Emeza nimero ya telefoni kugira ngo ufungure iyi komande yabitswe.')
+        : checkoutError(statusError, locale))}</Text>}
       {orderId && <Button label={t('Refresh order status', 'Vugurura uko komande ihagaze')} onPress={() => { void refresh(); }} busy={loading} variant="secondary" />}
 
       {journal && journal.orderIds.length > 1 && (

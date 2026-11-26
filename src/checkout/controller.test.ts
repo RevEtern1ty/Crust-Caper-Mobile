@@ -17,6 +17,7 @@ function fixture() {
   let breakCartClear = false;
   let failJournalWrite = false;
   let failOrderRead = false;
+  let readOnlyRecovery = false;
   const data = new Map<string, string>();
   const journal = new Map<string, string>();
   const orderCalls: string[] = [];
@@ -39,7 +40,8 @@ function fixture() {
       ...api,
       async getOrder(orderId) {
         if (failOrderRead) throw new Error('Temporarily unavailable');
-        return api.getOrder(orderId);
+        const order = await api.getOrder(orderId);
+        return readOnlyRecovery ? { ...order, recoveryReadOnly: true } : order;
       },
       async createOrder(input, idempotencyKey) {
         equal(input.phone, DEMO_PHONE);
@@ -103,6 +105,7 @@ function fixture() {
     stopBeforeCartClear: () => { breakCartClear = true; },
     blockJournal: () => { failJournalWrite = true; },
     blockOrderReads: () => { failOrderRead = true; },
+    readOrderAsRecoveryGuest: () => { readOnlyRecovery = true; },
     resetDemoStorage: () => { data.clear(); },
     removeJournal: () => { journal.clear(); },
     corruptDemoStorage: () => { data.set('crustcaper.demo.v1', 'invalid-demo-data'); },
@@ -281,6 +284,24 @@ test('the previous journal format without a cart fingerprint resumes the existin
   equal(restored.paymentStatus, 'processing');
   deepEqual(f.paymentCalls, ['key-2']);
   deepEqual(f.cartClears, []);
+});
+
+test('a read-only recovered payment preserves its intent and never retries it', async () => {
+  const f = fixture();
+  f.dropPaymentResponse();
+  await rejects(f.restart().begin(await f.quote(), 'cart'), /Payment response lost/);
+  const intent = f.savedJournal();
+  const attempt = (await f.api.getOrder(intent.active.orderId)).paymentAttempt;
+  ok(attempt);
+  await f.api.setDemoPaymentResult(intent.active.orderId, attempt.id, 'declined');
+  f.readOrderAsRecoveryGuest();
+
+  const restored = f.restart(false);
+  equal((await restored.resume(true)).paymentStatus, 'declined');
+  deepEqual(f.savedJournal(), intent);
+  deepEqual(f.paymentCalls, ['key-2']);
+  deepEqual(f.cartClears, []);
+  await rejects(restored.begin(await f.quote(), 'another-cart'), { code: 'active_checkout' });
 });
 
 

@@ -13,12 +13,13 @@ type Step = { kind: 'details' } | { kind: 'code'; challengeId: string } | { kind
 type Field = 'orderCode' | 'phone' | 'code';
 
 export default function OrderRecoveryScreen() {
-  const { from } = useLocalSearchParams<{ from?: string }>();
+  const { from, orderCode: savedCode } = useLocalSearchParams<{ from?: string; orderCode?: string }>();
   const { api, checkoutAllowed, locale, mode } = useShop();
   const { rememberRecoveredOrder, setRequestedOrderId } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const [step, setStep] = useState<Step>({ kind: 'details' });
-  const [orderCode, setOrderCode] = useState('');
+  const [orderCode, setOrderCode] = useState(() =>
+    typeof savedCode === 'string' && /^[0-9A-F]{8}$/.test(savedCode) ? savedCode : '');
   const [phone, setPhone] = useState('');
   const [code, setCode] = useState('');
   const [pending, setPending] = useState(false);

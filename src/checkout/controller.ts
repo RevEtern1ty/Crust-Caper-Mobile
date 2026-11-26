@@ -43,7 +43,7 @@ function isText(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
-function parseJournal(raw: string | null): CheckoutJournal {
+export function parseJournal(raw: string | null): CheckoutJournal {
   if (raw === null) {
     return emptyJournal;
   }
@@ -133,7 +133,7 @@ export class CheckoutController {
       }
       if (active) {
         const order = await this.getTrackedOrder(active.orderId);
-        if (order && (active.phase !== 'tracking' || !canStartNewOrder(order))) {
+        if (order && (order.recoveryReadOnly || active.phase !== 'tracking' || !canStartNewOrder(order))) {
           throw new CheckoutError('active_checkout');
         }
       }
@@ -159,6 +159,7 @@ export class CheckoutController {
 
       const order = await this.getTrackedOrder(active.orderId);
       if (!order) throw new ApiError('not_found');
+      if (order.recoveryReadOnly) return order;
       if (canStartNewOrder(order) || order.paymentStatus === 'processing') {
         if (active.phase === 'paying') {
           await this.finishPayment(active, order);

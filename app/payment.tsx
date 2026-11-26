@@ -22,7 +22,7 @@ export default function PaymentScreen() {
   const [problem, setProblem] = useState<string | null>(null);
   const running = useRef(false);
   const t = (en: string, rw: string) => copy(locale, en, rw);
-  const processing = !failed && order?.paymentStatus === 'processing' && order.paymentAttempt !== null;
+  const processing = !failed && order?.paymentStatus === 'processing' && order.paymentAttempt !== null && !order.recoveryReadOnly;
   const onDevice = Platform.OS === 'android' || Platform.OS === 'ios';
   function goToOrders() {
     if (from === 'orders' && router.canGoBack()) router.back();
@@ -65,7 +65,7 @@ export default function PaymentScreen() {
     try {
       const current = await refresh(true);
       const attempt = current?.paymentAttempt;
-      if (!shouldNavigate() || current?.status !== 'awaiting_payment' || current.paymentStatus !== 'processing'
+      if (!shouldNavigate() || current?.status !== 'awaiting_payment' || current.paymentStatus !== 'processing' || current.recoveryReadOnly
         || attempt?.id !== attemptId || !attempt.checkoutUrl) return;
 
       await openBrowserAsync(attempt.checkoutUrl);

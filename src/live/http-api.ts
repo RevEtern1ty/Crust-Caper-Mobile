@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { hasSavedCheckout } from '../checkout/controller';
+import { canStartNewOrder, hasSavedCheckout, parseJournal } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError } from '../domain/types';
 import type { ApiErrorCode, Locale, Order, PaymentAttempt, ShopApi, Storage } from '../domain/types';
@@ -8,6 +8,17 @@ import { menuResponse, orderAccessChallenge, orderAccessGrant, orderResponse, pa
 
 type Session = z.infer<typeof sessionResponse>;
 type Fetcher = (url: string, options: RequestInit) => Promise<Pick<Response, 'ok' | 'status' | 'redirected' | 'url' | 'json' | 'headers' | 'body'>>;
+const recoverySession = z.object({
+  guest: sessionResponse,
+  previous: z.string().nullable(),
+  challengeId: z.guid().nullable(),
+  grants: z.array(z.guid()).max(10),
+});
+type RecoverySession = z.infer<typeof recoverySession>;
+
+class GuestRejected extends ApiError {
+  constructor() { super('unauthenticated'); }
+}
 
 export type ConnectedConfig = {
   profile: 'local' | 'stage' | 'production';
@@ -73,10 +84,15 @@ export function createLiveApi({
   const base = new URL(config.apiBaseUrl);
   const endpoint = base.origin + '/api/v1';
   const sessionKey = journalKey + '.guest';
+  const recoveryKey = journalKey + '.recovery-guest';
   const hosts = new Set(config.pspHosts);
   const orderPath = (id: string) => '/orders/' + encodeURIComponent(id);
   const receiptPath = (id: string) => orderPath(id) + '/receipt';
   let sessionPromise: Promise<Session> | null = null;
+  let activation: Promise<boolean> | null = null;
+  let recoveryQueue: Promise<void> = Promise.resolve();
+  let pendingRecovery: RecoverySession | null = null;
+  let primaryChallenge: { id: string; refreshToken: string } | null = null;
   let installation: Promise<string> | null = null;
 
   const checkedPayment = (attempt: PaymentAttempt): PaymentAttempt => ({
@@ -125,6 +141,7 @@ export function createLiveApi({
         signal: controller.signal,
       });
       if (response.redirected || (response.url && response.url !== url)) invalidResponse();
+      if (response.status === 401 && (token || path === '/guest-sessions/refresh')) throw new GuestRejected();
       if (pdf && !response.ok) throw new ApiError(errorCode(response.status, null));
       if (pdf && response.status !== 200) invalidResponse();
       if (method === 'DELETE' && response.ok && response.status !== 204) invalidResponse();
@@ -144,12 +161,16 @@ export function createLiveApi({
 
   async function durableSession(session: Session): Promise<Session> {
     if (Date.parse(session.expiresAt) <= now() || Date.parse(session.refreshExpiresAt) <= now()) invalidResponse();
+    await writeSaved(sessionKey, JSON.stringify(session));
+    return session;
+  }
+
+  async function writeSaved(key: string, value: string) {
     try {
-      await storage.setItem(sessionKey, JSON.stringify(session));
+      await storage.setItem(key, value);
     } catch {
       throw new ApiError('storage_unavailable');
     }
-    return session;
   }
 
   async function readSaved(key: string): Promise<string | null> {
@@ -160,46 +181,134 @@ export function createLiveApi({
     }
   }
 
+  function decodeSaved<T>(raw: string, schema: z.ZodType<T>): T {
+    try {
+      return schema.parse(JSON.parse(raw));
+    } catch {
+      throw new ApiError('storage_unavailable');
+    }
+  }
+
+  function refreshSession(refreshToken: string): Promise<Session> {
+    return request({
+      path: '/guest-sessions/refresh', method: 'POST', schema: sessionResponse, body: { refreshToken },
+    });
+  }
+
   function guestSession(rejectedAccessToken?: string): Promise<Session> {
+    if (activation) return activation.catch(() => undefined).then(() => guestSession(rejectedAccessToken));
     if (sessionPromise) return sessionPromise;
     sessionPromise = (async () => {
       const raw = await readSaved(sessionKey);
       if (raw !== null) {
-        let parsed: ReturnType<typeof sessionResponse.safeParse>;
-        try {
-          parsed = sessionResponse.safeParse(JSON.parse(raw));
-        } catch {
-          throw new ApiError('storage_unavailable');
-        }
-        if (!parsed.success) throw new ApiError('storage_unavailable');
-        const existing = parsed.data;
+        const existing = decodeSaved(raw, sessionResponse);
         if (Date.parse(existing.expiresAt) > now() && existing.accessToken !== rejectedAccessToken) {
           return existing;
         }
         if (Date.parse(existing.refreshExpiresAt) > now()) {
-          return durableSession(await request({
-            path: '/guest-sessions/refresh', method: 'POST', schema: sessionResponse,
-            body: { refreshToken: existing.refreshToken },
-          }));
+          const refreshed = await refreshSession(existing.refreshToken);
+          if (refreshed.refreshToken !== existing.refreshToken) invalidResponse();
+          return durableSession(refreshed);
         }
       }
       // Never replace the identity behind a durable checkout with a fresh guest.
       if (rejectedAccessToken !== undefined || hasSavedCheckout(await readSaved(journalKey))) {
-        throw new ApiError('unauthenticated');
+        throw new GuestRejected();
       }
       return durableSession(await request({ path: '/guest-sessions', method: 'POST', schema: sessionResponse }));
     })().finally(() => { sessionPromise = null; });
     return sessionPromise;
   }
 
-  async function authorized<T>(options: Parameters<typeof request<T>>[0]): Promise<T> {
-    const { accessToken } = await guestSession();
+  async function sendWithGuest<T>(options: Parameters<typeof request<T>>[0], guest: Session, retry: () => Promise<Session>): Promise<T> {
     try {
-      return await request({ ...options, token: accessToken });
+      return await request({ ...options, token: guest.accessToken });
     } catch (error) {
-      if (!(error instanceof ApiError) || error.code !== 'unauthenticated') throw error;
-      const updated = await guestSession(accessToken);
+      if (!(error instanceof GuestRejected)) throw error;
+      const updated = await retry();
+      // A request started by the previous identity must not be repeated after recovery.
+      if (updated.refreshToken !== guest.refreshToken) throw error;
       return request({ ...options, token: updated.accessToken });
+    }
+  }
+
+  async function primaryRequest<T>(options: Parameters<typeof request<T>>[0], expectedRefreshToken?: string) {
+    const guest = await guestSession();
+    if (expectedRefreshToken !== undefined && guest.refreshToken !== expectedRefreshToken) throw new ApiError('unauthenticated');
+    const payload = await sendWithGuest(options, guest, () => guestSession(guest.accessToken));
+    return { payload, refreshToken: guest.refreshToken };
+  }
+
+  async function authorized<T>(options: Parameters<typeof request<T>>[0]): Promise<T> {
+    return (await primaryRequest(options)).payload;
+  }
+
+  function queueRecovery<T>(operation: () => Promise<T>): Promise<T> {
+    const next = recoveryQueue.then(operation);
+    recoveryQueue = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  async function loadRecovery(): Promise<RecoverySession | null> {
+    if (pendingRecovery) return pendingRecovery;
+    const raw = await readSaved(recoveryKey);
+    return raw === null ? null : decodeSaved(raw, recoverySession.nullable());
+  }
+
+  async function saveRecovery(record: RecoverySession): Promise<void> {
+    await writeSaved(recoveryKey, JSON.stringify(record));
+    pendingRecovery = record;
+  }
+
+  function sendRecovery<T>(options: Parameters<typeof request<T>>[0], record: RecoverySession): Promise<T> {
+    return sendWithGuest(options, record.guest, async () => {
+      if (Date.parse(record.guest.refreshExpiresAt) <= now()) throw new ApiError('unauthenticated');
+      const refreshed = await refreshSession(record.guest.refreshToken);
+      if (refreshed.refreshToken !== record.guest.refreshToken) invalidResponse();
+      record.guest = refreshed;
+      await saveRecovery(record);
+      return refreshed;
+    });
+  }
+
+  function activateRecovery(record: RecoverySession, orderId: string): Promise<boolean> {
+    const reading = sessionPromise;
+    activation = (async () => {
+      await reading?.catch(() => undefined);
+      const current = await readSaved(sessionKey);
+      // The main write can succeed even when a storage response was lost.
+      if (current !== null && decodeSaved(current, sessionResponse).refreshToken === record.guest.refreshToken) return true;
+      if (current !== record.previous) return false;
+
+      const raw = await readSaved(journalKey);
+      let active;
+      try { ({ active } = parseJournal(raw)); }
+      catch { return false; }
+      if (active) {
+        if (active.phase !== 'tracking' || active.orderId !== orderId) return false;
+        const snapshot = await sendRecovery({ path: orderPath(orderId), schema: orderResponse }, record)
+          .then(order => checkedOrder(order, orderId)).catch(() => null);
+        if (!snapshot || !canStartNewOrder(snapshot)) return false;
+      }
+      if (await readSaved(journalKey) !== raw || await readSaved(sessionKey) !== current) return false;
+      await durableSession(record.guest);
+      return true;
+    })().finally(() => { activation = null; });
+    return activation;
+  }
+
+  async function authorizedRead<T>(orderId: string, options: Parameters<typeof request<T>>[0]): Promise<{
+    payload: T; recoveryReadOnly?: true;
+  }> {
+    try {
+      return { payload: await authorized(options) };
+    } catch (error) {
+      if (!(error instanceof GuestRejected) && !(error instanceof ApiError && error.code === 'not_found')) throw error;
+      return queueRecovery(async () => {
+        const record = await loadRecovery();
+        if (!record?.grants.includes(orderId)) throw error;
+        return { payload: await sendRecovery(options, record), recoveryReadOnly: true };
+      });
     }
   }
 
@@ -261,21 +370,68 @@ export function createLiveApi({
       return checkedPayment(attempt);
     },
     async getOrder(orderId) {
-      return checkedOrder(await authorized({ path: orderPath(orderId), schema: orderResponse }), orderId);
+      const result = await authorizedRead(orderId, { path: orderPath(orderId), schema: orderResponse });
+      const order = checkedOrder(result.payload, orderId);
+      return result.recoveryReadOnly ? { ...order, recoveryReadOnly: true } : order;
     },
     async getReceiptPdf(orderId) {
       if (!paymentReturnOrderId(orderId)) throw new ApiError('invalid_input');
-      return authorized({ path: receiptPath(orderId), schema: z.instanceof(Uint8Array), pdf: true });
+      const result = await authorizedRead(orderId, { path: receiptPath(orderId), schema: z.instanceof(Uint8Array), pdf: true });
+      return result.payload;
     },
     async reorder(orderId) {
       return authorized({ path: orderPath(orderId) + '/reorder', method: 'POST', schema: reorderResponse });
     },
-    async requestOrderAccess(input) {
-      return authorized({ path: '/order-access/challenges', method: 'POST', schema: orderAccessChallenge, body: input });
+    requestOrderAccess(input) {
+      return queueRecovery(async () => {
+        const options = { path: '/order-access/challenges', method: 'POST', schema: orderAccessChallenge, body: input } as const;
+        const before = await readSaved(sessionKey);
+        try {
+          const result = await primaryRequest(options);
+          primaryChallenge = { id: result.payload.challengeId, refreshToken: result.refreshToken };
+          return result.payload;
+        } catch (error) {
+          if (!(error instanceof GuestRejected)) throw error;
+        }
+
+        const previous = await readSaved(sessionKey);
+        if (previous !== before && (previous === null || before === null
+          || decodeSaved(previous, sessionResponse).refreshToken !== decodeSaved(before, sessionResponse).refreshToken)) {
+          throw new ApiError('unauthenticated');
+        }
+        const saved = await loadRecovery();
+        const reusable = saved?.previous === previous && Date.parse(saved.guest.refreshExpiresAt) > now() ? saved : null;
+        const guest = reusable?.guest ?? await request({ path: '/guest-sessions', method: 'POST', schema: sessionResponse });
+        const provisional = { guest, previous, challengeId: null, grants: reusable?.grants ?? [] };
+        await saveRecovery(provisional);
+        const result = await sendRecovery(options, provisional);
+        const challenge = { ...provisional, challengeId: result.challengeId };
+        pendingRecovery = challenge;
+        // The guest is already saved. If this write fails the open prompt can still use it.
+        await saveRecovery(challenge).catch(() => undefined);
+        return result;
+      });
     },
-    async verifyOrderAccess(challengeId, code) {
+    verifyOrderAccess(challengeId, code) {
       const path = '/order-access/challenges/' + encodeURIComponent(challengeId) + '/verify';
-      return authorized({ path, method: 'POST', schema: orderAccessGrant, body: { code } });
+      const options = { path, method: 'POST', schema: orderAccessGrant, body: { code } } as const;
+      return queueRecovery(async () => {
+        if (primaryChallenge?.id === challengeId) {
+          return (await primaryRequest(options, primaryChallenge.refreshToken)).payload;
+        }
+        const record = await loadRecovery();
+        if (record?.challengeId !== challengeId) return authorized(options);
+
+        const grant = await sendRecovery(options, record);
+        const granted = { ...record, grants: [grant.orderId, ...record.grants.filter(id => id !== grant.orderId)].slice(0, 10) };
+        await saveRecovery(granted);
+        if (await activateRecovery(granted, grant.orderId)) {
+          primaryChallenge = { id: challengeId, refreshToken: granted.guest.refreshToken };
+          pendingRecovery = null;
+          await writeSaved(recoveryKey, 'null').catch(() => undefined);
+        }
+        return grant;
+      });
     },
     ...(config.profile !== 'local' && paymentReturnOrderId(config.pushProjectId) && newInstallationId ? {
       pickupAlerts: {

@@ -14,6 +14,8 @@ cd server
 
 Use `gradlew.bat` on Windows. The local stack uses a loopback-only PostgreSQL database and synthetic restaurant data. Set `CRUSTCAPER_BUILD_PROFILE=local` and `CRUSTCAPER_API_BASE_URL=http://127.0.0.1:18080/api/v1`, then run the connected app from the repository root.
 
+For an existing PostgreSQL 17 installation, create a dedicated empty local test database. Point `CRUSTCAPER_DB_URL`, `CRUSTCAPER_DB_USER` and `CRUSTCAPER_DB_PASSWORD` at that database for Gradle tests and the local JAR. Start the JAR with `--spring.profiles.active=local` and `CRUSTCAPER_PORT=18080`, then use `node tooling/preview-server.cjs dist-connected` from the repository root. Set `CRUSTCAPER_ORDER_ACCESS_PROVIDER=local` for synthetic phone verification.
+
 ```sh
 npm ci
 npm run build:connected-web

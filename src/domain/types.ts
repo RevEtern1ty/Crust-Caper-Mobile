@@ -101,6 +101,8 @@ export type PaymentAttempt = {
 }
 
 export type Order = {
+  /** The local recovery session can read this order; the original checkout owns payment. */
+  recoveryReadOnly?: true;
   id: string
   storeId: string
   slotId: string
