@@ -5,7 +5,7 @@ const { createHash, X509Certificate } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const { mkdir } = require('node:fs/promises');
 const https = require('node:https');
-const { resolve } = require('node:path');
+const { dirname, resolve } = require('node:path');
 const { test } = require('node:test');
 const { connect } = require('node:tls');
 const { chromium } = require('playwright-core');
@@ -21,9 +21,11 @@ const guestCookie = '__Host-crustcaper-web';
 const evidence = process.env.CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR;
 const project = process.env.CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT;
 const webPerf = process.env.CRUSTCAPER_HTTPS_TEST_WEB_PERF === '1';
+const catalogPhotos = process.env.CRUSTCAPER_HTTPS_TEST_CATALOG_PHOTOS === '1';
+const approvedPhotoPath = '/catalog-photos/double-smash-r39.jpg';
 const uuid = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
-function request(ca, path, { method = 'GET', headers } = {}) {
+function request(ca, path, { method = 'GET', headers, binary = false } = {}) {
   return new Promise((done, reject) => {
     const outbound = https.request({
       hostname: '127.0.0.1', port: 443, servername: storefront, ca, method, path,
@@ -32,11 +34,10 @@ function request(ca, path, { method = 'GET', headers } = {}) {
       const chunks = [];
       response.on('data', chunk => chunks.push(chunk));
       response.on('error', reject);
-      response.on('end', () => done({
-        status: response.statusCode,
-        headers: response.headers,
-        body: Buffer.concat(chunks).toString('utf8'),
-      }));
+      response.on('end', () => {
+        const body = Buffer.concat(chunks);
+        done({ status: response.statusCode, headers: response.headers, body: binary ? body : body.toString('utf8') });
+      });
     });
     outbound.on('error', reject);
     outbound.on('timeout', () => outbound.destroy(new Error('HTTPS fixture request timed out')));
@@ -154,6 +155,71 @@ async function checkNoJavaScript(browser) {
   }
 }
 
+async function checkPhotoTransport(ca) {
+  const source = readFileSync(resolve(dirname(module.filename), '..', 'assets', 'menu', 'double-smash.jpg'));
+  const [get, head, absent, nonRaster] = await Promise.all([
+    request(ca, approvedPhotoPath, { binary: true }),
+    request(ca, approvedPhotoPath, { method: 'HEAD', binary: true }),
+    request(ca, '/catalog-photos/not-in-fixture.jpg'),
+    request(ca, '/catalog-photos/double-smash-r39.svg'),
+  ]);
+  for (const photo of [get, head]) {
+    assert.equal(photo.status, 200);
+    assert.equal(photo.headers['content-type'], 'image/jpeg');
+    assert.equal(Number(photo.headers['content-length']), source.length);
+    assert.equal(photo.headers['x-content-type-options'], 'nosniff');
+  }
+  const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+  assert.equal(digest(get.body), digest(source), 'GET must serve the exact approved image');
+  assert.equal(head.body.length, 0);
+  assert.equal(absent.status, 404);
+  assert.equal(nonRaster.status, 404);
+}
+
+async function checkPhotoRendering(browser) {
+  const url = origin + approvedPhotoPath;
+  const viewport = { width: 390, height: 844 };
+  const catalog = await newContext(browser, { javaScriptEnabled: false, viewport }, false);
+  try {
+    const page = await catalog.newPage();
+    for (const locale of ['en', 'rw']) {
+      for (const [path, selector] of [
+        ['/menu/' + locale, 'img.hero-photo'],
+        ['/menu/' + locale + '/double-smash', 'img.product-photo'],
+      ]) {
+        const response = await page.goto(origin + path);
+        assert.equal(response.status(), 200);
+        assert.equal(page.url(), origin + path);
+        assert.equal(await page.locator('html').getAttribute('lang'), locale);
+        const photo = page.locator(selector);
+        await photo.waitFor({ state: 'visible' });
+        const decoded = await photo.evaluate(image => ({ url: image.currentSrc, width: image.naturalWidth }));
+        assert.equal(decoded.url, url);
+        assert.ok(decoded.width > 0, 'SSR approved image must decode with JavaScript disabled');
+      }
+      await capture(page, 'catalog-photo-ssr-' + locale);
+    }
+  } finally {
+    await catalog.close();
+  }
+
+  const storefront = await newContext(browser, { viewport }, false);
+  try {
+    const page = await storefront.newPage();
+    const response = await page.goto(origin + '/product/double-smash');
+    assert.equal(response.status(), 200);
+    await page.getByRole('heading', { name: 'Double Smash', exact: true }).first().waitFor();
+    await page.waitForFunction(expected => [...document.images].some(image =>
+      image.currentSrc === expected && image.naturalWidth > 0 && [...image.parentElement.children].some(layer =>
+        getComputedStyle(layer).backgroundImage === 'url("' + expected + '")'
+        && layer.getBoundingClientRect().width > 0 && layer.getBoundingClientRect().height > 0)), url,
+    { timeout: 12000 });
+    await capture(page, 'catalog-photo-expo');
+  } finally {
+    await storefront.close();
+  }
+}
+
 async function checkGuestCheckout(browser, ca) {
   const context = await newContext(browser, { viewport: { width: 390, height: 844 } });
   try {
@@ -239,13 +305,15 @@ async function checkGuestCheckout(browser, ca) {
 }
 
 const scenario = webPerf ? 'HTTPS catalog captures cold mobile web performance'
-  : 'HTTPS storefront renders public pages and preserves a single verified guest payment';
+  : catalogPhotos ? 'HTTPS storefront serves and renders only the approved catalog photo'
+    : 'HTTPS storefront renders public pages and preserves a single verified guest payment';
 
 test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   const caPath = process.env.CRUSTCAPER_HTTPS_TEST_CA;
   assert.ok(caPath, 'the HTTPS storefront launcher must provide a fixture CA');
   const ca = readFileSync(caPath);
   if (!webPerf) await checkPublicCatalog(ca);
+  if (catalogPhotos) await checkPhotoTransport(ca);
   const pins = await Promise.all([fixturePin(ca, storefront), fixturePin(ca, provider)]);
   const browser = await chromium.launch({
     channel: 'chrome',
@@ -260,6 +328,10 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
     await checkWebPerformance({
       browser, createContext: options => newContext(browser, options, false), origin, evidence,
     });
+    return;
+  }
+  if (catalogPhotos) {
+    await checkPhotoRendering(browser);
     return;
   }
   await checkNoJavaScript(browser);
