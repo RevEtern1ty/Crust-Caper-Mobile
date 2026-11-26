@@ -5,7 +5,7 @@ import { AppState, Platform, StyleSheet, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CheckoutProvider } from '../src/checkout/context';
 import { PickupAlertResponses } from '../src/checkout/pickup-alert';
-import { purgeExpiredReceiptFiles } from '../src/checkout/receipt-sharing';
+import { purgeExpiredSharedDocuments } from '../src/checkout/document-sharing';
 import { ShopProvider, useShop } from '../src/state/shop';
 import { Button, colors, Text } from '../src/ui/core';
 import { copy } from '../src/ui/format';
@@ -90,9 +90,9 @@ function DraftStorageNotice() {
 
 export default function RootLayout() {
   useEffect(() => {
-    purgeExpiredReceiptFiles();
+    purgeExpiredSharedDocuments();
     const handle = AppState.addEventListener('change', (state) => {
-      if (state === 'active') purgeExpiredReceiptFiles();
+      if (state === 'active') purgeExpiredSharedDocuments();
     });
     return () => handle.remove();
   }, []);

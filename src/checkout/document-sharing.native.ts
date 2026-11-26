@@ -6,7 +6,8 @@ import { ApiError } from '../domain/types';
 import { PDF_MIME_TYPE } from '../live/receipt';
 
 const receivingAppGraceMs = 2 * 60 * 1000;
-const receiptDirectoryName = 'crustcaper-receipt-sharing';
+// Keep sweeping the same cache directory across app upgrades.
+const shareDirectoryName = 'crustcaper-receipt-sharing';
 const taskNamePattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const activeTasks = new Set<string>();
 
@@ -18,9 +19,9 @@ function removeTask(directory: Directory) {
   }
 }
 
-export function purgeExpiredReceiptFiles() {
+export function purgeExpiredSharedDocuments() {
   try {
-    const directory = new Directory(Paths.cache, receiptDirectoryName);
+    const directory = new Directory(Paths.cache, shareDirectoryName);
     if (!directory.exists) return;
 
     const cutoff = Date.now() - receivingAppGraceMs;
@@ -35,22 +36,36 @@ export function purgeExpiredReceiptFiles() {
   }
 }
 
-export async function shareReceipt(bytes: Uint8Array, fileName: string, dialogTitle: string, canShare: () => boolean): Promise<void> {
+export function shareReceipt(bytes: Uint8Array, fileName: string, dialogTitle: string, canShare: () => boolean) {
+  return shareDocument(bytes, fileName, { dialogTitle, mimeType: PDF_MIME_TYPE, UTI: 'com.adobe.pdf' }, canShare);
+}
+
+export function shareOrderData(json: string, dialogTitle: string, canShare: () => boolean) {
+  return shareDocument(json, 'crustcaper-order-data.json',
+    { dialogTitle, mimeType: 'application/json', UTI: 'public.json' }, canShare);
+}
+
+async function shareDocument(
+  content: string | Uint8Array,
+  fileName: string,
+  options: Parameters<typeof shareAsync>[1],
+  canShare: () => boolean,
+) {
   const available = await isAvailableAsync();
   if (!canShare()) return;
   if (!available) throw new ApiError('service_unavailable');
 
   const task = randomUUID();
-  const directory = new Directory(Paths.cache, receiptDirectoryName, task);
+  const directory = new Directory(Paths.cache, shareDirectoryName, task);
   const file = new File(directory, fileName);
   let shared = false;
   try {
     directory.create({ intermediates: true });
     activeTasks.add(task);
     file.create();
-    file.write(bytes);
+    file.write(content);
     if (!canShare()) return;
-    await shareAsync(file.uri, { dialogTitle, mimeType: PDF_MIME_TYPE, UTI: 'com.adobe.pdf' });
+    await shareAsync(file.uri, options);
     shared = true;
   } finally {
     const cleanUp = () => {

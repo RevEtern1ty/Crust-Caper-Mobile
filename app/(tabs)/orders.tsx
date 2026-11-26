@@ -10,7 +10,7 @@ import { reorderOfferForCart } from '../../src/checkout/reorder-review';
 import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
 import { PickupAlertPanel } from '../../src/checkout/pickup-alert';
 import { hasInconsistentPayment, isAwaitingUnpaidHold, isExpiredUnpaidHold } from '../../src/checkout/pickup-hold';
-import { shareReceipt } from '../../src/checkout/receipt-sharing';
+import { shareReceipt } from '../../src/checkout/document-sharing';
 import { ApiError, type DemoKitchenStatus, type ReorderResult } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';

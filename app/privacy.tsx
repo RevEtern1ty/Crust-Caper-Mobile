@@ -1,8 +1,9 @@
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { AppState, Platform, Share, type Text as NativeText } from 'react-native';
+import { AppState, Platform, type Text as NativeText } from 'react-native';
 import { OrderAccessForm } from '../src/checkout/OrderAccessForm';
 import { useCheckout } from '../src/checkout/context';
+import { shareOrderData } from '../src/checkout/document-sharing';
 import { ApiError, type Locale, type OrderErasureRequest, type ShopApi } from '../src/domain/types';
 import { useShop } from '../src/state/shop';
 import { Button, Card, Screen, Text } from '../src/ui/core';
@@ -141,7 +142,10 @@ function VerifiedOrderPrivacy({ order, locale, api, captureAction, onClear }: {
     try {
       if (action === 'export') {
         const data = await getOrderDataExport(orderId);
-        if (isCurrent()) await shareOrderData(data, t('Order data', 'Amakuru ya komande'));
+        if (isCurrent()) {
+          const json = `${JSON.stringify(data, null, 2)}\n`;
+          await shareOrderData(json, t('Order data', 'Amakuru ya komande'), isCurrent);
+        }
       } else {
         const result = await requestOrderErasure(orderId);
         if (!isCurrent()) return;
@@ -157,8 +161,8 @@ function VerifiedOrderPrivacy({ order, locale, api, captureAction, onClear }: {
         setStatus({ state: 'unavailable' });
       }
     } finally {
-      if (isCurrent()) setBusy(null);
       running.current = false;
+      setBusy(null);
     }
   }
 
@@ -204,24 +208,4 @@ function VerifiedOrderPrivacy({ order, locale, api, captureAction, onClear }: {
 
 function privacyGrantExpired(error: unknown) {
   return error instanceof ApiError && (error.code === 'not_found' || error.code === 'unauthenticated');
-}
-
-async function shareOrderData(data: Awaited<ReturnType<PrivacyApi['getOrderDataExport']>>, title: string) {
-  const json = `${JSON.stringify(data, null, 2)}\n`;
-  if (Platform.OS !== 'web') {
-    await Share.share({ title, message: json }, { dialogTitle: title });
-    return;
-  }
-
-  const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = 'crustcaper-order-data.json';
-  try {
-    document.body.append(link);
-    link.click();
-  } finally {
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1_000);
-  }
 }
