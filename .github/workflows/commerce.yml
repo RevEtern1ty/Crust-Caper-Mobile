@@ -69,6 +69,20 @@ jobs:
           done
           sed -n '1,100p' "$RUNNER_TEMP/crustcaper-api.log"
           exit 1
+      - name: Back up and restore the connected test database
+        timeout-minutes: 3
+        env:
+          POSTGRES_SERVICE: ${{ job.services.postgres.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tooling_dir=$(docker exec "$POSTGRES_SERVICE" mktemp -d)
+          docker cp server/tooling/. "$POSTGRES_SERVICE:$tooling_dir/"
+          docker exec --workdir "$tooling_dir" "$POSTGRES_SERVICE" bash -euc '
+            export PGHOST=127.0.0.1 PGUSER="$POSTGRES_USER" PGDATABASE="$POSTGRES_DB"
+            export PGPASSWORD="$POSTGRES_PASSWORD"
+            bash test-postgres-recovery.sh
+          '
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: crustcaper-api-${{ github.sha }}

@@ -9,6 +9,7 @@ import { ApiError, type CartLine, type Order, type Quote } from '../domain/types
 import { privateStorage } from '../state/private-storage';
 import { useShop } from '../state/shop';
 import { CheckoutController, CheckoutError, type CheckoutContact, type CheckoutJournal } from './controller';
+import { nextOrderStatusDelay, type OrderStatusResult } from './order-status-polling';
 
 type Context = {
   journal: CheckoutJournal | null;
@@ -125,8 +126,11 @@ export function useRouteActionGuard() {
   };
 }
 
-const statusRefreshMs = 3000;
-const maxPolls = 8;
+type StatusPolling = {
+  orderId: string;
+  clearTimer: () => void;
+  onResult: (result: OrderStatusResult) => void;
+};
 
 export function useOrderStatus(orderId: string | null) {
   const { api, mode } = useShop();
@@ -134,62 +138,79 @@ export function useOrderStatus(orderId: string | null) {
   const [failure, setFailure] = useState<{ orderId: string; error: unknown } | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const version = useRef(0);
+  const pending = useRef<Promise<Order | null> | null>(null);
+  const polling = useRef<StatusPolling | null>(null);
 
-  const refresh = useCallback(async (silent = false) => {
-    if (!orderId) return null;
+  const refresh = useCallback((silent = false) => {
+    const monitor = polling.current;
+    if (!orderId || monitor?.orderId !== orderId) return Promise.resolve(null);
 
+    monitor.clearTimer();
     const request = ++version.current;
     if (!silent) setLoadingId(orderId);
-    try {
-      const order = await api.getOrder(orderId);
-      if (request === version.current) {
+
+    const earlierRequest = pending.current;
+    const read = async () => {
+      // A manual status check must see a fresh response after any earlier poll.
+      await earlierRequest;
+      if (request !== version.current) return null;
+      try {
+        const order = await api.getOrder(orderId);
+        if (request !== version.current) return null;
         setKnown(order);
         setFailure(null);
-      }
-      return order;
-    } catch (error) {
-      if (request === version.current) {
+        monitor.onResult({ order });
+        return order;
+      } catch (error) {
+        if (request !== version.current) return null;
         setFailure({ orderId, error });
         if (error instanceof ApiError && (error.code === 'unauthenticated' || error.code === 'not_found')) {
           setKnown(null);
         }
+        monitor.onResult({ error });
+        return null;
+      } finally {
+        if (request === version.current) setLoadingId(null);
       }
-      return null;
-    } finally {
-      if (request === version.current) setLoadingId(null);
-    }
+    };
+    const latest = read();
+    pending.current = latest;
+    return latest.finally(() => {
+      if (pending.current === latest) pending.current = null;
+    });
   }, [api, orderId]);
 
   useFocusEffect(useCallback(() => {
     if (!orderId) return;
 
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let cycle = 0;
-
-    async function poll(pollCycle: number, count: number) {
-      const order = await refresh(count > 0);
-      if (pollCycle !== cycle) return;
-
-      const inKitchen = order?.status === 'accepted' || order?.status === 'preparing';
-      if (mode === 'connected' && inKitchen) {
-        timer = setTimeout(() => { void poll(pollCycle, 1); }, 5000);
-        return;
-      }
-
-      if (count < maxPolls && (!order || order.paymentStatus === 'processing' || inKitchen)) {
-        timer = setTimeout(() => { void poll(pollCycle, count + 1); }, statusRefreshMs);
-      }
-    }
+    let attempts = 0;
+    let consecutiveFailures = 0;
+    const monitor: StatusPolling = {
+      orderId,
+      clearTimer: () => clearTimeout(timer),
+      onResult: (result) => {
+        if (polling.current !== monitor) return;
+        consecutiveFailures = 'error' in result ? consecutiveFailures + 1 : 0;
+        const delay = nextOrderStatusDelay(mode, result, ++attempts, consecutiveFailures);
+        if (delay !== null) timer = setTimeout(() => { void refresh(true); }, delay);
+      },
+    };
 
     function start() {
-      clearTimeout(timer);
-      void poll(++cycle, 0);
+      if (polling.current === monitor) return;
+      attempts = 0;
+      consecutiveFailures = 0;
+      polling.current = monitor;
+      void refresh();
     }
 
     function stop() {
-      cycle++;
-      version.current++;
-      clearTimeout(timer);
+      if (polling.current === monitor) {
+        polling.current = null;
+        version.current++;
+      }
+      monitor.clearTimer();
     }
 
     if (AppState.currentState !== 'background' && AppState.currentState !== 'inactive') start();

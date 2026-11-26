@@ -246,10 +246,27 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   await secondDevice.close();
 
   assert.equal((await advance(pickup, 'collected', pickupCode === '000000' ? '999999' : '000000')).status, 409);
+  await page.bringToFront();
+  const statusUrl = `${api}/orders/${order.id}`;
+  const lastReady = page.waitForResponse(response => response.url() === statusUrl && response.ok());
+  await button(page, 'Refresh order status').click();
+  assert.equal((await (await lastReady).json()).status, 'ready');
+  // Give a loop scheduled from the preparing state time to observe Ready and retire.
+  await delay(6000);
+  assert.equal(await page.evaluate(() => document.visibilityState), 'visible');
+  await shown(page, 'Ready for pickup');
+  let failedStatusPolls = 0;
+  await page.route(statusUrl, route => {
+    failedStatusPolls++;
+    return route.abort('connectionfailed');
+  }, { times: 1 });
   assert.equal((await advance(pickup, 'collected', pickupCode)).status, 200);
-  await page.reload();
-  await shown(page, 'Picked up');
+  const collectedAt = Date.now();
+  await page.getByText('Picked up', { exact: true }).first().waitFor({ timeout: 14_000 });
+  t.diagnostic(`Open order showed the collected status ${Date.now() - collectedAt} ms after API confirmation`);
+  assert.equal(failedStatusPolls, 1, 'Foreground status should recover from a failed request without a reload');
   assert.equal(await page.getByText('Pickup code', { exact: true }).count(), 0);
+  await capture(page, 'connected-order-collected');
 
   const { order: newerOrder } = await openCheckout();
   const views = [];
