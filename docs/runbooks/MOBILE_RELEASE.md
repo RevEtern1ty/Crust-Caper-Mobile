@@ -26,6 +26,52 @@ evidence_dir=$(mktemp -d)
 bash tooling/android-emulator-smoke.sh android/app/build/outputs/apk/release/app-release.apk demo "$evidence_dir"
 ```
 
+### Заказ в локальном Android APK
+
+Соберите APK профиля `local` из чистой копии проверяемого SHA. Вариант для Linux использует образ `reactnativecommunity/react-native-android@sha256:71884cd2953769cdaedced1922970d3168d9028f74f78246c5f0cbc6d60598df`. В нём установлены JDK 17, Android API 36, Build Tools 36.0.0, CMake 3.30.5 и NDK 27.1.12297006. Подключите Node.js 24.22.0 согласно `.nvmrc` для установки зависимостей и сборки JS. [Dockerfile v20.1](https://github.com/react-native-community/docker-android/blob/v20.1/Dockerfile) · [Node.js 24.22.0](https://nodejs.org/dist/v24.22.0/)
+
+Адрес `10.0.2.2` доступен из Android Emulator и ведёт на loopback хоста. В примере API слушает `127.0.0.1:18080` на хосте эмулятора. [Адреса эмулятора](https://developer.android.com/studio/run/emulator-networking-address)
+
+При сборке модуль `react-native-safe-area-context` запрашивает Build Tools 35.0.0, а приложение и `expo-modules-core` используют CMake 3.22.1. Команда ниже добавляет недостающие версии через `sdkmanager` с уже принятыми в образе лицензиями.
+
+```sh
+set -eu
+node_dir=$(mktemp -d)
+curl -fsSL https://nodejs.org/dist/v24.22.0/node-v24.22.0-linux-x64.tar.gz -o "$node_dir/node.tar.gz"
+printf '28ea0a438de9a13bd7891fd758eee6c7819ee8af5442dfd8d45bd65e56d4228c  %s\n' "$node_dir/node.tar.gz" | sha256sum -c -
+tar --no-same-owner -xzf "$node_dir/node.tar.gz" -C "$node_dir"
+export PATH="$node_dir/node-v24.22.0-linux-x64/bin:$PATH"
+
+export CI=1 EXPO_NO_TELEMETRY=1 CRUSTCAPER_BUILD_PROFILE=local CRUSTCAPER_STORE_ID=kigali
+export CRUSTCAPER_API_BASE_URL=http://10.0.2.2:18080/api/v1
+for package in 'build-tools;35.0.0' 'cmake;3.22.1'; do
+  if [ ! -f "$ANDROID_HOME/${package%;*}/${package#*;}/source.properties" ]; then
+    "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
+      --install "$package" </dev/null
+  fi
+done
+npm ci
+npx --no-install expo prebuild --platform android --no-install
+(
+  cd android
+  bash ./gradlew --no-daemon --max-workers=2 :app:assembleRelease \
+    '-Dorg.gradle.jvmargs=-Xmx1800m -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8' \
+    -PreactNativeArchitectures=x86_64 -Pandroid.builder.sdkDownload=false
+)
+apk=android/app/build/outputs/apk/release/app-release.apk
+"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$apk"
+sha256sum "$apk"
+```
+
+Запустите JAR этого же кандидата с Java 21, профилем Spring `local` и `CRUSTCAPER_PORT=18080`. Используйте отдельную PostgreSQL со свежими синтетическими данными и пустой очередью кухни. Проверьте готовность API на `http://127.0.0.1:18080/actuator/health/readiness`. Перенесите APK из среды сборки на хост эмулятора и запустите тест из корня репозитория с Python 3.11 или новее. Нужен один загруженный изолированный x86_64-эмулятор с английским интерфейсом, включённой сетью и без перенаправлений ADB. Сценарий запускается без Metro. [Запуск API и PostgreSQL](../../server/README.md#local-integration)
+
+```sh
+evidence_dir=$(mktemp -d)
+python3 tooling/android-connected-checkout.py /path/to/app-release.apk "$evidence_dir"
+```
+
+Сценарий проверяет установку того же APK, заказ через мобильные экраны, восстановление текущего заказа после холодного запуска, тестовую оплату, приготовление и выдачу. После выдачи код исчезает, статус сохраняется при повторном запуске. Сохраните SHA исходников и APK, версию эмулятора и результаты `evidence.json`, `menu.png` и `collected.png`. Эта сборка имеет отладочную подпись и ABI x86_64. Подписанные сборки, реальные платежи и приёмка на физических устройствах проходят по следующей матрице.
+
 ## Подключённая приёмка
 
 1. Зафиксировать SHA, изолированную среду, OpenAPI, данные тестовой точки, устройства, ОС и сеть. В Android-пилоте взять бюджетный и современный телефоны, в iOS — iPhone 11 и доступную актуальную модель.

@@ -112,18 +112,29 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - name: Install the Android NDK required by React Native
+      - name: Install the Android SDK packages required by the build
         timeout-minutes: 8
         shell: bash
         run: |
           ndk_version="$(sed -nE 's/^ndkVersion = "([^"]+)"$/\1/p' node_modules/react-native/gradle/libs.versions.toml)"
           [[ "$ndk_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           ndk="$ANDROID_HOME/ndk/$ndk_version"
-          if [[ ! -f "$ndk/source.properties" ]]; then
+          packages=()
+          [[ -f "$ndk/source.properties" ]] || packages+=("ndk;$ndk_version")
+          [[ -f "$ANDROID_HOME/platforms/android-36/android.jar" ]] || packages+=('platforms;android-36')
+          [[ -x "$ANDROID_HOME/build-tools/36.0.0/aapt" ]] || packages+=('build-tools;36.0.0')
+          # Android Gradle Plugin also configures native libraries with these revisions.
+          [[ -x "$ANDROID_HOME/build-tools/35.0.0/aapt" ]] || packages+=('build-tools;35.0.0')
+          [[ -x "$ANDROID_HOME/cmake/3.22.1/bin/cmake" ]] || packages+=('cmake;3.22.1')
+          if (( ${#packages[@]} )); then
             timeout --kill-after=5s 7m "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-              --sdk_root="$ANDROID_HOME" --install "ndk;$ndk_version" </dev/null
+              --sdk_root="$ANDROID_HOME" --install "${packages[@]}" </dev/null
           fi
           test -f "$ndk/source.properties"
+          test -f "$ANDROID_HOME/platforms/android-36/android.jar"
+          test -x "$ANDROID_HOME/build-tools/36.0.0/aapt"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/aapt"
+          test -x "$ANDROID_HOME/cmake/3.22.1/bin/cmake"
           printf 'ANDROID_NDK=%s\nANDROID_NDK_HOME=%s\nANDROID_NDK_ROOT=%s\n' "$ndk" "$ndk" "$ndk" >> "$GITHUB_ENV"
       - run: npx expo prebuild --platform android --no-install
       - name: Build with bundled JS and debug signing
