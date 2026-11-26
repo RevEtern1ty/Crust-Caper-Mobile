@@ -20,7 +20,10 @@ type Action = 'resume' | 'reorder' | 'kitchen' | 'receipt';
 
 export default function OrdersScreen() {
   const { api, mode, demoApi, checkoutAllowed, locale, menu, cart, hydrated, replaceCart } = useShop();
-  const { journal, requestedOrderId, setRequestedOrderId, restoreFailed, retryRestore, resumeCheckout, finishExpiredHold, busy } = useCheckout();
+  const {
+    journal, requestedOrderId, setRequestedOrderId, restoreFailed, retryRestore, resumeCheckout,
+    requestPendingOrderRecovery, finishExpiredHold, busy,
+  } = useCheckout();
   const guardNavigation = useRouteActionGuard();
   const latestId = journal?.orderIds[0] ?? null;
   const [choice, setChoice] = useState<{ latest: string | null; id: string } | null>(null);
@@ -137,6 +140,10 @@ export default function OrdersScreen() {
           <Text variant="heading">{t('Finish your last checkout', 'Rangiza kwishyura komande ya nyuma')}</Text>
           <Text>{t('Continue with the same order request.', 'Komeza icyifuzo cya komande kimwe.')}</Text>
           {checkoutAllowed && <Button label={t('Resume checkout', 'Komeza kwishyura')} onPress={() => resume()} busy={busy || action === 'resume'} disabled={!hydrated} />}
+          {requestPendingOrderRecovery && <Button label={t('Recover checkout by phone', 'Ongera ufungure ubwishyu ukoresheje telefoni')}
+            variant="secondary" disabled={!hydrated || busy} onPress={() => router.push({
+              pathname: '/order-recovery', params: { from: 'orders', pending: '1' },
+            })} />}
         </Card>
       )}
 

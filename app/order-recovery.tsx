@@ -9,21 +9,28 @@ import { useShop } from '../src/state/shop';
 import { Button, Card, colors, Screen, Text } from '../src/ui/core';
 import { copy } from '../src/ui/format';
 
-type Step = { kind: 'details' } | { kind: 'code'; challengeId: string } | { kind: 'save'; orderId: string; sessionRevision: number };
+type Step = { kind: 'details' } | { kind: 'code'; challengeId: string }
+  | { kind: 'save'; orderId: string; sessionRevision: number } | { kind: 'notPlaced' };
 type Field = 'orderCode' | 'phone' | 'code';
 
 export default function OrderRecoveryScreen() {
-  const { from, orderCode: savedCode } = useLocalSearchParams<{ from?: string; orderCode?: string }>();
+  const { from, orderCode: savedCode, pending: pendingParam } =
+    useLocalSearchParams<{ from?: string; orderCode?: string; pending?: string }>();
   const { api, checkoutAllowed, locale, mode } = useShop();
-  const { guestSessionEndPending, guestSessionRevision, rememberRecoveredOrder, setRequestedOrderId } = useCheckout();
+  const {
+    guestSessionEndPending, guestSessionRevision, journal, restoreFailed, pendingOrderRecoveryChallengeId,
+    requestPendingOrderRecovery, confirmPendingOrderRecovery, rememberRecoveredOrder, setRequestedOrderId,
+  } = useCheckout();
   const guardNavigation = useRouteActionGuard();
-  const [step, setStep] = useState<Step>({ kind: 'details' });
+  const [currentStep, setStep] = useState<Step>({ kind: 'details' });
+  const [dismissedChallenge, setDismissedChallenge] = useState<string>();
   const [orderCode, setOrderCode] = useState(() =>
     typeof savedCode === 'string' && /^[0-9A-F]{8}$/.test(savedCode) ? savedCode : '');
   const [phone, setPhone] = useState('');
   const [code, setCode] = useState('');
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  const [waiting, setWaiting] = useState(false);
   const [invalid, setInvalid] = useState<Field | null>(null);
   const orderInput = useRef<TextInput>(null);
   const phoneInput = useRef<TextInput>(null);
@@ -31,21 +38,31 @@ export default function OrderRecoveryScreen() {
   const running = useRef(false);
   const displayedRevision = useRef(guestSessionRevision);
   const t = (en: string, rw: string) => copy(locale, en, rw);
-  const available = mode === 'connected' && checkoutAllowed && !guestSessionEndPending && !!api.requestOrderAccess && !!api.verifyOrderAccess;
+  const pendingOrder = pendingParam === '1';
+  const step: Step = pendingOrder && currentStep.kind === 'details' && pendingOrderRecoveryChallengeId
+    && dismissedChallenge !== pendingOrderRecoveryChallengeId
+    ? { kind: 'code', challengeId: pendingOrderRecoveryChallengeId }
+    : currentStep;
+  const available = mode === 'connected' && checkoutAllowed && !guestSessionEndPending
+    && (pendingOrder
+      ? !!requestPendingOrderRecovery && !!confirmPendingOrderRecovery && journal?.active?.phase === 'creating'
+      : !!api.requestOrderAccess && !!api.verifyOrderAccess);
 
   useEffect(() => {
     if (displayedRevision.current === guestSessionRevision) return;
     displayedRevision.current = guestSessionRevision;
     setStep({ kind: 'details' });
+    setDismissedChallenge(undefined);
     setOrderCode('');
     setPhone('');
     setCode('');
     setProblem(null);
+    setWaiting(false);
     setInvalid(null);
   }, [guestSessionRevision]);
 
   function goToOrders() {
-    if (from === 'orders' && router.canGoBack()) router.back();
+    if (!pendingOrder && from === 'orders' && router.canGoBack()) router.back();
     else router.replace('/(tabs)/orders');
   }
 
@@ -57,12 +74,12 @@ export default function OrderRecoveryScreen() {
   }
 
   async function submit() {
-    if (!available || !api.requestOrderAccess || !api.verifyOrderAccess || running.current) return;
+    if (!available || running.current) return;
 
     const reference = orderCode.trim().replace(/^#/, '').toUpperCase();
     const normalizedPhone = normalizePhone(phone);
     if (step.kind === 'details') {
-      if (!/^[0-9A-F]{8}$/.test(reference)) {
+      if (!pendingOrder && !/^[0-9A-F]{8}$/.test(reference)) {
         showInputError('orderCode', t('Enter the eight characters of the order number.', 'Andika inyuguti n’imibare umunani bya nimero ya komande.'));
         return;
       }
@@ -83,7 +100,34 @@ export default function OrderRecoveryScreen() {
     setPending(true);
     setInvalid(null);
     setProblem(null);
+    setWaiting(false);
     try {
+      if (pendingOrder) {
+        if (step.kind === 'details' && normalizedPhone && requestPendingOrderRecovery) {
+          const result = await requestPendingOrderRecovery(normalizedPhone);
+          if (!shouldNavigate() || displayedRevision.current !== sessionRevision) return;
+          if (result.state === 'not_placed') {
+            setPhone('');
+            setStep({ kind: 'notPlaced' });
+          } else if (result.state === 'waiting') {
+            setWaiting(true);
+          } else {
+            setStep({ kind: 'code', challengeId: result.challengeId });
+          }
+          return;
+        }
+        if (step.kind === 'code' && confirmPendingOrderRecovery) {
+          const order = await confirmPendingOrderRecovery(step.challengeId, code);
+          if (shouldNavigate() && displayedRevision.current === sessionRevision) {
+            setCode('');
+            setPhone('');
+            setRequestedOrderId(order.id);
+            goToOrders();
+          }
+        }
+        return;
+      }
+      if (!api.requestOrderAccess || !api.verifyOrderAccess) return;
       if (step.kind === 'details' && normalizedPhone) {
         const { challengeId } = await api.requestOrderAccess({ orderCode: reference, phone: normalizedPhone });
         if (shouldNavigate() && displayedRevision.current === sessionRevision) setStep({ kind: 'code', challengeId });
@@ -122,19 +166,38 @@ export default function OrderRecoveryScreen() {
   }
 
   function changeDetails() {
+    if (pendingOrder && step.kind === 'code') setDismissedChallenge(step.challengeId);
     setCode('');
     setInvalid(null);
     setProblem(null);
+    setWaiting(false);
     setStep({ kind: 'details' });
+  }
+
+  if (step.kind === 'notPlaced') {
+    return (
+      <Screen safeBottom>
+        <Text variant="title" accessibilityRole="header">{t('No order was placed', 'Nta komande yakozwe')}</Text>
+        <Text>{t('Your cart is saved. Choose a pickup time to check out again.', 'Agatebo kawe kabitswe. Hitamo igihe cyo gufata komande wongere wishyure.')}</Text>
+        <Button label={t('Back to checkout', 'Subira aho kwishyurira')} onPress={() => router.replace('/checkout')} />
+      </Screen>
+    );
+  }
+
+  if (pendingOrder && !journal && !restoreFailed && !guestSessionEndPending) {
+    return <Screen safeBottom><Text>{t('Opening saved checkout…', 'Turimo gufungura ubwishyu bwabitswe…')}</Text></Screen>;
   }
 
   if (!available) {
     return (
       <Screen safeBottom>
-        <Text variant="title" accessibilityRole="header">{t('Find an order', 'Shaka komande')}</Text>
+        <Text variant="title" accessibilityRole="header">{pendingOrder
+          ? t('Recover checkout', 'Ongera ufungure ubwishyu') : t('Find an order', 'Shaka komande')}</Text>
         <Text>{guestSessionEndPending
           ? t('Finish ending this session in Settings.', 'Rangiriza gusoza iki gihe mu Magenamiterere.')
-          : t('Use a connected CrustCaper app to recover an order.', 'Koresha porogaramu ya CrustCaper ihujwe na serivisi kugira ngo ubone komande.')}</Text>
+          : pendingOrder
+            ? t('Open Orders to check your saved checkout.', 'Fungura Komande urebe ubwishyu bwabitswe.')
+            : t('Use a connected CrustCaper app to recover an order.', 'Koresha porogaramu ya CrustCaper ihujwe na serivisi kugira ngo ubone komande.')}</Text>
         <Button label={t('Go to Orders', 'Jya muri Komande')} onPress={goToOrders} />
       </Screen>
     );
@@ -144,30 +207,42 @@ export default function OrderRecoveryScreen() {
     <Screen key={step.kind} safeBottom bottom={(
       <View style={styles.stack}>
         {problem && <Text tone="red" accessibilityRole="alert">{problem}</Text>}
-        <Button label={step.kind === 'details' ? t('Request verification code', 'Saba kode yo kwemeza')
+        <Button label={step.kind === 'details' ? (pendingOrder
+          ? t('Check saved checkout', 'Genzura ubwishyu bwabitswe') : t('Request verification code', 'Saba kode yo kwemeza'))
           : step.kind === 'code' ? t('Verify and open order', 'Emeza kode ufungure komande')
             : t('Save order', 'Bika komande')}
         busy={pending} onPress={() => { void submit(); }} />
       </View>
     )}>
-      <Text variant="title" accessibilityRole="header">{step.kind === 'details' ? t('Find your order', 'Shaka komande yawe')
+      <Text variant="title" accessibilityRole="header">{step.kind === 'details' ? (pendingOrder
+        ? t('Recover checkout', 'Ongera ufungure ubwishyu') : t('Find your order', 'Shaka komande yawe'))
         : step.kind === 'code' ? t('Verify your phone', 'Emeza nimero ya telefoni')
           : t('Order verified', 'Komande yemejwe')}</Text>
       {step.kind === 'details' && (
         <Card>
-          <Text>{t('Enter the order number and the phone number used at checkout.', 'Andika nimero ya komande na nimero ya telefoni wakoresheje igihe wayitumizaga.')}</Text>
-          <Text variant="label">{t('Order number', 'Nimero ya komande')}</Text>
-          <TextInput ref={orderInput} accessibilityLabel={t('Order number', 'Nimero ya komande')}
-            value={orderCode} onChangeText={(value) => { setOrderCode(value); setInvalid(null); }}
-            placeholder="#1A2B3C4D" placeholderTextColor={colors.muted}
-            autoCapitalize="characters" autoComplete="off" autoCorrect={false} maxLength={12} editable={!pending}
-            style={[styles.input, invalid === 'orderCode' && styles.invalid]} />
+          <Text>{pendingOrder
+            ? t('Enter the phone number you used at checkout.', 'Andika nimero ya telefoni wakoresheje igihe wayitumizaga.')
+            : t('Enter the order number and the phone number used at checkout.', 'Andika nimero ya komande na nimero ya telefoni wakoresheje igihe wayitumizaga.')}</Text>
+          {!pendingOrder && (
+            <>
+              <Text variant="label">{t('Order number', 'Nimero ya komande')}</Text>
+              <TextInput ref={orderInput} accessibilityLabel={t('Order number', 'Nimero ya komande')}
+                value={orderCode} onChangeText={(value) => { setOrderCode(value); setInvalid(null); }}
+                placeholder="#1A2B3C4D" placeholderTextColor={colors.muted}
+                autoCapitalize="characters" autoComplete="off" autoCorrect={false} maxLength={12} editable={!pending}
+                style={[styles.input, invalid === 'orderCode' && styles.invalid]} />
+            </>
+          )}
           <Text variant="label">{t('Phone number', 'Nimero ya telefoni')}</Text>
           <TextInput ref={phoneInput} accessibilityLabel={t('Phone number', 'Nimero ya telefoni')}
             value={phone} onChangeText={(value) => { setPhone(value); setInvalid(null); }}
             placeholder="+250 …" placeholderTextColor={colors.muted}
             autoComplete="tel" keyboardType="phone-pad" maxLength={24} editable={!pending}
             style={[styles.input, invalid === 'phone' && styles.invalid]} />
+          {waiting && <Text accessibilityLiveRegion="polite">{t(
+            'The previous request can still finish. Wait a moment and check again.',
+            'Icyifuzo cya mbere kiracyashobora kurangira. Tegereza gato wongere ugenzure.',
+          )}</Text>}
         </Card>
       )}
       {step.kind === 'code' && (
