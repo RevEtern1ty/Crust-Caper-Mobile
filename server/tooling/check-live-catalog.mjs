@@ -76,14 +76,45 @@ function timestamp(value) {
   return typeof value === 'string' && timestampPattern.test(value) ? Date.parse(value) : NaN;
 }
 
-async function readPublicFile(url, label, accept) {
+async function readPublicFile(url, label, accept, { headers, ...options } = {}) {
   const signal = AbortSignal.timeout(timeoutMs);
   try {
     return await fetch(url, {
-      headers: { Accept: accept, 'Accept-Encoding': 'identity' }, cache: 'no-store', redirect: 'manual', signal,
+      ...options,
+      headers: { Accept: accept, 'Accept-Encoding': 'identity', ...headers }, cache: 'no-store', redirect: 'manual', signal,
     });
   } catch {
     throw new Error(`${label}: ${signal.aborted ? 'request timed out' : 'could not connect'}.`);
+  }
+}
+
+async function checkWebCheckoutAuthorization(origin) {
+  const label = 'Web checkout authorization';
+  const type = 'application/problem+json';
+  // This checks the origin policy before the API binds any quote input or changes state.
+  const response = await readPublicFile(new URL('/api/v1/web/quotes', origin), label, type, {
+    method: 'POST',
+    credentials: 'omit',
+    headers: { Origin: origin, 'X-CrustCaper-Web': '1' },
+  });
+  let reason;
+  if (response.status !== 401) reason = `HTTP ${response.status}, expected 401. Check CRUSTCAPER_WEB_ORIGIN`;
+  else if (mediaType(response) !== type) reason = `expected ${type}`;
+  else if (response.headers.has('set-cookie')) reason = 'unexpected session cookie in the response';
+  if (reason) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`${label}: ${reason}.`);
+  }
+  const bytes = await readPublicBody(response, label, 1);
+  let problem;
+  try {
+    problem = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch {
+    throw new Error(`${label}: invalid problem JSON.`);
+  }
+  if (problem?.status !== 401 || problem.code !== 'unauthenticated'
+      || problem.type !== 'urn:crustcaper:problem:unauthenticated') {
+    throw new Error(`${label}: expected the unauthenticated problem for a request without a session.`);
   }
 }
 
@@ -373,8 +404,12 @@ async function checkStorefront(origin, menu, storeId, expectedVersion, checkout)
       verified.add(url.href);
     }
   }
+  if (checkout) await checkWebCheckoutAuthorization(origin);
   console.log(`Storefront EN and RW pages and ${verified.size} catalog photo files verified.`);
-  if (checkout) console.log('Checkout EN and RW handoffs and Expo entry verified.');
+  if (checkout) {
+    console.log('Checkout EN and RW handoffs and Expo entry verified.');
+    console.log('Same-origin web checkout requires a guest session.');
+  }
 }
 
 async function checkCatalog(args) {

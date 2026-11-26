@@ -16,6 +16,20 @@ async function mockFetch(requested, options, scenario) {
   if (url.origin !== origin || options.redirect !== 'manual' || options.headers.Authorization || options.headers.Cookie) {
     throw new Error('Unexpected request');
   }
+  if (url.pathname === '/api/v1/web/quotes') {
+    const headers = new Headers(options.headers);
+    if (url.search || options.method !== 'POST' || options.credentials !== 'omit' || options.body != null
+        || headers.get('Origin') !== origin || headers.get('X-CrustCaper-Web') !== '1'
+        || headers.has('Cookie') || headers.has('Authorization') || headers.has('X-CrustCaper-Session')
+        || headers.has('Idempotency-Key')) throw new Error('Unexpected web quote probe');
+    return new Response(scenario.quoteProbeBody ?? JSON.stringify({
+      status: 401, type: 'urn:crustcaper:problem:unauthenticated', code: 'unauthenticated',
+    }), { status: scenario.quoteProbeStatus ?? 401, headers: {
+      'content-type': scenario.quoteProbeType ?? 'application/problem+json',
+      ...(scenario.quoteProbeCookie ? { 'set-cookie': 'fixture=never-print' } : {}),
+      Location: '/never-follow',
+    } });
+  }
   if (url.pathname === '/api/v1/stores/kigali/menu') {
     const start = new Date(Date.now() + 20 * 60_000).toISOString();
     const end = new Date(Date.now() + 30 * 60_000).toISOString();
@@ -106,6 +120,7 @@ test('storefront gate checks both localized pages and available catalog photo pa
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /channel=web&locale=en/);
     assert.match(result.stdout, /REQUEST \/menu\/en\nREQUEST \/menu\/rw/);
+    assert.doesNotMatch(result.stdout, /REQUEST \/api\/v1\/web\/quotes/);
     assert.match(result.stdout, new RegExp(`${path ? 1 : 0} catalog photo files verified`));
   }
 });
@@ -175,7 +190,32 @@ test('checkout gate requests the same available item via both localized catalog 
     assert.match(result.stdout, new RegExp(`REQUEST /menu/${locale}/double-smash\\nREQUEST /product/double-smash\\?storefrontLocale=${locale}`));
   }
   assert.equal(result.stdout.match(/REQUEST \/_expo\/static\/js\/web\/entry-/g)?.length, 1);
+  assert.equal(result.stdout.match(/REQUEST \/api\/v1\/web\/quotes\n/g)?.length, 1);
   assert.match(result.stdout, /Checkout EN and RW handoffs and Expo entry verified/);
+});
+
+test('checkout gate fails if the API has disabled or rejected the configured web origin', () => {
+  for (const quoteProbeStatus of [403, 404, 302, 200]) {
+    const result = run({ quoteProbeStatus, quoteProbeBody: 'never-print this response' }, '--checkout');
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, new RegExp(`Web checkout authorization: HTTP ${quoteProbeStatus}, expected 401`));
+    assert.doesNotMatch(result.stderr, /never-print/);
+    assert.doesNotMatch(result.stdout, /REQUEST \/never-follow/);
+  }
+});
+
+test('checkout gate rejects an ambiguous authorization response without echoing it', () => {
+  for (const scenario of [
+    { quoteProbeType: 'text/html' },
+    { quoteProbeBody: 'never-print' },
+    { quoteProbeBody: JSON.stringify({ status: 401, code: 'never-print' }) },
+    { quoteProbeCookie: true },
+  ]) {
+    const result = run(scenario, '--checkout');
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Web checkout authorization:/);
+    assert.doesNotMatch(result.stderr, /never-print/);
+  }
 });
 
 test('checkout gate reads the Expo manifest when EAS and nested settings precede the restaurant', () => {
