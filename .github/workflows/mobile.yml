@@ -41,6 +41,8 @@ jobs:
 
       - run: npm ci
       - run: npm run check
+      - name: Verify Android smoke failure and cleanup handling
+        run: bash tooling/test-android-emulator-smoke.sh
       - name: Verify stage and production native configuration
         run: node tooling/check-native-profiles.cjs
       - run: npm run build:web
@@ -85,7 +87,7 @@ jobs:
     name: Compile Android ${{ matrix.artifact }} APK
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -110,6 +112,19 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
+      - name: Install the Android NDK required by React Native
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          ndk_version="$(sed -nE 's/^ndkVersion = "([^"]+)"$/\1/p' node_modules/react-native/gradle/libs.versions.toml)"
+          [[ "$ndk_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ndk="$ANDROID_HOME/ndk/$ndk_version"
+          if [[ ! -f "$ndk/source.properties" ]]; then
+            timeout --kill-after=5s 7m "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+              --sdk_root="$ANDROID_HOME" --install "ndk;$ndk_version" </dev/null
+          fi
+          test -f "$ndk/source.properties"
+          printf 'ANDROID_NDK=%s\nANDROID_NDK_HOME=%s\nANDROID_NDK_ROOT=%s\n' "$ndk" "$ndk" "$ndk" >> "$GITHUB_ENV"
       - run: npx expo prebuild --platform android --no-install
       - name: Build with bundled JS and debug signing
         working-directory: android
@@ -172,10 +187,81 @@ jobs:
           printf 'APK package: %s\nAPK minimum SDK: %s\nBundled JS size: %s bytes\n' \
             "$expected_package" "$expected_min_sdk" "$bundle_size"
           sha256sum "$apk"
+      - name: Smoke-test the same APK offline in a headless Android emulator
+        id: android_smoke
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          evidence_dir="$RUNNER_TEMP/crustcaper-android-smoke"
+          image="system-images;android-35;default;x86_64"
+          android_tools="$ANDROID_HOME/cmdline-tools/latest/bin"
+          emulator="$ANDROID_HOME/emulator/emulator"
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/crustcaper-android-avds"
+          export ANDROID_SERIAL=emulator-5554
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          mkdir -p "$evidence_dir" "$ANDROID_AVD_HOME"
+          exec > >(tee "$evidence_dir/runner.log") 2>&1
+
+          receipt="$evidence_dir/runner.txt"
+          emulator_pid=
+          cleanup() {
+            local result=$?
+            trap - EXIT
+            if [[ -n "$emulator_pid" ]]; then
+              timeout --kill-after=2s 8s adb emu kill >/dev/null 2>&1 || true
+              kill "$emulator_pid" 2>/dev/null || true
+              wait "$emulator_pid" 2>/dev/null || true
+            fi
+            printf 'smoke_exit_status=%s\n' "$result" >> "$receipt"
+            exit "$result"
+          }
+          trap cleanup EXIT
+          candidate="$(git rev-parse HEAD)"
+          printf 'source_sha=%s\nprofile=%s\nsystem_image=%s\n' "$candidate" "$CRUSTCAPER_BUILD_PROFILE" "$image" > "$receipt"
+          sha256sum "$apk" >> "$receipt"
+          test "$candidate" = "$GITHUB_SHA"
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm
+          sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+          [[ -r /dev/kvm && -w /dev/kvm ]]
+
+          # The runner image already provides the SDK licenses; fail rather than accept any prompts.
+          timeout --kill-after=5s 6m "$android_tools/sdkmanager" --sdk_root="$ANDROID_HOME" --install emulator "$image" </dev/null
+          "$emulator" -version
+          "$emulator" -accel-check
+          printf 'no\n' | timeout --kill-after=2s 30s "$android_tools/avdmanager" create avd -n crustcaper-smoke -k "$image" --device pixel_5
+          timeout --kill-after=2s 15s adb start-server
+          timeout --kill-after=5s 12m "$emulator" -avd crustcaper-smoke -port 5554 \
+            -accel on -gpu swiftshader -no-window -no-snapshot -no-audio -no-boot-anim \
+            -cores 2 -memory 2048 > "$evidence_dir/emulator.log" 2>&1 &
+          emulator_pid=$!
+
+          boot_deadline=$((SECONDS + 180))
+          until [[ "$(timeout --kill-after=2s 8s adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)" == 1 ]]; do
+            if ! kill -0 "$emulator_pid" 2>/dev/null || (( SECONDS >= boot_deadline )); then
+              echo 'The Android emulator failed to boot within 180 seconds.'
+              tail -n 60 "$evidence_dir/emulator.log"
+              exit 1
+            fi
+            sleep 2
+          done
+          timeout --kill-after=2s 12s adb shell input keyevent KEYCODE_WAKEUP
+          timeout --kill-after=2s 12s adb shell wm dismiss-keyguard
+          timeout --kill-after=55s 7m bash tooling/android-emulator-smoke.sh "$apk" "$CRUSTCAPER_BUILD_PROFILE" "$evidence_dir"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mobile-android-${{ matrix.artifact }}-${{ github.sha }}
           path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain Android emulator evidence
+        if: ${{ !cancelled() && steps.android_smoke.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-android-${{ matrix.artifact }}-emulator-smoke-${{ github.sha }}
+          path: ${{ runner.temp }}/crustcaper-android-smoke/
           if-no-files-found: error
           retention-days: 14
 
