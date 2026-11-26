@@ -33,7 +33,7 @@ public final class WebCheckoutFixture {
     private static final String FIXTURE_KEY = "fixture-only";
     private static final String DATABASE_TLS = "?sslmode=verify-full&sslrootcert=/run/crustcaper/postgres-ca.crt";
     private static final String FIXTURE_DATABASE_URL = "jdbc:postgresql://postgres:5432/storefront_fixture" + DATABASE_TLS;
-    private static final String RECOVERED_DATABASE_URL = "jdbc:postgresql://postgres:5432/storefront_recovered" + DATABASE_TLS;
+    private static final String RECOVERED_DATABASE_URL = "jdbc:postgresql://postgres-recovery:5432/storefront_recovered" + DATABASE_TLS;
     private static final String FIXTURE_DATABASE_USER = "storefront_fixture";
     private static final String RESTART_WEBHOOK_SECRET = "fixture-restart-webhook-v1";
     private static final String RETURN_URL = WEB_ORIGIN + "/payment-return";

@@ -4,7 +4,7 @@ const { randomBytes, randomUUID } = require('node:crypto');
 const { access, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const { basename, dirname, join, resolve } = require('node:path');
-const { fixtureDatabaseUrl, preparePostgresTls, postgresJdbcTlsQuery, postgresTlsEntrypoint,
+const { fixtureDatabaseUrl, preparePostgresTls, postgresCaMount, postgresJdbcTlsQuery, postgresTlsEntrypoint,
   postgresTlsMount, postgresTlsRuntime } = require('./storefront-postgres-tls.cjs');
 
 const root = resolve(dirname(module.filename), '..');
@@ -12,6 +12,7 @@ const deploy = join(root, 'server', 'deploy');
 const fixtureHost = 'crustcaper.test';
 const database = 'storefront_fixture';
 const recoveredDatabase = 'storefront_recovered';
+const recoveryHost = 'postgres-recovery';
 const testMain = 'com.crustcaper.api.payment.WebCheckoutFixture';
 const scratchPrefix = 'cc-storefront-';
 const fixturePhoto = { sku: 'double-smash', file: 'double-smash-r39.jpg' };
@@ -90,21 +91,48 @@ const mount = (source, target) => ({
   bind: { create_host_path: false },
 });
 
+function postgresService(host, name, password, tlsDirectory, volumes, labels) {
+  return {
+    image: postgresImage,
+    entrypoint: ['/bin/sh', '-ec', postgresTlsEntrypoint],
+    command: [],
+    restart: 'no',
+    tmpfs: [`${postgresTlsRuntime}:rw,noexec,nosuid,nodev,size=1m`],
+    ...(labels && { labels }),
+    environment: { POSTGRES_USER: database, POSTGRES_DB: name, POSTGRES_PASSWORD: password },
+    healthcheck: {
+      test: ['CMD-SHELL', 'PGPASSWORD="$${POSTGRES_PASSWORD}" PGSSLMODE=verify-full '
+        + `PGSSLROOTCERT=${postgresTlsRuntime}/ca.crt psql -h ${host} -XAtq --no-password -U ${database} -d ${name} -c 'SELECT 1'`],
+      interval: '2s', timeout: '3s', retries: 15,
+    },
+    volumes: [mount(tlsDirectory, postgresTlsMount), ...volumes],
+  };
+}
+
 async function prepareFixture(directory, testClasses, env, { load, paymentRestart, catalogPhotos, errorRehearsal, databaseRecovery }) {
   const fixturePassword = randomBytes(24).toString('hex');
   const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
   const composeEnvironment = join(directory, 'compose.env');
-  const { tlsDirectory, caFile: databaseCa } = await preparePostgresTls(directory, env, run);
+  const { tlsDirectory, caFile: databaseCa, caFingerprint } = await preparePostgresTls(directory, env, run);
   const caddyfile = join(directory, 'Caddyfile');
   const overlay = join(directory, 'fixture.json');
   let recoveryOverlay;
+  let recoveryPostgres;
   const recoveryTooling = [];
+  const operators = mount(join(root, 'server', 'tooling', 'operator-accounts.psql'), '/fixture/operator-accounts.psql');
   if (databaseRecovery) {
+    const recoveredTls = await preparePostgresTls(directory, env, run, recoveryHost);
+    if (recoveredTls.caFingerprint === caFingerprint) throw new Error('Recovery requires an independent PostgreSQL CA');
+    const recoveredPassword = randomBytes(24).toString('hex');
+    const recoveryEnvironment = join(directory, 'recovered-api.env');
+    await writeFile(recoveryEnvironment, `CRUSTCAPER_DB_PASSWORD=${recoveredPassword}\n`, { mode: 0o600 });
     recoveryOverlay = join(directory, 'recovery-cutover.json');
     await writeFile(recoveryOverlay, JSON.stringify({ services: { api: {
-      environment: { CRUSTCAPER_DB_URL: fixtureDatabaseUrl(recoveredDatabase) },
+      env_file: [{ path: dockerPath(recoveryEnvironment).replaceAll('$', '$$'), format: 'raw' }],
+      environment: { CRUSTCAPER_DB_URL: fixtureDatabaseUrl(recoveredDatabase, recoveryHost) },
       command: ['--recovery-api'],
+      volumes: [mount(recoveredTls.caFile, postgresCaMount)],
     } } }));
     for (const name of ['backup-postgres.sh', 'restore-postgres.sh', 'postgres-connection.sh']) {
       const source = join(root, 'server', 'tooling', name);
@@ -112,6 +140,9 @@ async function prepareFixture(directory, testClasses, env, { load, paymentRestar
       await writeFile(copy, (await readFile(source, 'utf8')).replaceAll('\r\n', '\n'));
       recoveryTooling.push(mount(copy, '/fixture/' + name));
     }
+    recoveryPostgres = postgresService(recoveryHost, 'postgres', recoveredPassword, recoveredTls.tlsDirectory, [
+      operators, ...recoveryTooling, 'recovered_db:/var/lib/postgresql/data',
+    ], recoveryLabel);
   }
   await writeFile(apiEnvironment, [
     'SPRING_PROFILES_ACTIVE=stage',
@@ -179,28 +210,15 @@ async function prepareFixture(directory, testClasses, env, { load, paymentRestar
       } }),
       catalog: { pull_policy: 'never' },
       edge: { volumes: [mount(caddyfile, '/etc/caddy/Caddyfile')] },
-      postgres: {
-        image: postgresImage,
-        entrypoint: ['/bin/sh', '-ec', postgresTlsEntrypoint],
-        command: [],
-        tmpfs: [`${postgresTlsRuntime}:rw,noexec,nosuid,nodev,size=1m`],
-        ...(errorRehearsal && { labels: errorRehearsalLabel }),
-        ...(databaseRecovery && { labels: recoveryLabel }),
-        environment: { POSTGRES_USER: database, POSTGRES_DB: database, POSTGRES_PASSWORD: fixturePassword },
-        healthcheck: {
-          test: ['CMD-SHELL', 'PGPASSWORD="$${POSTGRES_PASSWORD}" PGSSLMODE=verify-full '
-            + `PGSSLROOTCERT=${postgresTlsRuntime}/ca.crt psql -h postgres -XAtq --no-password -U ${database} -d ${database} -c 'SELECT 1'`],
-          interval: '2s', timeout: '3s', retries: 15,
-        },
-        volumes: [
-          mount(tlsDirectory, postgresTlsMount),
-          mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
-          ...(load || paymentRestart || catalogPhotos
-            ? [mount(join(root, 'server', 'tooling', 'operator-accounts.psql'), '/fixture/operator-accounts.psql')] : []),
-          ...recoveryTooling,
-        ],
-      },
+      postgres: postgresService('postgres', database, fixturePassword, tlsDirectory, [
+        mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
+        ...(load || paymentRestart || catalogPhotos ? [operators] : []),
+        ...recoveryTooling,
+        ...(databaseRecovery ? ['source_db:/var/lib/postgresql/data'] : []),
+      ], databaseRecovery ? recoveryLabel : errorRehearsal ? errorRehearsalLabel : undefined),
+      ...(databaseRecovery && { [recoveryHost]: recoveryPostgres }),
     },
+    ...(databaseRecovery && { volumes: { source_db: {}, recovered_db: {} } }),
   }, null, 2), { mode: 0o600 });
   return { apiEnvironment, composeEnvironment, databaseCa, overlay, recoveryOverlay, fixtureMfaKey };
 }
@@ -314,6 +332,9 @@ async function main() {
     command.push('-f', dockerPath(settings.overlay));
     const compose = (action, args, options) => run(action, 'docker', [...command, ...args], { env, ...options });
     await compose('Validate the deployed Compose files with the fixture overlay', ['config', '--quiet']);
+    if (databaseRecovery) await compose('Validate the recovery API cutover overlay', [
+      '-f', dockerPath(settings.recoveryOverlay), 'config', '--quiet',
+    ]);
     stop = () => compose('Stop the isolated storefront fixture', ['down', '--volumes', '--timeout', '15'],
       { cleanup: true, timeout: 45000 });
     await compose('Start the storefront HTTPS fixture', ['up', '-d', '--wait', '--wait-timeout', '90'],
@@ -332,6 +353,8 @@ async function main() {
         signal: recoverySignal,
         stopSource: (signal = recoverySignal) => compose('Stop only the primary fixture API',
           ['stop', '--timeout', '10', 'api'], { timeout: 20000, signal }),
+        stopSourceDatabase: (signal = recoverySignal) => compose('Stop only the primary fixture PostgreSQL server',
+          ['stop', '--timeout', '10', 'postgres'], { timeout: 20000, signal }),
         startRecovered: (signal = recoverySignal) => run('Start the restored fixture API', 'docker', [
           ...command, '-f', dockerPath(settings.recoveryOverlay),
           'up', '-d', '--no-deps', '--force-recreate', '--wait', '--wait-timeout', '35', 'api',
