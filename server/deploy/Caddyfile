@@ -29,6 +29,20 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 	@local path /api/v1/local /api/v1/local/*
 	@operatorHome path /operator /operator/
 	@publicRoutes path /api/v1 /api/v1/* /operator/* /payment-return /.well-known/apple-app-site-association /.well-known/assetlinks.json
+	@storefrontPages {
+		method GET HEAD
+		path / /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery /product/*
+		file {
+			root /srv/crustcaper-storefront
+			try_files /index.html
+		}
+	}
+	@storefrontAssets {
+		method GET HEAD
+		path /favicon.ico /_expo/static/* /assets/*
+		not path *.map
+	}
+	@storefrontPrivate path /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery
 	@receiptUpload {
 		method PUT
 		path_regexp ^/api/v1/operator/orders/[0-9a-fA-F-]{36}/receipt$
@@ -56,6 +70,20 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 					response_header_timeout 30s
 				}
 			}
+		}
+		handle @storefrontPages {
+			root * /srv/crustcaper-storefront
+			header @storefrontPrivate X-Robots-Tag "noindex"
+			header {
+				Cache-Control "no-store"
+				Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+			}
+			rewrite * /index.html
+			file_server
+		}
+		handle @storefrontAssets {
+			root * /srv/crustcaper-storefront
+			file_server
 		}
 		respond 404
 	}

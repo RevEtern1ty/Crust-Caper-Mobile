@@ -1,0 +1,13 @@
+services:
+  api:
+    environment:
+      CRUSTCAPER_WEB_ORIGIN: https://${CRUSTCAPER_HTTPS_HOST:?Set the storefront hostname}
+
+  edge:
+    volumes:
+      - type: bind
+        source: ${CRUSTCAPER_STOREFRONT_DIR:?Set the absolute path to the built storefront}
+        target: /srv/crustcaper-storefront
+        read_only: true
+        bind:
+          create_host_path: false

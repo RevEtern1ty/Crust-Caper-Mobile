@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: CrustCaper Shared API
-  version: 0.9.0
-  description: Implemented HTTP contract for the Spring Boot commerce service.
+  version: 0.10.0
+  description: Implemented Spring Boot commerce API. The web routes require an enabled storefront origin and otherwise return 404.
 servers:
   - url: /api/v1
 paths:
@@ -330,6 +330,187 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/NotFoundProblem' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /web/session:
+    get:
+      operationId: getWebSession
+      security: [{ webGuest: [] }]
+      description: Returns the browser session marker that identifies the HttpOnly cookie already set in this browser.
+      responses:
+        '200': { $ref: '#/components/responses/WebSession' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      operationId: createWebSession
+      parameters:
+        - $ref: '#/components/parameters/WebOrigin'
+        - $ref: '#/components/parameters/WebWrite'
+      description: Reuses an active cookie or sets a new __Host-crustcaper-web cookie with Secure, HttpOnly, SameSite=Lax and Path=/.
+      responses:
+        '200': { $ref: '#/components/responses/WebSession' }
+        '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    delete:
+      operationId: deleteWebSession
+      parameters:
+        - $ref: '#/components/parameters/WebOrigin'
+        - $ref: '#/components/parameters/WebWrite'
+        - $ref: '#/components/parameters/WebSessionContext'
+      description: Revokes the matching browser session. A retry with the cookie already removed succeeds.
+      responses:
+        '204': { description: The matching cookie is cleared. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/WebOriginRejected' }
+  /web/quotes:
+    post:
+      operationId: createWebQuote
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/WebOrigin'
+        - $ref: '#/components/parameters/WebWrite'
+        - $ref: '#/components/parameters/WebSessionContext'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteRequest' }
+      responses:
+        '200':
+          description: Current quote bound to this browser session.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '404': { $ref: '#/components/responses/StoreUnavailable' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /web/orders:
+    post:
+      operationId: createWebOrder
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/WebOrigin'
+        - $ref: '#/components/parameters/WebWrite'
+        - $ref: '#/components/parameters/WebSessionContext'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        $ref: '#/paths/~1orders/post/requestBody'
+      responses:
+        '200': { $ref: '#/components/responses/WebOrder' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /web/orders/recovery:
+    get:
+      operationId: recoverWebOrder
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/WebSessionContext'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': { $ref: '#/components/responses/WebOrder' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /web/orders/{id}:
+    get:
+      operationId: getWebOrder
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/WebSessionContext'
+      responses:
+        '200': { $ref: '#/components/responses/WebOrder' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /web/orders/{id}/receipt:
+    get:
+      operationId: downloadWebFiscalReceipt
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/WebSessionContext'
+      responses:
+        '200': { $ref: '#/paths/~1orders~1{id}~1receipt/get/responses/200' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+  /web/orders/{id}/reorder:
+    post:
+      operationId: reorderWebOrder
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/WebOrigin'
+        - $ref: '#/components/parameters/WebWrite'
+        - $ref: '#/components/parameters/WebSessionContext'
+      responses:
+        '200': { $ref: '#/paths/~1orders~1{id}~1reorder/post/responses/200' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /web/orders/{id}/payments:
+    post:
+      operationId: startWebPayment
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/WebOrigin'
+        - $ref: '#/components/parameters/WebWrite'
+        - $ref: '#/components/parameters/WebSessionContext'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200': { $ref: '#/paths/~1orders~1{id}~1payments/post/responses/200' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /web/order-access/challenges:
+    post:
+      operationId: requestWebOrderAccessChallenge
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/WebOrigin'
+        - $ref: '#/components/parameters/WebWrite'
+        - $ref: '#/components/parameters/WebSessionContext'
+      requestBody:
+        $ref: '#/paths/~1order-access~1challenges/post/requestBody'
+      responses:
+        '202': { $ref: '#/paths/~1order-access~1challenges/post/responses/202' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /web/order-access/challenges/{challengeId}/verify:
+    post:
+      operationId: verifyWebOrderAccessChallenge
+      security: [{ webGuest: [] }]
+      parameters:
+        - name: challengeId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/WebOrigin'
+        - $ref: '#/components/parameters/WebWrite'
+        - $ref: '#/components/parameters/WebSessionContext'
+      requestBody:
+        $ref: '#/paths/~1order-access~1challenges~1{challengeId}~1verify/post/requestBody'
+      responses:
+        '200': { $ref: '#/paths/~1order-access~1challenges~1{challengeId}~1verify/post/responses/200' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '404': { $ref: '#/paths/~1order-access~1challenges~1{challengeId}~1verify/post/responses/404' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/sessions:
     post:
@@ -959,6 +1140,11 @@ paths:
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 components:
   securitySchemes:
+    webGuest:
+      type: apiKey
+      in: cookie
+      name: __Host-crustcaper-web
+      description: Secure and HttpOnly guest credential scoped to the storefront host.
     guestOrAccount:
       type: http
       scheme: bearer
@@ -972,6 +1158,23 @@ components:
       in: header
       name: verif-hash
   parameters:
+    WebOrigin:
+      name: Origin
+      in: header
+      required: true
+      description: Browser-supplied origin. Must equal the configured HTTPS storefront origin.
+      schema: { type: string, format: uri }
+    WebWrite:
+      name: X-CrustCaper-Web
+      in: header
+      required: true
+      schema: { type: string, const: '1' }
+    WebSessionContext:
+      name: X-CrustCaper-Session
+      in: header
+      required: true
+      description: Nonsecret session marker from the web session endpoint. Must match the session authenticated by the cookie.
+      schema: { type: string, format: uuid }
     ReconciliationDate:
       name: date
       in: query
@@ -999,6 +1202,40 @@ components:
       description: Reuse the key with the same payload to recover the original operation.
       schema: { type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$' }
   responses:
+    WebSession:
+      description: Browser session marker and expiry.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+        Set-Cookie:
+          description: Present when a new session is set.
+          schema: { type: string }
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [sessionId, expiresAt]
+            properties:
+              sessionId: { type: string, format: uuid }
+              expiresAt: { $ref: '#/components/schemas/Timestamp' }
+    WebOrder:
+      description: Order visible to the browser session. Issued receipts use the web receipt route.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Order'
+              - type: object
+                properties:
+                  recoveryReadOnly: { type: boolean, const: true }
+    WebOriginRejected:
+      description: Origin or write marker is missing or invalid.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/ProblemDetails' }
     PickupAlert:
       description: Current notification preference for the guest, installation and order.
       headers:

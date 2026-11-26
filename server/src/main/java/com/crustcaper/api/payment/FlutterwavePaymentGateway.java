@@ -32,6 +32,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
 
     private static final String HOSTED_PAYMENT_PATH = "/v3/payments";
     private static final String PAYMENT_RETURN_PATH = "/payment-return";
+    static final String WEB_PAYMENT_RETURN_PATH = "/web-payment-return";
     private static final int MAX_RESPONSE_BYTES = 128 * 1024;
     private static final Pattern REFERENCE = Pattern.compile("[A-Za-z0-9_-]{1,128}");
     private static final Pattern TRANSACTION_ID = Pattern.compile("[1-9][0-9]{0,18}");
@@ -42,6 +43,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
 
     private final URI apiOrigin;
     private final URI returnUrl;
+    private final URI webReturnUrl;
     private final String secretKey;
     private final ObjectMapper mapper;
     private final ObjectReader responseReader;
@@ -51,15 +53,25 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
 
     FlutterwavePaymentGateway(URI apiOrigin, URI returnUrl, String secretKey, ObjectMapper mapper,
                              Clock clock, int connectTimeoutMs, int readTimeoutMs) {
+        this(apiOrigin, returnUrl, null, secretKey, mapper, clock, connectTimeoutMs, readTimeoutMs);
+    }
+
+    FlutterwavePaymentGateway(URI apiOrigin, URI returnUrl, URI webReturnUrl, String secretKey,
+                              ObjectMapper mapper, Clock clock, int connectTimeoutMs, int readTimeoutMs) {
         if (!isHttpsUrl(returnUrl) || !PAYMENT_RETURN_PATH.equals(returnUrl.getRawPath()) || returnUrl.getRawQuery() != null) {
             throw new IllegalStateException("CRUST_PAYMENT_RETURN_URL must be an absolute HTTPS URL at "
                     + PAYMENT_RETURN_PATH + " without a query or fragment");
+        }
+        if (webReturnUrl != null && (!isHttpsUrl(webReturnUrl)
+                || !WEB_PAYMENT_RETURN_PATH.equals(webReturnUrl.getRawPath()) || webReturnUrl.getRawQuery() != null)) {
+            throw new IllegalStateException("CRUSTCAPER_WEB_ORIGIN must be an absolute HTTPS origin");
         }
         if (secretKey == null || !secretKey.matches("[!-~]{1,512}")) {
             throw new IllegalStateException("FLUTTERWAVE_SECRET_KEY is missing or invalid");
         }
         this.apiOrigin = apiOrigin;
         this.returnUrl = returnUrl;
+        this.webReturnUrl = webReturnUrl;
         this.secretKey = secretKey;
         this.mapper = mapper;
         this.responseReader = mapper.readerFor(JsonNode.class)
@@ -73,11 +85,16 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
     @Override
     public HostedPayment open(PaymentRequest request) {
         validateRequest(request);
+        URI checkoutReturn = switch (request.checkoutChannel()) {
+            case MOBILE -> returnUrl;
+            case WEB -> webReturnUrl;
+        };
+        if (checkoutReturn == null) throw new PaymentGatewayException(NOT_DISPATCHED);
         ObjectNode payload = mapper.createObjectNode()
                 .put("tx_ref", request.reference())
                 .put("amount", request.amount())
                 .put("currency", request.currency())
-                .put("redirect_url", returnUrl.toASCIIString() + "?orderId=" + request.orderId())
+                .put("redirect_url", checkoutReturn.toASCIIString() + "?orderId=" + request.orderId())
                 .put("payment_options", "card,mobilemoneyrwanda")
                 .put("link_expiration", request.expiresAt().toString());
         ObjectNode customer = payload.putObject("customer").put("email", request.email());

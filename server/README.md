@@ -35,6 +35,7 @@ Build the Linux container with `docker build -t crustcaper-api ./server` or depl
 | `CRUSTCAPER_OPERATOR_MFA_KEY` | Required staff authenticator encryption key. Base64-encode 32 random bytes, use a separate key for each environment, and store it with the deployment secrets. See [Staff access](docs/OPERATIONS.md#выдача-доступа). |
 | `CRUSTCAPER_PAYMENT_PROVIDER` | `flutterwave`. |
 | `FLUTTERWAVE_SECRET_KEY`, `FLUTTERWAVE_WEBHOOK_SECRET`, `CRUST_PAYMENT_RETURN_URL` | Environment-specific provider configuration. See [Payments](docs/PAYMENTS.md). |
+| `CRUSTCAPER_WEB_ORIGIN` | Optional exact HTTPS origin for browser checkout. Empty disables browser commerce. The storefront Compose overlay sets this from the HTTPS hostname. |
 | `CRUSTCAPER_PORT` | Listener port behind the HTTPS ingress. Defaults to 8080. |
 
 Requests wait up to five seconds for a PostgreSQL connection from the runtime pool. Runtime pgJDBC connections default to a three-second socket connect timeout and a six-second socket read timeout. Parameters with the same names in the JDBC URL take precedence. Flyway opens a separate connection at startup using the same JDBC URL and credentials, so migrations can run beyond the runtime read timeout. Keep `sslmode=verify-full` and the CA configuration in the JDBC URL for deployments. [pgJDBC connection parameters](https://jdbc.postgresql.org/documentation/use/)
@@ -80,3 +81,22 @@ stage_compose exec -T edge wget -qO- http://api:8080/actuator/health/readiness
 ```
 
 Run the [connected release checks](../docs/runbooks/CONNECTED_RELEASE.md) against the deployed HTTPS hostname. The proxy exposes customer API and Flutterwave webhook, `/operator/index.html`, `/payment-return` and the two signing association URLs. Internal health probes stay inside the Docker network. The receipt upload route accepts up to 1 MiB and other requests are capped at 64 KiB. Before allowing pilot traffic, configure log and availability monitoring, an approved request-rate policy and rehearse [database backup and recovery](docs/DATABASE_RECOVERY.md). Prepare a verified previous image reference. Roll back the container by restoring that reference and rerunning `up` only after confirming the previous image supports the current Flyway schema.
+
+### Browser storefront
+
+Build the storefront from the repository root with Node 24 using the same HTTPS origin configured on the API. Replace the example hostname and store ID with the approved values for the environment.
+
+```sh
+npm ci
+CRUSTCAPER_BUILD_PROFILE=stage \
+CRUSTCAPER_WEB_CHECKOUT=true \
+CRUSTCAPER_API_BASE_URL=https://stage.example.test/api/v1 \
+CRUSTCAPER_APP_LINK_ORIGIN=https://stage.example.test \
+CRUSTCAPER_STORE_ID=kigali \
+CRUSTCAPER_PSP_HOSTS=checkout.flutterwave.com \
+npm run build:web
+```
+
+Set `CRUSTCAPER_STOREFRONT_DIR` in the Compose environment file to the absolute path of the exported `dist` directory. Mount only the build output. Add `-f server/deploy/compose.storefront.yml` to the existing HTTPS Compose command and keep the same project name. Run the validation and health checks above using all three files. For a different ingress, serve the storefront export and API on a single origin and set `CRUSTCAPER_WEB_ORIGIN` directly in the API environment. Serve `/web-payment-return` as a storefront route with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Keep the native association and `/payment-return` routes on the API. [Caddy static file routing](https://caddyserver.com/docs/caddyfile/directives/file_server)
+
+Browser guest credentials are set through a first-party HttpOnly cookie. Checkout and recovery use the browser session, the server-confirmed order and the payment provider's verified result. Test the hosted flow in the same tab over HTTPS, including a failed payment and recovery after reopening the browser, with Flutterwave Test before admitting recipients to the storefront.

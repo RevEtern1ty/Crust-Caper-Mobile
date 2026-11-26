@@ -1,5 +1,6 @@
 package com.crustcaper.api.payment;
 
+import com.crustcaper.api.WebOrigin;
 import tools.jackson.databind.ObjectMapper;
 import java.net.URI;
 import java.time.Clock;
@@ -25,8 +26,8 @@ class PaymentGatewayConfiguration {
         if (secret != null && (!secret.startsWith(requiredPrefix) || secret.length() == requiredPrefix.length())) {
             throw new IllegalStateException("Flutterwave requires a test key on stage and a live key outside stage");
         }
-        return new FlutterwavePaymentGateway(FlutterwavePaymentGateway.API_ORIGIN, configuredReturnUrl(), secret,
-                mapper, Clock.systemUTC(), 4_000, 8_000);
+        return new FlutterwavePaymentGateway(FlutterwavePaymentGateway.API_ORIGIN, configuredReturnUrl(),
+                configuredWebReturnUrl(environment), secret, mapper, Clock.systemUTC(), 4_000, 8_000);
     }
 
     @Bean
@@ -67,5 +68,10 @@ class PaymentGatewayConfiguration {
             // Avoid exposing a misconfigured URL in startup logs.
         }
         throw new IllegalStateException("CRUST_PAYMENT_RETURN_URL must be an absolute HTTPS URL");
+    }
+
+    private static URI configuredWebReturnUrl(Environment environment) {
+        String origin = WebOrigin.parse(environment.getProperty("crustcaper.web.origin"));
+        return origin == null ? null : URI.create(origin + FlutterwavePaymentGateway.WEB_PAYMENT_RETURN_PATH);
     }
 }

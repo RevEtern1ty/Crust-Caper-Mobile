@@ -19,7 +19,12 @@ public interface PaymentGateway {
     }
 
     record PaymentRequest(String reference, String orderId, long amount, String currency,
-                          String phone, String email, Instant expiresAt) {
+                          String phone, String email, Instant expiresAt, CheckoutChannel checkoutChannel) {
+        PaymentRequest(String reference, String orderId, long amount, String currency,
+                       String phone, String email, Instant expiresAt) {
+            this(reference, orderId, amount, currency, phone, email, expiresAt, CheckoutChannel.MOBILE);
+        }
+
         @Override
         public String toString() {
             return "PaymentRequest[redacted]";
@@ -38,5 +43,9 @@ public interface PaymentGateway {
 
     enum PaymentResult {
         PROCESSING, PAID, DECLINED
+    }
+
+    enum CheckoutChannel {
+        MOBILE, WEB
     }
 }

@@ -10,6 +10,7 @@ import static com.crustcaper.api.payment.PaymentGatewayException.Kind.UNAVAILABL
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import com.crustcaper.api.payment.PaymentGateway.PaymentRequest;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
 import tools.jackson.databind.JsonNode;
@@ -103,6 +104,27 @@ class FlutterwavePaymentGatewayTest {
                 .isEqualTo(PAYMENT_LINK);
         assertThat(mapper.readTree(recorded.get().body()).path("redirect_url").asString(""))
                 .isEqualTo(url + "?orderId=order-1");
+    }
+
+    @Test
+    void sendsWebOrdersBackToTheConfiguredStorefrontAndKeepsNativeReturn() throws IOException {
+        fixtureResponse(200, hostedLink(PAYMENT_LINK));
+        String browserReturn = "https://storefront.example.test/web-payment-return";
+        PaymentGateway bothChannels = new FlutterwavePaymentGateway(fixtureOrigin(), URI.create(RETURN),
+                URI.create(browserReturn), KEY, mapper, Clock.fixed(NOW, ZoneOffset.UTC), 1_000, 1_000);
+        PaymentRequest web = new PaymentRequest("attempt-1", "order-1", 9_200, "RWF", "+250700000000",
+                EMAIL, EXPIRY, CheckoutChannel.WEB);
+
+        assertThat(assertThrows(PaymentGatewayException.class, () -> gateway.open(web)).kind())
+                .isEqualTo(NOT_DISPATCHED);
+        assertThat(requestCount.get()).isZero();
+        bothChannels.open(web);
+        assertThat(mapper.readTree(recorded.get().body()).path("redirect_url").asString())
+                .isEqualTo(browserReturn + "?orderId=order-1");
+        bothChannels.open(paymentRequest(EMAIL, EXPIRY));
+        assertThat(mapper.readTree(recorded.get().body()).path("redirect_url").asString())
+                .isEqualTo(RETURN + "?orderId=order-1");
+        assertThat(requestCount.get()).isEqualTo(2);
     }
 
     @Test

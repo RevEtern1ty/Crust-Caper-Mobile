@@ -5,6 +5,7 @@ import static com.crustcaper.api.Catalog.dbTime;
 import static com.crustcaper.api.Catalog.readTime;
 
 import com.crustcaper.api.payment.PaymentGateway;
+import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import com.crustcaper.api.payment.PaymentGateway.PaymentRequest;
 import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
@@ -77,10 +78,11 @@ public class OrderService {
         UUID id, UUID quoteId, UUID owner, String storeId, String slotId, String phone, String email,
         List<CartLine> lines, long total, long tax, String status, String paymentStatus, String pickupCode,
         String receiptStatus, String receiptUrl, Instant createdAt, Instant reservationExpiresAt,
-        Instant startsAt, Instant endsAt
+        Instant startsAt, Instant endsAt, CheckoutChannel checkoutChannel
     ) {}
 
     private record OrderSnapshot(StoredOrder order, PaymentAttempt attempt, Instant checkedAt) {}
+    private record ReadOrder(Order order, boolean readOnly) {}
 
     private record Attempt(UUID id, UUID orderId, String status, String checkoutUrl, String providerTransactionId) {
         PaymentAttempt view() {
@@ -129,6 +131,15 @@ public class OrderService {
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public Order createOrder(UUID guest, String key, OrderInput input) {
+        return createOrder(guest, key, input, CheckoutChannel.MOBILE);
+    }
+
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public Order createWebOrder(UUID guest, String key, OrderInput input) {
+        return createOrder(guest, key, input, CheckoutChannel.WEB);
+    }
+
+    private Order createOrder(UUID guest, String key, OrderInput input, CheckoutChannel channel) {
         validateKey(key);
         if (input == null) throw ApiFailure.invalid();
         UUID quoteId = ApiFailure.uuid(input.quoteId(), ApiFailure.invalid());
@@ -182,12 +193,12 @@ public class OrderService {
         jdbc.sql("""
             INSERT INTO orders (id, quote_id, guest_session_id, request_key, store_id, slot_id, phone,
                 email, lines, total, tax, status, payment_status, created_at, reservation_expires_at,
-                pickup_starts_at, pickup_ends_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, 'awaiting_payment', 'unpaid', ?, ?, ?, ?)
+                pickup_starts_at, pickup_ends_at, checkout_channel)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, 'awaiting_payment', 'unpaid', ?, ?, ?, ?, ?)
             """)
             .params(id, quote.id(), guest, key, quote.storeId(), slot.id(), phone, email,
                 json.write(quote.lines()), quote.total(), quote.tax(), dbTime(now), dbTime(hold),
-                dbTime(slot.startsAt()), dbTime(slot.endsAt()))
+                dbTime(slot.startsAt()), dbTime(slot.endsAt()), channel.name().toLowerCase(Locale.ROOT))
             .update();
         return view(ownedSnapshot(guest, id), true);
     }
@@ -200,9 +211,18 @@ public class OrderService {
     }
 
     public Order getOrder(UUID guest, UUID id) {
+        return readOrder(guest, id).order();
+    }
+
+    WebOrder getWebOrder(UUID guest, UUID id) {
+        ReadOrder result = readOrder(guest, id);
+        return WebOrder.from(result.order(), result.readOnly());
+    }
+
+    private ReadOrder readOrder(UUID guest, UUID id) {
         OrderSnapshot snapshot = jdbc.sql(ORDER_SNAPSHOT + "WHERE orders.id = ? " + VISIBLE_TO_GUEST)
             .params(id, guest, guest).query(this::snapshotRow).optional().orElseThrow(ApiFailure::notFound);
-        if (!snapshot.order().owner().equals(guest)) return view(snapshot, false);
+        if (!snapshot.order().owner().equals(guest)) return new ReadOrder(view(snapshot, false), true);
         PaymentAttempt attempt = snapshot.attempt();
         if (attempt != null && attempt.status().equals("processing") && !localPayments
             && claimVerification(attempt.id())) {
@@ -216,7 +236,7 @@ public class OrderService {
             }
             snapshot = ownedSnapshot(guest, id);
         }
-        return view(snapshot, true);
+        return new ReadOrder(view(snapshot, true), false);
     }
 
     public Reorder reorder(UUID guest, UUID id) {
@@ -262,7 +282,8 @@ public class OrderService {
         Attempt attempt = start.attempt();
         try {
             String checkoutUrl = gateway.open(new PaymentRequest(attempt.id().toString(), id.toString(),
-                order.total(), CURRENCY, order.phone(), order.email(), order.reservationExpiresAt())).checkoutUrl();
+                order.total(), CURRENCY, order.phone(), order.email(), order.reservationExpiresAt(),
+                order.checkoutChannel())).checkoutUrl();
             jdbc.sql("UPDATE payment_attempts SET checkout_url = ? WHERE id = ? AND status = 'processing'")
                 .params(checkoutUrl, attempt.id()).update();
             return jdbc.sql("SELECT * FROM payment_attempts WHERE id = ?").param(attempt.id())
@@ -458,7 +479,8 @@ public class OrderService {
             rs.getLong("total"), rs.getLong("tax"), rs.getString("status"), rs.getString("payment_status"),
             rs.getString("pickup_code"), rs.getString("receipt_status"), rs.getString("receipt_url"),
             readTime(rs, "created_at"), readTime(rs, "reservation_expires_at"),
-            readTime(rs, "pickup_starts_at"), readTime(rs, "pickup_ends_at"));
+            readTime(rs, "pickup_starts_at"), readTime(rs, "pickup_ends_at"),
+            CheckoutChannel.valueOf(rs.getString("checkout_channel").toUpperCase(Locale.ROOT)));
     }
 
     private OrderSnapshot snapshotRow(ResultSet rs, int row) throws SQLException {
