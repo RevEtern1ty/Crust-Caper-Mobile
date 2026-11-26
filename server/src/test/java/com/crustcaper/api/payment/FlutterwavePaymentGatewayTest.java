@@ -5,6 +5,7 @@ import static com.crustcaper.api.payment.PaymentGateway.PaymentResult.PAID;
 import static com.crustcaper.api.payment.PaymentGateway.PaymentResult.PROCESSING;
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.INVALID_REQUEST;
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.INVALID_RESPONSE;
+import static com.crustcaper.api.payment.PaymentGatewayException.Kind.NOT_DISPATCHED;
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.UNAVAILABLE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -27,6 +28,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class FlutterwavePaymentGatewayTest {
@@ -52,7 +54,7 @@ class FlutterwavePaymentGatewayTest {
 
     @AfterEach
     void stopFixtureServer() {
-        fixture.stop(0);
+        if (fixture != null) fixture.stop(0);
     }
 
     @Test
@@ -139,6 +141,26 @@ class FlutterwavePaymentGatewayTest {
         assertThat(recorded.get().authorization()).isEqualTo("Bearer " + KEY);
     }
 
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"null", "\"9200\"", "0", "9199", "9199.9999999999999999999"})
+    void doesNotPublishPaidVerificationWithoutTheFullCharge(String chargedAmount) {
+        fixtureResponse(200, verifiedResponse("12345", "attempt-1", "9200", "RWF", "successful", chargedAmount));
+
+        assertThat(assertThrows(PaymentGatewayException.class, () -> gateway.verify("12345")).kind())
+                .isEqualTo(INVALID_RESPONSE);
+        assertThat(assertThrows(PaymentGatewayException.class, () -> gateway.verifyByReference("attempt-1")).kind())
+                .isEqualTo(INVALID_RESPONSE);
+    }
+
+    @Test
+    void keepsTheNominalAmountWhenTheActualChargeIncludesFees() {
+        fixtureResponse(200, verifiedResponse("12345", "attempt-1", "9200", "RWF", "successful", "9400"));
+
+        assertThat(gateway.verifyByReference("attempt-1"))
+                .contains(new VerifiedPayment("attempt-1", "12345", 9_200, "RWF", PAID));
+    }
+
     @Test
     void preservesNonfinalProviderVerificationAndLookupUsesStableReference() {
         fixtureResponse(200, verifiedResponse("12345", "attempt-1", "9200.0", "RWF", "pending"));
@@ -183,6 +205,37 @@ class FlutterwavePaymentGatewayTest {
         assertThat(error.kind()).isEqualTo(UNAVAILABLE);
         assertThat(error.getMessage()).doesNotContain(KEY, EMAIL);
         assertThat(error.getCause()).isNull();
+        assertThat(requestCount.get()).isEqualTo(1);
+    }
+
+    @Test
+    void distinguishesARefusedHostedConnectionFromAnUncertainResponse() {
+        stopFixtureServer();
+        fixture = null;
+
+        PaymentGatewayException refused = assertThrows(PaymentGatewayException.class,
+                () -> gateway.open(paymentRequest(EMAIL, EXPIRY)));
+        assertThat(refused.kind()).isEqualTo(NOT_DISPATCHED);
+        assertThat(refused.getCause()).isNull();
+        assertThat(assertThrows(PaymentGatewayException.class, () -> gateway.verify("12345")).kind())
+                .isEqualTo(UNAVAILABLE);
+    }
+
+    @Test
+    void keepsALostResponseUncertainAfterTheProviderReceivesTheBody() {
+        fixture.createContext("/v3/payments", exchange -> {
+            try (exchange) {
+                byte[] body = exchange.getRequestBody().readAllBytes();
+                recorded.set(new RecordedRequest(exchange.getRequestMethod(), exchange.getRequestURI(),
+                        exchange.getRequestHeaders().getFirst("Authorization"), exchange.getRequestHeaders().getFirst("Content-Type"), body));
+                requestCount.incrementAndGet();
+            }
+        });
+
+        PaymentGatewayException lost = assertThrows(PaymentGatewayException.class,
+                () -> gateway.open(paymentRequest(EMAIL, EXPIRY)));
+        assertThat(lost.kind()).isEqualTo(UNAVAILABLE);
+        assertThat(recorded.get().body()).isNotEmpty();
         assertThat(requestCount.get()).isEqualTo(1);
     }
 
@@ -263,9 +316,15 @@ class FlutterwavePaymentGatewayTest {
     }
 
     private static String verifiedResponse(String id, String reference, String amount, String currency, String status) {
+        return verifiedResponse(id, reference, amount, currency, status, "successful".equals(status) ? amount : null);
+    }
+
+    private static String verifiedResponse(String id, String reference, String amount, String currency, String status,
+                                           String chargedAmount) {
+        String chargeField = chargedAmount == null ? "" : ",\"charged_amount\":" + chargedAmount;
         return """
-                {"status":"success","data":{"id":%s,"tx_ref":"%s","amount":%s,"currency":"%s","status":"%s"}}
-                """.formatted(id, reference, amount, currency, status);
+                {"status":"success","data":{"id":%s,"tx_ref":"%s","amount":%s,"currency":"%s","status":"%s"%s}}
+                """.formatted(id, reference, amount, currency, status, chargeField);
     }
 
     private record RecordedRequest(String method, URI uri, String authorization, String contentType, byte[] body) { }

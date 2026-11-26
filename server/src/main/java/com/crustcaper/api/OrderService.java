@@ -46,6 +46,7 @@ public class OrderService {
     private static final String LATEST_ATTEMPT = """
         SELECT * FROM payment_attempts WHERE order_id = ? ORDER BY sequence DESC LIMIT 1
         """;
+    private static final String PAYMENT_MISMATCH = "payment_mismatch";
     private static final long MAX_PRICE = 1_000_000_000L;
 
     private final JdbcClient jdbc;
@@ -186,10 +187,13 @@ public class OrderService {
             && claimVerification(attempt.id())) {
             try {
                 gateway.verifyByReference(attempt.id().toString()).ifPresent(this::settlePayment);
-                order = owned(guest, id, false);
             } catch (PaymentGatewayException ignored) {
                 // Keep the last confirmed state during a temporary PSP outage.
+            } catch (ApiFailure error) {
+                if (!PAYMENT_MISMATCH.equals(error.code())) throw error;
+                // Reject unrelated money without hiding the order or changing its payment state.
             }
+            order = owned(guest, id, false);
         }
         return view(order);
     }
@@ -243,16 +247,19 @@ public class OrderService {
             return jdbc.sql("SELECT * FROM payment_attempts WHERE id = ?").param(attempt.id())
                 .query(OrderService::attemptRow).single().view();
         } catch (PaymentGatewayException error) {
-            if (error.kind() == PaymentGatewayException.Kind.INVALID_REQUEST) {
-                boolean expired = Objects.requireNonNull(transactions.execute(tx -> rejectUndispatchedPayment(guest, attempt)));
-                throw expired ? ApiFailure.conflict("reservation_expired") : ApiFailure.invalid();
+            boolean invalidRequest = error.kind() == PaymentGatewayException.Kind.INVALID_REQUEST;
+            if (invalidRequest || error.kind() == PaymentGatewayException.Kind.NOT_DISPATCHED) {
+                boolean expired = Objects.requireNonNull(transactions.execute(
+                    tx -> rejectUndispatchedPayment(guest, attempt, invalidRequest)));
+                if (expired) throw ApiFailure.conflict("reservation_expired");
+                throw invalidRequest ? ApiFailure.invalid() : ApiFailure.unavailable();
             }
             // The provider may have received the request. Keep this attempt for verification by reference.
             throw ApiFailure.unavailable();
         }
     }
 
-    private boolean rejectUndispatchedPayment(UUID guest, Attempt attempt) {
+    private boolean rejectUndispatchedPayment(UUID guest, Attempt attempt, boolean invalidRequest) {
         StoredOrder order = owned(guest, attempt.orderId(), true);
         boolean expired = !order.reservationExpiresAt().isAfter(databaseNow());
         Attempt current = latest(order.id());
@@ -263,8 +270,8 @@ public class OrderService {
             WHERE id = ? AND status = 'processing' AND checkout_url IS NULL AND provider_transaction_id IS NULL
             """).param(attempt.id()).update();
         if (closed == 1) {
-            jdbc.sql("UPDATE orders SET status = 'cancelled', payment_status = 'declined' WHERE id = ?")
-                .param(order.id()).update();
+            jdbc.sql("UPDATE orders SET status = ?, payment_status = 'declined' WHERE id = ?")
+                .params(expired || invalidRequest ? "cancelled" : "awaiting_payment", order.id()).update();
         }
         return expired;
     }
@@ -299,7 +306,7 @@ public class OrderService {
             Attempt attempt = jdbc.sql("SELECT * FROM payment_attempts WHERE id = ? FOR UPDATE").param(attemptId)
                 .query(OrderService::attemptRow).single();
             if (order.total() != payment.amount() || !CURRENCY.equals(payment.currency())) {
-                throw ApiFailure.conflict("payment_mismatch");
+                throw ApiFailure.conflict(PAYMENT_MISMATCH);
             }
             if (payment.result() == PaymentResult.PROCESSING || (payment.result() == PaymentResult.DECLINED && !localPayments)) {
                 return;

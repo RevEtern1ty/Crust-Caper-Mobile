@@ -118,18 +118,20 @@ export default function PaymentScreen() {
                 <Button label={t('Decline local test payment', 'Anga ubwishyu bw’igerageza')}
                   onPress={() => { void simulate('declined'); }} busy={busy === 'declined'} disabled={!!busy} variant="secondary" />
               </>
+            ) : !order.paymentAttempt?.checkoutUrl ? (
+              <Text tone="muted">{t(
+                'The payment page is unavailable. Refresh to check this payment, or follow it later in Orders.',
+                'Urupapuro rwo kwishyura ntiruboneka. Vugurura uko ubu bwishyu buhagaze cyangwa ubukurikirane nyuma muri Komande.',
+              )}</Text>
             ) : onDevice && checkoutAllowed ? (
-              <>
-                <Button label={t('Open payment page', 'Fungura urupapuro rwo kwishyura')}
-                  onPress={() => { void openHostedPayment(); }} busy={busy === 'browser'}
-                  disabled={!order.paymentAttempt?.checkoutUrl || loading} />
-                {!order.paymentAttempt?.checkoutUrl && <Text tone="muted" variant="small">{t(
-                  'Refresh the payment status to check for a payment page.',
-                  'Vugurura uko ubwishyu buhagaze urebe niba urupapuro rwo kwishyura ruboneka.',
-                )}</Text>}
-              </>
+              <Button label={t('Open payment page', 'Fungura urupapuro rwo kwishyura')}
+                onPress={() => { void openHostedPayment(); }} busy={busy === 'browser'} disabled={loading} />
             ) : <Text>{t('Open the Android or iOS app to pay.', 'Fungura porogaramu ya Android cyangwa iOS kugira ngo wishyure.')}</Text>
           )}
+          {processing && order.status === 'cancelled' && <Text tone="muted">{t(
+            'The pickup hold ended. Refresh to check this payment, or follow it later in Orders.',
+            'Igihe cyabikiwe komande cyarangiye. Vugurura uko ubu bwishyu buhagaze cyangwa ubukurikirane nyuma muri Komande.',
+          )}</Text>}
           {(problem || failed) && <Text tone="red" accessibilityRole="alert">{problem ?? checkoutError(error, locale)}</Text>}
           {orderId && <Button label={t('Refresh payment status', 'Vugurura uko ubwishyu buhagaze')} variant="secondary"
             onPress={() => { setProblem(null); void refresh(); }} busy={loading} disabled={!!busy} />}

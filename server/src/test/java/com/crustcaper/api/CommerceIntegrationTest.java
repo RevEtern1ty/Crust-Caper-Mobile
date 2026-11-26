@@ -4,7 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -13,13 +16,16 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 import com.crustcaper.api.payment.PaymentGateway;
+import com.crustcaper.api.payment.PaymentGateway.HostedPayment;
 import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
 import com.crustcaper.api.payment.PaymentGatewayException;
+import com.crustcaper.api.payment.FlutterwaveWebhookSignature;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -27,6 +33,8 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -37,6 +45,8 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.transaction.support.TransactionTemplate;
 
 @SpringBootTest(properties = {"crustcaper.order-access.provider=disabled", "crustcaper.push.provider=disabled"})
 @AutoConfigureMockMvc
@@ -50,8 +60,11 @@ class CommerceIntegrationTest {
     @Autowired MockMvc api;
     @Autowired JdbcClient jdbc;
     @Autowired ObjectMapper json;
+    @Autowired Catalog catalog;
+    @Autowired CommerceJson commerceJson;
     @Autowired GuestSessions sessions;
     @Autowired OrderService orders;
+    @Autowired TransactionTemplate transactions;
     @MockitoSpyBean PaymentGateway gateway;
 
     private String store;
@@ -250,15 +263,16 @@ class CommerceIntegrationTest {
             .param(UUID.fromString(second)).query(String.class).single()).isEqualTo("unavailable_reservation");
     }
 
-    @Test
-    void anUndispatchedPaymentClosesItsAttemptAndReleasesAnExpiredHold() throws Exception {
+    @ParameterizedTest
+    @EnumSource(value = PaymentGatewayException.Kind.class, names = {"INVALID_REQUEST", "NOT_DISPATCHED"})
+    void anUndispatchedPaymentClosesItsAttemptAndReleasesAnExpiredHold(PaymentGatewayException.Kind kind) throws Exception {
         String owner = guest();
         String quoteId = quote(owner).path("quoteId").asText();
         String id = body(create(owner, quoteId, "order").andExpect(status().isOk())).path("id").asText();
         doAnswer(invocation -> {
             jdbc.sql("UPDATE orders SET reservation_expires_at = clock_timestamp() WHERE id = ?")
                 .param(UUID.fromString(id)).update();
-            throw new PaymentGatewayException(PaymentGatewayException.Kind.INVALID_REQUEST);
+            throw new PaymentGatewayException(kind);
         }).when(gateway).open(any());
 
         api.perform(post(orderPath(id) + "/payments").header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "open"))
@@ -274,6 +288,92 @@ class CommerceIntegrationTest {
 
         String freshQuote = quote(owner).path("quoteId").asText();
         create(owner, freshQuote, "new-order").andExpect(status().isOk());
+    }
+
+    @Test
+    void aConnectionFailureBeforeDispatchPreservesTheHoldAndAllowsAnExplicitPaymentRetry() throws Exception {
+        String owner = guest();
+        String quoteId = quote(owner).path("quoteId").asText();
+        JsonNode order = body(create(owner, quoteId, "order").andExpect(status().isOk()));
+        String id = order.path("id").asText();
+        UUID orderId = UUID.fromString(id);
+        String paymentPath = orderPath(id) + "/payments";
+        doThrow(new PaymentGatewayException(PaymentGatewayException.Kind.NOT_DISPATCHED))
+            .doReturn(new HostedPayment(null)).when(gateway).open(any());
+
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "open"))
+            .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("service_unavailable"));
+        String first = jdbc.sql("""
+            SELECT id FROM payment_attempts
+            WHERE order_id = ? AND status = 'declined' AND checkout_url IS NULL AND provider_transaction_id IS NULL
+            """).param(orderId).query(UUID.class).single().toString();
+        api.perform(get(orderPath(id)).header(HttpHeaders.AUTHORIZATION, owner)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.status").value("awaiting_payment"))
+            .andExpect(jsonPath("$.paymentStatus").value("declined"))
+            .andExpect(jsonPath("$.reservationExpiresAt").value(order.path("reservationExpiresAt").asText()));
+        quoteRequest(guest(), 1, 9200).andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("slot_unavailable"));
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "open"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(first))
+            .andExpect(jsonPath("$.status").value("declined"));
+        verify(gateway).open(any());
+
+        String retry = beginPayment(owner, id, "new-attempt");
+        assertThat(retry).isNotEqualTo(first);
+        assertThat(beginPayment(owner, id, "new-attempt")).isEqualTo(retry);
+        verify(gateway, times(2)).open(any());
+        localResult(owner, id, retry, "paid").andExpect(status().isOk())
+            .andExpect(jsonPath("$.status").value("accepted")).andExpect(jsonPath("$.paymentStatus").value("paid"));
+        assertThat(jdbc.sql("SELECT status FROM payment_attempts WHERE order_id = ? ORDER BY sequence")
+            .param(orderId).query(String.class).list()).containsExactly("declined", "paid");
+    }
+
+    @Test
+    void rejectedProviderAmountsOrCurrenciesDoNotHideOwnerStatusAndAValidResultCanStillSettle() throws Exception {
+        String owner = guest();
+        String quoteId = quote(owner).path("quoteId").asText();
+        String id = body(create(owner, quoteId, "order").andExpect(status().isOk())).path("id").asText();
+        String attempt = beginPayment(owner, id, "open");
+        UUID attemptId = UUID.fromString(attempt);
+        var wrongAmount = new VerifiedPayment(attempt, "9001", 9_199, "RWF", PaymentResult.PAID);
+        var wrongCurrency = new VerifiedPayment(attempt, "9001", 9_200, "USD", PaymentResult.PAID);
+        var valid = new VerifiedPayment(attempt, "9001", 9_200, "RWF", PaymentResult.PAID);
+        doReturn(Optional.of(wrongAmount)).doReturn(Optional.of(wrongCurrency)).doReturn(Optional.of(valid))
+            .when(gateway).verifyByReference(attempt);
+        doReturn(wrongAmount).when(gateway).verify("9001");
+        FlutterwaveWebhookSignature signature = mock(FlutterwaveWebhookSignature.class);
+        doReturn(true).when(signature).matches("fixture-signature");
+        // Only the provider is stubbed. Use the live verification path with this test's PostgreSQL fixtures.
+        var hostedOrders = new OrderService(jdbc, catalog, commerceJson, gateway, transactions, "flutterwave");
+        MockMvc hostedApi = MockMvcBuilders.standaloneSetup(new CommerceController(sessions, catalog, hostedOrders, commerceJson),
+                new FlutterwaveWebhooks(signature, gateway, hostedOrders))
+            .setControllerAdvice(new CommerceProblems()).build();
+
+        hostedApi.perform(post(ROOT + "/webhooks/flutterwave").header("verif-hash", "fixture-signature")
+            .contentType(MediaType.APPLICATION_JSON).content("""
+                {"event":"charge.completed","data":{"id":9001}}
+                """))
+            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("payment_mismatch"));
+        for (int read = 0; read < 2; read++) {
+            hostedApi.perform(get(orderPath(id)).header(HttpHeaders.AUTHORIZATION, owner)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("awaiting_payment"))
+                .andExpect(jsonPath("$.paymentStatus").value("processing"))
+                .andExpect(jsonPath("$.paymentAttempt.id").value(attempt))
+                .andExpect(jsonPath("$.pickupCode").isEmpty());
+            assertThat(jdbc.sql("""
+                SELECT status FROM payment_attempts WHERE id = ? AND provider_transaction_id IS NULL
+                """).param(attemptId).query(String.class).single()).isEqualTo("processing");
+            jdbc.sql("UPDATE payment_attempts SET last_checked_at = now() - interval '16 seconds' WHERE id = ?")
+                .param(attemptId).update();
+        }
+        hostedApi.perform(get(orderPath(id)).header(HttpHeaders.AUTHORIZATION, owner)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.status").value("accepted")).andExpect(jsonPath("$.paymentStatus").value("paid"))
+            .andExpect(jsonPath("$.paymentAttempt.id").value(attempt)).andExpect(jsonPath("$.pickupCode").isString());
+        assertThat(jdbc.sql("SELECT provider_transaction_id FROM payment_attempts WHERE id = ? AND status = 'paid'")
+            .param(attemptId).query(String.class).single()).isEqualTo("9001");
+        assertThat(jdbc.sql("SELECT count(*) FROM payment_exceptions WHERE attempt_id = ?")
+            .param(attemptId).query(Long.class).single()).isZero();
+        verify(gateway, times(3)).verifyByReference(attempt);
     }
 
     @Test

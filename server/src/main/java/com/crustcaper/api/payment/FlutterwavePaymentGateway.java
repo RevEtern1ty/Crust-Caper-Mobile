@@ -2,6 +2,7 @@ package com.crustcaper.api.payment;
 
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.INVALID_REQUEST;
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.INVALID_RESPONSE;
+import static com.crustcaper.api.payment.PaymentGatewayException.Kind.NOT_DISPATCHED;
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.UNAVAILABLE;
 
 import tools.jackson.core.JacksonException;
@@ -14,8 +15,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
+import java.net.ConnectException;
 import java.net.HttpURLConnection;
+import java.net.NoRouteToHostException;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Locale;
@@ -26,6 +30,7 @@ import java.util.regex.Pattern;
 final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory {
     static final URI API_ORIGIN = URI.create("https://api.flutterwave.com");
 
+    private static final String HOSTED_PAYMENT_PATH = "/v3/payments";
     private static final String PAYMENT_RETURN_PATH = "/payment-return";
     private static final int MAX_RESPONSE_BYTES = 128 * 1024;
     private static final Pattern REFERENCE = Pattern.compile("[A-Za-z0-9_-]{1,128}");
@@ -80,7 +85,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
             customer.put("phone_number", request.phone());
         }
         payload.putObject("customizations").put("title", "CrustCaper");
-        JsonNode data = successfulData(request("/v3/payments", payload));
+        JsonNode data = successfulData(request(HOSTED_PAYMENT_PATH, payload));
         String link = requiredText(data.path("link"));
         if (!isAllowedCheckoutUrl(link)) {
             throw new PaymentGatewayException(INVALID_RESPONSE);
@@ -198,6 +203,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
 
     private Response request(String path, ObjectNode payload) {
         HttpURLConnection connection = null;
+        boolean bodyStarted = false;
         try {
             connection = (HttpURLConnection) apiOrigin.resolve(path).toURL().openConnection();
             connection.setInstanceFollowRedirects(false);
@@ -213,6 +219,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
                 // Stream the request once. A broken connection can conceal a successfully opened payment.
                 connection.setFixedLengthStreamingMode(requestBody.length);
                 try (OutputStream output = connection.getOutputStream()) {
+                    bodyStarted = true;
                     output.write(requestBody);
                 }
             }
@@ -229,8 +236,12 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
                 }
                 return new Response(status, responseBody);
             }
-        } catch (IOException ignored) {
+        } catch (IOException failure) {
             // Do not attach provider response bodies or HTTP exceptions containing a request URL.
+            if (HOSTED_PAYMENT_PATH.equals(path) && !bodyStarted && (failure instanceof ConnectException
+                    || failure instanceof NoRouteToHostException || failure instanceof UnknownHostException)) {
+                throw new PaymentGatewayException(NOT_DISPATCHED);
+            }
             throw new PaymentGatewayException(UNAVAILABLE);
         } finally {
             if (connection != null) {
@@ -295,6 +306,13 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
             case "failed" -> PaymentResult.DECLINED;
             default -> throw new PaymentGatewayException(INVALID_RESPONSE);
         };
+        if (result == PaymentResult.PAID) {
+            // The charge can include fees. The nominal amount must still match the local order.
+            JsonNode chargedAmount = data.path("charged_amount");
+            if (!chargedAmount.isNumber() || chargedAmount.decimalValue().compareTo(BigDecimal.valueOf(amountRwf)) < 0) {
+                throw new PaymentGatewayException(INVALID_RESPONSE);
+            }
+        }
         return new VerifiedPayment(reference, id, amountRwf, currency, result);
     }
 
