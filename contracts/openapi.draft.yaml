@@ -1722,7 +1722,7 @@ components:
         recordedAt: { $ref: '#/components/schemas/Timestamp' }
     OperatorOrderDetails:
       type: object
-      required: [id, lines, pickupStartsAt, pickupEndsAt, acceptedAt]
+      required: [id, lines, total, currency, pickupStartsAt, pickupEndsAt, acceptedAt]
       properties:
         id: { type: string, format: uuid }
         lines:
@@ -1734,6 +1734,10 @@ components:
               sku: { type: string }
               modifierIds: { type: array, items: { type: string } }
               quantity: { type: integer, minimum: 1 }
+        total:
+          $ref: '#/components/schemas/Amount'
+          description: Persisted total of the direct order in whole RWF.
+        currency: { type: string, const: RWF }
         pickupStartsAt: { $ref: '#/components/schemas/Timestamp' }
         pickupEndsAt: { $ref: '#/components/schemas/Timestamp' }
         acceptedAt:

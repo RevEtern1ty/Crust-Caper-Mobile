@@ -78,6 +78,7 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .order-status { border-radius: .45rem; padding: .2rem .5rem; color: var(--plum); background: var(--paper); font-size: .8rem; font-weight: 750; line-height: 1.3; }
 .order-status[data-status="accepted"] { background: var(--mustard); }
 .order-status[data-status="ready"] { color: var(--green); background: var(--mint); }
+.order-total { margin-top: .38rem; font-weight: 730; overflow-wrap: anywhere; }
 .pickup-window { margin-block: .38rem .9rem; color: var(--muted); font-size: .9rem; overflow-wrap: anywhere; }
 .kitchen-wait { margin-block: -.3rem .85rem; color: var(--muted); font-weight: 700; overflow-wrap: anywhere; }
 .kitchen-wait[data-overdue="true"] { color: var(--red); }

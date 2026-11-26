@@ -243,7 +243,7 @@ class OperatorExternalOrdersIntegrationTest {
     }
 
     @Test
-    void kitchenQueueKeepsOnlineOrdersUnchangedAndExternalJobsAreOutsideCustomerAndFinancialApis() throws Exception {
+    void kitchenQueueShowsPaidOnlineOrdersAndExternalJobsStayOutsideCustomerAndFinancialApis() throws Exception {
         String store = store();
         Staff manager = staff(store, "manager");
         Staff kitchen = staff(store, "kitchen");
@@ -259,7 +259,7 @@ class OperatorExternalOrdersIntegrationTest {
         assertThat(queue.path("orders").size()).isOne();
         assertThat(queue.path("orders").get(0).path("id").asString()).isEqualTo(online);
         assertThat(queue.path("orders").get(0).propertyNames()).containsExactlyInAnyOrder(
-            "id", "status", "paymentStatus", "lines", "pickupStartsAt", "pickupEndsAt", "acceptedAt");
+            "id", "status", "paymentStatus", "lines", "total", "currency", "pickupStartsAt", "pickupEndsAt", "acceptedAt");
         assertThat(queue.path("externalOrders").size()).isOne();
         JsonNode job = queue.path("externalOrders").get(0);
         assertThat(job.path("id").asString()).isEqualTo(external);

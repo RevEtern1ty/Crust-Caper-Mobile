@@ -114,11 +114,18 @@ class OperatorIntegrationTest {
         assertThat(visible.path("id").asString("")).isEqualTo(accepted.orderId());
         assertThat(visible.path("status").asString("")).isEqualTo("accepted");
         assertThat(visible.path("paymentStatus").asString("")).isEqualTo("paid");
-        assertThat(keys(visible)).containsExactlyInAnyOrder("id", "status", "paymentStatus", "lines", "pickupStartsAt",
-                "pickupEndsAt", "acceptedAt");
+        JsonNode customerOrder = body(api.perform(get(API + "/orders/" + accepted.orderId())
+                .header(HttpHeaders.AUTHORIZATION, accepted.guestBearer())).andExpect(status().isOk()));
+        assertThat(visible.get("total")).isEqualTo(customerOrder.get("total"));
+        assertThat(visible.get("currency")).isEqualTo(customerOrder.get("currency"));
+        assertThat(keys(visible)).containsExactlyInAnyOrder("id", "status", "paymentStatus", "lines", "total",
+                "currency", "pickupStartsAt", "pickupEndsAt", "acceptedAt");
         assertThat(Instant.parse(queue.path("serverTime").asString()))
                 .isAfterOrEqualTo(Instant.parse(visible.path("acceptedAt").asString()));
         assertThat(keys(visible.path("lines").get(0))).containsExactlyInAnyOrder("sku", "modifierIds", "quantity");
+        change(staffBearer, accepted.orderId(), "preparing", null).andExpect(status().isOk())
+                .andExpect(jsonPath("$.total").value(customerOrder.get("total").asLong()))
+                .andExpect(jsonPath("$.currency").value("RWF"));
         change(staffBearer, differentStore.orderId(), "preparing", null).andExpect(status().isNotFound());
         change(staffBearer, unpaid.orderId(), "preparing", null).andExpect(status().isNotFound());
     }

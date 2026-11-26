@@ -510,6 +510,8 @@ function checkedOrder(order, completed = false) {
   if (!order || typeof order.id !== 'string' || !order.id || order.paymentStatus !== 'paid'
     || (!Object.hasOwn(statuses, order.status) && !(completed && order.status === 'collected'))
     || !Number.isFinite(Date.parse(order.pickupStartsAt)) || !Number.isFinite(Date.parse(order.pickupEndsAt))
+    || ((order.total !== undefined || order.currency !== undefined)
+      && (!Number.isSafeInteger(order.total) || order.total <= 0 || order.currency !== 'RWF'))
     || (order.acceptedAt != null && (typeof order.acceptedAt !== 'string' || !Number.isFinite(Date.parse(order.acceptedAt))))
     || !Array.isArray(order.lines) || !order.lines.every((line) => line && typeof line.sku === 'string'
       && Number.isInteger(line.quantity) && line.quantity > 0 && Array.isArray(line.modifierIds)
@@ -520,6 +522,8 @@ function checkedOrder(order, completed = false) {
     id: order.id,
     status: order.status,
     paymentStatus: order.paymentStatus,
+    total: order.total,
+    currency: order.currency,
     acceptedAt: order.acceptedAt ?? null,
     pickupStartsAt: order.pickupStartsAt,
     pickupEndsAt: order.pickupEndsAt,
@@ -646,6 +650,12 @@ function renderOrders() {
         time.textContent = `Handoff ${reviewTimeFormat.format(new Date(order.scheduledAt))} Kigali time`;
         delivery.addCardActions(card, order, session);
       } else {
+        if (order.total !== undefined) {
+          const total = document.createElement('p');
+          total.className = 'order-total';
+          total.textContent = `Paid total ${integerFormat.format(order.total)} ${order.currency}`;
+          time.before(total);
+        }
         time.textContent = pickupWindow(order.pickupStartsAt, order.pickupEndsAt);
         addAction(card, order);
         addCancellation(card, order);

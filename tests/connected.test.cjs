@@ -77,9 +77,9 @@ async function readyForPickup(kitchen, { buyer = contact, guestToken, quantity =
   for (const status of ['preparing', 'ready']) {
     assert.equal((await send(`/operator/orders/${id}/status`, { method: 'POST', token: kitchen, data: { status } })).status, 200);
   }
-  const { pickupCode } = await send(`/orders/${id}`, { token }).then(response => response.json());
+  const { pickupCode, total, currency } = await send(`/orders/${id}`, { token }).then(response => response.json());
   assert.match(pickupCode, /^[0-9]{6}$/);
-  return { id, token, pickupCode, number: '#' + id.slice(-8).toUpperCase() };
+  return { id, token, pickupCode, total, currency, number: '#' + id.slice(-8).toUpperCase() };
 }
 
 test('delivery intake and handoff recover lost replies alongside a paid direct order', { timeout: 35_000 }, async t => {
@@ -108,6 +108,12 @@ test('delivery intake and handoff recover lost replies alongside a paid direct o
   }
   const staffPage = await browser.newPage({ viewport: { width: 390, height: 844 }, timezoneId: 'Pacific/Honolulu' });
   await signIn(staffPage, 'demo-pickup');
+  const directCard = page => page.locator('#order-list > li').filter({
+    has: page.getByRole('heading', { name: `Order ${direct.number}`, exact: true }),
+  });
+  assert.equal(direct.currency, 'RWF');
+  const paidTotal = `Paid total ${direct.total.toLocaleString('en-GB')} RWF`;
+  await shown(directCard(staffPage), paidTotal);
   await button(staffPage, 'Add delivery order').click();
   const platform = staffPage.getByLabel('Delivery platform', { exact: true });
   await platform.selectOption('test-platform');
@@ -161,6 +167,19 @@ test('delivery intake and handoff recover lost replies alongside a paid direct o
   const external = card(kitchenPage);
   await external.waitFor();
   await shown(kitchenPage, `Order ${direct.number}`);
+  await shown(directCard(kitchenPage), paidTotal);
+  assert.equal(await external.getByText(/Paid total/).count(), 0);
+  assert.equal(Object.hasOwn(registered, 'total'), false);
+  for (const width of [320, 390, 430]) {
+    await kitchenPage.setViewportSize({ width, height: 844 });
+    for (const scale of [100, 200]) {
+      await kitchenPage.evaluate(value => { document.documentElement.style.fontSize = `${value}%`; }, scale);
+      await shown(directCard(kitchenPage), paidTotal);
+      assert.equal(await kitchenPage.evaluate(() => document.documentElement.scrollWidth), width);
+    }
+  }
+  await kitchenPage.evaluate(() => document.documentElement.style.removeProperty('font-size'));
+  await kitchenPage.setViewportSize({ width: 390, height: 844 });
   assert.equal(await button(kitchenPage, 'Add delivery order').isVisible(), false);
   assert.match(await external.innerText(), /Test delivery/);
   assert.match(await external.innerText(), /Platform sandwich/);

@@ -31,7 +31,7 @@ final class OperatorModels {
     @JsonIgnoreProperties(ignoreUnknown = true)
     record OrderLine(String sku, List<String> modifierIds, int quantity) { }
 
-    record OrderView(UUID id, String status, String paymentStatus, List<OrderLine> lines,
+    record OrderView(UUID id, String status, String paymentStatus, List<OrderLine> lines, long total, String currency,
                      Instant pickupStartsAt, Instant pickupEndsAt,
                      @JsonInclude(JsonInclude.Include.ALWAYS) Instant acceptedAt) { }
 

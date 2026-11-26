@@ -31,7 +31,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 @Service
 final class OperatorOrders {
     private static final Pattern PICKUP_CODE = Pattern.compile("[0-9]{6}");
-    private static final String ORDER_FIELDS = "id, status, payment_status, lines, pickup_starts_at, pickup_ends_at, accepted_at";
+    private static final String ORDER_FIELDS = "id, status, payment_status, lines, total, pickup_starts_at, pickup_ends_at, accepted_at";
     private static final String RESTAURANT_CANCELLED = "restaurant_cancelled";
     private static final int PAYMENT_REVIEW_LIMIT = 50;
     private static final String PAYMENT_REVIEW_FIELDS = """
@@ -236,7 +236,7 @@ final class OperatorOrders {
                     """).param(id).update();
             cancelPickupAlerts(id);
             recordEvent(actor, id, existing.status(), "cancelled", "changed");
-            return new OrderView(id, "cancelled", "refund_pending", existing.lines(),
+            return new OrderView(id, "cancelled", "refund_pending", existing.lines(), existing.total(), existing.currency(),
                     existing.pickupStartsAt(), existing.pickupEndsAt(), existing.acceptedAt());
         }));
     }
@@ -293,7 +293,7 @@ final class OperatorOrders {
         recordEvent(actor, id, transition.from(), transition.to(), "changed");
         if (transition == Transition.READY) enqueuePickupAlerts(id);
         OrderView before = existing.order();
-        return new Outcome(new OrderView(id, transition.to(), before.paymentStatus(), before.lines(),
+        return new Outcome(new OrderView(id, transition.to(), before.paymentStatus(), before.lines(), before.total(), before.currency(),
                 before.pickupStartsAt(), before.pickupEndsAt(), before.acceptedAt()), false);
     }
 
@@ -345,7 +345,7 @@ final class OperatorOrders {
         }
         OffsetDateTime acceptedAt = row.getObject("accepted_at", OffsetDateTime.class);
         return new OrderView(row.getObject("id", UUID.class), row.getString("status"), row.getString("payment_status"),
-                lines, row.getObject("pickup_starts_at", OffsetDateTime.class).toInstant(),
+                lines, row.getLong("total"), "RWF", row.getObject("pickup_starts_at", OffsetDateTime.class).toInstant(),
                 row.getObject("pickup_ends_at", OffsetDateTime.class).toInstant(),
                 acceptedAt == null ? null : acceptedAt.toInstant());
     }
