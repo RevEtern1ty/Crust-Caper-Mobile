@@ -96,12 +96,15 @@ const cards = new Map();
 const kitchenTransitions = new Set();
 const pickupChecks = new Map();
 const knownExternalOrders = new Set();
+const receiptCards = new Map();
+const receiptUploads = new Set();
 
 let session = null;
 let orders = [];
 let externalOrders = [];
 let sawExternalOrders = false;
 let receipts = [];
+let receiptRefresh = null;
 let timer;
 let kitchenTimer;
 let refreshVersion = 0;
@@ -758,6 +761,7 @@ function renderedReceipt(entry) {
   if (entry.receiptStatus === 'pending') {
     const form = card.querySelector('.receipt-form');
     form.hidden = false;
+    if (receiptUploads.has(entry.orderId)) setReceiptFormBusy(card, true);
     form.addEventListener('submit', (event) => {
       event.preventDefault();
       void attachReceipt(entry, card, form);
@@ -768,18 +772,46 @@ function renderedReceipt(entry) {
   return card;
 }
 
+function receiptCard(entry) {
+  const previous = receiptCards.get(entry.orderId);
+  if (previous && previous.entry.receiptStatus === entry.receiptStatus
+    && previous.entry.receiptReference === entry.receiptReference && previous.entry.total === entry.total) return previous.card;
+  const card = renderedReceipt(entry);
+  receiptCards.set(entry.orderId, { entry, card });
+  return card;
+}
+
 function renderReceipts() {
   const orderCode = fiscalReceiptsFilter.value.trim().replace(/^#/, '').toLowerCase();
   const visible = receipts.filter((entry) => entry.orderId.slice(-8).includes(orderCode));
-  fiscalReceiptsList.replaceChildren(...visible.map(renderedReceipt));
+  const listedIds = new Set(receipts.map(({ orderId }) => orderId));
+  for (const id of receiptCards.keys()) {
+    if (!listedIds.has(id)) receiptCards.delete(id);
+  }
+  const focused = document.activeElement;
+  const visibleCards = new Set(visible.map(receiptCard));
+  for (const card of Array.from(fiscalReceiptsList.children)) {
+    if (!visibleCards.has(card)) card.remove();
+  }
+  let index = 0;
+  for (const card of visibleCards) {
+    const current = fiscalReceiptsList.children[index++] ?? null;
+    if (card !== current) fiscalReceiptsList.insertBefore(card, current);
+  }
+  if (document.activeElement === document.body && fiscalReceiptsList.contains(focused)) {
+    focused.focus({ preventScroll: true });
+  }
   showMessage(fiscalReceiptsEmpty, visible.length ? ''
     : orderCode ? 'No matching order in this list.' : 'No paid orders for fiscal receipts.');
 }
 
+function setReceiptFormBusy(card, busy) {
+  card.querySelectorAll('.receipt-form input, .receipt-form button').forEach((control) => { control.disabled = busy; });
+}
+
 async function attachReceipt(entry, card, form) {
   const current = availableSession();
-  const submit = form.querySelector('button');
-  if (current?.role !== 'manager' || submit.disabled) return;
+  if (current?.role !== 'manager' || receiptUploads.has(entry.orderId) || !card.isConnected) return;
   const reference = form.elements.namedItem('reference').value.trim();
   const total = form.elements.namedItem('total').value.trim();
   const file = form.elements.namedItem('document').files[0];
@@ -798,32 +830,41 @@ async function attachReceipt(entry, card, form) {
     return;
   }
 
-  const inputs = form.querySelectorAll('input');
-  inputs.forEach((input) => { input.disabled = true; });
-  submit.disabled = true;
+  const focusedBeforeUpload = card.contains(document.activeElement);
+  receiptUploads.add(entry.orderId);
+  setReceiptFormBusy(card, true);
   showMessage(problem);
   try {
     const data = checkedReceipt(await request(`/orders/${entry.orderId}/receipt`, {
       method: 'PUT', token: current.accessToken, receipt: { file, reference, total }, timeoutMs: 25_000,
     }));
     if (session !== current) return;
-    if (data.orderId !== entry.orderId || data.receiptStatus !== 'issued' || data.receiptReference !== reference) {
+    if (data.orderId !== entry.orderId || data.total !== entry.total
+      || data.receiptStatus !== 'issued' || data.receiptReference !== reference) {
       throw new ApiError(502, 'invalid_response');
     }
-    receipts = receipts.map((item) => item.orderId === data.orderId ? data : item);
-    const updated = renderedReceipt(data);
-    card.replaceWith(updated);
-    const status = updated.querySelector('.fiscal-result');
-    status.tabIndex = -1;
-    status.focus();
+    receiptRefresh?.attachments.set(data.orderId, data);
+    receipts = receipts.map((item) => item.orderId === data.orderId && item.receiptStatus === 'pending' ? data : item);
+    const previous = receiptCards.get(data.orderId)?.card;
+    const focused = document.activeElement;
+    const focusResult = previous?.isConnected
+      && (previous.contains(focused) || (focusedBeforeUpload && focused === document.body));
+    renderReceipts();
+    const result = receiptCards.get(data.orderId)?.card.querySelector('.fiscal-result');
+    if (focusResult && result?.isConnected && !result.hidden) {
+      result.tabIndex = -1;
+      result.focus();
+    }
   } catch (error) {
     if (session !== current) return;
     if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
     else showMessage(problem, messageFor(error));
   } finally {
     if (session === current) {
-      submit.disabled = false;
-      inputs.forEach((input) => { input.disabled = false; });
+      receiptUploads.delete(entry.orderId);
+      setReceiptFormBusy(card, false);
+      const latest = receiptCards.get(entry.orderId)?.card;
+      if (latest && latest !== card) setReceiptFormBusy(latest, false);
     }
   }
 }
@@ -876,6 +917,9 @@ function closeSession(message = '') {
   showMessage(pendingPaymentsProblem);
   showMessage(pendingPaymentsEmpty);
   receipts = [];
+  receiptRefresh = null;
+  receiptUploads.clear();
+  receiptCards.clear();
   fiscalReceipts.hidden = true;
   fiscalReceiptsJump.hidden = true;
   fiscalReceiptsFilter.value = '';
@@ -1096,6 +1140,8 @@ async function refreshReceipts() {
   const current = availableSession();
   if (current?.role !== 'manager' || fiscalReceiptsRefresh.disabled) return;
 
+  const refresh = { attachments: new Map() };
+  receiptRefresh = refresh;
   fiscalReceiptsRefresh.disabled = true;
   showMessage(fiscalReceiptsProblem);
   showMessage(fiscalReceiptsEmpty, receipts.length ? '' : 'Loading fiscal receipts…');
@@ -1103,19 +1149,25 @@ async function refreshReceipts() {
     const data = await request('/receipts', { token: current.accessToken });
     if (session !== current) return;
     if (!Array.isArray(data) || data.length > 100) throw new ApiError(502, 'invalid_response');
-    receipts = data.map(checkedReceipt);
+    receipts = data.map(checkedReceipt).map((entry) => {
+      // A list request already in flight can still return the pre-upload state for an attached receipt.
+      return entry.receiptStatus === 'pending' ? refresh.attachments.get(entry.orderId) ?? entry : entry;
+    });
     renderReceipts();
   } catch (error) {
     if (session !== current) return;
     if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
     else {
-      receipts = [];
-      fiscalReceiptsList.replaceChildren();
+      receipts = receipts.filter(({ orderId }) => refresh.attachments.has(orderId) || receiptUploads.has(orderId));
+      renderReceipts();
       showMessage(fiscalReceiptsEmpty);
       showMessage(fiscalReceiptsProblem, messageFor(error));
     }
   } finally {
-    if (session === current) fiscalReceiptsRefresh.disabled = false;
+    if (session === current) {
+      receiptRefresh = null;
+      fiscalReceiptsRefresh.disabled = false;
+    }
   }
 }
 
