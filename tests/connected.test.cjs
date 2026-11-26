@@ -1469,8 +1469,9 @@ test('manager finds and attaches a fiscal receipt beyond the rolling queue', { t
   await card.getByText('Awaiting receipt', { exact: true }).waitFor();
 
   const refresh = button(page, 'Refresh fiscal receipts');
+  const rechecked = match(order.number.slice(1).toLowerCase());
   await refresh.click();
-  await refresh.click({ trial: true });
+  assert.deepEqual((await (await rechecked).json()).map(row => row.orderId), [order.id]);
   await card.getByText('Awaiting receipt', { exact: true }).waitFor();
   const { total } = await send(`/orders/${order.id}`, { token: order.token }).then(response => response.json());
   const reference = `LOOKUP-${order.number.slice(1)}`;
@@ -1488,7 +1489,7 @@ test('manager finds and attaches a fiscal receipt beyond the rolling queue', { t
   await search.press('Enter');
   assert.deepEqual((await (await full).json()).map(row => row.receiptReference), [reference]);
   await card.getByText('Attached', { exact: true }).waitFor();
-  assert.equal(lookups.length, 2, 'The input must look up exact orders only on submit');
+  assert.equal(lookups.length, 3, 'Exact requests belong to two submits and one explicit refresh');
   assert.equal(uploads.length, 1);
   const persisted = await send(`/orders/${order.id}/receipt`, { token: order.token });
   assert.equal(persisted.status, 200);
