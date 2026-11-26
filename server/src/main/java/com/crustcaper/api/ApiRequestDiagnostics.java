@@ -9,6 +9,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.NestedExceptionUtils;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
@@ -59,13 +60,17 @@ public final class ApiRequestDiagnostics extends OncePerRequestFilter {
             chain.doFilter(request, response);
         } catch (ServletException | RuntimeException failure) {
             // The container renders the error after this dispatch. Count it before that dispatch.
-            if (!request.getMethod().equals("OPTIONS")) metrics.record(true);
+            if (!request.getMethod().equals("OPTIONS")
+                    && (isServerError(response.getStatus()) || (!response.isCommitted()
+                        && !(NestedExceptionUtils.getMostSpecificCause(failure) instanceof IOException)))) {
+                metrics.record(true);
+            }
             throw failure;
         }
         if (isAsyncStarted(request)) return;
 
         int status = response.getStatus();
-        boolean serverError = status >= 500 && status < 600;
+        boolean serverError = isServerError(status);
         Object pattern = request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
         if (!request.getMethod().equals("OPTIONS") && (serverError || (status >= 200 && status < 400 && pattern != null))) {
             metrics.record(serverError);
@@ -78,6 +83,10 @@ public final class ApiRequestDiagnostics extends OncePerRequestFilter {
                 category == null ? "unavailable" : category,
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - state.startedAt()));
         }
+    }
+
+    private static boolean isServerError(int status) {
+        return status >= 500 && status < 600;
     }
 
     private static String method(HttpServletRequest request) {

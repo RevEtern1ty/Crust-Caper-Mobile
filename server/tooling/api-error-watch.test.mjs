@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createApiErrorWatch } from './api-error-watch.mjs';
+import { createApiErrorWatch, watchApiErrorSamples } from './api-error-watch.mjs';
 
 const instanceId = '11223344-5566-4788-9900-112233445566';
 const nextInstance = '22334455-6677-4899-aa00-223344556677';
@@ -74,6 +74,29 @@ test('ignores invalid and repeated unreadable snapshots without echoing their fi
   }
   assert.deepEqual(watch.observe(sample(1, 0)), { event: 'telemetry_restored', incidentOpen: false });
 });
+
+test('a silent producer reports missing telemetry and cannot close an incident with the first new sample',
+  { timeout: 2000 }, async () => {
+    const pause = Promise.withResolvers();
+    async function* snapshots() {
+      yield sample(0, 0);
+      yield sample(3, 3);
+      yield sample(6, 6);
+      await pause.promise;
+      yield sample(50, 6);
+      yield sample(56, 6);
+      yield sample(62, 6);
+    }
+    const events = watchApiErrorSamples(snapshots(), 15);
+    assert.equal((await events.next()).value.event, 'ready');
+    assert.equal((await events.next()).value.event, 'incident');
+    assert.deepEqual((await events.next()).value,
+      { event: 'telemetry_unavailable', reason: 'sample_timeout', incidentOpen: true });
+    pause.resolve();
+    assert.deepEqual((await events.next()).value, { event: 'telemetry_restored', incidentOpen: true });
+    assert.deepEqual((await events.next()).value, { event: 'recovered', requests: 6, serverErrors: 0, errorRatePercent: 0 });
+    assert.equal((await events.next()).done, true);
+  });
 
 test('CLI delivers sanitized events, resumes at the next line and reports a closed input stream', () => {
   const input = Buffer.concat([

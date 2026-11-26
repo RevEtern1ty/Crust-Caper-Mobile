@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { setTimeout as delay } from 'node:timers/promises';
 import { TextDecoder } from 'node:util';
 import { isMainModule } from './check-live-catalog.mjs';
 
@@ -7,6 +8,7 @@ const maxLineBytes = 1024;
 const requiredWindows = 2;
 const minimumErrors = 3;
 const rateDivisor = 20n; // Five percent is exactly one in twenty requests.
+const sampleTimeout = Symbol('sample_timeout');
 
 function readSnapshot(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -69,7 +71,37 @@ export function createApiErrorWatch() {
     };
   }
 
-  return { observe };
+  return { observe, timeout: () => recordGap('sample_timeout') };
+}
+
+async function readWithDeadline(pending, maxGapMs) {
+  const timer = new AbortController();
+  try {
+    return await Promise.race([pending, delay(maxGapMs, sampleTimeout, { signal: timer.signal })]);
+  } finally {
+    timer.abort();
+  }
+}
+
+export async function* watchApiErrorSamples(input, maxGapMs = 90_000) {
+  const iterator = input[Symbol.asyncIterator]();
+  const watch = createApiErrorWatch();
+  try {
+    while (true) {
+      const pending = iterator.next();
+      let snapshot = await readWithDeadline(pending, maxGapMs);
+      if (snapshot === sampleTimeout) {
+        const event = watch.timeout();
+        if (event) yield event;
+        snapshot = await pending;
+      }
+      if (snapshot.done) return;
+      const event = watch.observe(snapshot.value);
+      if (event) yield event;
+    }
+  } finally {
+    await iterator.return?.();
+  }
 }
 
 async function* readSnapshots(input) {
@@ -126,7 +158,6 @@ async function main() {
     process.exitCode = 2;
     return;
   }
-  const watch = createApiErrorWatch();
   let stopping = false;
   const stop = () => {
     stopping = true;
@@ -138,10 +169,9 @@ async function main() {
   process.once('SIGTERM', stop);
   process.stdout.on('error', () => process.stdin.destroy());
   try {
-    for await (const snapshot of readSnapshots(process.stdin)) {
+    for await (const event of watchApiErrorSamples(readSnapshots(process.stdin))) {
       if (stopping) break;
-      const event = watch.observe(snapshot);
-      if (event) await writeEvent(event);
+      await writeEvent(event);
     }
   } catch (error) {
     if (!stopping) throw error;
