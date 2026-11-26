@@ -28,11 +28,15 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdfwriter.compress.CompressParameters;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -40,20 +44,24 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.context.transaction.TestTransaction;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 @SpringBootTest(properties = "crustcaper.web.origin=" + OperatorReceiptCorrectionIntegrationTest.ORIGIN)
 @AutoConfigureMockMvc
 @ActiveProfiles("local")
+@DirtiesContext
 @Transactional
 class OperatorReceiptCorrectionIntegrationTest {
     static final String ORIGIN = "https://receipt-test.crustcaper.invalid";
@@ -69,16 +77,37 @@ class OperatorReceiptCorrectionIntegrationTest {
     private static final long TOTAL = 9200;
     private static final String TRANSACTION = "94710301";
     private static final String REFUND = "94720301";
+    private static final Pattern TEST_DATABASE = Pattern.compile(
+        "jdbc:postgresql://(?:127\\.0\\.0\\.1|localhost|\\[::1\\]):[1-9][0-9]{0,4}/crustcaper_(?:dev|test)(?:_[a-z0-9_]+)?");
+    private static final String SCHEMA = "receipt_correction_test_" + UUID.randomUUID().toString().replace("-", "");
 
     @Autowired MockMvc api;
     @Autowired JdbcClient jdbc;
     @Autowired ObjectMapper json;
     @Autowired OrderService orders;
+    @Autowired TransactionTemplate transactions;
     @MockitoBean RefundDirectory refunds;
 
     @DynamicPropertySource
-    static void mfa(DynamicPropertyRegistry registry) {
+    static void isolatedFixtures(DynamicPropertyRegistry registry) {
+        String url = System.getenv().getOrDefault("CRUSTCAPER_DB_URL", "jdbc:postgresql://127.0.0.1:55432/crustcaper_dev");
+        if (!TEST_DATABASE.matcher(url).matches()) {
+            throw new IllegalStateException("Run this test on a dedicated loopback crustcaper_dev or crustcaper_test database");
+        }
+        String scopedUrl = url + "?currentSchema=" + SCHEMA;
+        registry.add("spring.datasource.url", () -> scopedUrl);
+        registry.add("spring.flyway.url", () -> scopedUrl);
+        registry.add("spring.flyway.schemas", () -> SCHEMA);
+        registry.add("spring.flyway.default-schema", () -> SCHEMA);
+        registry.add("spring.flyway.create-schemas", () -> true);
         OperatorMfaFixture.registerKey(registry);
+    }
+
+    @AfterAll
+    static void removeFixtures(@Autowired JdbcClient jdbc) {
+        assertThat(jdbc.sql("SELECT current_schema()").query(String.class).single()).isEqualTo(SCHEMA);
+        // The class-owned schema lets committed refund and correction fixtures keep their append-only triggers.
+        jdbc.sql("DROP SCHEMA " + SCHEMA + " CASCADE").update();
     }
 
     @Test
@@ -90,11 +119,8 @@ class OperatorReceiptCorrectionIntegrationTest {
         Guest owner = guest();
         Guest stranger = guest();
         Browser browser = browser();
-        UUID order = createOrder(store, owner);
-        UUID attempt = UUID.fromString(body(api.perform(post(API + "/orders/{id}/payments", order)
-            .header(HttpHeaders.AUTHORIZATION, owner.bearer()).header("Idempotency-Key", "correction-payment"))
-            .andExpect(status().isOk())).path("id").asString());
-        orders.settlePayment(new VerifiedPayment(attempt.toString(), TRANSACTION, TOTAL, "RWF", PaymentResult.PAID));
+        PaidOrder paid = payForOrder(store, owner, TRANSACTION);
+        UUID order = paid.id();
 
         byte[] original = pdf("Synthetic original receipt");
         byte[] correction = pdf("Synthetic correction receipt");
@@ -106,17 +132,9 @@ class OperatorReceiptCorrectionIntegrationTest {
         assertPdf(nativeGet(nativePath + "/receipt", owner), "receipt", order, original);
         nativeGet(nativePath + "/receipt-correction", owner).andExpect(status().isNotFound());
 
-        api.perform(post(operatorPath + "/cancel").header(HttpHeaders.AUTHORIZATION, manager.bearer()))
-            .andExpect(status().isOk()).andExpect(jsonPath("$.paymentStatus").value("refund_pending"));
+        cancelOrder(manager, operatorPath);
         assertUnavailable(manager, operatorPath, correction);
-        var request = new RefundRequest(REFUND, TRANSACTION, TOTAL, "RWF");
-        when(refunds.confirm(request)).thenReturn(Optional.of(
-            new ConfirmedRefund(REFUND, TRANSACTION, TOTAL, "RWF", "completed-momo")
-        ));
-        api.perform(post(OPERATOR + "/payment-exceptions/{attempt}/{transaction}/refund", attempt, TRANSACTION)
-            .header(HttpHeaders.AUTHORIZATION, manager.bearer()).contentType(MediaType.APPLICATION_JSON)
-            .content(json.writeValueAsBytes(Map.of("providerRefundId", REFUND))))
-            .andExpect(status().isOk()).andExpect(jsonPath("$.providerRefundId").value(REFUND));
+        recordRefund(manager, paid.attempt(), TRANSACTION, REFUND);
         api.perform(get(OPERATOR + "/receipts").header(HttpHeaders.AUTHORIZATION, manager.bearer()))
             .andExpect(status().isOk()).andExpect(jsonPath("$[0].orderId").value(order.toString()))
             .andExpect(jsonPath("$[0].correctionEligible").value(true));
@@ -185,6 +203,82 @@ class OperatorReceiptCorrectionIntegrationTest {
             .containsEntry("refund_total_rwf", TOTAL)
             .containsEntry("attached_by", manager.id())
             .containsEntry("correction_hash", sha256(correction));
+    }
+
+    @Test
+    void concurrentExactCorrectionRetryReadsTheCommittedAttachmentAfterWaiting() throws Exception {
+        String store = store();
+        Staff manager = staff(store, "manager");
+        String transaction = "94710302";
+        PaidOrder paid = payForOrder(store, guest(), transaction);
+        String orderPath = OPERATOR + "/orders/" + paid.id();
+        String correctionPath = orderPath + "/receipt-correction";
+        byte[] correction = pdf("Synthetic concurrent correction");
+        upload(manager, orderPath + "/receipt", ORIGINAL_REFERENCE, TOTAL, pdf("Synthetic concurrent original"))
+            .andExpect(status().isOk());
+        cancelOrder(manager, orderPath);
+        recordRefund(manager, paid.attempt(), transaction, "94720302");
+        TestTransaction.flagForCommit();
+        TestTransaction.end();
+
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var retry = transactions.execute(tx -> {
+                try {
+                    upload(manager, correctionPath, CORRECTION_REFERENCE, TOTAL, correction)
+                        .andExpect(status().isOk()).andExpect(jsonPath("$.receiptStatus").value("corrected"));
+                    var pending = executor.submit(() -> upload(manager, correctionPath, CORRECTION_REFERENCE, TOTAL, correction));
+                    waitForOrderLock();
+                    return pending;
+                } catch (Exception failure) {
+                    throw new IllegalStateException("Could not coordinate concurrent correction uploads", failure);
+                }
+            });
+            retry.get(5, TimeUnit.SECONDS).andExpect(status().isOk())
+                .andExpect(jsonPath("$.receiptStatus").value("corrected"))
+                .andExpect(jsonPath("$.correctionReference").value(CORRECTION_REFERENCE));
+        }
+        assertThat(jdbc.sql("SELECT encode(sha256, 'hex') FROM fiscal_receipt_corrections WHERE order_id = ?")
+            .param(paid.id()).query(String.class).single()).isEqualTo(sha256(correction));
+    }
+
+    private void waitForOrderLock() throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        do {
+            jdbc.sql("SELECT pg_stat_clear_snapshot()").query((row, index) -> true).single();
+            if (jdbc.sql("""
+                SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database() AND pid <> pg_backend_pid()
+                        AND wait_event_type = 'Lock' AND query LIKE '%FOR UPDATE%'
+                        AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))
+                """).query(Boolean.class).single()) return;
+            Thread.sleep(25);
+        } while (System.nanoTime() < deadline);
+        throw new AssertionError("The second correction never waited for the first correction's order lock");
+    }
+
+    private PaidOrder payForOrder(String store, Guest owner, String transaction) throws Exception {
+        UUID order = createOrder(store, owner);
+        UUID attempt = UUID.fromString(body(api.perform(post(API + "/orders/{id}/payments", order)
+            .header(HttpHeaders.AUTHORIZATION, owner.bearer()).header("Idempotency-Key", "correction-payment"))
+            .andExpect(status().isOk())).path("id").asString());
+        orders.settlePayment(new VerifiedPayment(attempt.toString(), transaction, TOTAL, "RWF", PaymentResult.PAID));
+        return new PaidOrder(order, attempt);
+    }
+
+    private void cancelOrder(Staff manager, String orderPath) throws Exception {
+        api.perform(post(orderPath + "/cancel").header(HttpHeaders.AUTHORIZATION, manager.bearer()))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.paymentStatus").value("refund_pending"));
+    }
+
+    private void recordRefund(Staff manager, UUID attempt, String transaction, String refund) throws Exception {
+        var request = new RefundRequest(refund, transaction, TOTAL, "RWF");
+        when(refunds.confirm(request)).thenReturn(Optional.of(
+            new ConfirmedRefund(refund, transaction, TOTAL, "RWF", "completed-momo")
+        ));
+        api.perform(post(OPERATOR + "/payment-exceptions/{attempt}/{transaction}/refund", attempt, transaction)
+            .header(HttpHeaders.AUTHORIZATION, manager.bearer()).contentType(MediaType.APPLICATION_JSON)
+            .content(json.writeValueAsBytes(Map.of("providerRefundId", refund))))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.providerRefundId").value(refund));
     }
 
     private void assertUnavailable(Staff manager, String orderPath, byte[] correction) throws Exception {
@@ -306,4 +400,5 @@ class OperatorReceiptCorrectionIntegrationTest {
     private record Staff(UUID id, String bearer) {}
     private record Guest(String bearer) {}
     private record Browser(UUID id, Cookie cookie) {}
+    private record PaidOrder(UUID id, UUID attempt) {}
 }
