@@ -1310,6 +1310,88 @@ async function checkProductInventory(browser, ca) {
   }
 }
 
+async function checkExpiredInventoryHoldRefreshesProduct(browser, ca) {
+  const sku = 'double-smash';
+  const menuPath = '/api/v1/stores/kigali/menu?channel=web';
+  const menu = await request(ca, menuPath);
+  assert.equal(menu.status, 200);
+  const { products, slots } = JSON.parse(menu.body);
+  const item = products.find(product => product.sku === sku);
+  const slot = slots.filter(slot => slot.available).at(-1);
+  assert.ok(item?.available && slot, 'the fixture requires two counted portions and an available pickup window');
+
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  try {
+    const page = await context.newPage();
+    await page.goto(origin + '/menu/en');
+    const order = await page.evaluate(async ({ sku, slotId, unitPrice, key }) => {
+      async function send(path, headers = {}, body) {
+        const response = await fetch('/api/v1/web/' + path, {
+          method: 'POST', credentials: 'same-origin', cache: 'no-store',
+          headers: { 'X-CrustCaper-Web': '1', ...headers, ...(body && { 'Content-Type': 'application/json' }) },
+          body: body && JSON.stringify(body),
+        });
+        if (!response.ok) throw new Error('Inventory fixture ' + path + ' returned ' + response.status);
+        return response.json();
+      }
+      const session = await send('session');
+      const scoped = { 'X-CrustCaper-Session': session.sessionId };
+      const quote = await send('quotes', scoped, {
+        storeId: 'kigali', slotId, lines: [{ sku, modifierIds: [], quantity: 2, unitPrice }],
+      });
+      return send('orders', { ...scoped, 'Idempotency-Key': key }, {
+        quoteId: quote.quoteId, phone: '+250700000000', email: 'stock-expiry@example.test',
+      });
+    }, { sku, slotId: slot.id, unitPrice: item.price, key: 'stock-expiry-' + randomUUID() });
+    assert.ok(uuid.test(order.id) && order.status === 'awaiting_payment' && order.paymentStatus === 'unpaid');
+    assert.ok(order.lines.some(line => line.sku === sku && line.quantity === 2));
+
+    const shortenHold = `
+      UPDATE orders o SET reservation_expires_at = clock_timestamp() + interval '10 seconds'
+      WHERE o.id = :'order_id' AND o.store_id = 'kigali' AND o.checkout_channel = 'web'
+        AND o.status = 'awaiting_payment' AND o.payment_status = 'unpaid'
+        AND o.reservation_expires_at > clock_timestamp() + interval '10 seconds'
+        AND NOT EXISTS (SELECT 1 FROM payment_attempts p WHERE p.order_id = o.id)
+      RETURNING to_char(reservation_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"');`;
+    const shortened = spawnSync('docker', ['exec', '-i', fixtureDatabase(), 'psql', '-XAtq', '--no-password',
+      '-v', 'ON_ERROR_STOP=1', '-U', 'storefront_fixture', '-d', 'storefront_fixture',
+      '-v', 'order_id=' + order.id, '-f', '-',
+    ], { encoding: 'utf8', input: shortenHold + '\n', timeout: 10000 });
+    assert.equal(shortened.status, 0, 'could not set the fixture hold deadline');
+    const deadline = Date.parse(shortened.stdout.trim());
+    assert.ok(Number.isFinite(deadline), 'expected to shorten exactly the unpaid fixture hold');
+
+    const productUrl = origin + '/product/' + sku;
+    const isMenu = response => response.url() === origin + menuPath && response.ok();
+    const [before, entry] = await Promise.all([
+      page.waitForResponse(isMenu, { timeout: 9000 }),
+      page.goto(productUrl, { waitUntil: 'domcontentloaded' }),
+    ]);
+    assert.equal(entry.status(), 200);
+    assert.equal(Date.parse(before.headers()['x-next-sale-change-at']), deadline);
+    assert.ok(Date.parse(before.headers()['x-availability-checked-at']) < deadline);
+    await shown(page, 'Currently unavailable', 5000);
+    assert.equal(await button(page, /^Add to cart/).isDisabled(), true);
+    assert.equal(await page.evaluate(() => document.visibilityState), 'visible');
+    let navigations = 0;
+    page.on('framenavigated', frame => { if (frame === page.mainFrame()) navigations++; });
+
+    const [after] = await Promise.all([
+      page.waitForResponse(response => isMenu(response)
+        && Date.parse(response.headers()['x-availability-checked-at']) >= deadline, { timeout: 17000 }),
+      page.getByRole('button', { name: /^Add to cart/, disabled: false }).waitFor({ timeout: 17000 }),
+    ]);
+    const refreshed = await after.json();
+    assert.equal(refreshed.products.find(product => product.sku === sku)?.available, true);
+    assert.equal(await page.getByText('Currently unavailable', { exact: true }).count(), 0);
+    assert.equal(page.url(), productUrl);
+    assert.equal(navigations, 0, 'the product should refresh with its original document still open');
+    await capture(page, 'product-available-after-unpaid-hold-expiry');
+  } finally {
+    await context.close();
+  }
+}
+
 const scenario = webPerf ? 'HTTPS catalog captures cold mobile web performance'
   : catalogPhotos ? 'HTTPS storefront renders the approved photo and preserves a single verified guest payment'
     : 'HTTPS storefront renders public pages and preserves a single verified guest payment';
@@ -1352,6 +1434,8 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
       () => checkRecipeApproval(browser, ca));
     await t.test('the manager can count portions once after a lost reply and restore both sales channels',
       () => checkProductInventory(browser, ca));
+    await t.test('an open product returns to stock after its unpaid hold expires over HTTPS',
+      () => checkExpiredInventoryHoldRefreshesProduct(browser, ca));
     await t.test('published sale rules update channel visibility and localized availability over HTTPS',
       () => checkProductSaleRules(browser, ca));
   }
