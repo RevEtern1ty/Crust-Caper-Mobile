@@ -590,10 +590,34 @@ async function checkVerifiedOrderPrivacy(browser, page, ca, order, orderPath, st
 
 async function checkPrivacyLayout(page, locale) {
   for (const width of [320, 390, 430]) {
+    const scale = width === 390 ? '' : '200%';
     await page.setViewportSize({ width, height: 844 });
-    await page.evaluate(scale => { document.documentElement.style.fontSize = scale; }, width === 390 ? '' : '200%');
-    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    await page.evaluate(scale => { document.documentElement.style.fontSize = scale; }, scale);
+    const layout = await page.evaluate(() => {
+      const viewportWidth = window.innerWidth;
+      const documentWidth = document.documentElement.scrollWidth;
+      if (documentWidth <= viewportWidth) return { viewportWidth, documentWidth };
+
+      const overflowing = [];
+      for (const element of document.body.querySelectorAll('*')) {
+        const bounds = element.getBoundingClientRect();
+        if (bounds.width > 0 && bounds.right > viewportWidth + 0.5) {
+          overflowing.push({
+            element: element.localName,
+            role: element.getAttribute('role'),
+            left: Math.round(bounds.left),
+            right: Math.round(bounds.right),
+            maxWidth: getComputedStyle(element).maxWidth,
+          });
+        }
+      }
+      overflowing.sort((left, right) => right.right - left.right);
+      return { viewportWidth, documentWidth, overflowing: overflowing.slice(0, 8) };
+    });
     await capture(page, 'order-privacy-' + locale + '-' + width);
+    const label = `Privacy layout for ${locale} at ${width}px and ${scale || '100%'} text size`;
+    assert.equal(layout.viewportWidth, width, label);
+    assert.ok(layout.documentWidth <= width, `${label}: ${JSON.stringify(layout)}`);
   }
   await page.setViewportSize({ width: 390, height: 844 });
   await page.evaluate(() => { document.documentElement.style.fontSize = ''; });

@@ -1,3 +1,4 @@
+import { Header } from '@react-navigation/elements';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useState } from 'react';
@@ -14,6 +15,7 @@ export const unstable_settings = { anchor: '(tabs)' };
 
 function Routes() {
   const { hydrated, locale, mode, setLocale, webCheckout } = useShop();
+  const privacyTitle = copy(locale, 'Order privacy', 'Amakuru bwite ya komande');
   useEffect(() => {
     if (!webCheckout || !hydrated || typeof window === 'undefined') return;
 
@@ -54,7 +56,20 @@ function Routes() {
       <Stack.Screen name="payment-return" options={{ headerShown: false }} />
       <Stack.Screen name="web-payment-return" options={{ headerShown: false }} />
       <Stack.Screen name="order-recovery" options={{ title: copy(locale, 'Find an order', 'Shaka komande') }} />
-      <Stack.Screen name="privacy" options={{ title: copy(locale, 'Order privacy', 'Amakuru bwite ya komande') }} />
+      <Stack.Screen name="privacy" options={{
+        title: privacyTitle,
+        // Let the browser shrink the title row even before the navigator observes the new width.
+        header: Platform.OS === 'web' ? ({ back, options }) => (
+          <Header back={back} title={privacyTitle}
+            headerBackButtonDisplayMode={options.headerBackButtonDisplayMode}
+            headerShadowVisible={options.headerShadowVisible}
+            headerStyle={options.headerStyle}
+            headerTintColor={options.headerTintColor}
+            headerTitleStyle={options.headerTitleStyle}
+            headerTitleContainerStyle={styles.privacyHeaderTitle}
+          />
+        ) : undefined,
+      }} />
       <Stack.Screen name="settings" options={{ title: copy(locale, 'Settings', 'Amagenamiterere') }} />
     </Stack>
   );
@@ -120,6 +135,7 @@ const styles = StyleSheet.create({
     flex: 1, width: '100%', backgroundColor: colors.cream,
     ...(Platform.OS === 'web' ? { maxWidth: 760, borderLeftWidth: 1, borderRightWidth: 1, borderColor: colors.border } : {}),
   },
+  privacyHeaderTitle: { flexShrink: 1, minWidth: 0 },
   storageNotice: {
     flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', columnGap: 12, rowGap: 6,
     paddingHorizontal: 18, paddingTop: 10, backgroundColor: colors.cream,
