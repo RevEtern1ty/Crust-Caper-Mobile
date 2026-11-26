@@ -2,31 +2,52 @@ const packagePattern = /^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/;
 const fingerprintPattern = /^[0-9A-F]{2}(?::[0-9A-F]{2}){31}$/i;
 const paymentReturn = '/payment-return';
 const androidRelation = 'delegate_permission/common.handle_all_urls';
+const maxResponseBytes = 1024 * 1024;
+const callbackProbe = {
+  orderId: 'c0de0000-1111-4222-8333-444444444444',
+  tx_ref: 'cc-app-link-fixture-reference',
+  transaction_id: '987654321098765432',
+  status: 'cc-app-link-fixture-status',
+};
 
-async function readPublished(origin, path, mediaType) {
+async function readPublished(origin, path, mediaType, query) {
+  const url = new URL(path, origin);
+  if (query) url.search = new URLSearchParams(query);
   const signal = AbortSignal.timeout(8000);
   let response;
   try {
-    response = await fetch(new URL(path, origin), {
-      headers: { Accept: mediaType }, cache: 'no-store', redirect: 'manual', signal,
+    response = await fetch(url, {
+      headers: { Accept: mediaType }, cache: 'no-store', credentials: 'omit', redirect: 'manual', signal,
     });
   } catch {
     throw new Error(`${path} could not be reached over verified HTTPS.`);
   }
-  if (response.status !== 200) {
-    await response.body?.cancel();
+  if (response.status !== 200 || response.redirected) {
+    await response.body?.cancel().catch(() => {});
     throw new Error(`${path} returned HTTP ${response.status}. Expected 200 without a redirect.`);
   }
   const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
   if (contentType !== mediaType) {
-    await response.body?.cancel();
+    await response.body?.cancel().catch(() => {});
     throw new Error(`${path} did not return ${mediaType}.`);
   }
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let length = 0;
+  let text = '';
   try {
-    return mediaType === 'application/json' ? await response.json() : await response.text();
+    for await (const chunk of response.body ?? []) {
+      length += chunk.byteLength;
+      if (length > maxResponseBytes) break;
+      text += decoder.decode(chunk, { stream: true });
+    }
+    if (length <= maxResponseBytes) {
+      text += decoder.decode();
+      return { headers: response.headers, content: mediaType === 'application/json' ? JSON.parse(text) : text };
+    }
   } catch {
     throw new Error(`${path} could not be read as ${mediaType} before the request ended.`);
   }
+  throw new Error(`${path} exceeded the 1 MiB response size limit.`);
 }
 
 function matchesAndroid(links, androidPackage, fingerprint) {
@@ -50,6 +71,26 @@ function matchesApple(association, iosAppId) {
     && Object.keys(components[0]).every(key => key === '/' || key === 'comment');
 }
 
+function headerValues(headers, name) {
+  return (headers.get(name) ?? '').split(',').map(value => value.trim().toLowerCase());
+}
+
+function verifyPaymentReturn({ headers, content }) {
+  if (!headerValues(headers, 'Cache-Control').includes('no-store')) {
+    throw new Error(`${paymentReturn} must set Cache-Control: no-store.`);
+  }
+  if (!headerValues(headers, 'Referrer-Policy').every(value => value === 'no-referrer')) {
+    throw new Error(`${paymentReturn} must set Referrer-Policy: no-referrer.`);
+  }
+  const output = [content, ...headers.values()];
+  if (Object.values(callbackProbe).some(value => output.some(part => part.includes(value)))) {
+    throw new Error(`${paymentReturn} reflected a callback parameter.`);
+  }
+  if (!content.includes('<title>Return to CrustCaper</title>')) {
+    throw new Error(`${paymentReturn} did not serve the CrustCaper return page.`);
+  }
+}
+
 async function checkAppLinks(args) {
   const [base, deployedReturn, androidPackage, fingerprint, iosAppId] = args;
   if (args.length !== 5 || !packagePattern.test(androidPackage) || !fingerprintPattern.test(fingerprint)
@@ -71,17 +112,15 @@ async function checkAppLinks(args) {
   const [assetLinks, appleAssociation, returnPage] = await Promise.all([
     readPublished(origin, '/.well-known/assetlinks.json', 'application/json'),
     readPublished(origin, '/.well-known/apple-app-site-association', 'application/json'),
-    readPublished(origin, paymentReturn, 'text/html'),
+    readPublished(origin, paymentReturn, 'text/html', callbackProbe),
   ]);
-  if (!matchesAndroid(assetLinks, androidPackage, fingerprint.toUpperCase())) {
+  if (!matchesAndroid(assetLinks.content, androidPackage, fingerprint.toUpperCase())) {
     throw new Error('Android association does not match the expected package and signing certificate.');
   }
-  if (!matchesApple(appleAssociation, iosAppId)) {
+  if (!matchesApple(appleAssociation.content, iosAppId)) {
     throw new Error(`Apple association does not map the expected application ID to ${paymentReturn}.`);
   }
-  if (!returnPage.includes('<title>Return to CrustCaper</title>')) {
-    throw new Error(`${paymentReturn} did not serve the CrustCaper return page.`);
-  }
+  verifyPaymentReturn(returnPage);
   console.log(`Verified Android and Apple associations and ${paymentReturn} over HTTPS.`);
 }
 
