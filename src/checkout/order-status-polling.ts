@@ -1,7 +1,7 @@
 import { ApiError, type Order } from '../domain/types';
 import { hasInconsistentPayment, isAwaitingUnpaidHold, type HoldState } from './pickup-hold';
 
-type PolledOrder = HoldState & Partial<Pick<Order, 'reservationExpiresAt'>> & {
+type PolledOrder = HoldState & Partial<Pick<Order, 'reservationExpiresAt' | 'receiptStatus'>> & {
   paymentAttempt?: { id?: string } | null;
 };
 export type OrderStatusResult = { order: PolledOrder } | { error: unknown };
@@ -10,7 +10,13 @@ export type UncertainPayment = { since: number; attemptId: string | null };
 const unpaidHoldCheckIntervalMs = 60_000;
 const overdueHoldCheckIntervalMs = 15_000;
 const holdDeadlineGraceMs = 1000;
+const receiptCheckIntervalMs = 15_000;
+export const receiptChecksPerVisit = 8;
 export const delayedPaymentThresholdMs = 18_000;
+
+export function isWaitingForReceipt(order: PolledOrder): boolean {
+  return order.status === 'collected' && order.paymentStatus === 'paid' && order.receiptStatus === 'pending';
+}
 
 function isPaymentUncertain(order: PolledOrder): boolean {
   return order.paymentStatus === 'processing' || hasInconsistentPayment(order);
@@ -47,15 +53,18 @@ export function nextOrderStatusDelay(
   consecutiveFailures: number,
   now = Date.now(),
   uncertainForMs: number | null = null,
+  receiptChecksRemaining: number | null = null,
 ): number | null {
   if ('error' in result) {
     const code = result.error instanceof ApiError ? result.error.code : null;
     if (code === 'unauthenticated' || code === 'not_found') return null;
     if (mode === 'demo') return attempts < 9 ? 3000 : null;
+    if (receiptChecksRemaining === 0) return null;
     const paymentDelay = uncertainForMs === null ? 0 : paymentCheckDelay(uncertainForMs);
-    if (code === 'rate_limited') return Math.max(15_000, paymentDelay);
+    const minDelay = Math.max(paymentDelay, receiptChecksRemaining === null ? 0 : receiptCheckIntervalMs);
+    if (code === 'rate_limited') return Math.max(15_000, minDelay);
     if (code === 'network_unavailable' || code === 'service_unavailable' || code === 'invalid_response') {
-      return Math.max(5000 * Math.min(consecutiveFailures, 3), paymentDelay);
+      return Math.max(5000 * Math.min(consecutiveFailures, 3), minDelay);
     }
     return null;
   }
@@ -77,5 +86,6 @@ export function nextOrderStatusDelay(
   if (uncertain) return paymentCheckDelay(uncertainForMs ?? 0);
   if (inKitchen || status === 'ready') return 5000;
   if (paymentStatus === 'refund_pending') return 15_000;
+  if (receiptChecksRemaining && isWaitingForReceipt(result.order)) return receiptCheckIntervalMs;
   return null;
 }

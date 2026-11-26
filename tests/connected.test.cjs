@@ -1143,6 +1143,86 @@ test('a fiscal receipt export is canceled when the selected order or app visibil
   assert.deepEqual(writes, []);
 });
 
+test('an open picked-up order shows a later fiscal receipt without manual refresh', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, serviceWorkers: 'block' });
+  page.setDefaultTimeout(7500);
+  await page.clock.install();
+  const reads = [];
+  page.on('request', request => {
+    if (request.method() === 'GET') reads.push(request.url());
+  });
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const { order } = await placeBrowserOrder(page, origin, { ...contact, email: 'receipt-after-pickup@example.test' });
+  await button(page, 'Confirm local test payment').click();
+  await shown(page, 'Order accepted');
+
+  const [kitchen, pickup, manager] = await Promise.all(['demo-kitchen', 'demo-pickup', 'demo-manager'].map(operator));
+  t.after(() => Promise.all([kitchen, pickup, manager].map(token => send('/operator/sessions/current', { method: 'DELETE', token }))));
+  const orderPath = `/orders/${order.id}`;
+  const orderUrl = api + orderPath;
+  const readCount = () => reads.filter(url => url === orderUrl).length;
+  const waitForRead = () => page.waitForResponse(response =>
+    response.url() === orderUrl && response.request().method() === 'GET' && response.ok());
+  const advance = (token, status, pickupCode) => send('/operator' + orderPath + '/status', {
+    method: 'POST', token, data: { status, pickupCode },
+  });
+  await page.clock.pauseAt(await page.evaluate(() => Date.now()) + 500);
+  for (const status of ['preparing', 'ready']) assert.equal((await advance(kitchen, status)).status, 200);
+  const ready = waitForRead();
+  await page.clock.fastForward(5200);
+  await shown(page, 'Ready for pickup');
+  const { pickupCode } = await (await ready).json();
+  assert.match(pickupCode, /^[0-9]{6}$/);
+
+  assert.equal((await advance(pickup, 'collected', pickupCode)).status, 200);
+  await page.clock.fastForward(5200);
+  await shown(page, 'Picked up');
+  await shown(page, 'The receipt is pending.');
+  const waitingReads = readCount();
+  await page.clock.fastForward(9000);
+  assert.equal(readCount(), waitingReads, 'receipt checks use a slower cadence than pickup status');
+
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await page.clock.fastForward(31_000);
+  assert.equal(readCount(), waitingReads, 'there is no receipt polling while the app is hidden');
+  const resumed = waitForRead();
+  await page.evaluate(() => {
+    Reflect.deleteProperty(document, 'visibilityState');
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  assert.equal((await (await resumed).json()).receiptStatus, 'pending');
+  await page.getByRole('button', { name: 'Refresh order status', exact: true, disabled: false }).waitFor();
+
+  const pdf = testReceipt();
+  const attached = await fetch(api + '/operator' + orderPath + '/receipt', {
+    method: 'PUT', redirect: 'error', signal: AbortSignal.timeout(10_000), body: pdf,
+    headers: { Authorization: 'Bearer ' + manager, 'Content-Type': 'application/pdf',
+      'X-Receipt-Reference': 'AFTER-PICKUP-' + order.id.slice(-8).toUpperCase(), 'X-Receipt-Total-RWF': String(order.total) },
+  });
+  assert.equal(attached.status, 200);
+  assert.equal((await attached.json()).receiptStatus, 'issued');
+  const beforeReceipt = readCount();
+  await page.clock.fastForward(15_100);
+  await button(page, 'Download receipt').waitFor();
+  assert.equal(readCount(), beforeReceipt + 1);
+  await capture(page, 'receipt-after-pickup-issued');
+  assert.ok((await downloadedReceipt(page)).equals(pdf));
+  await page.clock.fastForward(31_000);
+  assert.equal(readCount(), beforeReceipt + 1, 'issued receipts do not need further status reads');
+});
+
 test('a saved Orders action error follows the chosen language and keeps its support ID', { timeout: 25_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const server = createPreviewServer(dist);

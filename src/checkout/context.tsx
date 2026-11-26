@@ -9,7 +9,7 @@ import { ApiError, type CartLine, type Order, type PendingCheckoutRecovery, type
 import { privateStorage } from '../state/private-storage';
 import { useShop } from '../state/shop';
 import { CheckoutController, CheckoutError, type CheckoutContact, type CheckoutJournal } from './controller';
-import { delayedPaymentThresholdMs, nextOrderStatusDelay, nextUncertainPayment,
+import { delayedPaymentThresholdMs, isWaitingForReceipt, nextOrderStatusDelay, nextUncertainPayment, receiptChecksPerVisit,
   type OrderStatusResult, type UncertainPayment } from './order-status-polling';
 import { isExpiredUnpaidHold } from './pickup-hold';
 
@@ -191,7 +191,7 @@ type StatusPolling = {
   onResult: (result: OrderStatusResult) => void;
 };
 
-export function useOrderStatus(orderId: string | null) {
+export function useOrderStatus(orderId: string | null, { watchPendingReceipt = false } = {}) {
   const { api, mode, pickupNow } = useShop();
   const { finishExpiredHold, observePaymentUncertainty } = useCheckout();
   const [known, setKnown] = useState<Order | null>(null);
@@ -254,16 +254,24 @@ export function useOrderStatus(orderId: string | null) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let attempts = 0;
     let consecutiveFailures = 0;
+    let receiptChecksRemaining: number | null = null;
     const monitor: StatusPolling = {
       orderId,
       clearTimer: () => clearTimeout(timer),
       onResult: (result) => {
         if (polling.current !== monitor) return;
         consecutiveFailures = 'error' in result ? consecutiveFailures + 1 : 0;
+        if (watchPendingReceipt && mode === 'connected' && 'order' in result) {
+          receiptChecksRemaining = isWaitingForReceipt(result.order) ? receiptChecksRemaining ?? receiptChecksPerVisit : null;
+        }
         const uncertainFor = mode === 'connected' ? observePaymentUncertainty(orderId, result) : null;
         setDelayedPaymentId(uncertainFor !== null && uncertainFor >= delayedPaymentThresholdMs ? orderId : null);
-        const delay = nextOrderStatusDelay(mode, result, ++attempts, consecutiveFailures, pickupClock.current(), uncertainFor);
-        if (delay !== null) timer = setTimeout(() => { void refresh(true); }, delay);
+        const delay = nextOrderStatusDelay(mode, result, ++attempts, consecutiveFailures, pickupClock.current(),
+          uncertainFor, receiptChecksRemaining);
+        if (delay !== null) timer = setTimeout(() => {
+          if (receiptChecksRemaining !== null) receiptChecksRemaining--;
+          void refresh(true);
+        }, delay);
       },
     };
 
@@ -271,6 +279,7 @@ export function useOrderStatus(orderId: string | null) {
       if (polling.current === monitor) return;
       attempts = 0;
       consecutiveFailures = 0;
+      if (receiptChecksRemaining !== null) receiptChecksRemaining = receiptChecksPerVisit;
       polling.current = monitor;
       void refresh();
     }
@@ -293,7 +302,7 @@ export function useOrderStatus(orderId: string | null) {
       stop();
       subscription.remove();
     };
-  }, [mode, observePaymentUncertainty, orderId, refresh]));
+  }, [mode, observePaymentUncertainty, orderId, refresh, watchPendingReceipt]));
 
   return {
     order: known?.id === orderId ? known : null,

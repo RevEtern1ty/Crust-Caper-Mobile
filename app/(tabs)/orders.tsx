@@ -34,7 +34,7 @@ export default function OrdersScreen() {
   const receiptRevision = useRef(0);
   const linkedOrderId = savedPaymentReturnOrderId(requestedOrderId ?? undefined, journal?.orderIds ?? []);
   const orderId = linkedOrderId ?? (choice?.latest === latestId ? choice.id : latestId);
-  const { order, loading, failed, error: statusError, refresh, delayedPayment } = useOrderStatus(orderId);
+  const { order, loading, failed, error: statusError, refresh, delayedPayment } = useOrderStatus(orderId, { watchPendingReceipt: true });
   const t = (en: string, rw: string) => copy(locale, en, rw);
   const showDelayedPayment = !!order && delayedPayment && !failed;
   const savedOrderId = savedPaymentReturnOrderId(orderId ?? undefined, journal?.orderIds ?? []);

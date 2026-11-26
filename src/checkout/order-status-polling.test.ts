@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { ApiError, type Order } from '../domain/types';
-import { delayedPaymentThresholdMs, nextOrderStatusDelay, nextUncertainPayment } from './order-status-polling';
+import { delayedPaymentThresholdMs, nextOrderStatusDelay, nextUncertainPayment, receiptChecksPerVisit } from './order-status-polling';
 
 test('connected orders keep checking once ready and stop once picked up', () => {
   const check = (status: Order['status']) =>
@@ -12,6 +12,25 @@ test('connected orders keep checking once ready and stop once picked up', () => 
   assert.equal(check('preparing'), 5000);
   assert.equal(check('ready'), 5000);
   assert.equal(check('collected'), null);
+});
+
+test('an open collected order checks for its outstanding receipt at low frequency', () => {
+  const collected = { status: 'collected', paymentStatus: 'paid', receiptStatus: 'pending' } as const;
+  const absent = { order: collected };
+  assert.equal(nextOrderStatusDelay('connected', absent, 110, 0, 0, null, receiptChecksPerVisit), 15_000);
+  assert.equal(nextOrderStatusDelay('connected', absent, 110, 0, 0, null, 0), null);
+  assert.equal(nextOrderStatusDelay('connected', absent, 110, 0), null);
+  for (const receiptStatus of ['issued', 'corrected'] as const) {
+    const available = { order: { ...collected, receiptStatus } };
+    assert.equal(nextOrderStatusDelay('connected', available, 110, 0, 0, null, receiptChecksPerVisit), null);
+  }
+  assert.equal(nextOrderStatusDelay('demo', absent, 1, 0), null);
+
+  const offline = { error: new ApiError('network_unavailable') };
+  assert.equal(nextOrderStatusDelay('connected', offline, 110, 1, 0, null, 1), 15_000);
+  assert.equal(nextOrderStatusDelay('connected', offline, 110, 2, 0, null, 0), null);
+  const denied = { error: new ApiError('unauthenticated') };
+  assert.equal(nextOrderStatusDelay('connected', denied, 110, 1, 0, null, 1), null);
 });
 
 test('connected status checks recover from repeated temporary failures without busy retrying', () => {
