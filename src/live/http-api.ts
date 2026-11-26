@@ -268,7 +268,8 @@ export function createLiveApi({
     if (pending.rotationKey
       ? !pending.sessionId || refreshed.sessionId !== pending.sessionId || refreshed.refreshToken === pending.refreshToken
       : refreshed.refreshToken !== pending.refreshToken || (pending.sessionId && refreshed.sessionId !== pending.sessionId)) invalidResponse();
-    if (Date.parse(refreshed.expiresAt) <= now() || Date.parse(refreshed.refreshExpiresAt) <= now()) invalidResponse();
+    if (refreshed.accessToken === pending.accessToken
+      || Date.parse(refreshed.expiresAt) <= now() || Date.parse(refreshed.refreshExpiresAt) <= now()) invalidResponse();
     await save(refreshed);
     return refreshed;
   }
@@ -326,7 +327,13 @@ export function createLiveApi({
 
   function guestSession(rejectedAccessToken?: string, allowNewGuest = true): Promise<Session> {
     if (activation) return activation.catch(() => undefined).then(() => guestSession(rejectedAccessToken, allowNewGuest));
-    if (sessionPromise) return sessionPromise;
+    if (sessionPromise) {
+      if (rejectedAccessToken === undefined) return sessionPromise;
+      // A lookup started before the 401 can still return the rejected bearer.
+      return sessionPromise.then(guest => guest.accessToken === rejectedAccessToken
+        ? guestSession(rejectedAccessToken, allowNewGuest)
+        : guest);
+    }
     sessionPromise = (async () => {
       const raw = await readSaved(sessionKey);
       const recovered = await adoptCheckoutRecovery(raw, rejectedAccessToken, allowNewGuest);

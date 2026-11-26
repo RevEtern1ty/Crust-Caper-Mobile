@@ -226,8 +226,13 @@ test('expiring a former guest never issues a new identity over saved order histo
 test('an unavailable server is distinguishable from a missing committed order', async () => {
   const { storage } = memory();
   let status = 503;
-  const { fetcher } = transport(call => /\/guest-sessions(?:\/refresh)?$/.test(call.url)
-    ? Response.json(session) : Response.json({ code: 'not_found' }, { status }));
+  const { fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) return Response.json(session);
+    if (call.url.endsWith('/guest-sessions/refresh')) {
+      return Response.json({ ...session, accessToken: 'renewed_' + 'c'.repeat(40) });
+    }
+    return Response.json({ code: 'not_found' }, { status });
+  });
   const api = createLiveApi({ config, storage, journalKey, fetcher, now });
   await assert.rejects(() => api.recoverOrder!('q'), { code: 'service_unavailable' });
   status = 401;
@@ -918,6 +923,73 @@ const sessionKey = journalKey + '.guest';
 const rotationId = '3924cf26-6df1-4b2a-8f24-2ea91f0cf94d';
 const rotatable = { ...session, sessionId: '1de47e8f-b6a9-457e-aa68-3c79463d12f5' };
 const rotated = { ...rotatable, accessToken: 'updated_' + 'c'.repeat(40), refreshToken: 'successor_' + 'd'.repeat(40) };
+
+test('concurrent 401s during a saved guest lookup share one credential rotation', { timeout: 5_000 }, async () => {
+  const { storage, data } = memory();
+  data.set(sessionKey, JSON.stringify(rotatable));
+  const initialRequestsSent = Promise.withResolvers<void>();
+  const rejectOldRequests = Promise.withResolvers<void>();
+  const lookupStarted = Promise.withResolvers<void>();
+  const releaseLookup = Promise.withResolvers<void>();
+  const read = storage.getItem;
+  let pauseNextLookup = false;
+  storage.getItem = async (key) => {
+    if (key === sessionKey && pauseNextLookup) {
+      pauseNextLookup = false;
+      lookupStarted.resolve();
+      await releaseLookup.promise;
+    }
+    return read(key);
+  };
+
+  let oldTokenRequests = 0;
+  const { calls, fetcher } = transport(async call => {
+    if (call.url.endsWith('/guest-sessions/refresh')) {
+      assert.deepEqual(call.body, { refreshToken, rotationKey: rotationId });
+      return Response.json(rotated);
+    }
+    assert.equal(call.url, config.apiBaseUrl + '/orders/' + order.id);
+    if (call.token === 'Bearer ' + accessToken) {
+      if (++oldTokenRequests === 2) initialRequestsSent.resolve();
+      await rejectOldRequests.promise;
+      return new Response(null, { status: 401 });
+    }
+    assert.equal(call.token, 'Bearer ' + rotated.accessToken);
+    return Response.json(order);
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now, newRotationKey: () => rotationId });
+  const first = api.getOrder(order.id);
+  const second = api.getOrder(order.id);
+  await initialRequestsSent.promise;
+  pauseNextLookup = true;
+  const pending = Promise.all([first, second, api.getOrder(order.id)]);
+  await lookupStarted.promise;
+  rejectOldRequests.resolve();
+  // Drain the 401 continuations while the ordinary storage read is still blocked.
+  await new Promise<void>(resolve => setImmediate(resolve));
+  releaseLookup.resolve();
+
+  assert.deepEqual((await pending).map(result => result.id), [order.id, order.id, order.id]);
+  assert.equal(calls.filter(call => call.url.endsWith('/guest-sessions/refresh')).length, 1);
+  assert.equal(oldTokenRequests, 3);
+  assert.deepEqual(JSON.parse(data.get(sessionKey)!), rotated);
+});
+
+test('a refresh response with the rejected bearer leaves the saved rotation retryable', async () => {
+  const { storage, data } = memory();
+  data.set(sessionKey, JSON.stringify(rotatable));
+  const { calls, fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions/refresh')) return Response.json({ ...rotated, accessToken });
+    assert.equal(call.url, config.apiBaseUrl + '/orders/' + order.id);
+    assert.equal(call.token, 'Bearer ' + accessToken);
+    return new Response(null, { status: 401 });
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now, newRotationKey: () => rotationId });
+
+  await assert.rejects(api.getOrder(order.id), { code: 'invalid_response' });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(data.get(sessionKey)!), { ...rotatable, rotationKey: rotationId });
+});
 
 for (const failure of ['network', 'storage'] as const) {
   test(`rotating refresh survives a lost ${failure} reply with the saved rotation key and same order`, async () => {
