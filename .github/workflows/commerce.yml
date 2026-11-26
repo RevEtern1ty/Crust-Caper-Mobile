@@ -117,7 +117,7 @@ jobs:
           npm ci
           npm --prefix storefront ci
           npm --prefix storefront test
-          node --test server/tooling/check-live-catalog.test.mjs
+          node --test server/tooling/check-live-catalog.test.mjs server/tooling/storefront-availability.test.mjs
           npm --prefix storefront audit --omit=dev --audit-level=high
       - name: Build the HTTPS checkout and isolated provider fixture
         run: |
@@ -144,6 +144,11 @@ jobs:
         env:
           CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: ${{ runner.temp }}/crustcaper-https-evidence/payment-restart
         run: npm run test:storefront:kitchen-restart
+      - name: Verify external availability signals during catalog and API outages
+        timeout-minutes: 5
+        env:
+          CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: ${{ runner.temp }}/crustcaper-https-evidence/availability
+        run: npm run test:storefront:availability
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

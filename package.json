@@ -30,6 +30,8 @@
     "test:storefront:catalog-photos": "node tooling/storefront-stack.cjs --catalog-photos",
     "test:storefront:payment-restart": "node tooling/storefront-stack.cjs --payment-restart",
     "test:storefront:kitchen-restart": "node tooling/storefront-stack.cjs --kitchen-restart",
+    "test:storefront:availability": "node tooling/storefront-stack.cjs --availability",
+    "monitor:storefront": "node server/tooling/storefront-availability.mjs",
     "start:local-stack": "node tooling/local-stack.cjs"
   },
   "dependencies": {
