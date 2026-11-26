@@ -14,8 +14,10 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.TransientDataAccessException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionCallback;
 import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
@@ -162,7 +164,13 @@ final class OrderAccessService {
             finishUnsuccessfulVerification(challenge, claimed, check == VerificationCheck.EXPIRED);
             throw ApiFailure.notFound();
         }
-        return Objects.requireNonNull(transactions.execute(tx -> grant(guest, challenge, claimed)));
+        TransactionCallback<VerifiedOrder> approvedGrant = tx -> grant(guest, challenge, claimed);
+        try {
+            return Objects.requireNonNull(transactions.execute(approvedGrant));
+        } catch (TransientDataAccessException ignored) {
+            // The provider has consumed the code. Retry only the local transaction with the same approved claim.
+            return Objects.requireNonNull(transactions.execute(approvedGrant));
+        }
     }
 
     private Verification claimVerification(UUID guest, UUID challenge) {

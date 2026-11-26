@@ -2,6 +2,7 @@ package com.crustcaper.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -23,9 +24,12 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -55,7 +59,7 @@ class OrderAccessIntegrationTest {
     private static final String CHECKOUT = "https://checkout.example.invalid/synthetic";
 
     @Autowired MockMvc api;
-    @Autowired JdbcClient jdbc;
+    @MockitoSpyBean JdbcClient jdbc;
     @Autowired ObjectMapper json;
     @Autowired GuestSessions sessions;
     @MockitoSpyBean PhoneVerificationGateway gateway;
@@ -158,6 +162,60 @@ class OrderAccessIntegrationTest {
             .param(target.id()).query(UUID.class).single()).isEqualTo(sessions.authenticate(owner));
         assertThat(jdbc.sql("SELECT count(*) FROM order_read_grants WHERE order_id = ?")
             .param(target.id()).query(Long.class).single()).isEqualTo(1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2})
+    void approvedMobileRecoveryRetriesOnlyOneTransientGrantFailure(int failures) throws Exception {
+        String owner = guest();
+        String recovering = guest();
+        String unrelatedGuest = guest();
+        ExistingOrder target = order(owner, "approved-recovery", PHONE);
+        JsonNode proof = body(api.perform(post("/api/v1/checkout-recovery").header(HttpHeaders.AUTHORIZATION, recovering)
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(json.writeValueAsString(new CheckoutRecoveryController.Input(target.quoteId(), "approved-recovery", PHONE))))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.state").value("verify")));
+        UUID challenge = UUID.fromString(proof.path("challengeId").asString());
+        awaitState(challenge, "sent");
+        verifyChallenge(unrelatedGuest, challenge, OTP).andExpect(status().isNotFound());
+
+        var grantWrites = new AtomicInteger();
+        doAnswer(invocation -> {
+            if (grantWrites.incrementAndGet() <= failures) {
+                // PostgreSQL aborts the current grant transaction after the challenge and order updates.
+                jdbc.sql("DO $$ BEGIN RAISE EXCEPTION 'synthetic grant serialization failure' USING ERRCODE = '40001'; END $$")
+                    .update();
+            }
+            return invocation.callRealMethod();
+        }).when(jdbc).sql(startsWith("INSERT INTO order_read_grants"));
+
+        ResultActions result = verifyChallenge(recovering, challenge, OTP);
+        if (failures == 1) {
+            result.andExpect(status().isOk()).andExpect(jsonPath("$.orderId").value(target.id().toString()));
+            verifyChallenge(recovering, challenge, OTP).andExpect(status().isOk())
+                .andExpect(jsonPath("$.orderId").value(target.id().toString()));
+            awaitState(challenge, "verified");
+            assertThat(jdbc.sql("SELECT mobile_checkout_guest_session_id FROM orders WHERE id = ?")
+                .param(target.id()).query(UUID.class).single()).isEqualTo(sessions.authenticate(recovering));
+            assertThat(jdbc.sql("SELECT guest_session_id FROM order_read_grants WHERE order_id = ?")
+                .param(target.id()).query(UUID.class).list()).containsExactly(sessions.authenticate(recovering));
+            api.perform(get(ORDERS + "/" + target.id()).header(HttpHeaders.AUTHORIZATION, recovering))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.recoveryReadOnly").doesNotExist());
+        } else {
+            result.andExpect(status().isServiceUnavailable());
+            awaitState(challenge, "checking");
+            assertThat(jdbc.sql("SELECT mobile_checkout_guest_session_id IS NULL FROM orders WHERE id = ?")
+                .param(target.id()).query(Boolean.class).single()).isTrue();
+            assertThat(jdbc.sql("SELECT count(*) FROM order_read_grants WHERE order_id = ?")
+                .param(target.id()).query(Long.class).single()).isZero();
+            verifyChallenge(recovering, challenge, OTP).andExpect(status().isNotFound());
+        }
+        assertThat(grantWrites.get()).isEqualTo(2);
+        assertThat(jdbc.sql("SELECT attempts FROM order_access_challenges WHERE id = ?")
+            .param(challenge).query(Integer.class).single()).isEqualTo(1);
+        verify(gateway, times(1)).check(anyString(), anyString());
+        api.perform(get(ORDERS + "/" + target.id()).header(HttpHeaders.AUTHORIZATION, unrelatedGuest))
+            .andExpect(status().isNotFound());
     }
 
     @Test
