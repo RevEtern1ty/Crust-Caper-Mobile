@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { hasSavedCheckout, parseJournal } from '../checkout/controller';
+import { canStartNewOrder, hasSavedCheckout, parseJournal } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError, type Order, type PaymentAttempt, type PendingCheckoutIntent, type Storage } from '../domain/types';
 import { apiResponseError, invalidResponse, rememberVerifiedOrder, safeHttps, type ConnectedConfig, type LiveShopApi } from './http-api';
@@ -49,6 +49,11 @@ const cookieLock = 'crustcaper-web-session-v1';
 
 class NoWebSession extends ApiError {
   constructor() { super('unauthenticated'); }
+}
+
+function settledForNewCheckout(order: Order): boolean {
+  return order.status !== 'awaiting_payment' && order.paymentStatus !== 'processing'
+    && order.paymentAttempt?.status !== 'processing' && canStartNewOrder(order);
 }
 
 export function createWebLiveApi({
@@ -190,6 +195,24 @@ export function createWebLiveApi({
     return pending.finally(() => work.delete(pending));
   }
 
+  // Only a read grant for the same settled order can establish this replacement under the cookie lock.
+  async function promoteSettledRecovery(previous: string, journal: string | null, expectedOrderId?: string) {
+    const recovery = await savedRecovery();
+    if (!recovery?.owned || recovery.sessionId === previous) return null;
+    let active;
+    try { ({ active } = parseJournal(journal)); }
+    catch { return null; }
+    if (active?.phase !== 'tracking' || !recovery.orderIds.includes(active.orderId)
+      || (expectedOrderId && expectedOrderId !== active.orderId)) return null;
+    const sessionId = recovery.sessionId;
+    if (await currentCookieContext() !== sessionId) return null;
+    const order = checkedOrder(await privateCall({ path: orderPath(active.orderId), schema: webOrderResponse }, sessionId), active.orderId);
+    if (!settledForNewCheckout(order) || await currentCookieContext() !== sessionId
+      || await savedContext() !== previous || await read(journalKey) !== journal || ending) return null;
+    await save(contextKey, sessionId);
+    return sessionId;
+  }
+
   function forQuote() {
     return withCookieLock(async () => {
       const saved = await savedContext();
@@ -206,7 +229,7 @@ export function createWebLiveApi({
             return recovered.sessionId;
           }
         }
-        if (saved) return saved;
+        if (saved) return await promoteSettledRecovery(saved, journal) ?? saved;
         throw new ApiError('unauthenticated');
       }
       const active = await currentCookieContext();
@@ -390,7 +413,18 @@ export function createWebLiveApi({
     },
     async getOrder(orderId) {
       const { payload, alternateContext } = await readOrder(orderId, { path: orderPath(orderId), schema: webOrderResponse });
-      return checkedOrder(alternateContext ? { ...payload, recoveryReadOnly: true } : payload, orderId);
+      const order = checkedOrder(alternateContext ? { ...payload, recoveryReadOnly: true } : payload, orderId);
+      if (!order.recoveryReadOnly || !settledForNewCheckout(order)) return order;
+
+      const canContinueCheckout = await withCookieLock(async () => {
+        const saved = await savedContext();
+        if (!saved) return false;
+        const recovery = await savedRecovery();
+        if (recovery?.owned && recovery.sessionId === saved && recovery.orderIds.includes(orderId)) return true;
+        return alternateContext && !!await promoteSettledRecovery(saved, await read(journalKey), orderId);
+      }).catch(() => false);
+      // The prior order can seed a fresh cart using the sanitized payment projection above.
+      return canContinueCheckout ? { ...order, recoveryReadOnly: undefined } : order;
     },
     async getReceiptPdf(orderId) {
       const result = await readOrder(orderId, { path: receiptPath(orderId), schema: z.instanceof(Uint8Array), pdf: true });

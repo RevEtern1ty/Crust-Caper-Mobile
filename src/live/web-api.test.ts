@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { CheckoutController } from '../checkout/controller';
 import { ApiError } from '../domain/types';
 import { createWebLiveApi } from './web-api';
 
@@ -32,6 +33,13 @@ const order = {
 const pendingJournal = JSON.stringify({
   version: 1, active: { phase: 'paying', orderId, key: 'pay-key' }, orderIds: [orderId],
 });
+const trackedJournal = JSON.stringify({
+  version: 1, active: { phase: 'tracking', orderId, key: 'pay-key' }, orderIds: [orderId],
+});
+const collectedOrder = {
+  ...order, status: 'collected', paymentStatus: 'paid', paymentAttempt: { ...attempt, status: 'paid', checkoutUrl: null },
+  recoveryReadOnly: true,
+};
 const checkoutIntent = { quoteId: 'quote-1', key: 'create-key' };
 const pendingCreation = {
   version: 1, active: { phase: 'creating', ...checkoutIntent, cartFingerprint: 'hash' }, orderIds: [unknownOrderId],
@@ -213,6 +221,99 @@ test('stale checkout stays bound to the original context while explicit OTP only
   assert.equal(transport.calls.find(call => call.path.endsWith('/payments'))?.key, 'pay-key');
   assert.equal(transport.calls.some(call => call.context === second && call.path.includes(unknownOrderId)), false);
   assert.equal(transport.calls.some(call => call.path === sessionPath && call.method === 'POST'), false);
+});
+
+test('OTP recovers the same settled tab order after a lost cookie and allows a fresh checkout after restart', async () => {
+  const { storage, saved } = memory([
+    [journalKey, trackedJournal], [journalKey + '.context', second],
+    [journalKey + '.quote', JSON.stringify({ quoteId: 'previous-quote', sessionId: second })],
+  ]);
+  const transport = fixture(null, ({ path }) => {
+    if (path === '/web/order-access/challenges') return Response.json({ challengeId });
+    if (path.endsWith('/verify')) return Response.json({ orderId });
+    if (path === '/web/orders/' + orderId) return Response.json(collectedOrder);
+    if (path === '/web/orders/' + orderId + '/reorder') return Response.json({ lines, changes: [] });
+    if (path === '/web/orders') return Response.json({ ...order, id: unknownOrderId, paymentStatus: 'unpaid', paymentAttempt: null });
+    if (path === `/web/orders/${unknownOrderId}/payments`) return Response.json(attempt);
+    if (path === '/web/orders/' + unknownOrderId) return Response.json({ ...order, id: unknownOrderId });
+    return new Response(null, { status: 404 });
+  });
+  const start = () => createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+
+  const expired = start();
+  await assert.rejects(expired.getOrder(orderId), { code: 'unauthenticated' });
+  await expired.requestOrderAccess!({ orderCode: '193A002B', phone });
+  await expired.verifyOrderAccess!(challengeId, '010101');
+
+  const restarted = start();
+  const recoveredOrder = await restarted.getOrder(orderId);
+  assert.equal(recoveredOrder.status, 'collected');
+  await assert.rejects(restarted.createOrder({ quoteId: 'previous-quote', phone }, 'previous-order-key'), { code: 'unauthenticated' });
+  const freshQuote = await restarted.createQuote(quoteInput);
+  assert.equal(freshQuote.id, 'quote-1');
+  assert.equal(saved.get(journalKey + '.context'), first);
+  assert.equal(saved.get(journalKey), trackedJournal);
+  assert.equal(recoveredOrder.recoveryReadOnly, undefined);
+  assert.equal((await restarted.getOrder(orderId)).recoveryReadOnly, undefined);
+  assert.deepEqual(await restarted.reorder(orderId), { lines, changes: [] });
+  assert.deepEqual(transport.calls.filter(call => call.path === '/web/quotes').map(call => call.context), [first]);
+  assert.equal(transport.calls.some(call => call.path === '/web/orders' || call.path.endsWith('/payments')), false);
+
+  const keys = ['new-order-key', 'new-payment-key'];
+  const checkout = new CheckoutController({ api: restarted, storage, storageKey: journalKey,
+    newKey: () => keys.shift()!, onOrderCreated: async () => {} });
+  assert.equal((await checkout.begin(freshQuote, 'new-cart-hash', { phone })).id, unknownOrderId);
+  assert.deepEqual(checkout.snapshot.orderIds, [unknownOrderId, orderId]);
+  assert.deepEqual(transport.calls.filter(call => call.path === '/web/orders' || call.path.endsWith('/payments'))
+    .map(call => [call.path, call.context, call.key]), [
+    ['/web/orders', first, 'new-order-key'], [`/web/orders/${unknownOrderId}/payments`, first, 'new-payment-key'],
+  ]);
+});
+
+test('settled verification only promotes the same tracked checkout and its own unchanged cookie', async t => {
+  const concurrentJournal = JSON.stringify(pendingCreation);
+  const cases = [
+    { name: 'the order screen has not been opened', quoteAllowed: true },
+    { name: 'the previous payment has an uncertain reply', savedJournal: pendingJournal },
+    { name: 'the previous checkout is still processing after a cancelled hold', snapshot: { ...order, status: 'cancelled' } },
+    { name: 'the read grant belongs to a different order', savedJournal: JSON.stringify({
+      version: 1, active: { phase: 'tracking', orderId: unknownOrderId, key: 'different-order' }, orderIds: [unknownOrderId, orderId],
+    }) },
+    { name: 'the recoverer uses another tab’s existing cookie', preexistingCookie: first },
+    { name: 'the cookie changes during the order read', changedCookie: 'a0cbaec1-ad0b-408f-a2ff-0089f8cd0809' },
+    { name: 'the journal changes during the order read', changedJournal: concurrentJournal },
+  ];
+  for (const { name, quoteAllowed, savedJournal = trackedJournal, snapshot = collectedOrder, preexistingCookie = null,
+    changedCookie, changedJournal } of cases) {
+    await t.test(name, async () => {
+      const { storage, saved } = memory([[journalKey, savedJournal], [journalKey + '.context', second]]);
+      const transport = fixture(preexistingCookie, ({ path }) => {
+        if (path === '/web/order-access/challenges') return Response.json({ challengeId });
+        if (path.endsWith('/verify')) return Response.json({ orderId });
+        if (path === '/web/orders/' + orderId) {
+          if (changedCookie) transport.setCookie(changedCookie);
+          if (changedJournal) saved.set(journalKey, changedJournal);
+          return Response.json({ ...snapshot, recoveryReadOnly: true });
+        }
+        return new Response(null, { status: 404 });
+      });
+      const start = () => createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+      const recovering = start();
+      await recovering.requestOrderAccess!({ orderCode: '193A002B', phone });
+      await recovering.verifyOrderAccess!(challengeId, '010101');
+
+      if (quoteAllowed) {
+        assert.equal((await start().createQuote(quoteInput)).id, 'quote-1');
+      } else {
+        await assert.rejects(start().createQuote(quoteInput), { code: 'unauthenticated' });
+      }
+      assert.equal(saved.get(journalKey + '.context'), quoteAllowed ? first : second);
+      assert.equal(saved.get(journalKey), changedJournal ?? savedJournal);
+      assert.deepEqual(transport.calls.filter(call => call.path === '/web/quotes').map(call => call.context),
+        [quoteAllowed ? first : second]);
+      assert.equal(transport.calls.some(call => call.path === '/web/orders' || call.path.endsWith('/payments')), false);
+    });
+  }
 });
 
 test('order privacy uses the verified web context and write marker without changing the checkout context', async () => {
