@@ -237,11 +237,12 @@ test('checkout shows the server-confirmed item names when the buyer menu is stal
   const response = await reply;
   assert.equal(response.status(), 200);
   assert.deepEqual((await response.json()).lines[0].soldItem.name, product.name);
-  await shown(page, 'Included tax');
-  assert.equal(await page.getByText('1 × ' + product.name.en, { exact: true }).count(), 1,
+  const summary = page.getByRole('heading', { name: 'Order summary', exact: true }).locator('..');
+  await shown(summary, 'Included tax');
+  assert.equal(await summary.getByText('1 × ' + product.name.en, { exact: true }).count(), 1,
     'The buyer must confirm the name in the quote, even when prices match a stale menu');
-  await shown(page, cheese.name.en);
-  assert.equal(await page.getByText(staleOption, { exact: true }).count(), 0);
+  await shown(summary, cheese.name.en);
+  assert.equal(await summary.getByText(staleOption, { exact: true }).count(), 0);
   await button(page, /^Confirm .*RWF/).waitFor();
 });
 
