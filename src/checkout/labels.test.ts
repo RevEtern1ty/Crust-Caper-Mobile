@@ -19,6 +19,12 @@ test('checkout uses the normal error message when a valid support number is unav
     'Unable to complete the request. Try again.');
 });
 
+test('checkout tells buyers to wait after reaching a quota', () => {
+  const error = new ApiError('rate_limited');
+  assert.equal(checkoutError(error, 'en'), 'Too many attempts. Try again later.');
+  assert.equal(checkoutError(error, 'rw'), 'Wagerageje inshuro nyinshi. Ongera ugerageze nyuma.');
+});
+
 test('saved orders show the purchase names while legacy orders keep their existing fallback', () => {
   const line = { sku: 'double-smash', modifierIds: ['extra-cheese'], quantity: 1, unitPrice: 9700 };
   const archived: OrderLine = {

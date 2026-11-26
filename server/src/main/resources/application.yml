@@ -45,6 +45,12 @@ management:
         readiness:
           include: readinessState,db
 crustcaper:
+  checkout:
+    quotas:
+      quotes-per-session: ${CRUSTCAPER_CHECKOUT_QUOTES_PER_SESSION:30}
+      quotes-per-store: ${CRUSTCAPER_CHECKOUT_QUOTES_PER_STORE:240}
+      orders-per-session: ${CRUSTCAPER_CHECKOUT_ORDERS_PER_SESSION:8}
+      orders-per-store: ${CRUSTCAPER_CHECKOUT_ORDERS_PER_STORE:120}
   web:
     origin: ${CRUSTCAPER_WEB_ORIGIN:}
   operator:

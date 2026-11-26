@@ -5,11 +5,17 @@ import java.util.UUID;
 public final class ApiFailure extends RuntimeException {
     private final int status;
     private final String code;
+    private final Integer retryAfterSeconds;
 
     private ApiFailure(int status, String code) {
+        this(status, code, null);
+    }
+
+    private ApiFailure(int status, String code, Integer retryAfterSeconds) {
         super(code);
         this.status = status;
         this.code = code;
+        this.retryAfterSeconds = retryAfterSeconds;
     }
 
     public int status() {
@@ -18,6 +24,10 @@ public final class ApiFailure extends RuntimeException {
 
     public String code() {
         return code;
+    }
+
+    Integer retryAfterSeconds() {
+        return retryAfterSeconds;
     }
 
     static ApiFailure invalid() {
@@ -38,6 +48,10 @@ public final class ApiFailure extends RuntimeException {
 
     static ApiFailure conflict(String code) {
         return new ApiFailure(409, code);
+    }
+
+    static ApiFailure rateLimited(int retryAfterSeconds) {
+        return new ApiFailure(429, "rate_limited", retryAfterSeconds);
     }
 
     static ApiFailure unavailable() {

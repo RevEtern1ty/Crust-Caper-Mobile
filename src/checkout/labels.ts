@@ -106,6 +106,8 @@ function checkoutErrorMessage(error: unknown, locale: Locale) {
         return copy(locale, 'We couldn’t verify this order on this device. Try again or contact support.', 'Ntitwashoboye kwemeza iyi komande kuri iki gikoresho. Ongera ugerageze cyangwa usabe ubufasha.');
       case 'network_unavailable':
         return copy(locale, 'Unable to connect. Check your connection and try again.', 'Ntitwashoboye guhuza. Genzura interineti wongere ugerageze.');
+      case 'rate_limited':
+        return copy(locale, 'Too many attempts. Try again later.', 'Wagerageje inshuro nyinshi. Ongera ugerageze nyuma.');
       case 'service_unavailable':
         return copy(locale, 'The order service is temporarily unavailable. Try again shortly.', 'Serivisi ya komande ntiboneka by’akanya gato. Ongera ugerageze nyuma.');
       case 'invalid_response':

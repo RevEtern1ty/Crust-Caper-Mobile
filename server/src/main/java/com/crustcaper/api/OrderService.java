@@ -76,6 +76,7 @@ public class OrderService {
 
     private final JdbcClient jdbc;
     private final Catalog catalog;
+    private final CheckoutQuota checkoutQuota;
     private final CommerceJson json;
     private final PaymentGateway gateway;
     private final TransactionTemplate transactions;
@@ -106,10 +107,11 @@ public class OrderService {
     private record PaymentStart(Attempt attempt, StoredOrder order, boolean openGateway) {}
     record CheckoutLookup(UUID orderId, Instant retryAt) {}
 
-    OrderService(JdbcClient jdbc, Catalog catalog, CommerceJson json, PaymentGateway gateway,
+    OrderService(JdbcClient jdbc, Catalog catalog, CheckoutQuota checkoutQuota, CommerceJson json, PaymentGateway gateway,
                  TransactionTemplate transactions, @Value("${crustcaper.payment.provider}") String provider) {
         this.jdbc = jdbc;
         this.catalog = catalog;
+        this.checkoutQuota = checkoutQuota;
         this.json = json;
         this.gateway = gateway;
         this.transactions = new TransactionTemplate(Objects.requireNonNull(transactions.getTransactionManager()), transactions);
@@ -129,6 +131,7 @@ public class OrderService {
 
     private Quote createQuote(UUID guest, QuoteInput input, CheckoutChannel channel) {
         validateQuote(input);
+        checkoutQuota.admit(CheckoutQuota.Operation.QUOTE, guest, input.storeId(), catalog.databaseNow());
         Instant now = catalog.databaseNow();
         Catalog.QuoteCatalog quotedCatalog = catalog.quoteCatalog(input.storeId(), input.lines(), channel, now);
         Catalog.StoreData store = quotedCatalog.store();
@@ -202,6 +205,7 @@ public class OrderService {
         Map<String, Integer> quantities = Catalog.inventoryQuantities(quote.lines());
         // Orders for different slots still compete for the same units of a product.
         catalog.lockInventory(quote.storeId(), quantities.keySet());
+        checkoutQuota.admit(CheckoutQuota.Operation.ORDER, guest, quote.storeId(), catalog.databaseNow());
         Instant now = catalog.databaseNow();
         if (!quote.expiresAt().isAfter(now)) throw ApiFailure.conflict("quote_expired");
         if (!slot.startsAt().equals(quote.startsAt()) || !slot.endsAt().equals(quote.endsAt())) {

@@ -25,6 +25,9 @@ final class CommerceProblems {
         var response = ResponseEntity.status(status).contentType(MediaType.APPLICATION_PROBLEM_JSON)
             .cacheControl(CacheControl.noStore());
         if (status == 401) response.header(HttpHeaders.WWW_AUTHENTICATE, "Bearer");
+        if (failure.retryAfterSeconds() != null) {
+            response.header(HttpHeaders.RETRY_AFTER, failure.retryAfterSeconds().toString());
+        }
         return response.body(body);
     }
 

@@ -81,6 +81,7 @@ class CommerceIntegrationTest {
     @Autowired MockMvc api;
     @Autowired ObjectMapper json;
     @Autowired Catalog catalog;
+    @Autowired CheckoutQuota checkoutQuota;
     @Autowired CommerceJson commerceJson;
     @Autowired GuestSessions sessions;
     @Autowired OrderService orders;
@@ -479,7 +480,7 @@ class CommerceIntegrationTest {
         FlutterwaveWebhookSignature signature = mock(FlutterwaveWebhookSignature.class);
         doReturn(true).when(signature).matches("fixture-signature");
         // Only the provider is stubbed. Use the live verification path with this test's PostgreSQL fixtures.
-        var hostedOrders = new OrderService(jdbc, catalog, commerceJson, gateway, transactions, "flutterwave");
+        var hostedOrders = new OrderService(jdbc, catalog, checkoutQuota, commerceJson, gateway, transactions, "flutterwave");
         MockMvc hostedApi = MockMvcBuilders.standaloneSetup(new CommerceController(sessions, catalog, hostedOrders, commerceJson),
                 new FlutterwaveWebhooks(signature, gateway, hostedOrders))
             .setControllerAdvice(new CommerceProblems()).build();
