@@ -31,7 +31,9 @@
     "test:storefront:payment-restart": "node tooling/storefront-stack.cjs --payment-restart",
     "test:storefront:kitchen-restart": "node tooling/storefront-stack.cjs --kitchen-restart",
     "test:storefront:availability": "node tooling/storefront-stack.cjs --availability",
+    "test:storefront:api-errors": "node tooling/storefront-stack.cjs --error-rehearsal",
     "monitor:storefront": "node server/tooling/storefront-availability.mjs",
+    "monitor:api-errors": "node server/tooling/api-error-watch.mjs",
     "start:local-stack": "node tooling/local-stack.cjs"
   },
   "dependencies": {

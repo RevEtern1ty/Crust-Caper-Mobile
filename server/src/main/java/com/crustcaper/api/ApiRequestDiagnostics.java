@@ -22,8 +22,13 @@ public final class ApiRequestDiagnostics extends OncePerRequestFilter {
     private static final Logger LOG = LoggerFactory.getLogger(ApiRequestDiagnostics.class);
     private static final String STATE = ApiRequestDiagnostics.class.getName() + ".state";
     private static final String CATEGORY = ApiRequestDiagnostics.class.getName() + ".category";
+    private final CommerceErrorMetrics metrics;
 
     private record RequestState(String id, long startedAt) {}
+
+    ApiRequestDiagnostics(CommerceErrorMetrics metrics) {
+        this.metrics = metrics;
+    }
 
     static void markFailure(HttpServletRequest request, String category) {
         request.setAttribute(CATEGORY, category);
@@ -50,13 +55,26 @@ public final class ApiRequestDiagnostics extends OncePerRequestFilter {
             request.setAttribute(STATE, state);
         }
         response.setHeader(HEADER, state.id());
-        chain.doFilter(request, response);
-        if (!isAsyncStarted(request) && response.getStatus() >= 500) {
+        try {
+            chain.doFilter(request, response);
+        } catch (ServletException | RuntimeException failure) {
+            // The container renders the error after this dispatch. Count it before that dispatch.
+            if (!request.getMethod().equals("OPTIONS")) metrics.record(true);
+            throw failure;
+        }
+        if (isAsyncStarted(request)) return;
+
+        int status = response.getStatus();
+        boolean serverError = status >= 500 && status < 600;
+        Object pattern = request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
+        if (!request.getMethod().equals("OPTIONS") && (serverError || (status >= 200 && status < 400 && pattern != null))) {
+            metrics.record(serverError);
+        }
+        if (status >= 500) {
             // The MVC mapping contains placeholders. Never substitute the actual request URI.
-            Object pattern = request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
             Object category = request.getAttribute(CATEGORY);
             LOG.warn("api_request_failed requestId={} route={} method={} status={} category={} elapsedMs={}",
-                state.id(), pattern == null ? "unmatched" : pattern, method(request), response.getStatus(),
+                state.id(), pattern == null ? "unmatched" : pattern, method(request), status,
                 category == null ? "unavailable" : category,
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - state.startedAt()));
         }
