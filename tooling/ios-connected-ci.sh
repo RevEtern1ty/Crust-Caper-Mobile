@@ -24,6 +24,7 @@ phase='Verify the build host'
 scratch_dir=''
 pg_data=''
 api_pid=''
+access_log=''
 
 finish() {
   local result=$? cleanup_failed=false logfile
@@ -53,6 +54,10 @@ finish() {
         if [[ -f "$scratch_dir/$logfile" ]]; then cp "$scratch_dir/$logfile" "$evidence_dir/"; fi
       done
     fi
+    if [[ -n "$access_log" && -f "$access_log" ]]; then
+      grep -E '^GET (/actuator/health/readiness +|/api/v1/stores/kigali/menu \?channel=(web|mobile) )[1-5][0-9]{2}$' \
+        "$access_log" > "$evidence_dir/fixture-access.txt"
+    fi
   fi
   if [[ -n "$scratch_dir" ]] && ! $cleanup_failed; then
     rm -rf -- "$scratch_dir" || cleanup_failed=true
@@ -73,6 +78,17 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+await_menu_request() {
+  local expected=$1 attempt
+  for ((attempt = 0; attempt < 12; attempt++)); do
+    kill -0 "$api_pid" 2>/dev/null || break
+    if [[ -f "$access_log" ]] && grep -Fxq "$expected" "$access_log"; then return 0; fi
+    sleep 0.25
+  done
+  printf 'The running fixture access log did not contain %s.\n' "$expected" >&2
+  return 1
+}
 
 if [[ -e ios || -L ios ]]; then
   printf 'Run the connected smoke in a fresh checkout without a generated ios project.\n' >&2
@@ -133,7 +149,7 @@ env -i PATH="$PATH" CRUSTCAPER_PORT="$api_port" \
   "$java_bin" -jar "$jar" --spring.profiles.active=local \
   --server.address=127.0.0.1 --crustcaper.payment.provider=local --crustcaper.push.provider=disabled \
   --server.tomcat.accesslog.enabled=true --server.tomcat.accesslog.buffered=false \
-  --server.tomcat.accesslog.rotatable=false --server.tomcat.accesslog.directory="$scratch_dir" \
+  --server.tomcat.accesslog.rotate=false --server.tomcat.accesslog.directory="$scratch_dir" \
   --server.tomcat.accesslog.prefix=menu-access --server.tomcat.accesslog.suffix=.log \
   '--server.tomcat.accesslog.pattern=%m %U %q %s' > "$scratch_dir/api.log" 2>&1 &
 api_pid=$!
@@ -153,6 +169,11 @@ if ! $ready; then
   exit 1
 fi
 
+phase='Verify the menu and access logging before the iOS build'
+printf '\n%s\n' "$phase"
+curl --noproxy '*' --fail --silent --show-error --max-time 5 "$origin/api/v1/stores/kigali/menu?channel=web" >/dev/null
+await_menu_request 'GET /api/v1/stores/kigali/menu ?channel=web 200'
+
 phase='Run the local Release on the iPhone simulator'
 printf '\n%s\n' "$phase"
 CRUSTCAPER_API_BASE_URL="$origin/api/v1" CRUSTCAPER_STORE_ID=kigali \
@@ -161,9 +182,6 @@ CRUSTCAPER_API_BASE_URL="$origin/api/v1" CRUSTCAPER_STORE_ID=kigali \
 phase='Verify the simulator fetched the menu from the local API'
 printf '\n%s\n' "$phase"
 menu_request='GET /api/v1/stores/kigali/menu ?channel=mobile 200'
-if ! kill -0 "$api_pid" 2>/dev/null || ! grep -Fxq "$menu_request" "$access_log"; then
-  printf 'The API did not observe a successful mobile menu request during the simulator smoke.\n' >&2
-  exit 1
-fi
+await_menu_request "$menu_request"
 printf 'Source SHA: %s\nAPI JAR SHA-256: %s\nDatabase: %s\nAPI readiness: UP at %s\nMobile request: %s\nScope: iOS Release simulator boot and HTTP menu retrieval from the Spring Boot/PostgreSQL fixture.\n' \
   "$source_sha" "$jar_sha" "$pg_version" "$origin" "$menu_request" | tee "$evidence_dir/connected.txt"
