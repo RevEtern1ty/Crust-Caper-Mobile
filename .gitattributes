@@ -1,3 +1,4 @@
 *.cmd text eol=crlf
 /server/gradlew text eol=lf
 /server/gradlew.bat text eol=crlf
+*.sh text eol=lf

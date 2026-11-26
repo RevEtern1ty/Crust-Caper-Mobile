@@ -5,7 +5,9 @@ const { join } = require('node:path');
 
 const sourceShaPattern = /^[0-9a-f]{40}$/;
 const workflowPath = '.github/workflows/mobile.yml';
+const attributesPath = '.gitattributes';
 const nonBuildFiles = new Set([
+  attributesPath,
   workflowPath,
   'docs/runbooks/MOBILE_RELEASE.md',
   'tooling/android-emulator-smoke.sh',
@@ -63,6 +65,13 @@ function checkSource(runId, profile) {
   const changed = readCommand('git', ['diff', '--name-only', '--no-renames', '-z', sourceSha, currentSha, '--'],
     'The source and current checkout trees could not be compared.').split('\0').filter(Boolean);
   if (changed.some(path => !nonBuildFiles.has(path))) throw new Error('The source run and checkout differ in build inputs.');
+  if (changed.includes(attributesPath)) {
+    const message = 'The source run and checkout differ in Git attributes that control build inputs.';
+    const original = readCommand('git', ['show', `${sourceSha}:${attributesPath}`], message);
+    const updated = readCommand('git', ['show', `${currentSha}:${attributesPath}`], message);
+    // Linux already received LF from the original checkout; enforce it on exports from Windows too.
+    if (updated !== original + '*.sh text eol=lf\n') throw new Error(message);
+  }
 
   const flavor = profile === 'demo' ? 'demo' : 'connected-ci';
   const apk = `mobile-android-${flavor}-${sourceSha}`;
