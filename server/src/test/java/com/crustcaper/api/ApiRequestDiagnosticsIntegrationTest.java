@@ -2,14 +2,19 @@ package com.crustcaper.api;
 
 import static com.crustcaper.api.ApiModels.AVAILABILITY_CHECKED_AT_HEADER;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.hamcrest.Matchers.containsString;
 import static org.mockito.Mockito.doThrow;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.head;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.options;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,10 +25,14 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.dao.TransientDataAccessResourceException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.util.AopTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -31,12 +40,16 @@ import org.springframework.test.web.servlet.MockMvc;
 @ExtendWith(OutputCaptureExtension.class)
 class ApiRequestDiagnosticsIntegrationTest {
     private static final String MENU_ROUTE = "/api/v1/stores/{id}/menu";
+    private static final String COMMERCE_ERRORS = "/actuator/commerceerrors";
+    private static final MediaType ACTUATOR_JSON = MediaType.parseMediaType("application/vnd.spring-boot.actuator.v3+json");
     private static final String REQUEST_ID = "X-Request-ID";
     private static final String UUID_V4 = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
     private static final String FAILURE_EVENT = "api_request_failed";
     private static final String ORIGIN = "http://127.0.0.1:41233";
 
     @Autowired MockMvc api;
+    @Autowired ObjectMapper json;
+    @Autowired ApiRequestDiagnostics diagnostics;
     @MockitoSpyBean Catalog catalog;
 
     @Test
@@ -90,4 +103,84 @@ class ApiRequestDiagnosticsIntegrationTest {
         assertThat(invalid.getHeader(REQUEST_ID)).matches(UUID_V4).isNotEqualTo(healthyId);
         assertThat(output.getAll()).doesNotContain(FAILURE_EVENT);
     }
+
+    @Test
+    void commerceSnapshotCountsCompletedRequestsAndExcludesExpectedClientFailuresAndProbeTraffic() throws Exception {
+        Snapshot before = snapshot();
+        assertThat(snapshot()).isEqualTo(before);
+
+        var menu = api.perform(get(MENU_ROUTE, "kigali")).andExpect(status().isOk())
+            .andExpect(header().exists(HttpHeaders.ETAG)).andReturn().getResponse();
+        api.perform(get(MENU_ROUTE, "kigali").header(HttpHeaders.IF_NONE_MATCH, menu.getHeader(HttpHeaders.ETAG)))
+            .andExpect(status().isNotModified());
+        assertCounts(before, 2, 0);
+
+        api.perform(get(MENU_ROUTE, "kigali").queryParam("channel", "invalid")).andExpect(status().isBadRequest());
+        api.perform(get("/api/v1/operator/orders")).andExpect(status().isUnauthorized());
+        api.perform(get("/api/v1/no-such-commerce-route")).andExpect(status().isNotFound());
+        api.perform(options(MENU_ROUTE, "kigali").header(HttpHeaders.ORIGIN, ORIGIN)
+                .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+            .andExpect(status().isOk());
+        api.perform(head(COMMERCE_ERRORS)).andExpect(status().isOk());
+        api.perform(get("/actuator/health/readiness")).andExpect(status().isOk());
+        api.perform(get("/operator/index.html")).andExpect(status().isOk());
+        api.perform(get("/api/v10/stores/kigali/menu")).andExpect(status().isNotFound());
+        assertCounts(before, 2, 0);
+
+        String store = "private-snapshot-store";
+        Catalog target = AopTestUtils.getUltimateTargetObject(catalog);
+        doThrow(new TransientDataAccessResourceException("private-snapshot-exception")).when(target).menu(store);
+        api.perform(get(MENU_ROUTE, store).header(HttpHeaders.AUTHORIZATION, "Bearer private-snapshot-authorization")
+                .queryParam("customer", "private-snapshot-query"))
+            .andExpect(status().isServiceUnavailable());
+        assertCounts(before, 3, 1);
+        assertCounts(before, 3, 1);
+    }
+
+    @Test
+    void failingServletWorkCountsOnceEvenWithoutAnMvcMappingAndIoFailuresDoNotCount() throws Exception {
+        Snapshot before = snapshot();
+        String store = "private-unhandled-store";
+        Catalog target = AopTestUtils.getUltimateTargetObject(catalog);
+        doThrow(new IllegalStateException("private-unhandled-exception")).when(target).menu(store);
+        assertThatThrownBy(() -> api.perform(get(MENU_ROUTE, store)))
+            .hasRootCauseExactlyInstanceOf(IllegalStateException.class);
+        assertCounts(before, 1, 1);
+
+        var unmapped = new MockHttpServletRequest("GET", "/api/v1/fallback-probe");
+        diagnostics.doFilter(unmapped, new MockHttpServletResponse(), (request, response) ->
+            ((HttpServletResponse) response).setStatus(HttpServletResponse.SC_BAD_GATEWAY));
+        assertCounts(before, 2, 2);
+
+        var disconnected = new MockHttpServletRequest("GET", "/api/v1/disconnect-probe");
+        assertThatThrownBy(() -> diagnostics.doFilter(disconnected, new MockHttpServletResponse(), (request, response) -> {
+            throw new IOException("private-disconnect-marker");
+        })).isInstanceOf(IOException.class);
+        assertCounts(before, 2, 2);
+    }
+
+    private void assertCounts(Snapshot baseline, long requests, long errors) throws Exception {
+        Snapshot current = snapshot();
+        assertThat(current.instanceId()).isEqualTo(baseline.instanceId());
+        assertThat(current.requests()).isEqualTo(baseline.requests() + requests);
+        assertThat(current.serverErrors()).isEqualTo(baseline.serverErrors() + errors);
+    }
+
+    private Snapshot snapshot() throws Exception {
+        var response = api.perform(get(COMMERCE_ERRORS).accept(ACTUATOR_JSON)).andExpect(status().isOk())
+            .andExpect(content().contentTypeCompatibleWith(ACTUATOR_JSON)).andReturn().getResponse();
+        JsonNode counters = json.readTree(response.getContentAsByteArray());
+        assertThat(counters.propertyNames()).containsExactlyInAnyOrder("instanceId", "requests", "serverErrors");
+        assertThat(counters.path("instanceId").asString()).matches(UUID_V4);
+        assertThat(counters.path("requests").isIntegralNumber()).isTrue();
+        assertThat(counters.path("serverErrors").isIntegralNumber()).isTrue();
+        long requests = counters.path("requests").asLong();
+        long errors = counters.path("serverErrors").asLong();
+        assertThat(requests).isNotNegative();
+        assertThat(errors).isBetween(0L, requests);
+        assertThat(response.getContentAsString()).doesNotContain("private-", "/api/v1/");
+        return new Snapshot(counters.path("instanceId").asString(), requests, errors);
+    }
+
+    private record Snapshot(String instanceId, long requests, long serverErrors) { }
 }
