@@ -72,12 +72,11 @@ function StoreDetails({ locale, store }: { locale: Locale; store: Store }) {
         {store.area[locale] && <div>{store.area[locale]}</div>}
       </address>
       {store.hours[locale] && <p>{store.hours[locale]}</p>}
-      {(store.directionsUrl || store.supportUrl) && (
-        <div className="store-links">
-          {store.directionsUrl && <a href={store.directionsUrl} rel="noreferrer">{t.directions}</a>}
-          {store.supportUrl && <a href={store.supportUrl} rel="noreferrer">{t.contact}</a>}
-        </div>
-      )}
+      <div className="store-links">
+        {store.directionsUrl && <a href={store.directionsUrl} rel="noreferrer">{t.directions}</a>}
+        {store.supportUrl && <a href={store.supportUrl} rel="noreferrer">{t.contact}</a>}
+        <a href={'/privacy?storefrontLocale=' + locale}>{t.privacy}</a>
+      </div>
     </footer>
   );
 }

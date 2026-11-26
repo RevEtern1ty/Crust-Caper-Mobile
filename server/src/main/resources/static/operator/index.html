@@ -49,6 +49,7 @@
           <div class="toolbar">
             <button class="button button-secondary" id="external-order-jump" type="button" hidden>Add delivery order</button>
             <button class="button button-secondary" id="operations-signals-jump" type="button" hidden>Operations signals</button>
+            <button class="button button-secondary" id="erasure-requests-jump" type="button" hidden>Data requests</button>
             <button class="button button-secondary" id="payment-review-jump" type="button" hidden>Payment review</button>
             <button class="button button-secondary" id="fiscal-receipts-jump" type="button" hidden>Fiscal receipts</button>
             <button class="button button-secondary" id="reconciliation-jump" type="button" hidden>Daily reconciliation</button>
@@ -102,6 +103,19 @@
               </dd>
             </div>
           </dl>
+        </section>
+
+        <section class="payment-review" id="erasure-requests" aria-labelledby="erasure-requests-title" hidden>
+          <h2 id="erasure-requests-title" tabindex="-1">Order data requests</h2>
+          <p class="payment-review-help">Send verified deletion requests to the person responsible for reviewing data retention.</p>
+          <div class="toolbar" role="group" aria-label="Request status">
+            <button class="button button-secondary" id="erasure-requests-pending" type="button" aria-pressed="true">Pending</button>
+            <button class="button button-secondary" id="erasure-requests-in-review" type="button" aria-pressed="false">In review</button>
+            <button class="button button-secondary" id="erasure-requests-refresh" type="button">Refresh requests</button>
+          </div>
+          <p class="problem" id="erasure-requests-problem" role="alert" hidden></p>
+          <p class="queue-notice" id="erasure-requests-status" role="status" hidden></p>
+          <ul class="order-list" id="erasure-requests-list" aria-label="Deletion requests"></ul>
         </section>
 
         <section class="payment-review external-intake" id="external-order-intake" aria-labelledby="external-order-intake-title" hidden>

@@ -169,6 +169,39 @@ paths:
               schema: { type: string, format: binary }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
+  /orders/{id}/data-export:
+    get:
+      operationId: exportOrderData
+      security: [{ guestOrAccount: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      description: The contact and order details for one order. The same guest session must have verified the phone through order access in the past ten minutes.
+      responses:
+        '200': { $ref: '#/components/responses/OrderDataExport' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /orders/{id}/erasure-request:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    get:
+      operationId: getOrderErasureRequest
+      security: [{ guestOrAccount: [] }]
+      description: Read the deletion request for one order after recent phone verification in the same guest session.
+      responses:
+        '200': { $ref: '#/components/responses/OrderErasureRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    put:
+      operationId: requestOrderErasure
+      security: [{ guestOrAccount: [] }]
+      description: Submit the order for a data retention review. A repeat returns the same request. Submission does not modify the order, payment or receipt.
+      responses:
+        '200': { $ref: '#/components/responses/OrderErasureRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /orders/{id}/pickup-alert:
     parameters:
       - $ref: '#/components/parameters/OrderId'
@@ -495,6 +528,44 @@ paths:
         '200': { $ref: '#/paths/~1orders~1{id}~1receipt/get/responses/200' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
+  /web/orders/{id}/data-export:
+    get:
+      operationId: exportWebOrderData
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/WebSessionContext'
+      description: The contact and order details for one order after recent phone verification in the web guest session.
+      responses:
+        '200': { $ref: '#/components/responses/OrderDataExport' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /web/orders/{id}/erasure-request:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+      - $ref: '#/components/parameters/WebSessionContext'
+    get:
+      operationId: getWebOrderErasureRequest
+      security: [{ webGuest: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OrderErasureRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    put:
+      operationId: requestWebOrderErasure
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/WebOrigin'
+        - $ref: '#/components/parameters/WebWrite'
+      description: Submit a deletion request in the recently verified web guest session. Repeated submissions return the same request.
+      responses:
+        '200': { $ref: '#/components/responses/OrderErasureRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/WebOriginRejected' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /web/orders/{id}/reorder:
     post:
       operationId: reorderWebOrder
@@ -1030,6 +1101,51 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/erasure-requests:
+    get:
+      operationId: listOperatorErasureRequests
+      security: [{ operatorBearer: [] }]
+      description: Order deletion requests from the manager's assigned store. The response contains request metadata.
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/OrderErasureStatus', default: pending }
+      responses:
+        '200':
+          description: Up to 100 requests in the selected state.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/OperatorErasureRequest' } }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/erasure-requests/{requestId}/review:
+    post:
+      operationId: startOperatorErasureReview
+      security: [{ operatorBearer: [] }]
+      description: Record the manager and time of the first review action. Replays preserve the recorded action.
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Request marked in review for referral to the data retention reviewer.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorErasureRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/operations/signals:
     get:
       operationId: getOperatorOperationsSignals
@@ -1315,6 +1431,22 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/PickupAlert' }
+    OrderDataExport:
+      description: Order and contact data for the verified guest.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/OrderDataExport' }
+    OrderErasureRequest:
+      description: The order's deletion request or null before submission.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/OrderErasureRequestResponse' }
     OperatorAvailability:
       description: Current restaurant and item availability. Changes to published values advance the version.
       headers:
@@ -1750,6 +1882,57 @@ components:
         store: { $ref: '#/components/schemas/Store' }
         products: { type: array, items: { $ref: '#/components/schemas/Product' } }
         slots: { type: array, items: { $ref: '#/components/schemas/Slot' } }
+    OrderDataExport:
+      type: object
+      additionalProperties: false
+      required: [orderId, storeId, phone, email, lines, total, tax, currency, status, paymentStatus, receiptStatus,
+        createdAt, pickupStartsAt, pickupEndsAt]
+      properties:
+        orderId: { type: string, format: uuid }
+        storeId: { type: string }
+        phone: { type: string }
+        email: { type: ['string', 'null'] }
+        lines: { type: array, items: { $ref: '#/components/schemas/CartLine' } }
+        total: { $ref: '#/components/schemas/Amount' }
+        tax: { $ref: '#/components/schemas/Amount' }
+        currency: { type: string, const: RWF }
+        status: { $ref: '#/components/schemas/Order/properties/status' }
+        paymentStatus: { $ref: '#/components/schemas/Order/properties/paymentStatus' }
+        receiptStatus: { $ref: '#/components/schemas/Order/properties/receiptStatus' }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+        pickupStartsAt: { $ref: '#/components/schemas/Timestamp' }
+        pickupEndsAt: { $ref: '#/components/schemas/Timestamp' }
+    OrderErasureStatus:
+      type: string
+      enum: [pending, in_review]
+    OrderErasureRequest:
+      type: object
+      additionalProperties: false
+      required: [requestId, submittedAt, status, reviewedAt]
+      properties:
+        requestId: { type: string, format: uuid }
+        submittedAt: { $ref: '#/components/schemas/Timestamp' }
+        status: { $ref: '#/components/schemas/OrderErasureStatus' }
+        reviewedAt: { type: ['string', 'null'], format: date-time }
+    OrderErasureRequestResponse:
+      type: object
+      additionalProperties: false
+      required: [request]
+      properties:
+        request:
+          oneOf:
+            - $ref: '#/components/schemas/OrderErasureRequest'
+            - type: 'null'
+    OperatorErasureRequest:
+      type: object
+      additionalProperties: false
+      required: [requestId, orderId, submittedAt, status, reviewedAt]
+      properties:
+        requestId: { type: string, format: uuid }
+        orderId: { type: string, format: uuid }
+        submittedAt: { $ref: '#/components/schemas/Timestamp' }
+        status: { $ref: '#/components/schemas/OrderErasureStatus' }
+        reviewedAt: { type: ['string', 'null'], format: date-time }
     CartLine:
       type: object
       required: [sku, modifierIds, quantity, unitPrice]

@@ -1,6 +1,7 @@
 import { mountAvailability } from './availability.js';
 import { mountExternalOrders, readExternalOrder } from './external-orders.js';
 import { mountOperationsSignals } from './operations-signals.js';
+import { mountErasureRequests } from './erasure-requests.js';
 import { createOrderSound } from './order-sound.js';
 import { mountReconciliation } from './reconciliation.js';
 
@@ -127,6 +128,9 @@ const availability = mountAvailability({ currentSession: availableSession, reque
 const reconciliation = mountReconciliation({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
 const operationsSignals = mountOperationsSignals({
   currentSession: availableSession, request, messageFor, showMessage, closeSession, canRefresh: queueVisible,
+});
+const erasureRequests = mountErasureRequests({
+  currentSession: availableSession, request, messageFor, showMessage, closeSession,
 });
 const delivery = mountExternalOrders({
   currentSession: availableSession, request, showMessage, messageFor, closeSession, queueFresh, syncQueue: syncKitchenSignal,
@@ -882,6 +886,7 @@ function closeSession(message = '') {
   availability.reset();
   reconciliation.reset();
   operationsSignals.reset();
+  erasureRequests.reset();
   delivery.reset();
   workstation.hidden = true;
   signIn.hidden = false;
@@ -1379,6 +1384,7 @@ loginForm.addEventListener('submit', async (event) => {
     void refreshQueue();
     if (data.role === 'manager') {
       operationsSignals.show();
+      erasureRequests.show();
       reconciliation.show();
       void refreshPendingPayments();
       void refreshPaymentReview();

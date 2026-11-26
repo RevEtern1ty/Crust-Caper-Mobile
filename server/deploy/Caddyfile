@@ -59,7 +59,7 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 	}
 	@storefrontPages {
 		method GET HEAD
-		path / /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery /product/*
+		path / /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery /privacy /product/*
 		file {
 			root /srv/crustcaper-storefront
 			try_files /index.html
@@ -70,7 +70,7 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 		path /favicon.ico /_expo/static/* /assets/*
 		not path *.map
 	}
-	@storefrontPrivate path /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery /product/*
+	@storefrontPrivate path /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery /privacy /product/*
 	@receiptUpload {
 		method PUT
 		path_regexp ^/api/v1/operator/orders/[0-9a-fA-F-]{36}/receipt$

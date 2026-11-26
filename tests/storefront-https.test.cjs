@@ -3,12 +3,14 @@ const { Buffer } = require('node:buffer');
 const { spawnSync } = require('node:child_process');
 const { createHash, X509Certificate } = require('node:crypto');
 const { readFileSync } = require('node:fs');
-const { mkdir } = require('node:fs/promises');
+const { mkdir, readFile } = require('node:fs/promises');
+const { setTimeout: delay } = require('node:timers/promises');
 const https = require('node:https');
 const { dirname, resolve } = require('node:path');
 const { test } = require('node:test');
 const { connect } = require('node:tls');
 const { chromium } = require('playwright-core');
+const { provisionStaffCredentials } = require('../tooling/storefront-load-kitchen.cjs');
 const { checkWebPerformance } = require('./storefront-web-perf.cjs');
 
 const storefront = 'crustcaper.test';
@@ -98,6 +100,12 @@ async function checkPublicCatalog(ca) {
   assert.equal(kinyarwanda.status, 200);
   assert.match(kinyarwanda.body, /<html[^>]*lang="rw"/);
   assert.match(kinyarwanda.body, /Ingano/);
+  assert.ok(kinyarwanda.body.includes('/privacy?storefrontLocale=rw'));
+  assert.ok(english.body.includes('/privacy?storefrontLocale=en'));
+  const privacy = await request(ca, '/privacy');
+  assert.equal(privacy.status, 200);
+  assert.match(privacy.headers['cache-control'], /no-store/);
+  assert.match(privacy.headers['x-robots-tag'], /noindex/);
   assert.equal((await request(ca, '/menu/en/not-on-the-menu')).status, 404);
   assert.equal((await request(ca, '/menu/fr/double-smash')).status, 404);
   assert.match((await request(ca, '/robots.txt')).body, /Disallow: \/\r?\n/);
@@ -312,7 +320,142 @@ async function checkGuestCheckout(browser, ca) {
     await shown(page, 'Paid');
     if (project) verifyPaymentRow(order.id);
     await capture(page, 'catalog-to-paid');
+    if (catalogPhotos) await checkOrderPrivacy(browser, ca, order, session.sessionId, cookie);
     assert.deepEqual(failures, []);
+  } finally {
+    await context.close();
+  }
+}
+
+async function checkOrderPrivacy(browser, ca, order, sessionId, cookie) {
+  const orderPath = '/api/v1/web/orders/' + order.id;
+  const statusPath = orderPath + '/erasure-request';
+  const webHeaders = { 'X-CrustCaper-Session': sessionId, Cookie: guestCookie + '=' + cookie.value };
+  assert.equal((await request(ca, orderPath + '/data-export', { headers: webHeaders })).status, 404);
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  try {
+    await checkVerifiedOrderPrivacy(browser, await context.newPage(), ca, order, orderPath, statusPath);
+  } finally {
+    await context.close();
+  }
+}
+
+async function checkVerifiedOrderPrivacy(browser, page, ca, order, orderPath, statusPath) {
+  await page.goto(origin + '/menu/rw');
+  await page.locator('a[href="/privacy?storefrontLocale=rw"]').click();
+  await page.waitForURL(origin + '/privacy');
+  await page.locator('html[lang="rw"]').waitFor({ state: 'attached' });
+  await page.getByLabel('Nimero ya komande', { exact: true }).waitFor();
+  await checkPrivacyLayout(page, 'rw');
+  await page.goto(origin + '/privacy?storefrontLocale=en');
+  await page.waitForURL(origin + '/privacy');
+  await page.locator('html[lang="en"]').waitFor({ state: 'attached' });
+  await page.getByLabel('Order number', { exact: true }).waitFor();
+  await checkPrivacyLayout(page, 'en');
+
+  await page.getByLabel('Order number', { exact: true }).fill(order.id.slice(-8).toUpperCase());
+  await page.getByLabel('Phone number', { exact: true }).fill('+250700000000');
+  await button(page, 'Request verification code').click();
+  await shown(page, 'Verify your phone');
+  await page.getByLabel('Verification code', { exact: true }).fill('418263');
+  let verification;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const verified = page.waitForResponse(response => response.request().method() === 'POST'
+      && /\/api\/v1\/web\/order-access\/challenges\/[^/]+\/verify$/.test(new URL(response.url()).pathname));
+    await button(page, 'Verify and continue').click();
+    verification = await verified;
+    if (verification.ok()) break;
+    assert.equal(verification.status(), 404);
+    await delay(500);
+  }
+  assert.ok(verification?.ok());
+  assert.equal((await verification.json()).orderId, order.id);
+  assert.equal(new URL(page.url()).search, '');
+
+  const verifiedContext = (await verification.request().allHeaders())['x-crustcaper-session'];
+  const freshCookie = (await page.context().cookies(origin)).find(candidate => candidate.name === guestCookie);
+  assert.ok(uuid.test(verifiedContext) && freshCookie?.secure && freshCookie.httpOnly);
+  const scope = { 'X-CrustCaper-Session': verifiedContext, Cookie: guestCookie + '=' + freshCookie.value };
+  assert.equal((await request(ca, statusPath, { method: 'PUT', headers: {
+    ...scope, Origin: 'https://other.example.test', 'X-CrustCaper-Web': '1',
+  } })).status, 403);
+  assert.deepEqual(JSON.parse((await request(ca, statusPath, { headers: scope })).body), { request: null });
+  const [download] = await Promise.all([
+    page.waitForEvent('download'), button(page, 'Download order data').click(),
+  ]);
+  try {
+    assert.equal(download.suggestedFilename(), 'crustcaper-order-data.json');
+    const exported = JSON.parse(await readFile(await download.path(), 'utf8'));
+    assert.equal(exported.orderId, order.id);
+    assert.equal(exported.paymentStatus, 'paid');
+    assert.equal(exported.total, order.total);
+    assert.ok(exported.phone === '+250700000000' && exported.email === 'storefront-checkout@example.test');
+    assert.deepEqual(Object.keys(exported).sort(), ['createdAt', 'currency', 'email', 'lines', 'orderId', 'paymentStatus',
+      'phone', 'pickupEndsAt', 'pickupStartsAt', 'receiptStatus', 'status', 'storeId', 'tax', 'total']);
+  } finally {
+    await download.delete();
+  }
+  assert.equal(await page.evaluate(() => JSON.stringify([localStorage, sessionStorage])
+    .includes('storefront-checkout@example.test')), false);
+  await button(page, 'Request deletion').click();
+  const recorded = page.waitForResponse(response => response.request().method() === 'PUT'
+    && response.ok() && new URL(response.url()).pathname === statusPath);
+  await button(page, 'Submit deletion request').click();
+  const { request: accepted } = await (await recorded).json();
+  assert.ok(uuid.test(accepted.requestId));
+  assert.equal(accepted.status, 'pending');
+  await shown(page, 'Pending review');
+  await capture(page, 'order-privacy-request-pending');
+  const repeat = await request(ca, statusPath, { method: 'PUT', headers: {
+    ...scope, Origin: origin, 'X-CrustCaper-Web': '1',
+  } });
+  assert.deepEqual(JSON.parse(repeat.body), { request: accepted });
+  await checkPrivacyStaff(browser, order.id, accepted);
+  const reviewed = await request(ca, statusPath, { headers: scope });
+  assert.equal(reviewed.status, 200);
+  assert.equal(JSON.parse(reviewed.body).request.status, 'in_review');
+  const unchanged = JSON.parse((await request(ca, orderPath, { headers: scope })).body);
+  assert.equal(unchanged.paymentStatus, 'paid');
+  assert.equal(unchanged.total, order.total);
+}
+
+async function checkPrivacyLayout(page, locale) {
+  for (const width of [320, 390, 430]) {
+    await page.setViewportSize({ width, height: 844 });
+    await page.evaluate(scale => { document.documentElement.style.fontSize = scale; }, width === 390 ? '' : '200%');
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    await capture(page, 'order-privacy-' + locale + '-' + width);
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => { document.documentElement.style.fontSize = ''; });
+}
+
+async function checkPrivacyStaff(browser, orderId, accepted) {
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  try {
+    const staff = await context.newPage();
+    const credentials = provisionStaffCredentials(project, 'manager');
+    await staff.goto(origin + '/operator/index.html');
+    await staff.getByLabel('Username', { exact: true }).fill(credentials.username);
+    await staff.getByLabel('Password', { exact: true }).fill(credentials.password);
+    await staff.locator('#authenticator-code').fill(credentials.authenticatorCode);
+    await button(staff, 'Sign in').click();
+    await button(staff, 'Data requests').click();
+    const region = staff.getByRole('region', { name: 'Order data requests' });
+    const card = region.getByRole('listitem').filter({ hasText: accepted.requestId });
+    await card.getByRole('heading', { name: 'Order #' + orderId.slice(-8).toUpperCase() }).waitFor();
+    const result = staff.waitForResponse(response => response.request().method() === 'POST' && response.ok()
+      && new URL(response.url()).pathname === '/api/v1/operator/erasure-requests/' + accepted.requestId + '/review');
+    await button(card, 'Start review').click();
+    const data = await (await result).json();
+    assert.deepEqual(Object.keys(data).sort(), ['orderId', 'requestId', 'reviewedAt', 'status', 'submittedAt']);
+    assert.equal(data.status, 'in_review');
+    assert.equal(data.requestId, accepted.requestId);
+    await button(region, 'In review').click();
+    await card.getByText(/^Review started /).waitFor();
+    await capture(staff, 'order-privacy-manager-review');
+    await button(staff, 'Sign out').click();
+    await staff.getByLabel('Username', { exact: true }).waitFor();
   } finally {
     await context.close();
   }

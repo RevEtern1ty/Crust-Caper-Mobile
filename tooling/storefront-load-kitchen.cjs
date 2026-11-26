@@ -146,4 +146,4 @@ async function openKitchenMonitor(options) {
   };
 }
 
-module.exports = { openKitchenSession, openKitchenMonitor, openStaffSession, provisionKitchenCredentials };
+module.exports = { openKitchenSession, openKitchenMonitor, openStaffSession, provisionKitchenCredentials, provisionStaffCredentials };

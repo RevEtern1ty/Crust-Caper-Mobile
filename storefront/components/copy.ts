@@ -3,7 +3,7 @@ import type { Locale } from '../lib/catalog';
 const labels = {
   en: {
     menu: 'Menu', orders: 'Orders', cart: 'Cart', customerNav: 'Order and cart', language: 'Language', main: 'Skip to content',
-    store: 'Pickup location', directions: 'Directions', contact: 'Contact the restaurant',
+    store: 'Pickup location', directions: 'Directions', contact: 'Contact the restaurant', privacy: 'Order privacy',
     nearest: 'Next available pickup', closed: 'The restaurant is closed',
     noTimes: 'Pickup times are unavailable',
     soldOut: 'Currently unavailable', emptyMenu: 'No items are available in the menu right now.',
@@ -21,7 +21,7 @@ const labels = {
   rw: {
     menu: 'Ifunguro', orders: 'Komande', cart: 'Agatebo', customerNav: 'Komande n’agatebo', language: 'Ururimi',
     main: 'Jya ku bikubiye ku rupapuro',
-    store: 'Aho ufatira komande', directions: 'Inzira', contact: 'Vugana na resitora',
+    store: 'Aho ufatira komande', directions: 'Inzira', contact: 'Vugana na resitora', privacy: 'Amakuru bwite ya komande',
     nearest: 'Igihe cya hafi cyo gufata komande',
     closed: 'Resitora irafunze', noTimes: 'Igihe cyo gufata komande ntikiboneka',
     soldOut: 'Ntikiboneka ubu',

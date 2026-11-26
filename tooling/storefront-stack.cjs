@@ -88,7 +88,7 @@ const mount = (source, target) => ({
   bind: { create_host_path: false },
 });
 
-async function prepareFixture(directory, testClasses, { load, paymentRestart, errorRehearsal, databaseRecovery }) {
+async function prepareFixture(directory, testClasses, { load, paymentRestart, catalogPhotos, errorRehearsal, databaseRecovery }) {
   const fixturePassword = randomBytes(24).toString('hex');
   const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
@@ -190,7 +190,7 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, er
         },
         volumes: [
           mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
-          ...(load || paymentRestart
+          ...(load || paymentRestart || catalogPhotos
             ? [mount(join(root, 'server', 'tooling', 'operator-accounts.psql'), '/fixture/operator-accounts.psql')] : []),
           ...recoveryTooling,
         ],
@@ -276,7 +276,7 @@ async function main() {
       await copyFile(join(root, 'assets', 'menu', `${fixturePhoto.sku}.jpg`), join(photos, fixturePhoto.file));
       await writeFile(join(photos, 'double-smash-r39.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
     }
-    const settings = await prepareFixture(directory, testClasses, { load, paymentRestart, errorRehearsal, databaseRecovery });
+    const settings = await prepareFixture(directory, testClasses, { load, paymentRestart, catalogPhotos, errorRehearsal, databaseRecovery });
     const env = {
       ...hostEnv,
       CRUSTCAPER_API_IMAGE: apiImage,
@@ -332,7 +332,7 @@ async function main() {
         CRUSTCAPER_HTTPS_TEST_CA: browserCa,
         CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT: project,
         ...(evidence && { CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: evidence }),
-        ...((load || paymentRestart) && { CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY: settings.fixtureMfaKey }),
+        ...((load || paymentRestart || catalogPhotos) && { CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY: settings.fixtureMfaKey }),
         ...(webPerf && { CRUSTCAPER_HTTPS_TEST_WEB_PERF: '1' }),
         ...(catalogPhotos && { CRUSTCAPER_HTTPS_TEST_CATALOG_PHOTOS: '1' }),
         ...(paymentRestart && { CRUSTCAPER_HTTPS_TEST_PAYMENT_RESTART: '1' }),
