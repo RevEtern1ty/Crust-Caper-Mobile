@@ -199,6 +199,103 @@ async function placeBrowserOrder(page, origin, buyer, screenshot) {
   return { order, attempt };
 }
 
+async function inspectCartHeader(page, cart, locale) {
+  const fits = () => cart.evaluate(element => {
+    const { left, top, right, bottom, width, height } = element.getBoundingClientRect();
+    const hit = document.elementFromPoint(left + width / 2, top + height / 2);
+    return width >= 48 && height >= 48 && left >= 0 && top >= 0
+      && right <= window.innerWidth && bottom <= window.innerHeight && element.contains(hit);
+  });
+  for (const width of [320, 390, 430]) {
+    await page.setViewportSize({ width, height: 800 });
+    assert.ok(await fits(), `Cart control must fit at ${width}px in ${locale}`);
+    await capture(page, `connected-product-cart-${locale}-${width}`);
+    await page.evaluate(() => {
+      for (const node of document.querySelectorAll('div, span, p, h1, h2, h3')) {
+        if (node.children.length || !node.textContent.trim() || node.closest('[aria-hidden=true], [hidden]')) continue;
+        const { fontSize, lineHeight } = getComputedStyle(node);
+        node.dataset.cartZoomStyles = JSON.stringify([node.style.fontSize, node.style.lineHeight]);
+        node.style.fontSize = `${parseFloat(fontSize) * 2}px`;
+        if (Number.isFinite(parseFloat(lineHeight))) node.style.lineHeight = `${parseFloat(lineHeight) * 2}px`;
+      }
+    });
+    try {
+      assert.ok(await fits(), `Cart control must fit at ${width}px in ${locale} with 200% text`);
+      await capture(page, `connected-product-cart-${locale}-${width}-large-text`);
+    } finally {
+      await page.evaluate(() => {
+        for (const node of document.querySelectorAll('[data-cart-zoom-styles]')) {
+          const [fontSize, lineHeight] = JSON.parse(node.dataset.cartZoomStyles);
+          node.style.fontSize = fontSize;
+          node.style.lineHeight = lineHeight;
+          delete node.dataset.cartZoomStyles;
+        }
+      });
+    }
+  }
+}
+
+test('the buyer can open the cart from product details and return to their selected options', { timeout: 30_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  await page.goto(origin);
+  await button(page, /^Double Smash,/).click();
+  await button(page, /^Add to cart/).click();
+  await button(page, /^Classic Smash,/).click();
+  const cheese = button(page, /Extra cheese/);
+  await cheese.click();
+  assert.equal(await cheese.getAttribute('aria-pressed'), 'true');
+
+  const cart = button(page, 'Cart, 1 item');
+  await cart.waitFor();
+  await inspectCartHeader(page, cart, 'en');
+  await page.setViewportSize({ width: 320, height: 800 });
+  await cart.focus();
+  assert.equal(await cart.evaluate(el => document.activeElement === el), true);
+  await page.keyboard.press('Enter');
+  await shown(page, 'Your cart');
+  await shown(page, 'Double Smash');
+  assert.equal(await page.getByText('Classic Smash', { exact: true }).filter({ visible: true }).count(), 0);
+
+  await page.goBack();
+  await button(page, 'Add to cart · 7,400 RWF').waitFor();
+  assert.equal(await cheese.getAttribute('aria-pressed'), 'true');
+  assert.equal(await cart.isVisible(), true);
+
+  await cart.tap();
+  await button(page, 'Edit options').click();
+  const save = button(page, /^Save item/);
+  await save.waitFor();
+  assert.equal(await cart.isVisible(), false);
+  await button(page, /No pickles/).click();
+  await save.click();
+  await shown(page, 'Your cart');
+  await shown(page, 'No pickles');
+
+  await page.goto(origin + '/settings');
+  await button(page, 'Kinyarwanda').click();
+  await shown(page, 'Amagenamiterere');
+  await page.goto(origin);
+  await button(page, /^Classic Smash,/).click();
+  const igitebo = button(page, 'Igitebo, ibintu 1');
+  await igitebo.waitFor();
+  await inspectCartHeader(page, igitebo, 'rw');
+  await igitebo.tap();
+  await shown(page, 'Igitebo cyawe');
+  await shown(page, 'Double Smash');
+});
+
 test('guest rotation and logout recover from committed responses lost by the browser', { timeout: 65_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const server = createPreviewServer(dist);

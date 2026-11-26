@@ -198,6 +198,10 @@ jobs:
           printf 'APK package: %s\nAPK minimum SDK: %s\nBundled JS size: %s bytes\n' \
             "$expected_package" "$expected_min_sdk" "$bundle_size"
           sha256sum "$apk"
+      - name: Verify 16 KiB APK and ELF segment alignment
+        run: |
+          python3 tooling/check-android-page-size.py android/app/build/outputs/apk/release/app-release.apk \
+            --zipalign "$ANDROID_HOME/build-tools/36.0.0/zipalign"
       - name: Smoke-test the same APK offline in a headless Android emulator
         id: android_smoke
         timeout-minutes: 20

@@ -166,6 +166,19 @@ class GuestSessionLifecycleIntegrationTest {
             .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"));
     }
 
+    @Test
+    void revokedGuestCannotPlaceAnOrderFromAnExistingQuote() throws Exception {
+        JsonNode guest = createGuest();
+        var input = prepareOrder(guest);
+        revoke(token(guest), null).andExpect(status().isNoContent());
+
+        placeOrder(guest, input).andExpect(status().isUnauthorized());
+        assertThat(jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?")
+            .param(store).query(Long.class).single()).isZero();
+        api.perform(get("/api/v1/stores/" + store + "/menu"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.slots[0].available").value(true));
+    }
+
     private JsonNode createGuest() throws Exception {
         JsonNode created = body(api.perform(post(SESSIONS)).andExpect(status().isOk()));
         guests.add(sessions.authenticate(bearer(created)));
@@ -173,6 +186,10 @@ class GuestSessionLifecycleIntegrationTest {
     }
 
     private String createOrder(JsonNode guest) throws Exception {
+        return body(placeOrder(guest, prepareOrder(guest)).andExpect(status().isOk())).path("id").asString("");
+    }
+
+    private ApiModels.OrderInput prepareOrder(JsonNode guest) throws Exception {
         store = "session-test-" + UUID.randomUUID();
         jdbc.sql("""
             INSERT INTO stores (id, name, area, hours, open, tax_basis_points, version)
@@ -190,11 +207,13 @@ class GuestSessionLifecycleIntegrationTest {
         var input = new ApiModels.QuoteInput(store, SLOT, List.of(new ApiModels.CartLine("double-smash", List.of(), 1, 9200)));
         JsonNode quote = body(api.perform(post("/api/v1/quotes").header(HttpHeaders.AUTHORIZATION, bearer(guest))
             .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(input))).andExpect(status().isOk()));
-        var orderInput = new ApiModels.OrderInput(quote.path("quoteId").asString(""), "+250700000000", "session@example.test");
-        JsonNode order = body(api.perform(post(ORDERS).header(HttpHeaders.AUTHORIZATION, bearer(guest))
+        return new ApiModels.OrderInput(quote.path("quoteId").asString(""), "+250700000000", "session@example.test");
+    }
+
+    private ResultActions placeOrder(JsonNode guest, ApiModels.OrderInput orderInput) throws Exception {
+        return api.perform(post(ORDERS).header(HttpHeaders.AUTHORIZATION, bearer(guest))
             .header("Idempotency-Key", "guest-session-order").contentType(MediaType.APPLICATION_JSON)
-            .content(json.writeValueAsString(orderInput))).andExpect(status().isOk()));
-        return order.path("id").asString("");
+            .content(json.writeValueAsString(orderInput)));
     }
 
     private MockHttpServletResponse refreshAtBarrier(String token, String key, CountDownLatch ready, CountDownLatch start)

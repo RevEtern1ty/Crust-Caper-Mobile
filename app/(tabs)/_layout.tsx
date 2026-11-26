@@ -2,12 +2,13 @@ import { Tabs, useRouter } from 'expo-router';
 import { Image, Platform, Pressable, StyleSheet, useWindowDimensions, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useShop } from '../../src/state/shop';
+import { CartHeaderButton } from '../../src/ui/cart-header-button';
 import { colors, Icon, Text } from '../../src/ui/core';
 import { copy } from '../../src/ui/format';
 
 function BrandHeader() {
   const { top } = useSafeAreaInsets();
-  const { locale, count } = useShop();
+  const { locale } = useShop();
   const router = useRouter();
   return (
     <View style={[styles.header, { paddingTop: top + 8 }]}>
@@ -20,11 +21,7 @@ function BrandHeader() {
           onPress={() => router.push('/settings')} style={styles.language}>
           <Text variant="label" tone="cream">{locale.toUpperCase()}</Text>
         </Pressable>
-        <Pressable accessibilityRole="button" accessibilityLabel={copy(locale, count === 1 ? 'Cart, 1 item' : `Cart, ${count} items`, `Igitebo, ibintu ${count}`)}
-          onPress={() => router.push('/cart')} style={styles.bag}>
-          <Icon name="bag-handle-outline" color={colors.cream} />
-          {count > 0 && <Text variant="small" tone="mustard">{count}</Text>}
-        </Pressable>
+        <CartHeaderButton />
       </View>
     </View>
   );
@@ -75,9 +72,4 @@ const styles = StyleSheet.create({
   mark: { width: 27, height: 27, flexShrink: 0, resizeMode: 'contain' },
   actions: { flexDirection: 'row', gap: 6, flexShrink: 0 },
   language: { minHeight: 48, minWidth: 48, alignItems: 'center', justifyContent: 'center' },
-  bag: {
-    minHeight: 48, minWidth: 48, paddingHorizontal: 9, borderRadius: 12,
-    borderColor: '#72586D', borderWidth: 1, alignItems: 'center', justifyContent: 'center',
-    flexDirection: 'row', gap: 3,
-  },
 });

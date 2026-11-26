@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { ActivityIndicator, Image, Platform, Pressable, StyleSheet, View } from 'react-native';
 import type { CartLine, Product } from '../../src/domain/types';
 import { lineKey, MAX_QUANTITY, useShop } from '../../src/state/shop';
+import { CartHeaderButton } from '../../src/ui/cart-header-button';
 import { Button, Card, colors, Icon, Screen, Text } from '../../src/ui/core';
 import { copy, money } from '../../src/ui/format';
 import { menuPhoto } from '../../src/ui/menu-photos';
@@ -34,8 +35,13 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
       disabled={!product.available || exceedsLimit || !hydrated}
       onPress={updateCart}
     />}>
-      <Stack.Screen options={{ title: product.name[locale] }} />
-      {photo && <Image source={photo} style={styles.photo} accessible={false} />}
+      <Stack.Screen options={{
+        title: product.name[locale],
+        headerRight: editing ? undefined : () => <CartHeaderButton />,
+      }} />
+      {photo && <View style={styles.photoFrame}>
+        <Image source={photo} style={styles.photo} accessible={false} />
+      </View>}
       <View style={styles.intro}>
         <Text variant="title" accessibilityRole="header">{product.name[locale]}</Text>
         <Text tone="muted">{product.description[locale]}</Text>
@@ -93,7 +99,8 @@ export default function ProductScreen() {
 }
 
 const styles = StyleSheet.create({
-  photo: { aspectRatio: 1.58, width: '100%', maxHeight: 360, borderRadius: 16, backgroundColor: colors.plum },
+  photoFrame: { alignSelf: 'stretch', aspectRatio: 1.58, maxHeight: 360, borderRadius: 16, overflow: 'hidden', backgroundColor: colors.plum },
+  photo: { width: '100%', height: '100%' },
   intro: { gap: 6 },
   options: { gap: 8 },
   option: {

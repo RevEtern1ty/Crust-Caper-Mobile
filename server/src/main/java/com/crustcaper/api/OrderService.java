@@ -129,8 +129,13 @@ public class OrderService {
             throw ApiFailure.invalid();
         }
 
-        // All writes using the same guest idempotency namespace acquire this row before checking the key.
-        jdbc.sql("SELECT id FROM guest_sessions WHERE id = ? AND expires_at > now() FOR UPDATE")
+        // Check expiry after locking the guest that owns the order's idempotency key.
+        jdbc.sql("""
+            WITH locked_guest AS MATERIALIZED (
+                SELECT id, expires_at FROM guest_sessions WHERE id = ? FOR UPDATE
+            )
+            SELECT id FROM locked_guest WHERE expires_at > clock_timestamp()
+            """)
             .param(guest).query(UUID.class).optional().orElseThrow(ApiFailure::unauthenticated);
         StoredOrder existing = recoverRecord(guest, key);
         if (existing != null) {
