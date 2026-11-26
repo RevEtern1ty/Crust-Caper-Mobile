@@ -19,6 +19,7 @@ import com.crustcaper.api.operator.OperatorMfaFixture;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
@@ -88,6 +89,7 @@ class FlutterwaveCheckoutIntegrationTest {
     private static final AtomicLong TRANSACTION = new AtomicLong();
     private static final AtomicBoolean TIMEOUT_NEXT_OPEN = new AtomicBoolean();
     private static final AtomicBoolean RETURN_HOSTED_LINK = new AtomicBoolean();
+    private static final AtomicBoolean SEND_SLOW_HOSTED_LINK = new AtomicBoolean();
     private static final AtomicReference<Runnable> BEFORE_HOSTED_LINK = new AtomicReference<>();
     private static HttpServer provider;
 
@@ -120,7 +122,11 @@ class FlutterwaveCheckoutIntegrationTest {
                         "data", WIRE_JSON.createObjectNode().put("link", RETRY_LINK)));
                     exchange.getResponseHeaders().set("Content-Type", "application/json");
                     exchange.sendResponseHeaders(200, body.length);
-                    exchange.getResponseBody().write(body);
+                    if (SEND_SLOW_HOSTED_LINK.getAndSet(false)) {
+                        sendSlowly(exchange, body);
+                    } else {
+                        exchange.getResponseBody().write(body);
+                    }
                 }
             }
         });
@@ -155,6 +161,7 @@ class FlutterwaveCheckoutIntegrationTest {
         TRANSACTION.set(ThreadLocalRandom.current().nextLong(1_000_000_000_000_000L, Long.MAX_VALUE));
         TIMEOUT_NEXT_OPEN.set(false);
         RETURN_HOSTED_LINK.set(false);
+        SEND_SLOW_HOSTED_LINK.set(false);
         BEFORE_HOSTED_LINK.set(null);
     }
 
@@ -185,6 +192,25 @@ class FlutterwaveCheckoutIntegrationTest {
 
     private static boolean authorized(HttpExchange exchange) {
         return ("Bearer " + FIXTURE_KEY).equals(exchange.getRequestHeaders().getFirst("Authorization"));
+    }
+
+    private static void sendSlowly(HttpExchange exchange, byte[] body) throws IOException {
+        var output = exchange.getResponseBody();
+        int fragments = 30;
+        for (int fragment = 0; fragment < fragments; fragment++) {
+            if (fragment > 0) {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt();
+                    throw new InterruptedIOException("Fixture response interrupted");
+                }
+            }
+            int start = fragment * body.length / fragments;
+            int end = (fragment + 1) * body.length / fragments;
+            output.write(body, start, end - start);
+            output.flush();
+        }
     }
 
     private static void verify(HttpExchange exchange) throws IOException {
@@ -272,6 +298,40 @@ class FlutterwaveCheckoutIntegrationTest {
         assertThat(jdbc.sql("SELECT count(*) FROM payment_attempts WHERE order_id = ?")
             .param(UUID.fromString(order)).query(Integer.class).single()).isEqualTo(1);
         assertThat(OPENS.get()).isEqualTo(1);
+    }
+
+    @Test
+    void aSlowHostedResponseLeavesOneRecoverablePaymentAttempt() throws Exception {
+        String kitchen = seedStoreAndKitchen();
+        FixtureOrder input = createOrder();
+        String authorization = "Bearer " + input.guestToken();
+        String paymentPath = API + "/orders/" + input.orderId() + "/payments";
+        RETURN_HOSTED_LINK.set(true);
+        SEND_SLOW_HOSTED_LINK.set(true);
+
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "slow-wire-payment"))
+            .andExpect(status().isServiceUnavailable());
+        String reference = OPEN_BODY.get().path("tx_ref").asString();
+        UUID attempt = UUID.fromString(reference);
+        assertThat(verificationTime(attempt)).isNull();
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "slow-wire-payment"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(reference))
+            .andExpect(jsonPath("$.checkoutUrl").value(nullValue()));
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "other-wire-payment"))
+            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("payment_pending"));
+        assertThat(OPENS.get()).isEqualTo(1);
+
+        CHARGED.set(TOTAL);
+        String transaction = Long.toString(TRANSACTION.get());
+        api.perform(post(API + "/webhooks/flutterwave").header("verif-hash", WEBHOOK_SECRET).contentType(MediaType.APPLICATION_JSON)
+            .content("{\"event\":\"charge.completed\",\"data\":{\"id\":" + transaction + "}}"))
+            .andExpect(status().isOk());
+        assertThat(jdbc.sql("SELECT id FROM payment_attempts WHERE order_id = ? AND status = 'paid' AND verified_at IS NOT NULL")
+            .param(UUID.fromString(input.orderId())).query(UUID.class).list()).containsExactly(attempt);
+        assertThat(OPENS.get()).isEqualTo(1);
+        api.perform(get(API + "/operator/orders").header(HttpHeaders.AUTHORIZATION, "Bearer " + kitchen))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.orders.length()").value(1))
+            .andExpect(jsonPath("$.orders[0].id").value(input.orderId()));
     }
 
     @Test
