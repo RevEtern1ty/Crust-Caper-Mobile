@@ -1,7 +1,9 @@
 import { Buffer } from 'node:buffer';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-const storeIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const versionPattern = /^[A-Za-z0-9._:-]{1,100}$/;
+export const storeIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+export const versionPattern = /^[A-Za-z0-9._:-]{1,100}$/;
 const timestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const catalogPhotoPath = /^\/catalog-photos\/[a-z0-9][a-z0-9._-]{0,119}\.(?:avif|jpe?g|png|webp)$/;
 const existingPhotoPath = /^\/assets\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.(?:avif|gif|jpe?g|png|webp)$/i;
@@ -10,6 +12,16 @@ const photoMediaTypes = { avif: 'image/avif', gif: 'image/gif', jpg: 'image/jpeg
 const pngSignature = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
 const pngTrailer = Buffer.from('0000000049454e44ae426082', 'hex');
 const timeoutMs = 8000;
+
+export function isMainModule(meta) {
+  if (typeof meta.main === 'boolean') return meta.main;
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(meta.url));
+  } catch {
+    return false;
+  }
+}
 
 function menuUrl(baseUrl, storeId, channel) {
   const url = URL.parse(baseUrl);
@@ -84,11 +96,15 @@ async function checkStorefrontPage(origin, locale, storeId, expectedVersion) {
     throw new Error(`${label}: ${problem}.`);
   }
   const html = (await readPublicBody(response, label, 12)).toString('utf8');
-  const language = new RegExp(`<html\\b[^>]*\\slang="${locale}"(?=\\s|>)`, 'i');
-  if (!language.test(html) || !/<main\b[^>]*\sid="main"(?=\s|>)/i.test(html)
-      || !html.includes('</main>') || !html.trimEnd().endsWith('</html>')) {
+  if (!hasRenderedCatalogDocument(html, locale)) {
     throw new Error(`${label}: missing or incomplete localized catalog HTML.`);
   }
+}
+
+export function hasRenderedCatalogDocument(html, locale) {
+  const language = new RegExp(`<html\\b[^>]*\\slang="${locale}"(?=\\s|>)`, 'i');
+  return language.test(html) && /<main\b[^>]*\sid="main"(?=\s|>)/i.test(html)
+    && html.includes('</main>') && html.trimEnd().endsWith('</html>');
 }
 
 function photoUrl(value, origin) {
@@ -245,9 +261,11 @@ async function checkCatalog(args) {
   console.log(`Orderable catalog verified for ${storeId}, version ${expectedVersion}.`);
 }
 
-try {
-  await checkCatalog(process.argv.slice(2));
-} catch (error) {
-  console.error(error.message);
-  process.exitCode = 1;
+if (isMainModule(import.meta)) {
+  try {
+    await checkCatalog(process.argv.slice(2));
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
 }
