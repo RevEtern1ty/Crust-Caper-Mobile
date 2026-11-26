@@ -14,14 +14,17 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
   const [selected, setSelected] = useState(editing?.modifierIds ?? []);
   const photo = menuPhoto(product.sku, fixturePhotos, product.photoUrl);
   const validSelected = product.modifiers.filter(option => selected.includes(option.id));
+  const availableSelectedIds = validSelected.map(option => option.id);
+  const hasUnavailableOptions = selected.some(id => !availableSelectedIds.includes(id));
   const unitPrice = product.price + validSelected.reduce((sum, option) => sum + option.price, 0);
-  const line = { sku: product.sku, modifierIds: validSelected.map(option => option.id), quantity: 1, unitPrice };
+  const line = { sku: product.sku, modifierIds: availableSelectedIds, quantity: 1, unitPrice };
   const key = lineKey(line);
   const editingKey = editing ? lineKey(editing) : null;
   const matchingQuantity = cart.find(item => lineKey(item) === key && key !== editingKey)?.quantity ?? 0;
   const exceedsLimit = matchingQuantity + (editing?.quantity ?? 1) > MAX_QUANTITY;
 
   function updateCart() {
+    if (hasUnavailableOptions) return;
     if (editingKey) editLine(editingKey, line);
     else addLine(line);
     if (router.canGoBack()) router.back();
@@ -32,7 +35,7 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
     <Screen safeBottom bottom={<Button
       label={editing ? copy(locale, `Save item · ${money(unitPrice * editing.quantity)}`, `Bika · ${money(unitPrice * editing.quantity)}`)
         : copy(locale, `Add to cart · ${money(unitPrice)}`, `Shyira mu gitebo · ${money(unitPrice)}`)}
-      disabled={!product.available || exceedsLimit || !hydrated}
+      disabled={!product.available || hasUnavailableOptions || exceedsLimit || !hydrated}
       onPress={updateCart}
     />}>
       <Stack.Screen options={{
@@ -58,6 +61,13 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
             ? copy(locale, 'None listed in the demo recipe.', 'Nta byanditswe mu ifunguro ry’igerageza.')
             : copy(locale, 'Ask the restaurant about allergens.', 'Baza resitora ku bitera ubwivumbure bw’umubiri.')}</Text>
       </Card>
+      {hasUnavailableOptions && <Card>
+        <Text tone="red" accessibilityRole="alert">{copy(locale,
+          'Some selected options are no longer available. Review your selection before saving.',
+          'Bimwe mu byo wahisemo ntibikiboneka. Ongera usuzume ibyo wahisemo mbere yo kubika.')}</Text>
+        <Button label={copy(locale, 'Remove unavailable options', 'Kuramo ibitakiboneka')}
+          variant="secondary" onPress={() => setSelected(availableSelectedIds)} />
+      </Card>}
       {product.modifiers.length > 0 && <View style={styles.options}>
         <Text variant="heading" accessibilityRole="header">{copy(locale, 'Make it yours', 'Hitamo ibyo wongeramo')}</Text>
         {product.modifiers.map(option => {
