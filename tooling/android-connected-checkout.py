@@ -5,6 +5,7 @@ Use `python tooling/android-connected-checkout.py APK EVIDENCE_DIR --adb PATH`.
 The local Release APK uses http://10.0.2.2:<api-port>/api/v1 by default.
 Use --adb-reverse for APKs built with http://127.0.0.1:<api-port>/api/v1.
 Use --upgrade-from OLD_APK for an in-place upgrade during a pending checkout.
+Use --check-payment-return to open the native local return route after force-stop.
 Use --late-receipt-pdf FIXTURE_PDF to attach a synthetic receipt after pickup.
 Start the matching Spring Boot local API on the host loopback with a fresh test database.
 """
@@ -16,6 +17,7 @@ import http.client
 import json
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -283,16 +285,25 @@ class Emulator:
         finally:
             self.disconnect_loopback()
 
-    def launch(self):
+    def _launch_cold(self, *intent):
         self.shell("input", "keyevent", "KEYCODE_WAKEUP")
         self.shell("wm", "dismiss-keyguard")
         self.shell("am", "force-stop", "--user", "0", PACKAGE)
-        response = text(self.shell("am", "start", "-W", "--user", "0", "-a", "android.intent.action.MAIN",
-                                   "-c", "android.intent.category.LAUNCHER", "-n", self.component, timeout=30))
+        response = text(self.shell("am", "start", "-W", "--user", "0", *intent, timeout=30))
         require(re.search(r"^Status:\s+ok$", response, re.MULTILINE), "Cold launch did not complete")
         pid = text(self.shell("pidof", PACKAGE))
         require(pid.isdecimal() and pid not in self.pids, "Cold launch did not start a new app process")
         self.pids.append(pid)
+
+    def launch(self):
+        self._launch_cold("-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", "-n", self.component)
+
+    def launch_payment_return(self, order_id, claimed_status):
+        query = urllib.parse.urlencode({"orderId": str(uuid.UUID(order_id)), "status": claimed_status})
+        uri = "crustcaper-local://payment-return?" + query
+        # adb passes the command through Android's shell, where the query separator needs quoting.
+        self._launch_cold("-a", "android.intent.action.VIEW", "-c", "android.intent.category.BROWSABLE",
+                          "-d", shlex.quote(uri), "-p", PACKAGE)
 
     def tree(self):
         path = self.remote_dir + "/window.xml"
@@ -375,6 +386,13 @@ class Emulator:
 
         self.await_nodes("the same paid, collected order without a pickup code", is_collected)
 
+    def wait_returned_payment(self, reference, expected, forbidden):
+        def verified(nodes):
+            labels = {label for node in nodes for label in names(node)}
+            return {"Orders", reference, expected} <= labels and forbidden not in labels
+
+        self.await_nodes("the returned order with its server-confirmed payment state", verified, scroll="up")
+
 
 def checkout(args, evidence):
     api = LocalApi(args.api)
@@ -432,10 +450,17 @@ def checkout(args, evidence):
             print("Install the exact candidate over the pending checkout", flush=True)
             device.install(args.apk, summary["apkSha256"], replace=True)
         print("Restore the same pending order after a cold launch", flush=True)
-        device.launch()
-        device.tap_label("Orders")
-        device.wait_label(reference)
-        device.wait_label("Checking payment")
+        if args.check_payment_return:
+            print("Open a local return claiming success for an unknown order", flush=True)
+            device.launch_payment_return("00000000-1111-2222-3333-444444444444", "successful")
+            device.wait_returned_payment(reference, "Checking payment", "Paid")
+            require(not api.queue(kitchen), "An unverified return added an order to the kitchen queue")
+            device.capture(evidence / "return-kept-payment-pending.png")
+        else:
+            device.launch()
+            device.tap_label("Orders")
+            device.wait_label(reference)
+            device.wait_label("Checking payment")
         if previous:
             device.capture(evidence / "pending-after-upgrade.png")
         device.tap_label("Open payment", scroll="down")
@@ -450,6 +475,15 @@ def checkout(args, evidence):
         order_id = str(uuid.UUID(order["id"]))
         require("#" + order_id[-8:].upper() == reference and order.get("status") == "accepted"
                 and order.get("paymentStatus") == "paid", "The native order and paid kitchen order do not match")
+        if args.check_payment_return:
+            print("Open a local return claiming failure for the verified paid order", flush=True)
+            device.launch_payment_return(order_id, "failed")
+            device.wait_returned_payment(reference, "Paid", "Payment declined")
+            confirmed = api.queue(kitchen)
+            require(len(confirmed) == 1 and confirmed[0].get("id") == order_id
+                    and confirmed[0].get("status") == "accepted" and confirmed[0].get("paymentStatus") == "paid",
+                    "A return changed the verified paid kitchen order")
+            device.capture(evidence / "return-kept-payment-paid.png")
         api.change(order_id, "preparing", kitchen)
         api.change(order_id, "ready", kitchen)
         device.wait_label("Ready for pickup")
@@ -475,6 +509,10 @@ def checkout(args, evidence):
         device.collected(reference, code)
         checks = ["exact installed APK", "same pending order after force-stop", "synthetic payment",
                   "paid kitchen order", "ready and collected updates without refresh", "collected order after force-stop"]
+        if args.check_payment_return:
+            summary["paymentReturnTransport"] = "Android VIEW intent for the local app scheme"
+            checks.extend(["an unknown successful return reopens the original pending order without an accepted payment",
+                           "a failed return leaves the verified original order paid and unique in the kitchen queue"])
         if args.late_receipt_pdf:
             checks.append("late receipt appeared after pickup without a manual refresh")
         if previous:
@@ -528,6 +566,8 @@ def main():
                         help="Use a local APK built for 127.0.0.1 and map the API port on the dedicated emulator")
     parser.add_argument("--check-session-end", action="store_true",
                         help="End the guest session on builds with the order-access settings screen")
+    parser.add_argument("--check-payment-return", action="store_true",
+                        help="Cold-launch the local app from payment return intents with conflicting result claims")
     parser.add_argument("--late-receipt-pdf", type=Path, metavar="FIXTURE_PDF",
                         help="Attach a synthetic receipt after pickup while the customer view stays open")
     args = parser.parse_args()
