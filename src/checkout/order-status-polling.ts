@@ -46,7 +46,7 @@ export function nextOrderStatusDelay(
     if (mode === 'demo') return attempts < 9 ? 3000 : null;
     const paymentDelay = uncertainForMs === null ? 0 : paymentCheckDelay(uncertainForMs);
     if (code === 'rate_limited') return Math.max(15_000, paymentDelay);
-    if (code === 'network_unavailable' || code === 'service_unavailable') {
+    if (code === 'network_unavailable' || code === 'service_unavailable' || code === 'invalid_response') {
       return Math.max(5000 * Math.min(consecutiveFailures, 3), paymentDelay);
     }
     return null;

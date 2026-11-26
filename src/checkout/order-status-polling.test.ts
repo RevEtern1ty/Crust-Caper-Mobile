@@ -15,10 +15,11 @@ test('connected orders keep checking once ready and stop once picked up', () => 
 });
 
 test('connected status checks recover from repeated temporary failures without busy retrying', () => {
-  const delay = (failureCount: number) =>
-    nextOrderStatusDelay('connected', { error: new ApiError('network_unavailable') }, 20, failureCount);
-
-  assert.deepEqual([delay(1), delay(2), delay(3), delay(20)], [5000, 10_000, 15_000, 15_000]);
+  for (const code of ['network_unavailable', 'invalid_response'] as const) {
+    const retryDelays = [1, 2, 3, 20].map(failures =>
+      nextOrderStatusDelay('connected', { error: new ApiError(code) }, 20, failures));
+    assert.deepEqual(retryDelays, [5000, 10_000, 15_000, 15_000], code);
+  }
   assert.equal(nextOrderStatusDelay('connected', { error: new ApiError('rate_limited') }, 1, 1), 15_000);
   assert.equal(nextOrderStatusDelay('connected', { error: new ApiError('not_found') }, 1, 1), null);
   assert.equal(nextOrderStatusDelay('connected', { error: new ApiError('unauthenticated') }, 1, 1), null);

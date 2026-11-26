@@ -1367,8 +1367,6 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   const lastReady = page.waitForResponse(response => response.url() === statusUrl && response.ok());
   await button(page, 'Refresh order status').click();
   assert.equal((await (await lastReady).json()).status, 'ready');
-  // Give a loop scheduled from the preparing state time to observe Ready and retire.
-  await delay(6000);
   assert.equal(await page.evaluate(() => document.visibilityState), 'visible');
   await shown(page, 'Ready for pickup');
   let failedStatusPolls = 0;
@@ -1376,11 +1374,24 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
     failedStatusPolls++;
     return route.abort('connectionfailed');
   }, { times: 1 });
+  await shown(page, 'Unable to connect. Check your connection and try again.');
+  let malformedStatusPolls = 0;
+  await page.route(statusUrl, async route => {
+    const response = await route.fetch();
+    assert.equal(response.status(), 200);
+    assert.equal((await response.json()).status, 'ready');
+    malformedStatusPolls++;
+    await route.fulfill({ response, json: { status: 'ready' } });
+  }, { times: 1 });
+  await page.getByText('We couldn’t verify the latest order status. Check again in Orders.', { exact: true })
+    .first().waitFor({ timeout: 12_000 });
+  await shown(page, 'Pickup code');
   assert.equal((await advance(pickup, 'collected', pickupCode)).status, 200);
   const collectedAt = Date.now();
   await page.getByText('Picked up', { exact: true }).first().waitFor({ timeout: 14_000 });
   t.diagnostic(`Open order showed the collected status ${Date.now() - collectedAt} ms after API confirmation`);
-  assert.equal(failedStatusPolls, 1, 'Foreground status should recover from a failed request without a reload');
+  assert.equal(failedStatusPolls, 1, 'Foreground status must recover from a failed connection');
+  assert.equal(malformedStatusPolls, 1, 'Foreground status must recover from an invalid successful response');
   assert.equal(await page.getByText('Pickup code', { exact: true }).count(), 0);
   await capture(page, 'connected-order-collected');
 
