@@ -18,7 +18,7 @@ function fixturePostgres(project) {
   return container;
 }
 
-function provisionKitchen(project) {
+function provisionKitchenCredentials(project) {
   const encodedKey = process.env.CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY ?? '';
   const key = Buffer.from(encodedKey, 'base64');
   assert.ok(key.length === 32 && key.toString('base64') === encodedKey, 'Missing isolated fixture MFA key');
@@ -62,7 +62,7 @@ function provisionKitchen(project) {
 }
 
 async function openKitchenSession({ request, project }) {
-  const signedIn = await request('/api/v1/operator/sessions', { method: 'POST', body: provisionKitchen(project) });
+  const signedIn = await request('/api/v1/operator/sessions', { method: 'POST', body: provisionKitchenCredentials(project) });
   assert.equal(signedIn.status, 201, 'Could not authenticate the synthetic kitchen');
   assert.ok(signedIn.data?.storeId === 'kigali' && signedIn.data.role === 'kitchen'
     && typeof signedIn.data.accessToken === 'string', 'Unexpected kitchen session metadata');
@@ -132,4 +132,4 @@ async function openKitchenMonitor(options) {
   };
 }
 
-module.exports = { openKitchenSession, openKitchenMonitor };
+module.exports = { openKitchenSession, openKitchenMonitor, provisionKitchenCredentials };

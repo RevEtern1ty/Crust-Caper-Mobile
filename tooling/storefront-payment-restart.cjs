@@ -5,7 +5,7 @@ const { performance } = require('node:perf_hooks');
 const { setTimeout: delay } = require('node:timers/promises');
 const { promisify } = require('node:util');
 const { openStorefrontFixture } = require('./storefront-load.cjs');
-const { openKitchenSession } = require('./storefront-load-kitchen.cjs');
+const { openKitchenSession, provisionKitchenCredentials } = require('./storefront-load-kitchen.cjs');
 const { beginCheckout } = require('./storefront-load-journey.cjs');
 
 const execute = promisify(execFile);
@@ -24,7 +24,7 @@ function ensure(condition, code) {
 
 function failureCode(error) {
   if (error instanceof RestartFailure) return error.message;
-  if (typeof error?.code === 'string' && /^checkout_[a-z_]{2,32}$/.test(error.code)) return error.code;
+  if (typeof error?.code === 'string' && /^(?:checkout|kitchen_ui)_[a-z_]{2,48}$/.test(error.code)) return error.code;
   return 'fixture_operation_failed';
 }
 
@@ -148,7 +148,7 @@ async function restartContainers(signal, project, fixture) {
   return { api, edge, postgres, provider };
 }
 
-async function exercise({ signal, project, request, kitchen, containers, report }) {
+async function exercise({ signal, project, request, kitchen, board, containers, report }) {
   const { api, ...services } = containers;
   const { edge, postgres } = services;
   report.phase = 'checkout';
@@ -193,6 +193,10 @@ async function exercise({ signal, project, request, kitchen, containers, report 
   ensureProcessing(whileDown);
   ensure(whileDown.lastChecked === claim.lastChecked, 'fixture_claim_not_preserved');
   await ensureUnchanged(signal, project, services);
+  if (board) {
+    report.phase = 'kitchen_browser_outage';
+    report.browser = { outage: await board.observeOutage() };
+  }
 
   await docker(signal, 'start', api.id);
   const restarted = await serviceContainer(signal, project, 'api', api.id);
@@ -232,19 +236,26 @@ async function exercise({ signal, project, request, kitchen, containers, report 
   ensure(queue.length === 1 && queue[0].id === order.orderId && queue[0].paymentStatus === 'paid'
     && queue[0].status === 'accepted' && Number.isFinite(Date.parse(queue[0].acceptedAt)), 'fixture_kitchen_order_mismatch');
   report.kitchen = { paidOrderCount: queue.length, visibleMsAfterVerifiedRead: Math.round(performance.now() - verifiedReadAt) };
+  if (board) {
+    report.phase = 'kitchen_browser_recovery';
+    report.browser.recovery = await board.observeRecovery({ orderId: order.orderId });
+  }
   report.phase = 'complete';
 }
 
 async function main() {
   const startedAt = performance.now();
+  const browserCheck = process.env.CRUSTCAPER_HTTPS_TEST_KITCHEN_RESTART === '1';
+  const directory = process.env.CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR;
   const report = { recordedAt: new Date().toISOString(), phase: 'preflight', passed: false, errors: [] };
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 145000).unref();
+  const timeout = setTimeout(() => controller.abort(), browserCheck ? 175000 : 145000).unref();
   const interrupt = () => controller.abort();
   for (const event of ['SIGINT', 'SIGTERM']) process.on(event, interrupt);
   const { signal } = controller;
   let fixture;
   let kitchen;
+  let board;
   try {
     ensure(process.argv.length === 2 && process.env.CRUSTCAPER_HTTPS_TEST_PAYMENT_RESTART === '1', 'fixture_restart_mode_required');
     const project = process.env.CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT;
@@ -253,10 +264,21 @@ async function main() {
     const containers = await restartContainers(signal, project, fixture);
     const request = restrictRequest(fixture.request);
     kitchen = await openKitchenSession({ request, project });
-    await exercise({ signal, project, request, kitchen, containers, report });
+    if (browserCheck) {
+      report.phase = 'kitchen_browser_sign_in';
+      const { openKitchenBoard } = require('./storefront-restart-kitchen.cjs');
+      board = await openKitchenBoard({ caFile, evidence: directory, signal,
+        credentials: () => provisionKitchenCredentials(project) });
+    }
+    await exercise({ signal, project, request, kitchen, board, containers, report });
   } catch (error) {
     report.errors.push(signal.aborted ? 'fixture_interrupted' : failureCode(error));
   } finally {
+    try {
+      await board?.close();
+    } catch {
+      report.errors.push('fixture_kitchen_board_close_failed');
+    }
     try {
       await kitchen?.close();
     } catch {
@@ -270,7 +292,6 @@ async function main() {
   report.elapsedMs = Math.round(performance.now() - startedAt);
   report.passed = report.errors.length === 0;
   const json = JSON.stringify(report, null, 2) + '\n';
-  const directory = process.env.CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR;
   if (directory) {
     await mkdir(directory, { recursive: true });
     await writeFile(join(directory, 'storefront-payment-restart.json'), json);

@@ -139,11 +139,11 @@ jobs:
             docker image inspect --format 'catalog={{.Id}}' "$CRUSTCAPER_FIXTURE_CATALOG_IMAGE"
           } >"$CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR/candidate.txt"
           npm run test:storefront:catalog-photos
-      - name: Verify scheduled payment reconciliation after a forced API stop
+      - name: Verify scheduled payment reconciliation and the open kitchen board after a forced API stop
         timeout-minutes: 5
         env:
           CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: ${{ runner.temp }}/crustcaper-https-evidence/payment-restart
-        run: npm run test:storefront:payment-restart
+        run: npm run test:storefront:kitchen-restart
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

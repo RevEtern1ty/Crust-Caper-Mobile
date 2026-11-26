@@ -209,9 +209,10 @@ async function main() {
   const load = mode === '--load' || mode === '--load-smoke';
   const webPerf = mode === '--web-perf';
   const catalogPhotos = mode === '--catalog-photos';
-  const paymentRestart = mode === '--payment-restart';
+  const kitchenRestart = mode === '--kitchen-restart';
+  const paymentRestart = mode === '--payment-restart' || kitchenRestart;
   if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart)) {
-    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart]');
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart]');
   }
   const script = paymentRestart ? 'tooling/storefront-payment-restart.cjs' : load ? 'tooling/storefront-load.cjs' : null;
   const scenarios = script
@@ -284,8 +285,9 @@ async function main() {
         ...(webPerf && { CRUSTCAPER_HTTPS_TEST_WEB_PERF: '1' }),
         ...(catalogPhotos && { CRUSTCAPER_HTTPS_TEST_CATALOG_PHOTOS: '1' }),
         ...(paymentRestart && { CRUSTCAPER_HTTPS_TEST_PAYMENT_RESTART: '1' }),
+        ...(kitchenRestart && { CRUSTCAPER_HTTPS_TEST_KITCHEN_RESTART: '1' }),
       },
-      timeout: { '--load': 300000, '--payment-restart': 160000 }[mode] ?? 180000,
+      timeout: { '--load': 300000, '--payment-restart': 160000, '--kitchen-restart': 190000 }[mode] ?? 180000,
     });
   } finally {
     if (stop) await stop();

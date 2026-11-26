@@ -12,6 +12,7 @@ const consoleUrl = origin + '/operator/index.html';
 const consoleApi = origin + '/api/v1/operator';
 const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const uiTimeoutMs = 9000;
+const kitchenVisibilityTargetMs = 10000;
 const subsequentPolls = 2;
 
 class KitchenFailure extends Error {
@@ -234,9 +235,11 @@ async function openKitchenBoard({ caFile, evidence, credentials, signal }) {
               && orders[0].status === 'accepted' && Number.isFinite(orders[0].acceptedAt) && serverTime >= orders[0].acceptedAt),
           'kitchen_ui_paid_order_mismatch');
           const firstRead = queue.paidReads[0];
+          const acceptedToBrowserPollMs = firstRead.serverTime - firstRead.orders[0].acceptedAt;
+          ensure(acceptedToBrowserPollMs <= kitchenVisibilityTargetMs, 'kitchen_ui_visibility_target_missed');
           await capture('stable');
           return {
-            acceptedToBrowserPollMs: firstRead.serverTime - firstRead.orders[0].acceptedAt,
+            acceptedToBrowserPollMs,
             browserPollToDomMs: first.browserPollToDomMs, domObservationWaitMs, paidOrderCount: after.cards.length,
             audioObservation: 'native_oscillator_starts',
             authenticatedPaidPolls: queue.paidReads.length, audioAlerts: after.audioAlerts, visualAlerts: after.visualAlerts,
