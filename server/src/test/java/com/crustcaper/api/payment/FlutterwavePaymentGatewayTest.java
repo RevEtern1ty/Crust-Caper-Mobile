@@ -22,18 +22,26 @@ import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.HttpURLConnection;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
@@ -396,6 +404,66 @@ class FlutterwavePaymentGatewayTest {
         });
         PaymentGateway shortRead = gatewayWithReadTimeout(100);
         assertThat(assertThrows(PaymentGatewayException.class, () -> shortRead.verify("12345")).kind()).isEqualTo(UNAVAILABLE);
+    }
+
+    private enum SlowResponsePart { HEADERS, BODY }
+
+    @ParameterizedTest
+    @EnumSource(SlowResponsePart.class)
+    void capsTotalTimeAndClosesTheSocketEvenWithRegularResponseProgress(SlowResponsePart part) throws Exception {
+        try (var listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
+             var provider = Executors.newSingleThreadExecutor()) {
+            listener.setSoTimeout(3_000);
+            var disconnectedBeforeCompletion = provider.submit(() -> sendSlowVerification(listener, part));
+            var adapter = new FlutterwavePaymentGateway(URI.create("http://127.0.0.1:" + listener.getLocalPort()),
+                    URI.create(RETURN), KEY, mapper, Clock.fixed(NOW, ZoneOffset.UTC), 400, 400);
+
+            PaymentGatewayException error = assertThrows(PaymentGatewayException.class, () -> adapter.verify("12345"));
+            assertThat(error.kind()).isEqualTo(UNAVAILABLE);
+            assertThat(error.getCause()).isNull();
+            assertThat(disconnectedBeforeCompletion.get(3, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    private static boolean sendSlowVerification(ServerSocket listener, SlowResponsePart part)
+            throws IOException, InterruptedException {
+        try (Socket peer = listener.accept()) {
+            peer.setSoTimeout(2_000);
+            var request = new BufferedReader(new InputStreamReader(peer.getInputStream(), StandardCharsets.US_ASCII));
+            assertThat(request.readLine()).isEqualTo("GET /v3/transactions/12345/verify HTTP/1.1");
+            while (!request.readLine().isEmpty()) {
+                // Consume all request headers before sending the synthetic verification.
+            }
+            byte[] response = verifiedResponse("12345", "attempt-1", "9200", "RWF", "successful")
+                    .getBytes(StandardCharsets.UTF_8);
+            var output = peer.getOutputStream();
+            output.write(("HTTP/1.1 200 OK\r\nContent-Length: " + response.length + "\r\nConnection: close\r\n")
+                    .getBytes(StandardCharsets.US_ASCII));
+            if (part == SlowResponsePart.BODY) output.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+            output.flush();
+            int chunks = 12;
+            try {
+                for (int index = 0; index < chunks; index++) {
+                    Thread.sleep(125);
+                    if (part == SlowResponsePart.HEADERS) {
+                        output.write(("X-Fixture-" + index + ": value\r\n").getBytes(StandardCharsets.US_ASCII));
+                    } else {
+                        int start = index * response.length / chunks;
+                        int end = (index + 1) * response.length / chunks;
+                        output.write(response, start, end - start);
+                    }
+                    output.flush();
+                }
+                if (part == SlowResponsePart.HEADERS) {
+                    output.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+                    output.write(response);
+                    output.flush();
+                }
+                return false;
+            } catch (SocketException clientClosed) {
+                return true;
+            }
+        }
     }
 
     @Test

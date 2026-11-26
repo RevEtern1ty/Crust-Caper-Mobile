@@ -4,6 +4,8 @@ import static com.crustcaper.api.payment.PaymentGatewayException.Kind.INVALID_RE
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.INVALID_RESPONSE;
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.NOT_DISPATCHED;
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.UNAVAILABLE;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.DeserializationFeature;
@@ -28,6 +30,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
 final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory {
@@ -37,6 +43,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
     private static final String PAYMENT_RETURN_PATH = "/payment-return";
     static final String WEB_PAYMENT_RETURN_PATH = "/web-payment-return";
     private static final int MAX_RESPONSE_BYTES = 128 * 1024;
+    private static final int MAX_IN_FLIGHT_REQUESTS = 32;
     private static final Pattern REFERENCE = Pattern.compile("[A-Za-z0-9_-]{1,128}");
     private static final Pattern TRANSACTION_ID = Pattern.compile("[1-9][0-9]{0,18}");
     private static final Pattern CURRENCY = Pattern.compile("[A-Z]{3}");
@@ -55,7 +62,9 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
     private final Clock clock;
     private final int connectTimeoutMs;
     private final int readTimeoutMs;
+    private final long totalTimeoutNanos;
     private final ConnectionFactory connections;
+    private final Semaphore inFlight = new Semaphore(MAX_IN_FLIGHT_REQUESTS);
 
     @FunctionalInterface
     interface ConnectionFactory {
@@ -94,6 +103,9 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
         if (secretKey == null || !secretKey.matches("[!-~]{1,512}")) {
             throw new IllegalStateException("FLUTTERWAVE_SECRET_KEY is missing or invalid");
         }
+        if (connectTimeoutMs <= 0 || readTimeoutMs <= 0) {
+            throw new IllegalStateException("Flutterwave connection and read timeouts must be positive");
+        }
         this.apiOrigin = apiOrigin;
         this.returnUrl = returnUrl;
         this.webReturnUrl = webReturnUrl;
@@ -106,6 +118,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
         this.clock = clock;
         this.connectTimeoutMs = connectTimeoutMs;
         this.readTimeoutMs = readTimeoutMs;
+        this.totalTimeoutNanos = MILLISECONDS.toNanos((long) connectTimeoutMs + readTimeoutMs);
         this.connections = connections;
     }
 
@@ -257,8 +270,52 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
     }
 
     private Response request(String path, ObjectNode payload) {
+        long deadline = System.nanoTime() + totalTimeoutNanos;
+        requireRequestBudget(deadline);
+        if (!inFlight.tryAcquire()) throw new PaymentGatewayException(payload == null ? UNAVAILABLE : NOT_DISPATCHED);
+        var task = new FutureTask<>(() -> exchange(path, payload, deadline));
+        try {
+            // Interrupting Java 21 virtual-thread socket I/O closes the socket without waiting for URLConnection's lock.
+            Thread.ofVirtual().name("crustcaper-flutterwave-request").inheritInheritableThreadLocals(false).start(() -> {
+                try {
+                    task.run();
+                } finally {
+                    // A resolver may take longer to return. Keep its slot until the worker really exits.
+                    inFlight.release();
+                }
+            });
+        } catch (RuntimeException | Error failure) {
+            inFlight.release();
+            throw failure;
+        }
+        try {
+            Response response = task.get(deadline - System.nanoTime(), NANOSECONDS);
+            requireRequestBudget(deadline);
+            return response;
+        } catch (TimeoutException failure) {
+            task.cancel(true);
+            throw new PaymentGatewayException(UNAVAILABLE);
+        } catch (InterruptedException failure) {
+            task.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new PaymentGatewayException(UNAVAILABLE);
+        } catch (ExecutionException failure) {
+            if (failure.getCause() instanceof RuntimeException runtime) throw runtime;
+            if (failure.getCause() instanceof Error fatal) throw fatal;
+            throw new PaymentGatewayException(UNAVAILABLE);
+        }
+    }
+
+    private static void requireRequestBudget(long deadline) {
+        if (Thread.currentThread().isInterrupted() || deadline - System.nanoTime() <= 0) {
+            throw new PaymentGatewayException(UNAVAILABLE);
+        }
+    }
+
+    private Response exchange(String path, ObjectNode payload, long deadline) {
         HttpURLConnection connection = null;
         try {
+            requireRequestBudget(deadline);
             connection = connections.open(apiOrigin.resolve(path));
             connection.setInstanceFollowRedirects(false);
             connection.setConnectTimeout(connectTimeoutMs);
@@ -272,17 +329,21 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
                 connection.setRequestProperty("Content-Type", "application/json");
                 // Stream the request once. A broken connection can conceal a successfully opened payment.
                 connection.setFixedLengthStreamingMode(requestBody.length);
+                requireRequestBudget(deadline);
                 // Only this phase can fail before the request's output stream has been requested.
                 try {
                     connection.connect();
                 } catch (ConnectException | NoRouteToHostException | UnknownHostException | SocketTimeoutException ignored) {
                     throw new PaymentGatewayException(NOT_DISPATCHED);
                 }
+                requireRequestBudget(deadline);
                 try (OutputStream output = connection.getOutputStream()) {
+                    requireRequestBudget(deadline);
                     output.write(requestBody);
                 }
             }
 
+            requireRequestBudget(deadline);
             int status = connection.getResponseCode();
             if (status != 200 && status != 400) {
                 return new Response(status, new byte[0]);
