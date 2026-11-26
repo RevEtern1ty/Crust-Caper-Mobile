@@ -6,11 +6,12 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: Native builds or pilot platform checks
+        description: Native builds, pilot checks or the iOS minimum runtime
         type: choice
         options:
           - native
           - pilot
+          - ios-minimum
         default: native
       android_apk_run:
         description: Successful Mobile CI run ID with a demo APK for pilot checks
@@ -97,7 +98,7 @@ jobs:
 
   android-demo:
     name: Compile Android ${{ matrix.artifact }} APK
-    if: inputs.suite != 'pilot' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    if: inputs.suite != 'pilot' && inputs.suite != 'ios-minimum' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     strategy:
@@ -298,10 +299,10 @@ jobs:
           retention-days: 14
 
   ios-simulator:
-    name: ${{ inputs.suite == 'pilot' && 'Build iOS Release and load menu from the local API' || 'Build and launch iOS demo on simulator' }}
+    name: ${{ inputs.suite == 'ios-minimum' && 'Verify connected Release on iOS 16.0' || inputs.suite == 'pilot' && 'Build iOS Release and load menu from the local API' || 'Build and launch iOS demo on simulator' }}
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: ${{ inputs.suite == 'ios-minimum' && 60 || 45 }}
     env:
       EXPO_NO_TELEMETRY: 1
       COCOAPODS_DISABLE_STATS: 'true'
@@ -313,16 +314,26 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
+      - name: Prepare the exact iOS 16.0 runtime
+        if: inputs.suite == 'ios-minimum'
+        id: minimum_runtime
+        timeout-minutes: 15
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+        run: |
+          printf 'DEVELOPER_DIR=%s\n' "$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          bash tooling/prepare-ios-minimum-ci.sh "$RUNNER_TEMP/crustcaper-ios-smoke"
       - run: npm ci
       - name: Verify iOS sharing completion in Swift
         run: node --import tsx --test src/checkout/receipt-sharing-ios.test.ts
       - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
-        if: inputs.suite == 'pilot'
+        if: inputs.suite == 'pilot' || inputs.suite == 'ios-minimum'
         with:
           distribution: temurin
           java-version: '21'
       - name: Install PostgreSQL 17 for the connected iOS fixture
-        if: inputs.suite == 'pilot'
+        if: inputs.suite == 'pilot' || inputs.suite == 'ios-minimum'
         timeout-minutes: 6
         run: |
           if ! brew list --versions postgresql@17 >/dev/null; then
@@ -330,7 +341,7 @@ jobs:
           fi
           test -x "$(brew --prefix postgresql@17)/bin/initdb"
       - name: Build unsigned Release and verify simulator launch
-        if: inputs.suite != 'pilot'
+        if: inputs.suite != 'pilot' && inputs.suite != 'ios-minimum'
         id: simulator_smoke
         shell: bash
         run: |
@@ -338,15 +349,34 @@ jobs:
           mkdir -p "$evidence_dir"
           bash tooling/ios-simulator-smoke.sh "$evidence_dir" 2>&1 | tee "$evidence_dir/smoke.log"
       - name: Verify the native app can load the real Spring Boot menu
-        if: inputs.suite == 'pilot'
+        if: inputs.suite == 'pilot' || inputs.suite == 'ios-minimum'
         id: connected_smoke
+        timeout-minutes: ${{ inputs.suite == 'ios-minimum' && 36 || 45 }}
         shell: bash
+        env:
+          CRUSTCAPER_IOS_SIMULATOR_UDID: ${{ steps.minimum_runtime.outputs.simulator }}
+          CRUSTCAPER_VERIFY_IOS_MINIMUM: ${{ inputs.suite == 'ios-minimum' }}
         run: |
           evidence_dir="$RUNNER_TEMP/crustcaper-ios-smoke"
           mkdir -p "$evidence_dir"
+          if [[ "$CRUSTCAPER_VERIFY_IOS_MINIMUM" == true ]]; then
+            test -n "$CRUSTCAPER_IOS_SIMULATOR_UDID"
+          fi
           bash tooling/ios-connected-ci.sh "$evidence_dir" 2>&1 | tee "$evidence_dir/connected-smoke.log"
+          if [[ "$CRUSTCAPER_VERIFY_IOS_MINIMUM" == true ]]; then
+            grep -Fxq 'Simulator: iPhone 14 on iOS 16-0' "$evidence_dir/simulator/evidence.txt"
+            grep -Fxq "Simulator UUID: $CRUSTCAPER_IOS_SIMULATOR_UDID" "$evidence_dir/simulator/evidence.txt"
+          fi
+      - name: Remove the iOS 16.0 simulator created by this job
+        if: ${{ always() && steps.minimum_runtime.outputs.simulator != '' }}
+        timeout-minutes: 2
+        env:
+          SIMULATOR_UDID: ${{ steps.minimum_runtime.outputs.simulator }}
+        run: |
+          xcrun simctl shutdown "$SIMULATOR_UDID" || true
+          xcrun simctl delete "$SIMULATOR_UDID"
       - name: Retain simulator evidence
-        if: ${{ !cancelled() && (steps.simulator_smoke.outcome != 'skipped' || steps.connected_smoke.outcome != 'skipped') }}
+        if: ${{ !cancelled() && (steps.minimum_runtime.outcome == 'success' || steps.minimum_runtime.outcome == 'failure' || steps.simulator_smoke.outcome != 'skipped' || steps.connected_smoke.outcome != 'skipped') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mobile-ios-simulator-smoke-${{ github.sha }}
