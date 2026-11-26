@@ -141,7 +141,11 @@ test('an earlier order retains its sold names after the public menu is renamed',
     const displayed = [page.getByText('1 × ' + product.name[locale], { exact: true }),
       page.getByText(cheese.name[locale], { exact: true })];
     for (const text of displayed) await text.evaluate(element => {
-      element.style.fontSize = Number.parseFloat(getComputedStyle(element).fontSize) * 2 + 'px';
+      const computed = getComputedStyle(element);
+      const fontSize = Number.parseFloat(computed.fontSize);
+      const lineHeight = Number.parseFloat(computed.lineHeight);
+      element.style.fontSize = fontSize * 2 + 'px';
+      if (Number.isFinite(lineHeight)) element.style.lineHeight = lineHeight * 2 + 'px';
     });
     for (const width of [320, 390, 430]) {
       await page.setViewportSize({ width, height: 844 });
@@ -149,8 +153,7 @@ test('an earlier order retains its sold names after the public menu is renamed',
         assert.ok(await text.evaluate(element => element.scrollWidth <= element.clientWidth + 1),
           `Sold item text wraps at ${width}px in ${locale}`);
       }
-      await displayed[0].scrollIntoViewIfNeeded();
-      await capture(page, `sold-item-${locale}-${width}`);
+      await capture(displayed[0].locator('../..'), `sold-item-${locale}-${width}`);
     }
   }
 
@@ -187,8 +190,7 @@ test('an earlier order retains its sold names after the public menu is renamed',
   for (const width of [320, 390, 430]) {
     await staff.setViewportSize({ width, height: 844 });
     assert.ok(await card.locator('.order-lines').evaluate(element => element.scrollWidth <= element.clientWidth + 1));
-    await card.locator('.order-lines').scrollIntoViewIfNeeded();
-    await capture(staff, `sold-item-kitchen-${width}`);
+    await capture(card.locator('.order-lines'), `sold-item-kitchen-${width}`);
   }
 });
 
@@ -243,7 +245,11 @@ test('checkout shows the server-confirmed item names when the buyer menu is stal
     'The buyer must confirm the name in the quote, even when prices match a stale menu');
   await shown(summary, cheese.name.en);
   assert.equal(await summary.getByText(staleOption, { exact: true }).count(), 0);
+  if (product.allergens.length) {
+    await shown(summary, 'Base recipe allergens · ' + product.allergens.map(allergen => allergen.en).join(', '));
+  }
   await button(page, /^Confirm .*RWF/).waitFor();
+  await capture(summary, 'authoritative-quote-review');
 });
 
 test('delivery intake and handoff recover lost replies alongside a paid direct order', { timeout: 35_000 }, async t => {
