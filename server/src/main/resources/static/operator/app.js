@@ -1,5 +1,6 @@
 import { mountAvailability } from './availability.js';
 import { mountExternalOrders, readExternalOrder } from './external-orders.js';
+import { mountOperationsSignals } from './operations-signals.js';
 import { createOrderSound } from './order-sound.js';
 import { mountReconciliation } from './reconciliation.js';
 
@@ -124,6 +125,9 @@ let authVersion = 0;
 let cancellation = null;
 const availability = mountAvailability({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
 const reconciliation = mountReconciliation({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
+const operationsSignals = mountOperationsSignals({
+  currentSession: availableSession, request, messageFor, showMessage, closeSession, canRefresh: queueVisible,
+});
 const delivery = mountExternalOrders({
   currentSession: availableSession, request, showMessage, messageFor, closeSession, queueFresh, syncQueue: syncKitchenSignal,
   isCurrent: (order) => externalOrders.some((item) => item.id === order.id && item.status === order.status),
@@ -144,7 +148,7 @@ class ApiError extends Error {
   }
 }
 
-async function request(path, { method = 'GET', token, body, receipt, csv = false, timeoutMs = 12_000 } = {}) {
+async function request(path, { method = 'GET', token, body, receipt, csv = false, timeoutMs = 12_000, signal } = {}) {
   const headers = { Accept: csv ? 'text/csv, application/problem+json' : 'application/json, application/problem+json' };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -155,6 +159,9 @@ async function request(path, { method = 'GET', token, body, receipt, csv = false
   }
 
   const abort = new AbortController();
+  const cancel = () => abort.abort();
+  if (signal?.aborted) cancel();
+  else signal?.addEventListener('abort', cancel, { once: true });
   const deadline = setTimeout(() => abort.abort(), timeoutMs);
   try {
     const response = await fetch(`/api/v1/operator${path}`, {
@@ -176,6 +183,7 @@ async function request(path, { method = 'GET', token, body, receipt, csv = false
     return data;
   } finally {
     clearTimeout(deadline);
+    signal?.removeEventListener('abort', cancel);
   }
 }
 
@@ -293,6 +301,7 @@ function recheckQueue() {
   if (!session) return;
   invalidateQueue();
   if (queueVisible()) void refreshQueue(true);
+  operationsSignals.recheck();
 }
 
 function pickupWindow(start, end) {
@@ -872,6 +881,7 @@ function closeSession(message = '') {
   showMessage(fiscalReceiptsEmpty);
   availability.reset();
   reconciliation.reset();
+  operationsSignals.reset();
   delivery.reset();
   workstation.hidden = true;
   signIn.hidden = false;
@@ -1368,6 +1378,7 @@ loginForm.addEventListener('submit', async (event) => {
     syncKitchenSignal();
     void refreshQueue();
     if (data.role === 'manager') {
+      operationsSignals.show();
       reconciliation.show();
       void refreshPendingPayments();
       void refreshPaymentReview();

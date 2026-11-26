@@ -1638,6 +1638,167 @@ test('manager can reconcile a Kigali date and download its CSV without leaking s
   assert.deepEqual(exports, [day, day, fastDate]);
 });
 
+test('manager operations signals keep failures unknown and discard the previous session', { timeout: 25_000 }, async t => {
+  let origin;
+  if (process.env.CRUSTCAPER_API_BASE_URL) {
+    assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+    origin = new URL(api).origin;
+  } else {
+    const server = createPreviewServer(resolve(dirname(module.filename), '../server/src/main/resources/static'));
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    origin = 'http://127.0.0.1:' + server.address().port;
+  }
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.setDefaultTimeout(6500);
+  await page.clock.install();
+  const prefix = origin + '/api/v1/operator';
+  const signalsUrl = prefix + '/operations/signals';
+  const observedAt = '2031-01-01T12:00:00Z';
+  const data = (payments, receipts) => ({ observedAt, paymentWithoutKitchen: payments, fiscalReceiptsOverdue: receipts,
+    fiscalReceiptOverdueAfterMinutes: 30 });
+  const reads = [];
+  const delayed = Promise.withResolvers();
+  const delayedFinished = Promise.withResolvers();
+  let next = { status: 200, json: data(2, 4) };
+  let holding = false;
+  await page.route(prefix + '/**', async route => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith('/sessions/current')) return route.fulfill({ status: 204 });
+    if (path.endsWith('/sessions')) {
+      const { username } = request.postDataJSON();
+      return route.fulfill({ status: 201, json: {
+        accessToken: username, role: username.startsWith('manager') ? 'manager' : username, storeId: 'kigali',
+        expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      } });
+    }
+    if (request.url() === signalsUrl) {
+      reads.push(request.headers().authorization);
+      if (holding) {
+        await delayed.promise;
+        await route.fulfill({ status: 401, json: { code: 'unauthenticated' } }).catch(() => {});
+        delayedFinished.resolve();
+        return;
+      }
+      return route.fulfill(next);
+    }
+    if (path.endsWith('/orders')) return route.fulfill({ json: { orders: [], serverTime: observedAt } });
+    if (path.endsWith('/payment-exceptions')) return route.fulfill({ json: { exceptions: [], nextCursor: null } });
+    if (path.endsWith('/payment-attempts/pending')) return route.fulfill({ json: { attempts: [], hasMore: false } });
+    if (path.endsWith('/external-order-channels')) return route.fulfill({ json: { channels: [] } });
+    if (path.endsWith('/receipts')) return route.fulfill({ json: [] });
+    return route.abort();
+  });
+
+  const panel = page.getByRole('region', { name: 'Operations signals' });
+  const jump = button(page, 'Operations signals');
+  const refresh = button(panel, 'Refresh signals');
+  const payments = page.locator('#operations-signals-payment');
+  const receipts = page.locator('#operations-signals-receipt');
+  const checked = page.locator('#operations-signals-checked');
+  const threshold = page.locator('#operations-signals-receipt-threshold');
+  const signOut = async () => {
+    await button(page, 'Sign out').click();
+    await shown(page, 'Staff sign in');
+  };
+  const signIn = async (username, heading) => {
+    await page.getByLabel('Username', { exact: true }).fill(username);
+    await page.getByLabel('Password', { exact: true }).fill('fixture-only');
+    await button(page, 'Sign in').click();
+    await page.getByRole('heading', { name: heading, exact: true }).waitFor();
+  };
+
+  try {
+    await page.goto(origin + '/operator/index.html');
+    await signIn('kitchen', 'Kitchen queue');
+    assert.equal(await panel.isVisible(), false);
+    assert.equal(await jump.isVisible(), false);
+    assert.deepEqual(reads, []);
+    await signOut();
+
+    await signIn('manager-first', 'Order queue');
+    await shown(payments, '2');
+    assert.equal(await receipts.textContent(), '4');
+    assert.equal(await panel.getByText('Confirmed more than 60 seconds ago').count(), 1);
+    await shown(threshold, 'Due 30 minutes after pickup');
+    assert.equal(await checked.locator('time').getAttribute('datetime'), observedAt);
+    await jump.click();
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'operations-signals-title');
+    for (const width of [320, 390, 430]) {
+      await page.setViewportSize({ width, height: 844 });
+      for (const scale of [100, 200]) {
+        await page.evaluate(value => { document.documentElement.style.fontSize = value + '%'; }, scale);
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+        await panel.getByRole('heading').scrollIntoViewIfNeeded();
+        await capture(page, 'manager-operations-signals-' + width + '-' + scale);
+      }
+    }
+    await page.evaluate(() => { document.documentElement.style.removeProperty('font-size'); });
+    await page.setViewportSize({ width: 390, height: 844 });
+
+    next = { status: 503, json: { detail: 'private service detail' } };
+    await refresh.click();
+    await shown(panel, 'Operations signals could not be loaded. Try again.');
+    assert.equal(await payments.textContent(), 'Unknown');
+    assert.equal(await receipts.textContent(), 'Unknown');
+    assert.equal(await threshold.isVisible(), false);
+    assert.equal(await checked.isVisible(), false);
+    assert.doesNotMatch(await panel.innerText(), /private service detail/);
+    await panel.getByRole('heading').scrollIntoViewIfNeeded();
+    await capture(page, 'manager-operations-signals-unknown');
+
+    next = { status: 200, json: data(-1, 8) };
+    await refresh.click();
+    await shown(panel, 'The operations signals response could not be verified. Try again.');
+    assert.equal(await receipts.textContent(), 'Unknown');
+
+    next = { status: 200, json: data(0, 0) };
+    await page.clock.runFor(30_100);
+    await shown(payments, '0');
+    assert.equal(await receipts.textContent(), '0');
+    assert.equal(await checked.isVisible(), true);
+
+    await page.clock.runFor(28_300);
+    holding = true;
+    const before = reads.length;
+    const oldRead = page.waitForRequest(request => request.url() === signalsUrl);
+    await refresh.click();
+    await oldRead;
+    assert.equal(await refresh.isDisabled(), true);
+    await page.clock.runFor(2000);
+    assert.equal(reads.length, before + 1, 'background poll must not overlap manual refresh');
+    await signOut();
+    assert.equal(await panel.isVisible(), false);
+    assert.equal(await payments.textContent(), 'Unknown');
+
+    holding = false;
+    next = { status: 200, json: data(7, 1) };
+    await signIn('manager-next', 'Order queue');
+    await shown(payments, '7');
+    delayed.resolve();
+    await delayedFinished.promise;
+    assert.equal(await panel.isVisible(), true);
+    assert.equal(await receipts.textContent(), '1');
+    assert.equal(reads.at(-1), 'Bearer manager-next');
+
+    await signOut();
+    const afterManagers = reads.length;
+    await signIn('pickup', 'Pickup queue');
+    await page.clock.runFor(31_000);
+    assert.equal(await panel.isVisible(), false);
+    assert.equal(await jump.isVisible(), false);
+    assert.equal(reads.length, afterManagers);
+  } finally {
+    delayed.resolve();
+  }
+});
+
 test('payment review displays a verified refund only after the API confirms it', { timeout: 30_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const browser = await chromium.launch({ channel: 'chrome' });
