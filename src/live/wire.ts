@@ -74,7 +74,7 @@ export const paymentResponse = z.object({
   checkoutUrl: z.string().max(2048).nullable(),
 });
 
-export const orderResponse = z.object({
+const orderFields = z.object({
   id: identifier,
   storeId: identifier,
   slotId: identifier,
@@ -92,9 +92,34 @@ export const orderResponse = z.object({
   reservationExpiresAt: timestamp,
   pickupStartsAt: timestamp,
   pickupEndsAt: timestamp,
-}).refine(value => value.tax <= value.total
-  && value.lines.reduce((total, line) => total + line.quantity * line.unitPrice, 0) === value.total
-  && Date.parse(value.pickupStartsAt) < Date.parse(value.pickupEndsAt));
+});
+
+function validOrderTotals(value: Pick<z.infer<typeof orderFields>, 'tax' | 'total' | 'lines' | 'pickupStartsAt' | 'pickupEndsAt'>) {
+  return value.tax <= value.total
+    && value.lines.reduce((total, line) => total + line.quantity * line.unitPrice, 0) === value.total
+    && Date.parse(value.pickupStartsAt) < Date.parse(value.pickupEndsAt);
+}
+
+export const orderResponse = orderFields.refine(validOrderTotals);
+
+const canonicalId = z.guid().refine(value => value === value.toLowerCase());
+export const orderDataExportResponse = z.strictObject({
+  ...orderFields.pick({ storeId: true, lines: true, total: true, tax: true, currency: true, status: true,
+    paymentStatus: true, receiptStatus: true, createdAt: true, pickupStartsAt: true, pickupEndsAt: true }).shape,
+  orderId: canonicalId,
+  phone: z.string().regex(/^\+[1-9][0-9]{7,14}$/),
+  email: z.string().min(1).max(254).nullable(),
+}).refine(validOrderTotals);
+
+const erasureRequest = z.strictObject({
+  requestId: canonicalId,
+  submittedAt: timestamp,
+  status: z.enum(['pending', 'in_review']),
+  reviewedAt: timestamp.nullable(),
+}).refine(value => value.status === 'pending' ? value.reviewedAt === null
+  : value.reviewedAt !== null && Date.parse(value.reviewedAt) >= Date.parse(value.submittedAt));
+
+export const orderErasureRequestResponse = z.strictObject({ request: erasureRequest.nullable() });
 
 export const sessionResponse = z.object({
   sessionId: z.guid().optional(),

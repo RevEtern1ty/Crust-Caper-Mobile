@@ -4,7 +4,10 @@ import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError } from '../domain/types';
 import type { ApiErrorCode, Locale, Order, PaymentAttempt, ShopApi, Storage } from '../domain/types';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
-import { menuResponse, orderAccessChallenge, orderAccessGrant, orderResponse, paymentResponse, quoteResponse, reorderResponse, sessionResponse } from './wire';
+import {
+  menuResponse, orderAccessChallenge, orderAccessGrant, orderDataExportResponse, orderErasureRequestResponse,
+  orderResponse, paymentResponse, quoteResponse, reorderResponse, sessionResponse,
+} from './wire';
 
 type Session = z.infer<typeof sessionResponse>;
 const savedSession = sessionResponse.extend({ rotationKey: z.guid().optional() });
@@ -59,6 +62,13 @@ export function invalidResponse(): never {
   throw new ApiError('invalid_response');
 }
 
+export function rememberVerifiedOrder(bindings: Map<string, string>, orderId: string, sessionId: string) {
+  bindings.delete(orderId);
+  bindings.set(orderId, sessionId);
+  const oldest = bindings.keys().next().value;
+  if (bindings.size > 10 && oldest !== undefined) bindings.delete(oldest);
+}
+
 function sameGuest(left: Session, right: Session): boolean {
   return left.sessionId && right.sessionId ? left.sessionId === right.sessionId : left.refreshToken === right.refreshToken;
 }
@@ -110,6 +120,7 @@ export function createLiveApi({
   let recoveryQueue: Promise<void> = Promise.resolve();
   let pendingRecovery: RecoverySession | null = null;
   let primaryChallenge: { id: string; guest: Session } | null = null;
+  const verifiedOrders = new Map<string, string>();
   let installation: Promise<string> | null = null;
   const guestWork = new Set<Promise<unknown>>();
   let ending: Promise<void> | null = null;
@@ -241,8 +252,8 @@ export function createLiveApi({
     return refreshed;
   }
 
-  function guestSession(rejectedAccessToken?: string): Promise<Session> {
-    if (activation) return activation.catch(() => undefined).then(() => guestSession(rejectedAccessToken));
+  function guestSession(rejectedAccessToken?: string, allowNewGuest = true): Promise<Session> {
+    if (activation) return activation.catch(() => undefined).then(() => guestSession(rejectedAccessToken, allowNewGuest));
     if (sessionPromise) return sessionPromise;
     sessionPromise = (async () => {
       const raw = await readSaved(sessionKey);
@@ -256,7 +267,7 @@ export function createLiveApi({
         }
       }
       // Never replace the identity behind a durable checkout with a fresh guest.
-      if (rejectedAccessToken !== undefined || hasSavedCheckout(await readSaved(journalKey))) {
+      if (!allowNewGuest || rejectedAccessToken !== undefined || hasSavedCheckout(await readSaved(journalKey))) {
         throw new GuestRejected();
       }
       return durableSession(await request({ path: '/guest-sessions', method: 'POST', schema: sessionResponse }));
@@ -294,7 +305,7 @@ export function createLiveApi({
 
   function primaryRequest<T>(options: Parameters<typeof request<T>>[0], expectedGuest?: Session) {
     return withGuestWork(async () => {
-      const guest = await guestSession();
+      const guest = await guestSession(undefined, expectedGuest === undefined);
       if (expectedGuest && !sameGuest(guest, expectedGuest)) throw new ApiError('unauthenticated');
       const payload = await sendWithGuest(options, guest, () => guestSession(guest.accessToken));
       return { payload, guest };
@@ -384,6 +395,31 @@ export function createLiveApi({
     });
   }
 
+  function privacyRequest<T>(orderId: string, suffix: string, schema: z.ZodType<T>, method: 'GET' | 'PUT' = 'GET') {
+    if (!paymentReturnOrderId(orderId)) throw new ApiError('invalid_input');
+    return queueRecovery(async () => {
+      const options = { path: orderPath(orderId) + suffix, method, schema };
+      const pinned = verifiedOrders.get(orderId);
+      const recovered = await loadRecovery();
+      // A read grant may belong to a different guest than the current checkout.
+      if (recovered?.grants.includes(orderId) && (!pinned || recovered.guest.sessionId === pinned)) {
+        return sendRecovery(options, recovered);
+      }
+      const raw = await readSaved(sessionKey);
+      const primary = raw === null ? null : decodeSaved(raw, savedSession);
+      if (!primary || (pinned && primary.sessionId !== pinned) || Date.parse(primary.refreshExpiresAt) <= now()) {
+        throw new ApiError('unauthenticated');
+      }
+      return (await primaryRequest(options, primary)).payload;
+    });
+  }
+
+  async function verifyPrimaryAccess(options: Parameters<typeof request<z.infer<typeof orderAccessGrant>>>[0], guest?: Session) {
+    const { payload, guest: verifiedGuest } = await primaryRequest(options, guest);
+    if (verifiedGuest.sessionId) rememberVerifiedOrder(verifiedOrders, payload.orderId, verifiedGuest.sessionId);
+    return payload;
+  }
+
   function pickupAlertPath(orderId: string) {
     if (!paymentReturnOrderId(orderId)) throw new ApiError('invalid_input');
     return orderPath(orderId) + '/pickup-alert';
@@ -410,6 +446,7 @@ export function createLiveApi({
       guestRevision++;
       ending = (async () => {
         await Promise.allSettled(guestWork);
+        verifiedOrders.clear();
         await writeSaved(endKey, 'pending');
         const raw = await readSaved(sessionKey);
         const recovery = await loadRecovery();
@@ -492,6 +529,19 @@ export function createLiveApi({
         return withVerifiedRecovery(orderId, error, (record) => sendRecovery(options, record));
       }
     },
+    async getOrderDataExport(orderId) {
+      const exported = await privacyRequest(orderId, '/data-export', orderDataExportResponse);
+      if (exported.orderId !== orderId || exported.storeId !== config.storeId) invalidResponse();
+      return exported;
+    },
+    async getOrderErasureRequest(orderId) {
+      return privacyRequest(orderId, '/erasure-request', orderErasureRequestResponse);
+    },
+    async requestOrderErasure(orderId) {
+      const result = await privacyRequest(orderId, '/erasure-request', orderErasureRequestResponse, 'PUT');
+      if (!result.request) invalidResponse();
+      return result;
+    },
     async reorder(orderId) {
       return authorized({ path: orderPath(orderId) + '/reorder', method: 'POST', schema: reorderResponse });
     },
@@ -530,14 +580,15 @@ export function createLiveApi({
       const options = { path, method: 'POST', schema: orderAccessGrant, body: { code } } as const;
       return queueRecovery(async () => {
         if (primaryChallenge?.id === challengeId) {
-          return (await primaryRequest(options, primaryChallenge.guest)).payload;
+          return verifyPrimaryAccess(options, primaryChallenge.guest);
         }
         const record = await loadRecovery();
-        if (record?.challengeId !== challengeId) return authorized(options);
+        if (record?.challengeId !== challengeId) return verifyPrimaryAccess(options);
 
         const grant = await sendRecovery(options, record);
         const granted = { ...record, grants: [grant.orderId, ...record.grants.filter(id => id !== grant.orderId)].slice(0, 10) };
         await saveRecovery(granted);
+        if (granted.guest.sessionId) rememberVerifiedOrder(verifiedOrders, grant.orderId, granted.guest.sessionId);
         await activateRecovery(granted, grant.orderId);
         return grant;
       });

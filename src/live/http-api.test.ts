@@ -280,6 +280,14 @@ test('order phone verification uses the same guest without saving the contact or
 const recoveryChallengeId = '85e9eb23-9b52-4905-8c81-7d347d746db9';
 const recoveryOrderId = '1cf5ba6e-0584-45b5-bbc5-3a5ec90502c9';
 const recoveryContact = { orderCode: 'C90502C9', phone: '+250700000000' };
+const privacyExport = {
+  orderId: recoveryOrderId, storeId: order.storeId, phone: recoveryContact.phone, email: 'export-fixture@example.test',
+  lines: order.lines, total: order.total, tax: order.tax, currency: order.currency, status: order.status,
+  paymentStatus: order.paymentStatus, receiptStatus: order.receiptStatus, createdAt: order.createdAt,
+  pickupStartsAt: order.pickupStartsAt, pickupEndsAt: order.pickupEndsAt,
+};
+const erasure = { request: { requestId: '9afe0a38-7a13-4425-8ace-2c491efac709', submittedAt: expiresAt,
+  status: 'pending', reviewedAt: null } };
 const expiredGuest = {
   ...session, expiresAt: '2026-11-25T09:00:00Z', refreshExpiresAt: '2026-11-25T09:30:00Z',
 };
@@ -740,6 +748,66 @@ test('phone verification stays bound to the guest identity across normal credent
   const challenge = await api.requestOrderAccess!(recoveryContact);
   time = Date.parse('2026-11-27T10:00:00Z');
   assert.equal((await api.verifyOrderAccess!(challenge.challengeId, '418263')).orderId, recoveryOrderId);
+});
+
+test('privacy reads and bodyless erasure PUT use the verified native bearer without storing private response data', async () => {
+  const { storage, data } = memory();
+  data.set(journalKey + '.guest', JSON.stringify(rotatable));
+  const { fetcher, calls } = transport(call => {
+    assert.equal(call.token, 'Bearer ' + rotatable.accessToken);
+    if (call.url.endsWith('/order-access/challenges')) return Response.json({ challengeId: recoveryChallengeId });
+    if (call.url.endsWith('/verify')) return Response.json({ orderId: recoveryOrderId });
+    assert.equal(call.body, undefined);
+    assert.equal(call.key, null);
+    if (call.url.endsWith('/data-export')) {
+      assert.equal(call.method, 'GET');
+      return Response.json(privacyExport);
+    }
+    assert.equal(call.url, config.apiBaseUrl + `/orders/${recoveryOrderId}/erasure-request`);
+    return Response.json(call.method === 'PUT' ? erasure : { request: null });
+  });
+  const options = { config, storage, journalKey, fetcher, now };
+  const api = createLiveApi(options);
+  await api.requestOrderAccess!(recoveryContact);
+  await api.verifyOrderAccess!(recoveryChallengeId, '418263');
+  assert.deepEqual(await api.getOrderDataExport!(recoveryOrderId), privacyExport);
+  assert.deepEqual(await api.getOrderErasureRequest!(recoveryOrderId), { request: null });
+  assert.deepEqual(await api.requestOrderErasure!(recoveryOrderId), erasure);
+  assert.deepEqual(await createLiveApi(options).getOrderDataExport!(recoveryOrderId), privacyExport);
+  assert.doesNotMatch(JSON.stringify([...data.values()]), /export-fixture|700000000|9afe0a38|418263/);
+
+  data.set(journalKey + '.guest', JSON.stringify(recoveryGuest));
+  const previousCalls = calls.length;
+  await assert.rejects(api.requestOrderErasure!(recoveryOrderId), { code: 'unauthenticated' });
+  assert.equal(calls.length, previousCalls);
+});
+
+test('stored native recovery grants take precedence over an unverified primary and do not switch on a 404', async () => {
+  const { storage, data } = memory();
+  data.set(journalKey + '.guest', JSON.stringify(rotatable));
+  data.set(journalKey + '.recovery-guest', JSON.stringify({ guest: recoveryGuest, previous: rotatable.sessionId,
+    challengeId: recoveryChallengeId, grants: [recoveryOrderId] }));
+  const { fetcher, calls } = transport(call => {
+    assert.equal(call.url, config.apiBaseUrl + `/orders/${recoveryOrderId}/data-export`);
+    assert.equal(call.token, 'Bearer ' + recoveryGuest.accessToken);
+    return calls.length === 1 ? Response.json({ ...privacyExport, email: null }) : new Response(null, { status: 404 });
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  assert.equal((await api.getOrderDataExport!(recoveryOrderId)).email, null);
+  await assert.rejects(api.getOrderDataExport!(recoveryOrderId), { code: 'not_found' });
+  assert.equal(calls.length, 2);
+});
+
+test('native privacy endpoints reject wrong-order exports and do not create a new identity', async () => {
+  const { storage, data } = memory();
+  const { fetcher, calls } = transport(() => Response.json({ ...privacyExport, orderId: pickupOrderId }));
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  await assert.rejects(api.getOrderDataExport!(recoveryOrderId), { code: 'unauthenticated' });
+  assert.equal(calls.length, 0);
+  data.set(journalKey + '.guest', JSON.stringify(rotatable));
+  await assert.rejects(api.getOrderDataExport!(recoveryOrderId), { code: 'invalid_response' });
+  await assert.rejects(api.requestOrderErasure!('../../orders'), { code: 'invalid_input' });
+  assert.equal(calls.length, 1);
 });
 
 test('logout retries a lost response, revokes both guests and clears only private checkout state', async () => {

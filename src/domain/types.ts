@@ -123,6 +123,22 @@ export type Order = {
   pickupEndsAt: string
 }
 
+export type OrderDataExport = Pick<Order, 'storeId' | 'lines' | 'total' | 'tax' | 'currency'
+  | 'status' | 'paymentStatus' | 'receiptStatus' | 'createdAt' | 'pickupStartsAt' | 'pickupEndsAt'> & {
+  orderId: string
+  phone: string
+  email: string | null
+}
+
+export type OrderErasureRequest = {
+  requestId: string
+  submittedAt: string
+  status: 'pending' | 'in_review'
+  reviewedAt: string | null
+}
+
+export type OrderErasureRequestResponse = { request: OrderErasureRequest | null }
+
 export type QuoteInput = { storeId: string; slotId: string; lines: CartLine[] }
 export type OrderInput = { quoteId: string; phone: string; email?: string }
 export type ReorderResult = { lines: CartLine[]; changes: QuoteChange[] }
@@ -170,6 +186,9 @@ export interface ShopApi {
   startPayment(orderId: string, key: string): Promise<PaymentAttempt>
   getOrder(orderId: string): Promise<Order>
   getReceiptPdf?(orderId: string): Promise<Uint8Array>
+  getOrderDataExport?(orderId: string): Promise<OrderDataExport>
+  getOrderErasureRequest?(orderId: string): Promise<OrderErasureRequestResponse>
+  requestOrderErasure?(orderId: string): Promise<OrderErasureRequestResponse>
   reorder(orderId: string): Promise<ReorderResult>
   requestOrderAccess?(input: OrderAccessRequest): Promise<{ challengeId: string }>
   verifyOrderAccess?(challengeId: string, code: string): Promise<{ orderId: string }>

@@ -36,6 +36,14 @@ const pendingCreation = {
   version: 1, active: { phase: 'creating', ...checkoutIntent, cartFingerprint: 'hash' }, orderIds: [unknownOrderId],
 };
 const phone = '+250780000001';
+const privacyExport = {
+  orderId, storeId: order.storeId, phone, email: 'private-web-fixture@example.test', lines: order.lines,
+  total: order.total, tax: order.tax, currency: order.currency, status: order.status, paymentStatus: order.paymentStatus,
+  receiptStatus: order.receiptStatus, createdAt: order.createdAt, pickupStartsAt: order.pickupStartsAt,
+  pickupEndsAt: order.pickupEndsAt,
+};
+const erasure = { request: { requestId: '1d21ef89-8d11-4175-829c-a9c53461cdf0', submittedAt: expiresAt,
+  status: 'pending', reviewedAt: null } };
 
 function memory(entries: [string, string][] = []) {
   const saved = new Map(entries);
@@ -160,6 +168,60 @@ test('stale checkout stays bound to the original context while explicit OTP only
   assert.equal(transport.calls.find(call => call.path.endsWith('/payments'))?.key, 'pay-key');
   assert.equal(transport.calls.some(call => call.context === second && call.path.includes(unknownOrderId)), false);
   assert.equal(transport.calls.some(call => call.path === sessionPath && call.method === 'POST'), false);
+});
+
+test('order privacy uses the verified web context and write marker without changing the checkout context', async () => {
+  const { storage, saved } = memory([[journalKey + '.context', first], [journalKey, pendingJournal]]);
+  const transport = fixture(second, ({ path, method, context, body, key }) => {
+    assert.equal(context, second);
+    if (path === '/web/order-access/challenges') return Response.json({ challengeId });
+    if (path.endsWith('/verify')) return Response.json({ orderId });
+    assert.equal(body, undefined);
+    assert.equal(key, null);
+    if (path === `/web/orders/${orderId}/data-export`) {
+      assert.equal(method, 'GET');
+      return Response.json(privacyExport);
+    }
+    assert.equal(path, `/web/orders/${orderId}/erasure-request`);
+    return Response.json(method === 'PUT' ? erasure : { request: null });
+  });
+  const options = { config, storage, journalKey, browser, fetcher: transport.fetcher };
+  const api = createWebLiveApi(options);
+  await api.requestOrderAccess!({ orderCode: '193A002B', phone });
+  await api.verifyOrderAccess!(challengeId, '010101');
+  assert.deepEqual(await api.getOrderDataExport!(orderId), privacyExport);
+  assert.deepEqual(await api.getOrderErasureRequest!(orderId), { request: null });
+  assert.deepEqual(await api.requestOrderErasure!(orderId), erasure);
+  assert.deepEqual(await createWebLiveApi(options).getOrderDataExport!(orderId), privacyExport);
+  assert.equal(saved.get(journalKey + '.context'), first);
+  assert.doesNotMatch(JSON.stringify([...saved.values()]), /private-web-fixture|780000001|1d21ef89|010101/);
+
+  transport.setCookie(first);
+  const previousWrites = transport.calls.filter(call => call.method === 'PUT').length;
+  await assert.rejects(api.requestOrderErasure!(orderId), { code: 'unauthenticated' });
+  assert.equal(transport.calls.filter(call => call.method === 'PUT').length, previousWrites);
+});
+
+test('an export response is discarded when its web session changes before delivery', async () => {
+  const { storage } = memory([[journalKey + '.context', first]]);
+  const transport = fixture(first, ({ path, context }) => {
+    assert.equal(path, `/web/orders/${orderId}/data-export`);
+    assert.equal(context, first);
+    transport.setCookie(second);
+    return Response.json(privacyExport);
+  });
+  const api = createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+  await assert.rejects(api.getOrderDataExport!(orderId), { code: 'unauthenticated' });
+  assert.deepEqual(transport.calls.map(call => call.path), [sessionPath, `/web/orders/${orderId}/data-export`, sessionPath]);
+});
+
+test('web privacy rejects an export for another store and a successful erasure write without a request', async () => {
+  const { storage } = memory([[journalKey + '.context', first]]);
+  const transport = fixture(first, ({ path }) => path.endsWith('/data-export')
+    ? Response.json({ ...privacyExport, storeId: 'wrong-store' }) : Response.json({ request: null }));
+  const api = createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+  await assert.rejects(api.getOrderDataExport!(orderId), { code: 'invalid_response' });
+  await assert.rejects(api.requestOrderErasure!(orderId), { code: 'invalid_response' });
 });
 
 test('ending a stale tab clears its own access without revoking the current cookie in another tab', async () => {

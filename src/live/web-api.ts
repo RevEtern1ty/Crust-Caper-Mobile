@@ -2,11 +2,11 @@ import { z } from 'zod';
 import { hasSavedCheckout, parseJournal } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError, type Order, type PaymentAttempt, type PendingCheckoutIntent, type Storage } from '../domain/types';
-import { errorCode, invalidResponse, safeHttps, type ConnectedConfig, type LiveShopApi } from './http-api';
+import { errorCode, invalidResponse, rememberVerifiedOrder, safeHttps, type ConnectedConfig, type LiveShopApi } from './http-api';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import {
-  menuResponse, orderAccessChallenge, orderAccessGrant, paymentResponse, pendingCheckoutRecovery, quoteResponse, reorderResponse,
-  webOrderResponse, webSessionResponse,
+  menuResponse, orderAccessChallenge, orderAccessGrant, orderDataExportResponse, orderErasureRequestResponse, paymentResponse,
+  pendingCheckoutRecovery, quoteResponse, reorderResponse, webOrderResponse, webSessionResponse,
 } from './wire';
 
 export function webCheckoutAvailable(config: ConnectedConfig): boolean {
@@ -27,7 +27,7 @@ type WebOptions = {
 type Request<T> = {
   path: string;
   schema: z.ZodType<T>;
-  method?: 'GET' | 'POST' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   key?: string;
   body?: unknown;
   pdf?: boolean;
@@ -71,6 +71,7 @@ export function createWebLiveApi({
   const work = new Set<Promise<unknown>>();
   let ending: Promise<void> | null = null;
   let challenge: { id: string; sessionId: string; separateContext: boolean } | null = null;
+  const verifiedOrders = new Map<string, string>();
 
   async function storageCall<T>(operation: () => Promise<T>): Promise<T> {
     try {
@@ -259,6 +260,19 @@ export function createWebLiveApi({
     });
   }
 
+  function privacyRequest<T>(orderId: string, options: Request<T>) {
+    return withWork(() => withCookieLock(async () => {
+      const recovered = await savedRecovery();
+      const sessionId = verifiedOrders.get(orderId)
+        ?? (recovered?.orderIds.includes(orderId) ? recovered.sessionId : await savedContext());
+      if (!sessionId || await currentCookieContext() !== sessionId || ending) throw new ApiError('unauthenticated');
+      const result = await privateCall(options, sessionId);
+      const stillCurrent = !ending && await currentCookieContext() === sessionId;
+      if (!stillCurrent || ending) throw new ApiError('unauthenticated');
+      return result;
+    }));
+  }
+
   function pendingRecoveryContext(intent: PendingCheckoutIntent) {
     return withCookieLock(async () => {
       await requirePendingIntent(intent);
@@ -295,6 +309,7 @@ export function createWebLiveApi({
       if (ending) return ending;
       ending = (async () => {
         await Promise.allSettled(work);
+        verifiedOrders.clear();
         await withCookieLock(async () => {
           await save(endKey, 'pending');
           const saved = await savedContext();
@@ -381,6 +396,21 @@ export function createWebLiveApi({
       const result = await readOrder(orderId, { path: receiptPath(orderId), schema: z.instanceof(Uint8Array), pdf: true });
       return result.payload;
     },
+    async getOrderDataExport(orderId) {
+      const exported = await privacyRequest(orderId, { path: orderPath(orderId) + '/data-export', schema: orderDataExportResponse });
+      if (exported.orderId !== orderId || exported.storeId !== config.storeId) invalidResponse();
+      return exported;
+    },
+    async getOrderErasureRequest(orderId) {
+      return privacyRequest(orderId, { path: orderPath(orderId) + '/erasure-request', schema: orderErasureRequestResponse });
+    },
+    async requestOrderErasure(orderId) {
+      const result = await privacyRequest(orderId, {
+        path: orderPath(orderId) + '/erasure-request', method: 'PUT', schema: orderErasureRequestResponse,
+      });
+      if (!result.request) invalidResponse();
+      return result;
+    },
     reorder(orderId) {
       return withWork(() => checkoutOrderCall(orderId, {
         path: orderPath(orderId) + '/reorder', method: 'POST', schema: reorderResponse,
@@ -454,6 +484,7 @@ export function createWebLiveApi({
           const owned = before?.sessionId === context.sessionId && before.owned;
           await save(recoveryKey, JSON.stringify({ sessionId: context.sessionId, orderIds, owned }));
         }
+        rememberVerifiedOrder(verifiedOrders, grant.orderId, context.sessionId);
         challenge = null;
         return grant;
       });
