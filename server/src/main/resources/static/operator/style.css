@@ -147,7 +147,8 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .payment-review-filters > .button[aria-pressed="true"] { background: var(--paper); border-color: var(--green); }
 .payment-review-more { margin-top: 1rem; }
 #reconciliation-jump, #operations-signals-jump, #operations-signals-refresh { max-width: 100%; overflow-wrap: anywhere; }
-#reconciliation .queue-header > div, #operations-signals .queue-header > div { min-width: 0; overflow-wrap: anywhere; }
+#reconciliation .queue-header > div, #operations-signals .queue-header > div,
+#availability .queue-header > div { min-width: 0; overflow-wrap: anywhere; }
 #operations-signals-counts [data-attention="true"] { color: var(--red); }
 .reconciliation-form { display: flex; flex-wrap: wrap; gap: .7rem; align-items: flex-end; margin-bottom: 1rem; }
 .reconciliation-form > div { width: min(17rem, 100%); display: grid; gap: .35rem; }
