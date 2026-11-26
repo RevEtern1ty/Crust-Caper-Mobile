@@ -9,6 +9,7 @@ const { resolve } = require('node:path');
 const { test } = require('node:test');
 const { connect } = require('node:tls');
 const { chromium } = require('playwright-core');
+const { checkWebPerformance } = require('./storefront-web-perf.cjs');
 
 const storefront = 'crustcaper.test';
 const provider = 'checkout.flutterwave.com';
@@ -19,6 +20,7 @@ const translatedProduct = '/menu/rw/double-smash';
 const guestCookie = '__Host-crustcaper-web';
 const evidence = process.env.CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR;
 const project = process.env.CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT;
+const webPerf = process.env.CRUSTCAPER_HTTPS_TEST_WEB_PERF === '1';
 const uuid = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
 function request(ca, path, { method = 'GET', headers } = {}) {
@@ -122,11 +124,11 @@ function verifyPaymentRow(orderId) {
   assert.equal(query.stdout.trim(), '1|1', 'order must have exactly one verified payment attempt');
 }
 
-async function newContext(browser, options) {
+async function newContext(browser, options, allowHostedPayment = true) {
   const context = await browser.newContext({ serviceWorkers: 'block', ...options });
   await context.route('**/*', route => {
     const site = new URL(route.request().url()).origin;
-    return site === origin || site === hostedOrigin ? route.continue() : route.abort();
+    return site === origin || (allowHostedPayment && site === hostedOrigin) ? route.continue() : route.abort();
   });
   return context;
 }
@@ -236,11 +238,14 @@ async function checkGuestCheckout(browser, ca) {
   }
 }
 
-test('HTTPS storefront renders public pages and preserves a single verified guest payment', { timeout: 90000 }, async t => {
+const scenario = webPerf ? 'HTTPS catalog captures cold mobile web performance'
+  : 'HTTPS storefront renders public pages and preserves a single verified guest payment';
+
+test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   const caPath = process.env.CRUSTCAPER_HTTPS_TEST_CA;
   assert.ok(caPath, 'the HTTPS storefront launcher must provide a fixture CA');
   const ca = readFileSync(caPath);
-  await checkPublicCatalog(ca);
+  if (!webPerf) await checkPublicCatalog(ca);
   const pins = await Promise.all([fixturePin(ca, storefront), fixturePin(ca, provider)]);
   const browser = await chromium.launch({
     channel: 'chrome',
@@ -251,6 +256,12 @@ test('HTTPS storefront renders public pages and preserves a single verified gues
     ],
   });
   t.after(() => browser.close());
+  if (webPerf) {
+    await checkWebPerformance({
+      browser, createContext: options => newContext(browser, options, false), origin, evidence,
+    });
+    return;
+  }
   await checkNoJavaScript(browser);
   await checkGuestCheckout(browser, ca);
 });
