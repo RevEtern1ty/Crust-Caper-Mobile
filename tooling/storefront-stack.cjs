@@ -9,19 +9,23 @@ const root = resolve(dirname(module.filename), '..');
 const deploy = join(root, 'server', 'deploy');
 const fixtureHost = 'crustcaper.test';
 const database = 'storefront_fixture';
+const recoveredDatabase = 'storefront_recovered';
 const testMain = 'com.crustcaper.api.payment.WebCheckoutFixture';
 const scratchPrefix = 'cc-storefront-';
 const fixturePhoto = { sku: 'double-smash', file: 'double-smash-r39.jpg' };
 const errorRehearsalLabel = { 'crustcaper.fixture.error-rehearsal': '1' };
+const recoveryLabel = { 'crustcaper.fixture.database-recovery': '1' };
 const postgresImage = 'postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193';
 const fixtureEntrypoint = ['java', '-Dloader.path=/fixture/classes/', `-Dloader.main=${testMain}`,
   '-cp', '/app/app.jar', 'org.springframework.boot.loader.launch.PropertiesLauncher'];
 
 let active;
 let interrupted = false;
+const interruption = new AbortController();
 
 function interrupt() {
   interrupted = true;
+  interruption.abort();
   if (active && !active.cleanup) active.child.kill();
 }
 
@@ -83,7 +87,7 @@ const mount = (source, target) => ({
   bind: { create_host_path: false },
 });
 
-async function prepareFixture(directory, testClasses, { load, paymentRestart, errorRehearsal }) {
+async function prepareFixture(directory, testClasses, { load, paymentRestart, errorRehearsal, databaseRecovery }) {
   const fixturePassword = randomBytes(24).toString('hex');
   const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
@@ -91,6 +95,21 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, er
   const unusedDatabaseCa = join(directory, 'postgres-ca.crt');
   const caddyfile = join(directory, 'Caddyfile');
   const overlay = join(directory, 'fixture.json');
+  let recoveryOverlay;
+  const recoveryTooling = [];
+  if (databaseRecovery) {
+    recoveryOverlay = join(directory, 'recovery-cutover.json');
+    await writeFile(recoveryOverlay, JSON.stringify({ services: { api: {
+      environment: { CRUSTCAPER_DB_URL: 'jdbc:postgresql://postgres:5432/' + recoveredDatabase },
+      command: ['--recovery-api'],
+    } } }));
+    for (const name of ['backup-postgres.sh', 'restore-postgres.sh']) {
+      const source = join(root, 'server', 'tooling', name);
+      const copy = join(directory, name);
+      await writeFile(copy, (await readFile(source, 'utf8')).replaceAll('\r\n', '\n'));
+      recoveryTooling.push(mount(copy, '/fixture/' + name));
+    }
+  }
   await writeFile(apiEnvironment, [
     'SPRING_PROFILES_ACTIVE=stage',
     `CRUSTCAPER_PAYMENT_PROVIDER=${paymentRestart ? 'flutterwave' : 'fixture'}`,
@@ -132,6 +151,7 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, er
       api: {
         pull_policy: 'never',
         ...(errorRehearsal && { labels: errorRehearsalLabel }),
+        ...(databaseRecovery && { labels: recoveryLabel }),
         entrypoint: fixtureEntrypoint,
         depends_on: {
           postgres: { condition: 'service_healthy' },
@@ -144,7 +164,8 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, er
         image: '${CRUSTCAPER_API_IMAGE:?Set the verified API image or digest}',
         pull_policy: 'never',
         entrypoint: fixtureEntrypoint,
-        command: ['--provider'],
+        command: [databaseRecovery ? '--recovery-provider' : '--provider'],
+        ...(databaseRecovery && { labels: recoveryLabel }),
         environment: { CRUSTCAPER_STOREFRONT_RESTART_PROVIDER: '1' },
         networks: ['default'],
         volumes: [fixtureClasses],
@@ -160,6 +181,7 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, er
       postgres: {
         image: postgresImage,
         ...(errorRehearsal && { labels: errorRehearsalLabel }),
+        ...(databaseRecovery && { labels: recoveryLabel }),
         environment: { POSTGRES_USER: database, POSTGRES_DB: database, POSTGRES_PASSWORD: fixturePassword },
         healthcheck: {
           test: ['CMD', 'pg_isready', '-U', database, '-d', database],
@@ -169,11 +191,12 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, er
           mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
           ...(load || paymentRestart
             ? [mount(join(root, 'server', 'tooling', 'operator-accounts.psql'), '/fixture/operator-accounts.psql')] : []),
+          ...recoveryTooling,
         ],
       },
     },
   }, null, 2), { mode: 0o600 });
-  return { apiEnvironment, composeEnvironment, unusedDatabaseCa, overlay, fixtureMfaKey };
+  return { apiEnvironment, composeEnvironment, unusedDatabaseCa, overlay, recoveryOverlay, fixtureMfaKey };
 }
 
 async function importCatalog(compose, { load, catalogPhotos, availability }) {
@@ -214,12 +237,14 @@ async function main() {
   const catalogPhotos = mode === '--catalog-photos';
   const availability = mode === '--availability';
   const errorRehearsal = mode === '--error-rehearsal';
+  const databaseRecovery = mode === '--database-recovery';
   const kitchenRestart = mode === '--kitchen-restart';
-  const paymentRestart = mode === '--payment-restart' || kitchenRestart;
+  const paymentRestart = mode === '--payment-restart' || kitchenRestart || databaseRecovery;
   if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart && !availability && !errorRehearsal)) {
-    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart | --availability | --error-rehearsal]');
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart | --availability | --error-rehearsal | --database-recovery]');
   }
-  const script = errorRehearsal ? 'tooling/storefront-error-rehearsal.cjs'
+  const script = databaseRecovery ? 'tooling/storefront-database-recovery.cjs'
+    : errorRehearsal ? 'tooling/storefront-error-rehearsal.cjs'
     : availability ? 'tooling/storefront-availability-rehearsal.cjs'
     : paymentRestart ? 'tooling/storefront-payment-restart.cjs' : load ? 'tooling/storefront-load.cjs' : null;
   const scenarios = script
@@ -250,7 +275,7 @@ async function main() {
       await copyFile(join(root, 'assets', 'menu', `${fixturePhoto.sku}.jpg`), join(photos, fixturePhoto.file));
       await writeFile(join(photos, 'double-smash-r39.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
     }
-    const settings = await prepareFixture(directory, testClasses, { load, paymentRestart, errorRehearsal });
+    const settings = await prepareFixture(directory, testClasses, { load, paymentRestart, errorRehearsal, databaseRecovery });
     const env = {
       ...hostEnv,
       CRUSTCAPER_API_IMAGE: apiImage,
@@ -282,6 +307,20 @@ async function main() {
       'cp', 'edge:/data/caddy/pki/authorities/local/root.crt', dockerPath(browserCa),
     ]);
     if (evidence) await mkdir(evidence, { recursive: true });
+    if (databaseRecovery) {
+      const { runDatabaseRecovery } = require('./storefront-database-recovery.cjs');
+      await runDatabaseRecovery({
+        project, caFile: browserCa, evidence, fixtureMfaKey: settings.fixtureMfaKey,
+        signal: AbortSignal.any([interruption.signal, AbortSignal.timeout(240000)]),
+        stopSource: () => compose('Stop only the primary fixture API',
+          ['stop', '--timeout', '10', 'api'], { timeout: 20000 }),
+        startRecovered: () => run('Start the restored fixture API', 'docker', [
+          ...command, '-f', dockerPath(settings.recoveryOverlay),
+          'up', '-d', '--no-deps', '--force-recreate', '--wait', '--wait-timeout', '35', 'api',
+        ], { env, timeout: 45000 }),
+      });
+      return;
+    }
     const childEnv = availability ? Object.fromEntries(Object.entries(hostEnv).filter(([name]) =>
       !/^(?:NODE_OPTIONS|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|NODE_USE_ENV_PROXY|(?:HTTP|HTTPS|ALL|NO)_PROXY)$/i.test(name)))
       : hostEnv;

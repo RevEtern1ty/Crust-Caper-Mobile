@@ -32,6 +32,7 @@ public final class WebCheckoutFixture {
     private static final String WEB_ORIGIN = "https://crustcaper.test";
     private static final String FIXTURE_KEY = "fixture-only";
     private static final String FIXTURE_DATABASE_URL = "jdbc:postgresql://postgres:5432/storefront_fixture";
+    private static final String RECOVERED_DATABASE_URL = "jdbc:postgresql://postgres:5432/storefront_recovered";
     private static final String FIXTURE_DATABASE_USER = "storefront_fixture";
     private static final String RESTART_WEBHOOK_SECRET = "fixture-restart-webhook-v1";
     private static final String RETURN_URL = WEB_ORIGIN + "/payment-return";
@@ -40,20 +41,24 @@ public final class WebCheckoutFixture {
     private WebCheckoutFixture() {}
 
     public static void main(String[] args) throws IOException {
-        if (args.length == 1 && "--provider".equals(args[0])) {
+        boolean restartProvider = args.length == 1 && "--provider".equals(args[0]);
+        boolean recoveryProvider = args.length == 1 && "--recovery-provider".equals(args[0]);
+        if (restartProvider || recoveryProvider) {
             if (!"1".equals(System.getenv("CRUSTCAPER_STOREFRONT_RESTART_PROVIDER"))) throw wrongFixture();
-            var provider = new Provider(new ObjectMapper(), true);
+            var provider = new Provider(new ObjectMapper(), true, restartProvider);
             Runtime.getRuntime().addShutdownHook(new Thread(provider::close, "fixture-provider-shutdown"));
             return;
         }
 
-        boolean restartApi = args.length == 1 && "--restart-api".equals(args[0]);
+        boolean recoveryApi = args.length == 1 && "--recovery-api".equals(args[0]);
+        boolean restartApi = recoveryApi || (args.length == 1 && "--restart-api".equals(args[0]));
+        String databaseUrl = recoveryApi ? RECOVERED_DATABASE_URL : FIXTURE_DATABASE_URL;
         if ((args.length != 0 && !restartApi)
             || !"stage".equals(System.getenv("SPRING_PROFILES_ACTIVE"))
             || !(restartApi ? "flutterwave" : "fixture").equals(System.getenv("CRUSTCAPER_PAYMENT_PROVIDER"))
             || !"disabled".equals(System.getenv("CRUSTCAPER_ORDER_ACCESS_PROVIDER"))
             || !WEB_ORIGIN.equals(System.getenv("CRUSTCAPER_WEB_ORIGIN"))
-            || !FIXTURE_DATABASE_URL.equals(System.getenv("CRUSTCAPER_DB_URL"))
+            || !databaseUrl.equals(System.getenv("CRUSTCAPER_DB_URL"))
             || !FIXTURE_DATABASE_USER.equals(System.getenv("CRUSTCAPER_DB_USER"))) {
             throw wrongFixture();
         }
@@ -103,7 +108,7 @@ public final class WebCheckoutFixture {
 
         @Bean(destroyMethod = "close")
         Provider fixtureProvider(ObjectMapper mapper) throws IOException {
-            return new Provider(mapper, false);
+            return new Provider(mapper, false, false);
         }
     }
 
@@ -111,9 +116,11 @@ public final class WebCheckoutFixture {
         @Bean
         static BeanFactoryPostProcessor removeConfiguredFlutterwaveGateway(Environment environment) {
             return factory -> {
+                String databaseUrl = environment.getProperty("spring.datasource.url", "");
                 if (!(factory instanceof BeanDefinitionRegistry registry)
                     || !Arrays.equals(environment.getActiveProfiles(), new String[] {"stage"})
-                    || !FIXTURE_DATABASE_URL.equals(environment.getProperty("spring.datasource.url"))
+                    || !(FIXTURE_DATABASE_URL.equals(databaseUrl) || RECOVERED_DATABASE_URL.equals(databaseUrl))
+                    || !databaseUrl.equals(System.getenv("CRUSTCAPER_DB_URL"))
                     || !FIXTURE_DATABASE_USER.equals(environment.getProperty("spring.datasource.username"))
                     || !WEB_ORIGIN.equals(environment.getProperty("crustcaper.web.origin"))
                     || !"disabled".equals(environment.getProperty("crustcaper.order-access.provider", "disabled"))
@@ -147,6 +154,7 @@ public final class WebCheckoutFixture {
         private final ObjectMapper mapper;
         private final HttpServer server;
         private final ExecutorService workers;
+        private final boolean holdFirstPaidVerification;
         private final Map<String, Charge> charges = new ConcurrentHashMap<>();
         private final AtomicLong sequences = new AtomicLong(7000);
         private final AtomicLong openCalls = new AtomicLong();
@@ -154,10 +162,11 @@ public final class WebCheckoutFixture {
         private final AtomicBoolean firstPaidVerificationStarted = new AtomicBoolean();
         private final AtomicBoolean firstPaidVerificationHeld = new AtomicBoolean();
 
-        Provider(ObjectMapper mapper, boolean restart) throws IOException {
+        Provider(ObjectMapper mapper, boolean external, boolean holdFirstPaidVerification) throws IOException {
             this.mapper = mapper;
+            this.holdFirstPaidVerification = holdFirstPaidVerification;
             server = HttpServer.create(new InetSocketAddress("0.0.0.0", PROVIDER_PORT), 0);
-            workers = restart ? Executors.newFixedThreadPool(4,
+            workers = external ? Executors.newFixedThreadPool(4,
                 Thread.ofPlatform().name("fixture-provider-", 0).factory()) : null;
             server.createContext("/v3/payments", this::open);
             server.createContext("/v3/transactions/verify_by_reference", this::verify);
@@ -218,7 +227,7 @@ public final class WebCheckoutFixture {
                     reply(exchange, 404, "{}", "application/json");
                     return;
                 }
-                if (workers != null && firstPaidVerificationStarted.compareAndSet(false, true)) {
+                if (holdFirstPaidVerification && firstPaidVerificationStarted.compareAndSet(false, true)) {
                     firstPaidVerificationHeld.set(true);
                     try {
                         Thread.sleep(VERIFY_HOLD);

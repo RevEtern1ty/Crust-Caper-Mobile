@@ -156,6 +156,11 @@ jobs:
         run: |
           node --test server/tooling/api-error-watch.test.mjs
           npm run test:storefront:api-errors
+      - name: Recover a live checkout database with its hosted payment ledger intact
+        timeout-minutes: 6
+        env:
+          CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: ${{ runner.temp }}/crustcaper-https-evidence/database-recovery
+        run: npm run test:storefront:database-recovery
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
