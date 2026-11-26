@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import { setTimeout as delay } from 'node:timers/promises';
 import { TextDecoder } from 'node:util';
 import { isMainModule } from './check-live-catalog.mjs';
+import { createPaymentReconciliationWatch } from './payment-reconciliation-watch.mjs';
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const maxLineBytes = 1024;
@@ -83,9 +84,8 @@ async function readWithDeadline(pending, maxGapMs) {
   }
 }
 
-export async function* watchApiErrorSamples(input, maxGapMs = 90_000) {
+async function* watchSamples(input, watch, maxGapMs = 90_000) {
   const iterator = input[Symbol.asyncIterator]();
-  const watch = createApiErrorWatch();
   try {
     while (true) {
       const pending = iterator.next();
@@ -102,6 +102,10 @@ export async function* watchApiErrorSamples(input, maxGapMs = 90_000) {
   } finally {
     await iterator.return?.();
   }
+}
+
+export function watchApiErrorSamples(input, maxGapMs = 90_000) {
+  return watchSamples(input, createApiErrorWatch(), maxGapMs);
 }
 
 async function* readSnapshots(input) {
@@ -153,8 +157,9 @@ function writeEvent(event) {
 }
 
 async function main() {
-  if (process.argv.length !== 2) {
-    console.error('Usage: node server/tooling/api-error-watch.mjs');
+  const payment = process.argv.length === 3 && process.argv[2] === '--payment-reconciliation';
+  if (process.argv.length !== 2 && !payment) {
+    console.error('Usage: node server/tooling/api-error-watch.mjs [--payment-reconciliation]');
     process.exitCode = 2;
     return;
   }
@@ -169,7 +174,8 @@ async function main() {
   process.once('SIGTERM', stop);
   process.stdout.on('error', () => process.stdin.destroy());
   try {
-    for await (const event of watchApiErrorSamples(readSnapshots(process.stdin))) {
+    const watch = payment ? createPaymentReconciliationWatch() : createApiErrorWatch();
+    for await (const event of watchSamples(readSnapshots(process.stdin), watch)) {
       if (stopping) break;
       await writeEvent(event);
     }

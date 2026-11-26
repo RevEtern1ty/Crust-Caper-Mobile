@@ -112,6 +112,7 @@ async function checkPublicCatalog(ca) {
   assert.equal((await request(ca, '/sitemap.xml')).status, 404);
   assert.equal((await request(ca, '/api/catalog-health')).status, 404);
   assert.equal((await request(ca, '/api/v1/local/orders')).status, 404);
+  assert.equal((await request(ca, '/actuator/paymentreconciliation')).status, 404);
 }
 
 function verifyPaymentRow(orderId) {

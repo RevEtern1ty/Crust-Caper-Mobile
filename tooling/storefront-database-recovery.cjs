@@ -145,6 +145,29 @@ async function unchangedPeers(signal, project, peers) {
   }
 }
 
+async function paymentReconciliationSnapshot(signal, edge) {
+  const response = await docker(signal, [
+    'exec', edge.id, 'wget', '-q', '-O', '-', 'http://api:8080/actuator/paymentreconciliation',
+  ]);
+  const snapshot = JSON.parse(response);
+  const totals = ['sweeps', 'confirmed', 'pending', 'providerErrors', 'rejected', 'settlementErrors', 'sweepErrors'];
+  requireCondition(Object.keys(snapshot).length === totals.length + 2 && snapshot.enabled === true
+    && typeof snapshot.instanceId === 'string' && /^[a-f0-9-]{36}$/.test(snapshot.instanceId)
+    && totals.every(key => Number.isSafeInteger(snapshot[key]) && snapshot[key] >= 0), 'database_recovery_payment_metrics');
+  return snapshot;
+}
+
+async function observeRecoveredReconciliation(signal, edge, sourceSnapshot) {
+  const deadline = performance.now() + 25_000;
+  while (performance.now() < deadline) {
+    const snapshot = await paymentReconciliationSnapshot(signal, edge);
+    requireCondition(snapshot.instanceId !== sourceSnapshot.instanceId, 'database_recovery_payment_metrics_instance');
+    if (snapshot.sweeps > 0) return snapshot.sweeps;
+    await delay(500, undefined, { signal });
+  }
+  throw new RecoveryFailure('database_recovery_payment_worker_inactive');
+}
+
 async function waitReady(signal, edge, request) {
   const deadline = performance.now() + 40000;
   while (!signal.aborted && performance.now() < deadline) {
@@ -191,6 +214,7 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
     await apiDatabase(active, api, source, '--restart-api');
     requireCondition(await sql(active, database, source, postgresJdbcTlsQuery) === 't', 'database_recovery_source_tls_unverified');
     report.postgresTls.sourceApi = true;
+    const sourcePaymentMetrics = await paymentReconciliationSnapshot(active, edge);
     const initial = await databaseSnapshot(active, database, source);
     verifyOrders(initial, 0, 0, 0, 0, 0, 0);
     requireCondition(await sql(active, database, source,
@@ -288,6 +312,9 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
     report.providerProcessUnchanged = true;
     report.sourceWitnessCountsUnchangedAfterStop = true;
     report.manualReconciliationRequired = true;
+    report.phase = 'payment_worker';
+    const completedSweeps = await observeRecoveredReconciliation(active, edge, sourcePaymentMetrics);
+    report.paymentReconciliation = { privateSnapshots: true, newInstance: true, completedSweeps };
     report.phase = 'complete';
   } catch (error) {
     const code = typeof error?.code === 'string' && /^(?:recovery|checkout)_[a-z_]{2,48}$/.test(error.code)
