@@ -52,6 +52,9 @@ class LocalCatalog implements CommandLineRunner {
     @Override
     @Transactional
     public void run(String... arguments) {
+        // The importer uses this lock even before a store row exists.
+        jdbc.sql("SELECT 1 FROM pg_advisory_xact_lock(hashtextextended('crustcaper:catalog:' || ?, 0))")
+            .param(STORE).query(Integer.class).single();
         jdbc.sql("""
             INSERT INTO stores (id, name, area, hours, open, tax_basis_points, version)
             VALUES (?, CAST(? AS jsonb), CAST(? AS jsonb), CAST(? AS jsonb), true, 1800, 'local-1')
