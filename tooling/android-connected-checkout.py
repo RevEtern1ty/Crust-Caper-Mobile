@@ -263,10 +263,13 @@ class Emulator:
             start, end = end, start
         self.shell("input", "swipe", x, start, x, end, "275")
 
-    def tap(self, description, match, *, scroll=None):
-        target = self.await_nodes(description, lambda nodes: next((
-            node for node in nodes if node.get("clickable") == "true" and node.get("enabled") == "true" and match(node)
-        ), None), scroll=scroll)
+    def tap(self, description, match, *, scroll=None, position=0):
+        def matching_control(nodes):
+            controls = [node for node in nodes
+                        if node.get("clickable") == "true" and node.get("enabled") == "true" and match(node)]
+            return controls[position] if position < len(controls) else None
+
+        target = self.await_nodes(description, matching_control, scroll=scroll)
         left, top, right, bottom = box(target)
         self.shell("input", "tap", (left + right) // 2, (top + bottom) // 2)
 
@@ -331,7 +334,9 @@ def checkout(args, evidence):
         device.tap_label(r"View cart · .+")
         device.tap_label("Choose pickup time")
         device.wait_label("Pickup time")
-        device.tap("an available pickup time", lambda node: node.get("class") == "android.widget.RadioButton")
+        # The first local window can close while the emulator enters contact details.
+        device.tap("the third available pickup time", lambda node: node.get("class") == "android.widget.RadioButton",
+                   scroll="down", position=2)
         device.type_field("Phone number", "+250 …", "+250700000000")
         device.type_field("Email address", "Email address", "native-checkout@example.test")
         device.tap_label("Review order")

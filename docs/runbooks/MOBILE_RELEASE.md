@@ -42,8 +42,9 @@ printf '28ea0a438de9a13bd7891fd758eee6c7819ee8af5442dfd8d45bd65e56d4228c  %s\n' 
 tar --no-same-owner -xzf "$node_dir/node.tar.gz" -C "$node_dir"
 export PATH="$node_dir/node-v24.22.0-linux-x64/bin:$PATH"
 
-export CI=1 EXPO_NO_TELEMETRY=1 CRUSTCAPER_BUILD_PROFILE=local CRUSTCAPER_STORE_ID=kigali
+export CI=1 NODE_ENV=production EXPO_NO_TELEMETRY=1 CRUSTCAPER_BUILD_PROFILE=local CRUSTCAPER_STORE_ID=kigali
 export CRUSTCAPER_API_BASE_URL=http://10.0.2.2:18080/api/v1
+export CMAKE_BUILD_PARALLEL_LEVEL=1
 for package in 'build-tools;35.0.0' 'cmake;3.22.1'; do
   if [ ! -f "$ANDROID_HOME/${package%;*}/${package#*;}/source.properties" ]; then
     "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
@@ -54,8 +55,9 @@ npm ci
 npx --no-install expo prebuild --platform android --no-install
 (
   cd android
-  bash ./gradlew --no-daemon --max-workers=2 :app:assembleRelease \
-    '-Dorg.gradle.jvmargs=-Xmx1800m -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8' \
+  bash ./gradlew --no-daemon --max-workers=1 :app:assembleRelease \
+    '-Dorg.gradle.jvmargs=-Xmx1400m -XX:MaxMetaspaceSize=512m -XX:ActiveProcessorCount=2 -Dfile.encoding=UTF-8' \
+    -Pkotlin.compiler.execution.strategy=in-process \
     -PreactNativeArchitectures=x86_64 -Pandroid.builder.sdkDownload=false
 )
 apk=android/app/build/outputs/apk/release/app-release.apk
