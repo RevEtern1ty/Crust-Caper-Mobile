@@ -151,6 +151,10 @@ const demoResult = inspect('demo', { CRUSTCAPER_PUSH_PROJECT_ID: pushProjectId }
 assert.equal(demoResult.status, 0, demoResult.stderr);
 assert.deepEqual(JSON.parse(demoResult.stdout).extra.restaurant, { profile: 'demo' });
 
+const webResult = inspect('stage', { CRUSTCAPER_WEB_CHECKOUT: 'true' });
+assert.equal(webResult.status, 0, webResult.stderr);
+assert.equal(JSON.parse(webResult.stdout).extra.restaurant.webCheckout, true);
+
 const rejectedProductionConfigs = [
   [{ CRUSTCAPER_API_BASE_URL: undefined }, 'Set CRUSTCAPER_API_BASE_URL'],
   [{ CRUSTCAPER_API_BASE_URL: 'http://127.0.0.1:18080/api/v1' }, 'must use a domain over HTTPS'],

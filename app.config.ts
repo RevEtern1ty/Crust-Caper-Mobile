@@ -159,7 +159,10 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     extra: {
       ...config.extra,
       ...(pushProjectId ? { eas: { ...config.extra?.eas, projectId: pushProjectId } } : {}),
-      restaurant: { profile, apiBaseUrl: api.origin + '/api/v1', storeId, pspHosts, pushProjectId, webCheckout },
+      restaurant: {
+        profile, apiBaseUrl: api.origin + '/api/v1', storeId, pspHosts, pushProjectId,
+        ...(webCheckout ? { webCheckout: true } : {}),
+      },
     },
   };
   return pushProjectId ? withFirebasePickupAlerts(resolved) : withoutPickupAlertEntitlement(resolved);

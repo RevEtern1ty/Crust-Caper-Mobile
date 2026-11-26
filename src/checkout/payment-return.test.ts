@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { paymentReturnOrderId, savedPaymentReturnOrderId } from './payment-return';
+import type { CheckoutJournal } from './controller';
+import { checkoutPaymentReturnOrderId, paymentReturnOrderId, savedPaymentReturnOrderId } from './payment-return';
 
 const first = '07f3f2a1-4a76-40a1-923d-30c01321be50';
 const latest = '4212aa0c-9be3-4fc6-9dc9-b79c651da531';
@@ -17,4 +18,24 @@ test('a payment return rejects missing, duplicate or malformed order IDs', () =>
     assert.equal(paymentReturnOrderId(value), null);
   }
   assert.equal(paymentReturnOrderId(first), first);
+});
+
+test('a return with an unavailable order ID selects the active checkout rather than a historical selection', () => {
+  const journal: CheckoutJournal = {
+    version: 1, active: { phase: 'paying', orderId: latest, key: 'payment-attempt' }, orderIds: [first, latest],
+  };
+  for (const input of [undefined, other, 'malformed', [latest, first]]) {
+    assert.equal(checkoutPaymentReturnOrderId(input, journal), latest);
+  }
+  assert.equal(checkoutPaymentReturnOrderId(first, journal), first);
+});
+
+test('a return with no confirmed active order never selects an unsaved ID', () => {
+  const journal: CheckoutJournal = {
+    version: 1, active: { phase: 'creating', quoteId: 'quote', key: 'intent', cartFingerprint: 'cart' },
+    orderIds: [first],
+  };
+  assert.equal(checkoutPaymentReturnOrderId(other, journal), null);
+  assert.equal(checkoutPaymentReturnOrderId(first, null), null);
+  assert.equal(checkoutPaymentReturnOrderId(other, { ...journal, active: null }), null);
 });

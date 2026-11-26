@@ -3,16 +3,17 @@ import * as WebBrowser from 'expo-web-browser';
 import { useCallback } from 'react';
 import { Platform } from 'react-native';
 import { useCheckout } from '../src/checkout/context';
-import { paymentReturnOrderId } from '../src/checkout/payment-return';
+import { checkoutPaymentReturnOrderId } from '../src/checkout/payment-return';
 
 export default function PaymentReturn() {
   const { orderId } = useLocalSearchParams<{ orderId?: string | string[] }>();
-  const { setRequestedOrderId } = useCheckout();
-  const requestedOrder = paymentReturnOrderId(orderId);
+  const { journal, restoreFailed, setRequestedOrderId } = useCheckout();
   useFocusEffect(useCallback(() => {
-    setRequestedOrderId(requestedOrder);
+    if (!journal && !restoreFailed) return;
+
+    setRequestedOrderId(checkoutPaymentReturnOrderId(orderId, journal));
     if (Platform.OS === 'ios') void WebBrowser.dismissBrowser().catch(() => undefined);
     router.replace('/(tabs)/orders');
-  }, [requestedOrder, setRequestedOrderId]));
+  }, [journal, orderId, restoreFailed, setRequestedOrderId]));
   return null;
 }
