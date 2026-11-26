@@ -1065,7 +1065,9 @@ test('open Orders reconciles a declined checkout after its pickup hold expires',
   const preview = page.waitForResponse(response =>
     response.url() === orderUrl + '/reorder' && response.request().method() === 'POST' && response.ok());
   await button(page, 'Review reorder').click();
-  assert.deepEqual((await (await preview).json()).lines, expiredOrder.lines);
+  assert.deepEqual((await (await preview).json()).lines, expiredOrder.lines.map(({ sku, modifierIds, quantity, unitPrice }) => (
+    { sku, modifierIds, quantity, unitPrice }
+  )));
   await shown(page, 'Available items today');
   await button(page, 'Add these items to cart').waitFor();
   assert.deepEqual(writes, [...initialWrites, orderPath + '/reorder']);
@@ -1534,6 +1536,8 @@ test('a shared order previews the mobile cart limit before saving it', { timeout
   const order = await send(`/orders/${id}`, { token: guestToken }).then(response => response.json());
   const [originalLine] = order.lines;
   assert.equal(originalLine.quantity, 12);
+  const { sku, modifierIds, unitPrice } = originalLine;
+  const currentItem = { sku, modifierIds, unitPrice };
   await page.evaluate(orderId => {
     const guestKey = Object.keys(sessionStorage).find(key => key.startsWith('crustcaper.checkout.v1.') && key.endsWith('.guest'));
     if (!guestKey) throw new Error('Expected the live browser guest session');
@@ -1554,7 +1558,7 @@ test('a shared order previews the mobile cart limit before saving it', { timeout
   await shown(page, 'Quantity · 12 → 9');
   const format = value => new Intl.NumberFormat('en-RW', { maximumFractionDigits: 0 }).format(value) + ' RWF';
   await shown(page, format(9 * originalLine.unitPrice));
-  assert.deepEqual(await savedLines(), [{ ...originalLine, quantity: 1 }]);
+  assert.deepEqual(await savedLines(), [{ ...currentItem, quantity: 1 }]);
   await inspectReorderLimit(page, 'en', 'Quantity · 12 → 9', 'Replace cart with these items');
 
   await page.goto(origin + '/settings');
@@ -1563,11 +1567,11 @@ test('a shared order previews the mobile cart limit before saving it', { timeout
   await page.goto(origin + '/orders');
   await button(page, 'Reba komande nshya isa n’iyi').click();
   await shown(page, 'Umubare · 12 → 9');
-  assert.deepEqual(await savedLines(), [{ ...originalLine, quantity: 1 }]);
+  assert.deepEqual(await savedLines(), [{ ...currentItem, quantity: 1 }]);
   await inspectReorderLimit(page, 'rw', 'Umubare · 12 → 9', 'Simbuza ibiri mu gatebo ibi biribwa');
   await button(page, 'Simbuza ibiri mu gatebo ibi biribwa').click();
   await shown(page, 'Igitebo cyawe');
-  const expected = [{ ...originalLine, quantity: 9 }];
+  const expected = [{ ...currentItem, quantity: 9 }];
   assert.deepEqual(await savedLines(), expected);
   await page.reload();
   await shown(page, 'Double Smash');
@@ -1582,14 +1586,14 @@ test('a shared order previews the mobile cart limit before saving it', { timeout
     const key = Object.keys(sessionStorage).find(key => key.startsWith('crustcaper.draft.v1.'));
     const previousDraft = JSON.parse(sessionStorage.getItem(key));
     sessionStorage.setItem(key, JSON.stringify({ ...previousDraft, cart: [line] }));
-  }, originalLine);
+  }, { ...currentItem, quantity: 12 });
   await page.reload();
   await shown(page, format(12 * originalLine.unitPrice));
-  assert.deepEqual(await savedLines(), [originalLine]);
+  assert.deepEqual(await savedLines(), [{ ...currentItem, quantity: 12 }]);
   assert.equal(await button(page, 'Ongeramo imwe muri Double Smash').isDisabled(), true);
   await removeOne.click();
   await shown(page, format(11 * originalLine.unitPrice));
-  assert.deepEqual(await savedLines(), [{ ...originalLine, quantity: 11 }]);
+  assert.deepEqual(await savedLines(), [{ ...currentItem, quantity: 11 }]);
 });
 
 async function withLargeText(page, inspect, selector = 'div, span, p, h1, h2, h3') {
