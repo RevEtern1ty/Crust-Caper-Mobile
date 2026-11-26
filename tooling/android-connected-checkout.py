@@ -377,6 +377,20 @@ def checkout(args, evidence):
         device.launch()
         device.tap_label("Orders")
         device.collected(reference, code)
+        checks = ["exact installed APK", "same pending order after force-stop", "synthetic payment",
+                  "paid kitchen order", "ready and collected updates without refresh", "collected order after force-stop"]
+        if args.check_session_end:
+            print("End the guest session and verify cleared order access after a cold launch", flush=True)
+            device.tap_label("Settings", scroll="up")
+            device.wait_label("Order access")
+            device.tap_label("End guest session", scroll="down")
+            device.tap_label("Confirm end session", scroll="down")
+            device.wait_label("Order access was cleared on this device.")
+            device.capture(evidence / "session-ended.png")
+            device.launch()
+            device.tap_label("Orders")
+            device.wait_label("No orders yet")
+            checks.append("guest session ended and order access cleared after force-stop")
         summary.update({
             "profile": "local",
             "androidApi": int(device.api_level),
@@ -384,9 +398,7 @@ def checkout(args, evidence):
             "orderReference": reference,
             "coldLaunchPids": list(map(int, device.pids)),
             "result": "passed",
-            "checks": ["exact installed APK", "same pending order after force-stop", "synthetic payment",
-                       "paid kitchen order", "ready and collected updates without refresh",
-                       "collected order after force-stop"],
+            "checks": checks,
         })
         return summary
     finally:
@@ -407,6 +419,8 @@ def main():
     parser.add_argument("--api", default="http://127.0.0.1:18080/api/v1")
     parser.add_argument("--adb", default=shutil.which("adb") or "adb")
     parser.add_argument("--aapt")
+    parser.add_argument("--check-session-end", action="store_true",
+                        help="End the guest session on builds with the order-access settings screen")
     args = parser.parse_args()
 
     try:
