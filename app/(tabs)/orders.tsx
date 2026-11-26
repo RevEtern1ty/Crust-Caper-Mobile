@@ -1,6 +1,6 @@
 import { router } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
-import { Platform, Pressable, StyleSheet, View } from 'react-native';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { AppState, Platform, Pressable, StyleSheet, View } from 'react-native';
 
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../../src/checkout/context';
 import { CheckoutError } from '../../src/checkout/controller';
@@ -31,6 +31,7 @@ export default function OrdersScreen() {
   const [preview, setPreview] = useState<{ orderId: string; result: ReorderResult } | null>(null);
   const [problem, setProblem] = useState<{ error: unknown } | null>(null);
   const running = useRef(false);
+  const receiptRevision = useRef(0);
   const linkedOrderId = savedPaymentReturnOrderId(requestedOrderId ?? undefined, journal?.orderIds ?? []);
   const orderId = linkedOrderId ?? (choice?.latest === latestId ? choice.id : latestId);
   const { order, loading, failed, error: statusError, refresh, delayedPayment } = useOrderStatus(orderId);
@@ -39,6 +40,17 @@ export default function OrdersScreen() {
   const savedOrderId = savedPaymentReturnOrderId(orderId ?? undefined, journal?.orderIds ?? []);
   const needsPhoneVerification = mode === 'connected' && savedOrderId !== null
     && statusError instanceof ApiError && (statusError.code === 'unauthenticated' || statusError.code === 'not_found');
+  const visibleReceiptOrderId = order?.receiptUrl && order.receiptStatus !== 'pending' ? order.id : null;
+
+  useLayoutEffect(() => {
+    const subscription = AppState.addEventListener('change', state => {
+      if (state !== 'active') receiptRevision.current++;
+    });
+    return () => {
+      receiptRevision.current++;
+      subscription.remove();
+    };
+  }, [visibleReceiptOrderId]);
 
   useEffect(() => {
     if (!journal || requestedOrderId === null) return;
@@ -100,11 +112,17 @@ export default function OrdersScreen() {
   }
 
   function openReceipt(id: string) {
-    const shouldOpen = guardNavigation();
+    const started = receiptRevision.current;
+    const stillFocused = guardNavigation();
+    const shouldOpen = () => stillFocused() && receiptRevision.current === started && AppState.currentState === 'active';
     void run('receipt', async () => {
       if (!api.getReceiptPdf) return;
-      const pdf = await api.getReceiptPdf(id);
-      if (shouldOpen()) await shareReceipt(pdf, `receipt-${id.slice(-8)}.pdf`, t('Receipt', 'Inyemezabwishyu'));
+      try {
+        const pdf = await api.getReceiptPdf(id);
+        if (shouldOpen()) await shareReceipt(pdf, `receipt-${id.slice(-8)}.pdf`, t('Receipt', 'Inyemezabwishyu'), shouldOpen);
+      } catch (error) {
+        if (shouldOpen()) throw error;
+      }
     });
   }
 
@@ -341,6 +359,7 @@ export default function OrdersScreen() {
                 aria-pressed={Platform.OS === 'web' ? id === orderId : undefined}
                 accessibilityState={Platform.OS === 'web' ? undefined : { selected: id === orderId }}
                 onPress={() => {
+                  if (id !== orderId) receiptRevision.current++;
                   setChoice({ latest: latestId, id });
                   setPreview(null);
                   setProblem(null);

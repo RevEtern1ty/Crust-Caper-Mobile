@@ -1009,6 +1009,121 @@ test('a late payment refund offers localized help beside its status', { timeout:
   assert.deepEqual(writes, []);
 });
 
+test('a fiscal receipt export is canceled when the selected order or app visibility changes', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, serviceWorkers: 'block' });
+  page.setDefaultTimeout(6500);
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const apiUrl = new URL(api);
+  const journalKey = 'crustcaper.checkout.v1.local.' + apiUrl.hostname + '.' + apiUrl.port + '.kigali';
+  const first = '2bba37e8-58db-4563-a4e2-fb197fe59890';
+  const second = '164064f3-2cad-475e-aa6b-67a8403ef030';
+  const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+  const guest = { accessToken: 'fixture_receipt_export_access_token_01', refreshToken: 'fixture_receipt_export_refresh_token_01',
+    expiresAt, refreshExpiresAt: expiresAt };
+  await page.addInitScript(({ origin, journalKey, orderIds, guest }) => {
+    if (location.origin !== origin) return;
+    sessionStorage.setItem(journalKey, JSON.stringify({ version: 1, active: null, orderIds }));
+    sessionStorage.setItem(journalKey + '.guest', JSON.stringify(guest));
+    window.receiptDownloadNames = [];
+    document.addEventListener('click', event => {
+      if (event.target instanceof HTMLAnchorElement && event.target.download) {
+        window.receiptDownloadNames.push(event.target.download);
+      }
+    }, true);
+  }, { origin, journalKey, orderIds: [first, second], guest });
+
+  const firstPdf = testReceipt();
+  const secondPdf = Buffer.concat([firstPdf, Buffer.from('\n')]);
+  const label = { en: 'Fixture store', rw: 'Fixture store' };
+  const menuUrl = api + '/stores/kigali/menu';
+  const cors = { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Headers': 'Authorization',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS' };
+  const writes = [];
+  let deferred;
+  await page.route('**/*', async route => {
+    const request = route.request();
+    const url = request.url();
+    if (new URL(url).origin === origin) return route.continue();
+    if (!url.startsWith(api + '/')) return route.abort();
+    if (request.method() === 'OPTIONS') return route.fulfill({ status: 204, headers: cors });
+    if (request.method() !== 'GET') {
+      writes.push(request.method());
+      return route.abort();
+    }
+    if (url === menuUrl || url.startsWith(menuUrl + '?')) {
+      return route.fulfill({ headers: cors, json: { version: 'fixture', updatedAt: new Date().toISOString(),
+        store: { id: 'kigali', name: label, area: label, open: true, hours: label }, products: [], slots: [] } });
+    }
+    const [section, id, receipt] = url.slice(api.length + 1).split('/');
+    if (section !== 'orders' || (id !== first && id !== second)) return route.abort();
+    if (receipt === 'receipt') {
+      if (deferred?.id === id) {
+        const pending = deferred;
+        deferred = undefined;
+        await pending.release.promise;
+      }
+      return route.fulfill({ headers: cors, contentType: 'application/pdf', body: id === first ? firstPdf : secondPdf });
+    }
+    const total = id === first ? 9200 : 9400;
+    return route.fulfill({ headers: cors, json: {
+      id, storeId: 'kigali', slotId: 'fixture-slot',
+      lines: [{ sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: total }],
+      total, tax: 1400, currency: 'RWF', status: 'collected', paymentStatus: 'paid',
+      pickupCode: null, receiptStatus: 'issued', receiptUrl: '/api/v1/orders/' + id + '/receipt', paymentAttempt: null,
+      createdAt: '2026-11-24T10:00:00Z', reservationExpiresAt: '2026-11-24T10:10:00Z',
+      pickupStartsAt: '2026-11-24T10:10:00Z', pickupEndsAt: '2026-11-24T10:20:00Z',
+    } });
+  });
+
+  const receiptButton = button(page, 'Download receipt');
+  const downloadNames = () => page.evaluate(() => window.receiptDownloadNames.slice());
+  async function deferExport(id, interrupt) {
+    const delayed = { id, release: Promise.withResolvers() };
+    deferred = delayed;
+    await receiptButton.waitFor();
+    const requested = page.waitForRequest(api + '/orders/' + id + '/receipt');
+    try {
+      await receiptButton.click();
+      await requested;
+      await interrupt();
+    } finally {
+      delayed.release.resolve();
+    }
+    const resumedButton = page.getByRole('button', { name: 'Download receipt', exact: true, disabled: false });
+    await resumedButton.waitFor();
+  }
+
+  await page.goto(origin + '/orders');
+  await shown(page, '9,200 RWF');
+  await deferExport(first, async () => {
+    await button(page, '#' + second.slice(-8).toUpperCase()).click();
+    await shown(page, '9,400 RWF');
+  });
+  assert.deepEqual(await downloadNames(), [], 'A late receipt must not download on another order');
+
+  await deferExport(second, () => page.evaluate(() => {
+    for (const state of ['hidden', 'visible']) {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: state });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }
+    delete document.visibilityState;
+  }));
+  assert.deepEqual(await downloadNames(), [], 'Returning to the foreground does not renew the old export');
+
+  assert.ok((await downloadedReceipt(page)).equals(secondPdf));
+  assert.deepEqual(await downloadNames(), ['receipt-' + second.slice(-8) + '.pdf']);
+  assert.deepEqual(writes, []);
+});
+
 test('a saved Orders action error follows the chosen language and keeps its support ID', { timeout: 25_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const server = createPreviewServer(dist);

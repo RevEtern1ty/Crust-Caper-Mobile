@@ -35,18 +35,21 @@ export function purgeExpiredReceiptFiles() {
   }
 }
 
-export async function shareReceipt(bytes: Uint8Array, fileName: string, dialogTitle: string): Promise<void> {
-  if (!(await isAvailableAsync())) throw new ApiError('service_unavailable');
+export async function shareReceipt(bytes: Uint8Array, fileName: string, dialogTitle: string, canShare: () => boolean): Promise<void> {
+  const available = await isAvailableAsync();
+  if (!canShare()) return;
+  if (!available) throw new ApiError('service_unavailable');
 
   const task = randomUUID();
   const directory = new Directory(Paths.cache, receiptDirectoryName, task);
   const file = new File(directory, fileName);
-  directory.create({ intermediates: true });
-  activeTasks.add(task);
   let shared = false;
   try {
+    directory.create({ intermediates: true });
+    activeTasks.add(task);
     file.create();
     file.write(bytes);
+    if (!canShare()) return;
     await shareAsync(file.uri, { dialogTitle, mimeType: PDF_MIME_TYPE, UTI: 'com.adobe.pdf' });
     shared = true;
   } finally {
