@@ -1953,14 +1953,8 @@ components:
         sku: { type: string }
         name: { $ref: '#/components/schemas/Localized' }
         description: { $ref: '#/components/schemas/Localized' }
-        ingredients:
-          type: array
-          items: { $ref: '#/components/schemas/Localized' }
-          description: Published ingredients of the base recipe.
-        allergens:
-          type: array
-          items: { $ref: '#/components/schemas/Localized' }
-          description: Published allergen declarations of the base recipe.
+        ingredients: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+        allergens: { type: array, items: { $ref: '#/components/schemas/Localized' } }
         category: { type: string, enum: [burgers, combos, sides, drinks] }
         price: { $ref: '#/components/schemas/Amount' }
         available: { type: boolean }
@@ -2055,8 +2049,14 @@ components:
           type: string
           description: Catalog edition used for the quote. Unrelated catalog changes do not change the saved edition.
         name: { $ref: '#/components/schemas/Localized' }
-        ingredients: { type: array, items: { $ref: '#/components/schemas/Localized' } }
-        allergens: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+        ingredients:
+          type: array
+          items: { $ref: '#/components/schemas/Localized' }
+          description: Published ingredients of the base recipe.
+        allergens:
+          type: array
+          items: { $ref: '#/components/schemas/Localized' }
+          description: Published allergen declarations of the base recipe.
         modifiers:
           type: array
           maxItems: 25
