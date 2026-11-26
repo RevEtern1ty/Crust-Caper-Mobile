@@ -25,6 +25,7 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -120,6 +121,80 @@ class OperatorIntegrationTest {
         assertThat(keys(visible.path("lines").get(0))).containsExactlyInAnyOrder("sku", "modifierIds", "quantity");
         change(staffBearer, differentStore.orderId(), "preparing", null).andExpect(status().isNotFound());
         change(staffBearer, unpaid.orderId(), "preparing", null).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void counterLookupReportsPickupProgressWithoutChangingCollection() throws Exception {
+        String pickup = login(newStaff(store, "pickup"));
+        String manager = login(newStaff(store, "manager"));
+        OrderFixture order = newOrder(store, true);
+        UUID id = UUID.fromString(order.orderId());
+        String code = order.orderId().substring(28).toUpperCase(Locale.ROOT);
+
+        JsonNode found = body(counterLookup(pickup, code).andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store")));
+        assertThat(keys(found)).containsExactlyInAnyOrder("orderId", "status", "pickupStartsAt", "pickupEndsAt");
+        assertThat(found.path("orderId").asString()).isEqualTo(order.orderId());
+        assertThat(found.path("status").asString()).isEqualTo("accepted");
+        assertThat(Instant.parse(found.path("pickupStartsAt").asString())).isEqualTo(jdbc.sql(
+                "SELECT pickup_starts_at FROM orders WHERE id = ?").param(id).query(OffsetDateTime.class).single().toInstant());
+        assertThat(Instant.parse(found.path("pickupEndsAt").asString())).isEqualTo(jdbc.sql(
+                "SELECT pickup_ends_at FROM orders WHERE id = ?").param(id).query(OffsetDateTime.class).single().toInstant());
+        assertThat(jdbc.sql("SELECT count(*) FROM operator_order_events WHERE order_id = ?")
+                .param(id).query(Long.class).single()).isZero();
+
+        change(manager, order.orderId(), "preparing", null).andExpect(status().isOk());
+        counterLookup(manager, order.orderId().toUpperCase(Locale.ROOT)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("preparing"));
+        change(manager, order.orderId(), "ready", null).andExpect(status().isOk());
+        counterLookup(pickup, code).andExpect(status().isOk()).andExpect(jsonPath("$.status").value("ready"));
+        assertThat(jdbc.sql("SELECT status = 'ready' AND payment_status = 'paid' AND pickup_code = ? FROM orders WHERE id = ?")
+                .params(order.code(), id).query(Boolean.class).single()).isTrue();
+        assertThat(jdbc.sql("SELECT count(*) FROM operator_order_events WHERE order_id = ?")
+                .param(id).query(Long.class).single()).isEqualTo(2);
+        change(pickup, order.orderId(), "collected", null).andExpect(status().isBadRequest());
+        change(pickup, order.orderId(), "collected", order.code()).andExpect(status().isOk());
+        counterLookup(pickup, code).andExpect(status().isOk()).andExpect(jsonPath("$.status").value("collected"));
+        assertPickupStatus(pickup, order.orderId(), "collected", true);
+        assertThat(jdbc.sql("SELECT count(*) FROM operator_order_events WHERE order_id = ?")
+                .param(id).query(Long.class).single()).isEqualTo(3);
+    }
+
+    @Test
+    void counterLookupRequiresItsOwnPickupOrManagerSessionAndRejectsAmbiguousShortCodes() throws Exception {
+        String foreign = newStore();
+        String pickup = login(newStaff(store, "pickup"));
+        String manager = login(newStaff(store, "manager"));
+        String kitchen = login(newStaff(store, "kitchen"));
+        String code = "D0E1F234";
+        OrderFixture paid = newOrder(store, true, UUID.fromString("10000000-0000-4000-8000-0000d0e1f234"));
+        OrderFixture unpaid = newOrder(store, false, UUID.fromString("20000000-0000-4000-8000-0000d0e1f234"));
+        OrderFixture elsewhere = newOrder(foreign, true, UUID.fromString("30000000-0000-4000-8000-0000d0e1f234"));
+        OrderFixture cancelled = newOrder(store, true, UUID.fromString("40000000-0000-4000-8000-0000d0e1f234"));
+        cancel(manager, cancelled.orderId()).andExpect(status().isOk());
+
+        counterLookup(pickup, code).andExpect(status().isOk()).andExpect(jsonPath("$.orderId").value(paid.orderId()));
+        api.perform(get(OPERATOR + "/orders/lookup").queryParam("orderCode", code)).andExpect(status().isUnauthorized());
+        counterLookup(paid.guestBearer(), code).andExpect(status().isUnauthorized());
+        counterLookup(kitchen, code).andExpect(status().isForbidden());
+        for (String missing : List.of("00000000", unpaid.orderId(), elsewhere.orderId(), cancelled.orderId())) {
+            counterLookup(manager, missing).andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("not_found"));
+        }
+        for (String invalid : List.of("", "#" + code, "D0E1F23", code + 'F', "d0e1f23g", "00000000-0000-0000-0000-00000000000z")) {
+            counterLookup(manager, invalid).andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("invalid_input"));
+        }
+        api.perform(get(OPERATOR + "/orders/lookup").header(HttpHeaders.AUTHORIZATION, manager)).andExpect(status().isBadRequest());
+        api.perform(get(OPERATOR + "/orders/lookup").queryParam("orderCode", code, code)
+                .header(HttpHeaders.AUTHORIZATION, manager)).andExpect(status().isBadRequest());
+
+        OrderFixture collision = newOrder(store, true, UUID.fromString("50000000-0000-4000-8000-0000d0e1f234"));
+        counterLookup(pickup, code).andExpect(status().isConflict()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+                .andExpect(jsonPath("$.code").value("order_code_ambiguous"));
+        for (OrderFixture match : List.of(paid, collision)) {
+            counterLookup(manager, match.orderId()).andExpect(status().isOk()).andExpect(jsonPath("$.orderId").value(match.orderId()));
+        }
+        api.perform(delete(OPERATOR + "/sessions/current").header(HttpHeaders.AUTHORIZATION, pickup)).andExpect(status().isNoContent());
+        counterLookup(pickup, paid.orderId()).andExpect(status().isUnauthorized());
     }
 
     @Test
@@ -1054,10 +1129,18 @@ class OperatorIntegrationTest {
     }
 
     private OrderFixture newOrder(String storeId, boolean paid) throws Exception {
+        return newOrder(storeId, paid, null);
+    }
+
+    private OrderFixture newOrder(String storeId, boolean paid, UUID fixtureId) throws Exception {
         String bearer = newGuest();
         String quoteId = body(quote(bearer, storeId).andExpect(status().isOk())).path("quoteId").asString("");
         String orderId = body(createOrder(bearer, quoteId, "fixture-order")
                 .andExpect(status().isOk())).path("id").asString("");
+        if (fixtureId != null) {
+            jdbc.sql("UPDATE orders SET id = ? WHERE id = ?").params(fixtureId, UUID.fromString(orderId)).update();
+            orderId = fixtureId.toString();
+        }
         if (!paid) {
             return new OrderFixture(orderId, bearer, null);
         }
@@ -1114,6 +1197,11 @@ class OperatorIntegrationTest {
 
     private ResultActions pickupStatus(String bearer, String orderId) throws Exception {
         return api.perform(get(OPERATOR + "/orders/{id}/pickup-status", orderId).header(HttpHeaders.AUTHORIZATION, bearer));
+    }
+
+    private ResultActions counterLookup(String bearer, String code) throws Exception {
+        return api.perform(get(OPERATOR + "/orders/lookup").queryParam("orderCode", code)
+                .header(HttpHeaders.AUTHORIZATION, bearer));
     }
 
     private void assertPickupStatus(String bearer, String orderId, String expectedStatus, boolean confirmed) throws Exception {

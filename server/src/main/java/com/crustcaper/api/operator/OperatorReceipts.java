@@ -4,7 +4,6 @@ import com.crustcaper.api.operator.OperatorSessions.Principal;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -16,8 +15,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 final class OperatorReceipts {
     private static final Pattern REFERENCE = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._/-]{0,79}");
     private static final Pattern WHOLE_RWF = Pattern.compile("[1-9][0-9]{0,18}");
-    private static final Pattern SHORT_ORDER_CODE = Pattern.compile("[0-9a-fA-F]{8}");
-    private static final Pattern FULL_ORDER_ID = Pattern.compile("[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final String ORDER_FIELDS = """
         SELECT o.id, o.status, o.receipt_status, o.receipt_url, o.total, f.reference
         FROM orders o LEFT JOIN fiscal_receipts f ON f.order_id = o.id
@@ -42,14 +39,10 @@ final class OperatorReceipts {
         Principal actor = manager(authorization, false);
         if (orderCode == null) return pendingAndRecent(actor.storeId());
 
-        boolean shortCode = SHORT_ORDER_CODE.matcher(orderCode).matches();
-        if (!shortCode && !FULL_ORDER_ID.matcher(orderCode).matches()) throw OperatorFailure.invalid();
-        // Keep the suffix predicate aligned with the existing orders_access_code expression index.
-        String match = shortCode ? "right(o.id::text, 8) = ?" : "o.id = ?";
-        Object reference = shortCode ? orderCode.toLowerCase(Locale.ROOT) : UUID.fromString(orderCode);
+        OperatorOrderCode match = OperatorOrderCode.parse(orderCode);
         List<ReceiptOrder> matches = jdbc.sql(ORDER_FIELDS
-                + " WHERE o.store_id = ? AND o.payment_status = 'paid' AND " + match + " LIMIT 2")
-            .params(actor.storeId(), reference).query(OperatorReceipts::view).list();
+                + " WHERE o.store_id = ? AND o.payment_status = 'paid' AND " + match.predicate() + " LIMIT 2")
+            .params(actor.storeId(), match.parameter()).query(OperatorReceipts::view).list();
         if (matches.size() > 1) throw OperatorFailure.conflict("receipt_order_code_ambiguous");
         return matches;
     }

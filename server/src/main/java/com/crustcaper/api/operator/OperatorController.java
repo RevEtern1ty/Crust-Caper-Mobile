@@ -4,6 +4,7 @@ import com.crustcaper.api.operator.OperatorModels.Login;
 import com.crustcaper.api.operator.OperatorModels.OrderView;
 import com.crustcaper.api.operator.OperatorModels.PaymentReview;
 import com.crustcaper.api.operator.OperatorModels.PaymentReviewPage;
+import com.crustcaper.api.operator.OperatorModels.PickupLookup;
 import com.crustcaper.api.operator.OperatorModels.PickupStatus;
 import com.crustcaper.api.operator.OperatorModels.Queue;
 import com.crustcaper.api.operator.OperatorModels.Session;
@@ -66,6 +67,13 @@ final class OperatorController {
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
             @PathVariable String id) {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.pickupStatus(authorization, id));
+    }
+
+    @GetMapping("/orders/lookup")
+    ResponseEntity<PickupLookup> pickupLookup(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+            @RequestParam(value = "orderCode", required = false) String orderCode) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.pickupLookup(authorization, orderCode));
     }
 
     @GetMapping(value = "/payment-exceptions", params = "!state")

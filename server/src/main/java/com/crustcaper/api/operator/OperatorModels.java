@@ -40,6 +40,8 @@ final class OperatorModels {
 
     record PickupStatus(UUID id, String status, boolean confirmedByCurrentOperator) { }
 
+    record PickupLookup(UUID orderId, String status, Instant pickupStartsAt, Instant pickupEndsAt) { }
+
     record PaymentExceptionView(UUID orderId, UUID merchantReference, String providerTransactionId,
                                 String reason, Instant createdAt,
                                 @JsonInclude(JsonInclude.Include.NON_NULL) RefundView refund) { }

@@ -5,6 +5,7 @@ import com.crustcaper.api.operator.OperatorModels.OrderView;
 import com.crustcaper.api.operator.OperatorModels.PaymentExceptionView;
 import com.crustcaper.api.operator.OperatorModels.PaymentReview;
 import com.crustcaper.api.operator.OperatorModels.PaymentReviewPage;
+import com.crustcaper.api.operator.OperatorModels.PickupLookup;
 import com.crustcaper.api.operator.OperatorModels.PickupStatus;
 import com.crustcaper.api.operator.OperatorModels.Queue;
 import com.crustcaper.api.operator.OperatorModels.StatusInput;
@@ -82,10 +83,7 @@ final class OperatorOrders {
     }
 
     PickupStatus pickupStatus(String authorization, String rawId) {
-        Principal actor = sessions.requirePrincipal(authorization, false);
-        if (!actor.role().equals("pickup") && !actor.role().equals("manager")) {
-            throw OperatorFailure.forbidden();
-        }
+        Principal actor = pickupOperator(authorization);
         return jdbc.sql("""
                 SELECT o.id, o.status, o.status = 'collected' AND EXISTS (
                     SELECT 1 FROM operator_order_events e
@@ -97,6 +95,29 @@ final class OperatorOrders {
                 .query((row, number) -> new PickupStatus(row.getObject("id", UUID.class), row.getString("status"),
                         row.getBoolean("confirmed_by_current_operator")))
                 .optional().orElseThrow(OperatorFailure::notFound);
+    }
+
+    PickupLookup pickupLookup(String authorization, String orderCode) {
+        Principal actor = pickupOperator(authorization);
+        OperatorOrderCode match = OperatorOrderCode.parse(orderCode);
+        List<PickupLookup> matches = jdbc.sql("""
+                SELECT o.id, o.status, o.pickup_starts_at, o.pickup_ends_at FROM orders o
+                WHERE o.store_id = ? AND o.payment_status = 'paid'
+                    AND o.status IN ('accepted', 'preparing', 'ready', 'collected') AND
+                """ + match.predicate() + " LIMIT 2").params(actor.storeId(), match.parameter())
+                .query((row, number) -> new PickupLookup(row.getObject("id", UUID.class), row.getString("status"),
+                        row.getObject("pickup_starts_at", OffsetDateTime.class).toInstant(),
+                        row.getObject("pickup_ends_at", OffsetDateTime.class).toInstant()))
+                .list();
+        if (matches.isEmpty()) throw OperatorFailure.notFound();
+        if (matches.size() > 1) throw OperatorFailure.conflict("order_code_ambiguous");
+        return matches.getFirst();
+    }
+
+    private Principal pickupOperator(String authorization) {
+        Principal actor = sessions.requirePrincipal(authorization, false);
+        if (!actor.role().equals("pickup") && !actor.role().equals("manager")) throw OperatorFailure.forbidden();
+        return actor;
     }
 
     PaymentReview paymentReview(String authorization, String after) {
