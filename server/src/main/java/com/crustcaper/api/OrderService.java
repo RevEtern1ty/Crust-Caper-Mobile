@@ -57,9 +57,15 @@ public class OrderService {
     private static final String LATEST_ATTEMPT = """
         SELECT * FROM payment_attempts WHERE order_id = ? ORDER BY sequence DESC LIMIT 1
         """;
+    private static final String PAYMENT_ATTEMPT_VIEW_COLUMNS = """
+        attempt.id AS attempt_id, attempt.status AS attempt_status,
+        CASE WHEN orders.status = 'awaiting_payment' AND orders.payment_status = 'processing'
+            AND orders.reservation_expires_at > statement_timestamp() AND attempt.status = 'processing'
+            THEN attempt.checkout_url END AS checkout_url
+        """;
     private static final String ORDER_SNAPSHOT = """
         SELECT orders.*, statement_timestamp() AS checked_at,
-               attempt.id AS attempt_id, attempt.status AS attempt_status, attempt.checkout_url
+        """ + PAYMENT_ATTEMPT_VIEW_COLUMNS + """
         FROM orders
         LEFT JOIN LATERAL (
             SELECT id, status, checkout_url FROM payment_attempts
@@ -95,11 +101,7 @@ public class OrderService {
     record ReadOrder(@JsonUnwrapped Order order,
                      @JsonInclude(JsonInclude.Include.NON_NULL) Boolean recoveryReadOnly) {}
 
-    private record Attempt(UUID id, UUID orderId, String status, String checkoutUrl, String providerTransactionId) {
-        PaymentAttempt view() {
-            return new PaymentAttempt(id, status, checkoutUrl);
-        }
-    }
+    private record Attempt(UUID id, UUID orderId, String status, String providerTransactionId) {}
 
     private record PaymentStart(Attempt attempt, StoredOrder order, boolean openGateway) {}
     record CheckoutLookup(UUID orderId, Instant retryAt) {}
@@ -330,17 +332,16 @@ public class OrderService {
     public PaymentAttempt startPayment(UUID guest, UUID id, String key) {
         validateKey(key);
         PaymentStart start = Objects.requireNonNull(transactions.execute(tx -> preparePayment(guest, id, key)));
-        if (!start.openGateway()) return start.attempt().view();
-        StoredOrder order = start.order();
         Attempt attempt = start.attempt();
+        if (!start.openGateway()) return paymentAttemptView(attempt.id());
+        StoredOrder order = start.order();
         try {
             String checkoutUrl = gateway.open(new PaymentRequest(attempt.id().toString(), id.toString(),
                 order.total(), CURRENCY, order.phone(), order.email(), order.reservationExpiresAt(),
                 order.checkoutChannel())).checkoutUrl();
             jdbc.sql("UPDATE payment_attempts SET checkout_url = ? WHERE id = ? AND status = 'processing'")
                 .params(checkoutUrl, attempt.id()).update();
-            return jdbc.sql("SELECT * FROM payment_attempts WHERE id = ?").param(attempt.id())
-                .query(OrderService::attemptRow).single().view();
+            return paymentAttemptView(attempt.id());
         } catch (PaymentGatewayException error) {
             boolean invalidRequest = error.kind() == PaymentGatewayException.Kind.INVALID_REQUEST;
             if (invalidRequest || error.kind() == PaymentGatewayException.Kind.NOT_DISPATCHED) {
@@ -352,6 +353,14 @@ public class OrderService {
             // The provider may have received the request. Keep this attempt for verification by reference.
             throw ApiFailure.unavailable();
         }
+    }
+
+    private PaymentAttempt paymentAttemptView(UUID id) {
+        // Hosted checkout creation can outlive the hold; evaluate what may be returned after the provider call.
+        return jdbc.sql("SELECT " + PAYMENT_ATTEMPT_VIEW_COLUMNS + """
+            FROM payment_attempts attempt JOIN orders ON orders.id = attempt.order_id
+            WHERE attempt.id = ?
+            """).param(id).query(OrderService::paymentAttemptRow).single();
     }
 
     private boolean rejectUndispatchedPayment(Attempt attempt, boolean invalidRequest) {
@@ -387,7 +396,7 @@ public class OrderService {
             VALUES (?, ?, ?, 'processing')
             """).params(reference, id, key).update();
         jdbc.sql("UPDATE orders SET payment_status = 'processing' WHERE id = ?").param(id).update();
-        return new PaymentStart(new Attempt(reference, id, "processing", null, null), order, true);
+        return new PaymentStart(new Attempt(reference, id, "processing", null), order, true);
     }
 
     public void settlePayment(VerifiedPayment payment) {
@@ -540,15 +549,18 @@ public class OrderService {
     }
 
     private OrderSnapshot snapshotRow(ResultSet rs, int row) throws SQLException {
+        return new OrderSnapshot(orderRow(rs, row), paymentAttemptRow(rs, row), readTime(rs, "checked_at"));
+    }
+
+    private static PaymentAttempt paymentAttemptRow(ResultSet rs, int row) throws SQLException {
         UUID attemptId = rs.getObject("attempt_id", UUID.class);
-        PaymentAttempt attempt = attemptId == null ? null
+        return attemptId == null ? null
             : new PaymentAttempt(attemptId, rs.getString("attempt_status"), rs.getString("checkout_url"));
-        return new OrderSnapshot(orderRow(rs, row), attempt, readTime(rs, "checked_at"));
     }
 
     private static Attempt attemptRow(ResultSet rs, int row) throws SQLException {
         return new Attempt(rs.getObject("id", UUID.class), rs.getObject("order_id", UUID.class),
-            rs.getString("status"), rs.getString("checkout_url"), rs.getString("provider_transaction_id"));
+            rs.getString("status"), rs.getString("provider_transaction_id"));
     }
 
     private Instant databaseNow() {

@@ -88,6 +88,7 @@ class FlutterwaveCheckoutIntegrationTest {
     private static final AtomicLong TRANSACTION = new AtomicLong();
     private static final AtomicBoolean TIMEOUT_NEXT_OPEN = new AtomicBoolean();
     private static final AtomicBoolean RETURN_HOSTED_LINK = new AtomicBoolean();
+    private static final AtomicReference<Runnable> BEFORE_HOSTED_LINK = new AtomicReference<>();
     private static HttpServer provider;
 
     private final String store = STORE_PREFIX + UUID.randomUUID();
@@ -113,6 +114,8 @@ class FlutterwaveCheckoutIntegrationTest {
                 OPEN_BODY.set(WIRE_JSON.readTree(exchange.getRequestBody()));
                 OPENS.incrementAndGet();
                 if (RETURN_HOSTED_LINK.get()) {
+                    Runnable beforeLink = BEFORE_HOSTED_LINK.getAndSet(null);
+                    if (beforeLink != null) beforeLink.run();
                     byte[] body = WIRE_JSON.writeValueAsBytes(WIRE_JSON.createObjectNode().put("status", "success").set(
                         "data", WIRE_JSON.createObjectNode().put("link", RETRY_LINK)));
                     exchange.getResponseHeaders().set("Content-Type", "application/json");
@@ -152,6 +155,7 @@ class FlutterwaveCheckoutIntegrationTest {
         TRANSACTION.set(ThreadLocalRandom.current().nextLong(1_000_000_000_000_000L, Long.MAX_VALUE));
         TIMEOUT_NEXT_OPEN.set(false);
         RETURN_HOSTED_LINK.set(false);
+        BEFORE_HOSTED_LINK.set(null);
     }
 
     @AfterEach
@@ -319,24 +323,115 @@ class FlutterwaveCheckoutIntegrationTest {
         assertThat(OPENS.get()).isEqualTo(1);
     }
 
+    @Test
+    void expiredHoldDoesNotExposeTheHostedLinkButStillReconcilesTheOriginalAttempt() throws Exception {
+        String kitchen = seedStoreAndKitchen();
+        FixtureOrder input = createOrder();
+        String authorization = "Bearer " + input.guestToken();
+        String orderPath = API + "/orders/" + input.orderId();
+        String paymentPath = orderPath + "/payments";
+        RETURN_HOSTED_LINK.set(true);
+        String attemptId = json.readTree(api.perform(post(paymentPath)
+                .header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "expiry-payment"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.checkoutUrl").value(RETRY_LINK))
+            .andReturn().getResponse().getContentAsByteArray()).path("id").asString();
+        api.perform(get(orderPath).header(HttpHeaders.AUTHORIZATION, authorization))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.paymentAttempt.checkoutUrl").value(RETRY_LINK));
+        expireHold(input);
+
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "expiry-payment"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(attemptId))
+            .andExpect(jsonPath("$.status").value("processing")).andExpect(jsonPath("$.checkoutUrl").value(nullValue()));
+        api.perform(get(orderPath).header(HttpHeaders.AUTHORIZATION, authorization))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.status").value("cancelled"))
+            .andExpect(jsonPath("$.paymentAttempt.id").value(attemptId))
+            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").value(nullValue()));
+        api.perform(get(API + "/orders/recovery").header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "wire-order"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.paymentAttempt.id").value(attemptId))
+            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").value(nullValue()));
+        api.perform(post(API + "/orders").header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "wire-order")
+                .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(orderInput(input.quoteId()))))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.paymentAttempt.id").value(attemptId))
+            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").value(nullValue()));
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "new-expired-payment"))
+            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("reservation_expired"));
+        assertThat(OPENS.get()).isEqualTo(1);
+
+        // The expired order no longer consumes the one-place slot.
+        FixtureOrder replacement = placeOrder(input.guestToken(), "replacement-order");
+        assertThat(replacement.orderId()).isNotEqualTo(input.orderId());
+
+        CHARGED.set(TOTAL);
+        String transaction = Long.toString(TRANSACTION.get());
+        api.perform(post(API + "/webhooks/flutterwave").header("verif-hash", WEBHOOK_SECRET).contentType(MediaType.APPLICATION_JSON)
+            .content("{\"event\":\"charge.completed\",\"data\":{\"id\":" + transaction + "}}"))
+            .andExpect(status().isOk());
+        api.perform(get(orderPath).header(HttpHeaders.AUTHORIZATION, authorization))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.status").value("cancelled"))
+            .andExpect(jsonPath("$.paymentStatus").value("refund_pending"))
+            .andExpect(jsonPath("$.paymentAttempt.id").value(attemptId))
+            .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").value(nullValue()));
+        api.perform(get(API + "/operator/orders").header(HttpHeaders.AUTHORIZATION, "Bearer " + kitchen))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.orders").isEmpty());
+        assertThat(jdbc.sql("""
+            SELECT reason FROM payment_exceptions WHERE attempt_id = ? AND provider_transaction_id = ?
+            """).params(UUID.fromString(attemptId), transaction).query(String.class).list())
+            .containsExactly("unavailable_reservation");
+    }
+
+    @Test
+    void providerLinkArrivingAfterExpiryKeepsTheAttemptWithoutExposingTheLink() throws Exception {
+        seedStoreAndKitchen();
+        FixtureOrder input = createOrder();
+        String authorization = "Bearer " + input.guestToken();
+        String paymentPath = API + "/orders/" + input.orderId() + "/payments";
+        RETURN_HOSTED_LINK.set(true);
+        BEFORE_HOSTED_LINK.set(() -> expireHold(input));
+
+        String reference = json.readTree(api.perform(post(paymentPath)
+                .header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "late-checkout-link"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.status").value("processing"))
+            .andExpect(jsonPath("$.checkoutUrl").value(nullValue()))
+            .andReturn().getResponse().getContentAsByteArray()).path("id").asString();
+        assertThat(OPEN_BODY.get().path("tx_ref").asString()).isEqualTo(reference);
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "late-checkout-link"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(reference))
+            .andExpect(jsonPath("$.checkoutUrl").value(nullValue()));
+        assertThat(jdbc.sql("SELECT id FROM payment_attempts WHERE order_id = ? AND status = 'processing'")
+            .param(UUID.fromString(input.orderId())).query(UUID.class).list()).containsExactly(UUID.fromString(reference));
+        assertThat(OPENS.get()).isEqualTo(1);
+    }
+
+    private void expireHold(FixtureOrder input) {
+        assertThat(jdbc.sql("UPDATE orders SET reservation_expires_at = clock_timestamp() - interval '1 second' WHERE id = ?")
+            .param(UUID.fromString(input.orderId())).update()).isEqualTo(1);
+    }
+
     private FixtureOrder createOrder() throws Exception {
         JsonNode session = json.readTree(api.perform(post(API + "/guest-sessions")).andExpect(status().isOk())
             .andReturn().getResponse().getContentAsByteArray());
         guestSession = UUID.fromString(session.path("sessionId").asString());
-        String guest = session.path("accessToken").asString();
+        return placeOrder(session.path("accessToken").asString(), "wire-order");
+    }
+
+    private FixtureOrder placeOrder(String guest, String key) throws Exception {
         var quoteInput = new QuoteInput(store, SLOT, List.of(new CartLine(SKU, List.of(), 1, TOTAL)));
         String quote = json.readTree(api.perform(post(API + "/quotes").header(HttpHeaders.AUTHORIZATION, "Bearer " + guest)
             .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(quoteInput)))
             .andExpect(status().isOk()).andExpect(jsonPath("$.total").value(TOTAL))
             .andReturn().getResponse().getContentAsByteArray()).path("quoteId").asString();
         String order = json.readTree(api.perform(post(API + "/orders").header(HttpHeaders.AUTHORIZATION, "Bearer " + guest)
-            .header(KEY, "wire-order").contentType(MediaType.APPLICATION_JSON)
-            .content(json.writeValueAsBytes(new OrderInput(quote, "+250700000000", "payment-wire@example.test"))))
+            .header(KEY, key).contentType(MediaType.APPLICATION_JSON)
+            .content(json.writeValueAsBytes(orderInput(quote))))
             .andExpect(status().isOk()).andReturn().getResponse().getContentAsByteArray()).path("id").asString();
-        return new FixtureOrder(guest, order);
+        return new FixtureOrder(guest, order, quote);
     }
 
-    private record FixtureOrder(String guestToken, String orderId) {}
+    private static OrderInput orderInput(String quote) {
+        return new OrderInput(quote, "+250700000000", "payment-wire@example.test");
+    }
+
+    private record FixtureOrder(String guestToken, String orderId, String quoteId) {}
 
     private OffsetDateTime verificationTime(UUID attemptId) {
         return jdbc.sql("SELECT verified_at FROM payment_attempts WHERE id = ?")
