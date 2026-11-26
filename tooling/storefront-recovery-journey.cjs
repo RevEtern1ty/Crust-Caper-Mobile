@@ -1,10 +1,13 @@
 const { Buffer } = require('node:buffer');
 const { isDeepStrictEqual } = require('node:util');
 const { prepareHostedCheckout } = require('./storefront-load-journey.cjs');
-const { openStaffSession } = require('./storefront-load-kitchen.cjs');
+const { openStaffSession, prepareStaffFixture } = require('./storefront-load-kitchen.cjs');
 
 const menuPath = '/api/v1/stores/kigali/menu?channel=web&locale=en';
 const receiptListPath = '/api/v1/operator/receipts';
+const staffSessionsPath = '/api/v1/operator/sessions';
+const recoveryOffboardingScope = Object.freeze({ storeId: 'kigali', username: 'recovery-offboarding-fixture',
+  accountId: '7219b205-edb7-4de3-b896-a1ef13bef551' });
 const slotId = 'fixture-slot-0';
 const paymentWaitMs = 45_000;
 const identityFields = [
@@ -61,6 +64,41 @@ function verifyQueue(orders, expectedCheckouts) {
   ensure(orders.length === expectedCheckouts.length && expectedCheckouts.every(({ order }) => orders.some(row =>
     row.id === order.orderId && row.status === 'accepted' && row.paymentStatus === 'paid'
       && Number.isFinite(Date.parse(row.acceptedAt)))), 'recovery_queue_identity');
+}
+
+function createRecoveryOffboarding({ request, fixtureMfaKey }) {
+  const { commands, credentials } = prepareStaffFixture('manager', fixtureMfaKey, recoveryOffboardingScope);
+  let bearer;
+
+  function signIn(step) {
+    return request(staffSessionsPath, { method: 'POST', body: credentials(step) });
+  }
+
+  function readReceipts() {
+    ensure(bearer, 'recovery_offboarding_bearer_missing');
+    return request(receiptListPath, { headers: { Authorization: 'Bearer ' + bearer } });
+  }
+
+  return {
+    async seed(apply) {
+      for (const command of commands) await apply(command);
+      commands.length = 0;
+      const signedIn = await signIn();
+      ensure(signedIn.status === 201 && signedIn.data?.role === 'manager' && signedIn.data.storeId === 'kigali'
+        && typeof signedIn.data.accessToken === 'string', 'recovery_offboarding_initial_auth');
+      bearer = signedIn.data.accessToken;
+      const response = await readReceipts();
+      ensure(response.status === 200 && Array.isArray(response.data), 'recovery_offboarding_initial_access');
+    },
+    async verifyOldSessionDenied(code) {
+      const response = await readReceipts();
+      ensure(response.status === 401 && response.data?.code === 'unauthenticated', code);
+    },
+    async verifyFreshLoginDenied(step) {
+      const response = await signIn(step);
+      ensure(response.status === 401 && response.data?.code === 'unauthenticated', 'recovery_offboarding_fresh_login');
+    },
+  };
 }
 
 function createRecoveryJourney({ request, project, signal, fixtureMfaKey }) {
@@ -208,4 +246,4 @@ function createRecoveryJourney({ request, project, signal, fixtureMfaKey }) {
   };
 }
 
-module.exports = { createRecoveryJourney };
+module.exports = { createRecoveryJourney, createRecoveryOffboarding, recoveryOffboardingScope };

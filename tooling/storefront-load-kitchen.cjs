@@ -18,28 +18,15 @@ function fixturePostgres(project) {
   return container;
 }
 
-function provisionStaffCredentials(project, role, encodedKey = process.env.CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY ?? '') {
+function prepareStaffFixture(role, encodedKey, identity) {
   assert.ok(role === 'kitchen' || role === 'manager', 'Expected a synthetic kitchen or manager role');
   const key = Buffer.from(encodedKey, 'base64');
   assert.ok(key.length === 32 && key.toString('base64') === encodedKey, 'Missing isolated fixture MFA key');
-  const container = fixturePostgres(project);
-  const accountId = randomUUID();
-  const username = 'load-' + role + '-' + accountId.slice(0, 8);
+  const { accountId, username } = identity;
   const password = randomBytes(24).toString('base64url');
   const salt = randomBytes(16);
   const passwordHash = ['', 'pbkdf2-sha256', '600000', salt.toString('base64url'),
     pbkdf2Sync(password, salt, 600000, 32, 'sha256').toString('base64url')].join('$');
-  const identity = { storeId: 'kigali', accountId, username };
-  function apply(payload) {
-    const input = Buffer.from(JSON.stringify({ ...identity, ...payload })).toString('base64') + '\n';
-    try {
-      execFileSync('docker', ['exec', '-i', container, 'psql', '-XAtq', '--no-password', '-U', database,
-        '-d', database, '-v', 'operator_database=' + database, '-f', '/fixture/operator-accounts.psql'],
-      { input, timeout: 10000, stdio: ['pipe', 'ignore', 'ignore'] });
-    } catch {
-      throw new Error('Could not provision the synthetic operator account');
-    }
-  }
   const secret = randomBytes(20);
   const nonce = randomBytes(12);
   const version = Buffer.from([1]);
@@ -50,15 +37,37 @@ function provisionStaffCredentials(project, role, encodedKey = process.env.CRUST
   const encryptedSecret = Buffer.concat([
     version, nonce, cipher.update(secret), cipher.final(), cipher.getAuthTag(),
   ]).toString('base64');
-  apply({ operation: 'create', role, passwordHash });
-  apply({ operation: 'enroll-mfa', encryptedSecret });
+  const commands = [
+    { ...identity, operation: 'create', role, passwordHash },
+    { ...identity, operation: 'enroll-mfa', encryptedSecret },
+  ];
+  function credentials(step = Math.floor(Date.now() / 30000)) {
+    const counter = Buffer.alloc(8);
+    counter.writeBigUInt64BE(BigInt(step));
+    const digest = createHmac('sha1', secret).update(counter).digest();
+    const authenticatorCode = ((digest.readUInt32BE(digest.at(-1) & 15) & 0x7fffffff) % 1000000)
+      .toString().padStart(6, '0');
+    return { username, password, authenticatorCode };
+  }
+  return { commands, credentials };
+}
 
-  const counter = Buffer.alloc(8);
-  counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30000)));
-  const digest = createHmac('sha1', secret).update(counter).digest();
-  const authenticatorCode = ((digest.readUInt32BE(digest.at(-1) & 15) & 0x7fffffff) % 1000000)
-    .toString().padStart(6, '0');
-  return { username, password, authenticatorCode };
+function provisionStaffCredentials(project, role, encodedKey = process.env.CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY ?? '') {
+  const container = fixturePostgres(project);
+  const accountId = randomUUID();
+  const identity = { storeId: 'kigali', accountId, username: 'load-' + role + '-' + accountId.slice(0, 8) };
+  const { commands, credentials } = prepareStaffFixture(role, encodedKey, identity);
+  for (const command of commands) {
+    const input = Buffer.from(JSON.stringify(command)).toString('base64') + '\n';
+    try {
+      execFileSync('docker', ['exec', '-i', container, 'psql', '-XAtq', '--no-password', '-U', database,
+        '-d', database, '-v', 'operator_database=' + database, '-f', '/fixture/operator-accounts.psql'],
+      { input, timeout: 10000, stdio: ['pipe', 'ignore', 'ignore'] });
+    } catch {
+      throw new Error('Could not provision the synthetic operator account');
+    }
+  }
+  return credentials();
 }
 
 function provisionKitchenCredentials(project) {
@@ -146,4 +155,5 @@ async function openKitchenMonitor(options) {
   };
 }
 
-module.exports = { openKitchenSession, openKitchenMonitor, openStaffSession, provisionKitchenCredentials, provisionStaffCredentials };
+module.exports = { openKitchenSession, openKitchenMonitor, openStaffSession, prepareStaffFixture,
+  provisionKitchenCredentials, provisionStaffCredentials };

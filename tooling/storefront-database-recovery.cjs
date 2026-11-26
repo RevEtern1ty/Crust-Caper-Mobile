@@ -1,3 +1,4 @@
+const { Buffer } = require('node:buffer');
 const { execFile } = require('node:child_process');
 const { mkdir, writeFile } = require('node:fs/promises');
 const { join } = require('node:path');
@@ -5,7 +6,7 @@ const { performance } = require('node:perf_hooks');
 const { setTimeout: delay } = require('node:timers/promises');
 const { promisify } = require('node:util');
 const { openStorefrontFixture } = require('./storefront-load.cjs');
-const { createRecoveryJourney } = require('./storefront-recovery-journey.cjs');
+const { createRecoveryJourney, createRecoveryOffboarding, recoveryOffboardingScope } = require('./storefront-recovery-journey.cjs');
 const { fixtureDatabaseUrl, postgresJdbcTlsQuery, postgresTlsRuntime } = require('./storefront-postgres-tls.cjs');
 
 const execute = promisify(execFile);
@@ -32,11 +33,16 @@ function requireCondition(condition, code) {
   if (!condition) throw new RecoveryFailure(code);
 }
 
-async function docker(signal, args, timeout = 9000) {
+async function docker(signal, args, timeout = 9000, input) {
   try {
-    const { stdout } = await execute('docker', args, {
+    const operation = execute('docker', args, {
       signal, encoding: 'utf8', timeout, maxBuffer: 64 * 1024, windowsHide: true,
     });
+    if (input !== undefined) {
+      operation.child.stdin.on('error', () => {});
+      operation.child.stdin.end(input);
+    }
+    const { stdout } = await operation;
     return stdout.trim();
   } catch {
     throw new RecoveryFailure('database_recovery_docker_failed');
@@ -72,13 +78,63 @@ async function apiDatabase(signal, container, database, flag) {
     'database_recovery_api_database');
 }
 
-function postgres(signal, container, database, command, timeout) {
+function postgres(signal, container, database, command, timeout, input) {
   requireCondition(database === source || database === recovered, 'database_recovery_unexpected_database');
-  return docker(signal, ['exec', container.id, 'bash', '-c', postgresEnvironment, 'crustcaper-rehearsal', database, ...command], timeout);
+  return docker(signal, ['exec', ...(input === undefined ? [] : ['-i']), container.id, 'bash', '-c', postgresEnvironment,
+    'crustcaper-rehearsal', database, ...command], timeout, input);
 }
 
 function sql(signal, container, database, query) {
   return postgres(signal, container, database, ['psql', '-XAtq', '--no-password', '-v', 'ON_ERROR_STOP=1', '-c', query]);
+}
+
+async function applyOffboardingAccount(signal, container, database, command, revokedSessions) {
+  const scope = recoveryOffboardingScope;
+  requireCondition(Object.keys(scope).every(key => command[key] === scope[key])
+    && (command.operation === 'disable' || (database === source && ['create', 'enroll-mfa'].includes(command.operation))),
+  'database_recovery_offboarding_scope');
+  const result = await postgres(signal, container, database, ['psql', '-XAtq', '--no-password',
+    '-v', `operator_database=${database}`, '-f', '/fixture/operator-accounts.psql'], 10000,
+  Buffer.from(JSON.stringify(command)).toString('base64') + '\n');
+  requireCondition(result === [command.operation, scope.storeId, scope.accountId, scope.username,
+    'manager', 't', revokedSessions].join('|'), 'database_recovery_offboarding_apply_failed');
+}
+
+async function offboardingSnapshot(signal, container, database) {
+  const { accountId, storeId, username } = recoveryOffboardingScope;
+  const result = await sql(signal, container, database, `
+    SELECT a.enabled, a.mfa_last_counter,
+      (SELECT count(*) FROM public.operator_sessions WHERE operator_id = a.id),
+      (SELECT count(*) FROM public.operator_sessions WHERE operator_id = a.id AND mfa_verified AND expires_at > now()),
+      NOT EXISTS (SELECT FROM pg_stat_activity WHERE datname = current_database()
+        AND backend_type = 'client backend' AND pid <> pg_backend_pid()),
+      floor(extract(epoch FROM clock_timestamp()) / 30)::bigint
+    FROM public.operator_accounts a WHERE a.id = '${accountId}' AND a.username = '${username}'
+      AND a.store_id = '${storeId}' AND a.role = 'manager'
+  `);
+  const [enabled, lastStep, sessions, verified, isolated, currentStep] = result.split('|');
+  requireCondition(/^[tf]$/.test(enabled) && /^[tf]$/.test(isolated) && [lastStep, sessions, verified, currentStep]
+    .every(value => /^\d+$/.test(value) && Number.isSafeInteger(Number(value))), 'database_recovery_offboarding_snapshot');
+  return { enabled: enabled === 't', lastStep: Number(lastStep), sessions: Number(sessions), verified: Number(verified),
+    isolated: isolated === 't', currentStep: Number(currentStep) };
+}
+
+function requireOffboardingState(state, enabled, lastStep, sessions) {
+  requireCondition(state.enabled === enabled && state.lastStep === lastStep
+    && state.sessions === sessions && state.verified === sessions, 'database_recovery_offboarding_state');
+}
+
+async function freshOffboardingStep(signal, container, lastStep) {
+  const deadline = performance.now() + 32000;
+  while (performance.now() < deadline) {
+    const state = await offboardingSnapshot(signal, container, recovered);
+    requireOffboardingState(state, false, lastStep, 0);
+    const step = Math.max(lastStep + 1, state.currentStep);
+    // A fresh counter must fit the API's ±1 TOTP window and exceed the snapshot's consumed counter.
+    if (step <= state.currentStep + 1) return step;
+    await delay(500, undefined, { signal });
+  }
+  throw new RecoveryFailure('database_recovery_offboarding_totp_window');
 }
 
 async function databaseSnapshot(signal, container, database) {
@@ -192,7 +248,7 @@ function elapsed(startedAt) {
 async function runDatabaseRecovery({ project, caFile, evidence, stopSource, startRecovered, signal, fixtureMfaKey }) {
   const report = {
     recordedAt: new Date().toISOString(), scope: 'local_disposable_cluster_separate_recovery_database',
-    phase: 'preflight', provider: {}, postgresTls: {}, errors: [], passed: false,
+    phase: 'preflight', provider: {}, postgresTls: {}, staffOffboarding: {}, errors: [], passed: false,
   };
   const active = AbortSignal.any([signal, AbortSignal.timeout(175000)]);
   let fixture;
@@ -221,10 +277,15 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
       `SELECT NOT EXISTS (SELECT FROM pg_database WHERE datname = '${recovered}')`) === 't', 'database_recovery_target_exists');
     report.provider.initial = await providerState(active, edge, 0, 0);
     journey = await createRecoveryJourney({ request: fixture.request, project, signal: active, fixtureMfaKey });
+    const offboarding = createRecoveryOffboarding({ request: fixture.request, fixtureMfaKey });
 
     report.phase = 'backup';
     const seed = witness(await journey.seed(), { paidOrders: 1, paymentAttempts: 2, pendingAttempts: 1,
       attachedReceipts: 1, managerSessionAuthenticated: true, kitchenSessionAuthenticated: true });
+    await offboarding.seed(command => applyOffboardingAccount(active, database, source, command, 0));
+    const staffAtBackup = await offboardingSnapshot(active, database, source);
+    requireOffboardingState(staffAtBackup, true, staffAtBackup.lastStep, 1);
+    report.staffOffboarding.snapshotSessionAuthenticated = true;
     const beforeBackup = await databaseSnapshot(active, database, source);
     verifyOrders(beforeBackup, 2, 1, 1, 2, 1, 1);
     report.provider.atBackup = await providerState(active, edge, 2, 1);
@@ -240,12 +301,20 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
     requireCondition(sameSnapshot(await databaseSnapshot(active, database, source), beforeBackup), 'database_recovery_snapshot_changed');
     report.backup = { bytes, elapsedMs: Math.round(backupCompletedAt - backupStartedAt), counts: counts(beforeBackup), seed };
 
-    report.phase = 'stop_source';
+    report.phase = 'post_snapshot';
     const later = witness(await journey.commitAfterSnapshot(), { postSnapshotOrders: 1, pendingAttempts: 2, retainedGuestBinding: true });
     const afterSnapshot = await databaseSnapshot(active, database, source);
     verifyOrders(afterSnapshot, 3, 1, 2, 3, 1, 1);
     report.provider.afterSnapshot = await providerState(active, edge, 3, 1);
     report.postSnapshot = { ...later, observedMsAfterBackup: elapsed(backupCompletedAt) };
+    const disable = Object.freeze({ operation: 'disable', ...recoveryOffboardingScope });
+    await applyOffboardingAccount(active, database, source, disable, 1);
+    requireOffboardingState(await offboardingSnapshot(active, database, source), false, staffAtBackup.lastStep, 0);
+    await offboarding.verifyOldSessionDenied('recovery_offboarding_source_old_session');
+    report.staffOffboarding.sourceOldSessionRejected = true;
+    // The simulated operator access record lives outside both databases and contains no credentials.
+    const retainedOffboarding = disable;
+    report.phase = 'stop_source';
     const beforeStop = await inspect(active, project, 'api');
     requireCondition(beforeStop.id === api.id && beforeStop.startedAt === api.startedAt && beforeStop.status === 'running',
       'database_recovery_source_changed_before_stop');
@@ -270,9 +339,20 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
     requireCondition(sameSnapshot(fromArchive, beforeBackup), 'database_recovery_restore_mismatch');
     report.restore = { elapsedMs: restoreElapsedMs, counts: counts(fromArchive), migrationHistoryMatches: true };
 
-    report.phase = 'recovered_api';
+    report.phase = 'offboarding_replay';
     const beforeStart = await inspect(active, project, 'api', api.id);
     requireCondition(beforeStart.status === 'exited' && beforeStart.startedAt === api.startedAt, 'database_recovery_source_restarted');
+    const restoredStaff = await offboardingSnapshot(active, database, recovered);
+    requireCondition(restoredStaff.isolated, 'database_recovery_offboarding_target_in_use');
+    requireOffboardingState(restoredStaff, true, staffAtBackup.lastStep, 1);
+    report.staffOffboarding.snapshotContainedPreviouslyActiveSession = true;
+    await applyOffboardingAccount(active, database, recovered, retainedOffboarding, 1);
+    const replayed = await offboardingSnapshot(active, database, recovered);
+    requireCondition(replayed.isolated, 'database_recovery_offboarding_target_in_use');
+    requireOffboardingState(replayed, false, staffAtBackup.lastStep, 0);
+    report.staffOffboarding.replayedBeforeRecoveredApi = true;
+
+    report.phase = 'recovered_api';
     const targetStartedAt = performance.now();
     await startRecovered(active);
     const target = await inspect(active, project, 'api');
@@ -284,12 +364,17 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
     report.postgresTls.restoredApi = true;
     report.recoveredApi = { readyAfterStartMs: elapsed(targetStartedAt), readyAfterRestoreStartedMs: elapsed(restoreStartedAt),
       readyAfterSourceStopStartedMs: elapsed(sourceStopStartedAt) };
+    await offboarding.verifyOldSessionDenied('recovery_offboarding_restored_old_session');
+    report.staffOffboarding.restoredOldSessionRejected = true;
+    await offboarding.verifyFreshLoginDenied(await freshOffboardingStep(active, database, staffAtBackup.lastStep));
+    report.staffOffboarding.restoredFreshLoginRejected = true;
     const reconcileStartedAt = performance.now();
     const originalJourney = witness(await journey.verifyRecovered(), {
       restoredPaidOrders: 2, restoredGuestSessions: 2, restoredStaffSessions: 2, restoredReceiptByteIdentical: true,
       restoredReceiptAccessScoped: true, originalPaymentAttemptsRetained: true, postSnapshotOrdersAbsent: 1,
       externalPaymentsRequiringReconciliation: 1,
     });
+    report.staffOffboarding.otherStaffSessionsRetained = true;
     const reconciled = await databaseSnapshot(active, database, recovered);
     verifyOrders(reconciled, 2, 2, 0, 2, 2, 1);
     report.provider.afterReconciliation = await providerState(active, edge, 3, 3);
