@@ -20,8 +20,11 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.context.ApplicationContext;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
@@ -125,6 +128,49 @@ class PaymentReconciliationIntegrationTest {
         assertThat(orders.getOrder(guest, outsideWindow.orderId()).paymentStatus()).isEqualTo("processing");
         assertThat(meters.get("crustcaper.payments.reconciliation").tag("result", "rejected").counter().count())
             .isEqualTo(1);
+    }
+
+    @Test
+    @ExtendWith(OutputCaptureExtension.class)
+    void aConflictingChargeDoesNotBlockTheNextDuePaymentInTheSamePoll(CapturedOutput output) {
+        var recorded = order("recorded");
+        var conflicting = order("conflicting");
+        var healthy = order("healthy");
+        String recordedTransaction = "123560001";
+        String healthyTransaction = "123560002";
+        orders.settlePayment(recorded.paid(recordedTransaction));
+        jdbc.sql("UPDATE payment_attempts SET initiated_at = now() - interval '45 seconds' WHERE id = ?")
+            .param(conflicting.attemptId()).update();
+        when(gateway.verifyByReference(conflicting.reference())).thenReturn(Optional.of(conflicting.paid(recordedTransaction)));
+        when(gateway.verifyByReference(healthy.reference())).thenReturn(Optional.of(healthy.paid(healthyTransaction)));
+
+        worker().poll();
+
+        var calls = inOrder(gateway);
+        calls.verify(gateway).verifyByReference(conflicting.reference());
+        calls.verify(gateway).verifyByReference(healthy.reference());
+        calls.verifyNoMoreInteractions();
+        assertThat(jdbc.sql("SELECT id FROM payment_attempts WHERE provider_transaction_id = ?")
+            .param(recordedTransaction).query(UUID.class).single()).isEqualTo(recorded.attemptId());
+        var unresolved = orders.getOrder(guest, conflicting.orderId());
+        assertThat(unresolved.status()).isEqualTo("awaiting_payment");
+        assertThat(unresolved.paymentStatus()).isEqualTo("processing");
+        assertThat(unresolved.paymentAttempt().id()).isEqualTo(conflicting.attemptId());
+        assertThat(jdbc.sql("""
+            SELECT count(*) FROM payment_attempts WHERE id = ? AND status = 'processing'
+                AND provider_transaction_id IS NULL AND last_checked_at IS NOT NULL
+            """).param(conflicting.attemptId()).query(Long.class).single()).isEqualTo(1);
+        assertThat(jdbc.sql("SELECT id FROM payment_attempts WHERE provider_transaction_id = ? AND status = 'paid'")
+            .param(healthyTransaction).query(UUID.class).single()).isEqualTo(healthy.attemptId());
+        assertThat(jdbc.sql("SELECT id FROM orders WHERE store_id = ? AND status = 'accepted' AND payment_status = 'paid'")
+            .param(store).query(UUID.class).list()).containsExactlyInAnyOrder(recorded.orderId(), healthy.orderId());
+        assertThat(meters.get("crustcaper.payments.reconciliation").tag("result", "settlement_error").counter().count())
+            .isEqualTo(1);
+        assertThat(meters.get("crustcaper.payments.reconciliation").tag("result", "verified").counter().count()).isEqualTo(1);
+        assertThat(output.getAll().lines().filter(line -> line.contains("payment_reconciliation_settlement_failed")).toList())
+            .hasSize(1);
+        assertThat(output.getAll()).doesNotContain(recordedTransaction, healthyTransaction, conflicting.reference(),
+            conflicting.orderId().toString(), "payment_attempts_provider_transaction_id_key");
     }
 
     @Test

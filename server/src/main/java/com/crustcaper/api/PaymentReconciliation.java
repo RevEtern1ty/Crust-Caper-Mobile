@@ -4,16 +4,21 @@ import static com.crustcaper.api.OrderService.AUTOMATIC_RECONCILIATION_WINDOW_HO
 
 import com.crustcaper.api.payment.PaymentGateway;
 import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
+import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
 import com.crustcaper.api.payment.PaymentGatewayException;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.util.Optional;
 import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
+import org.springframework.transaction.TransactionException;
 
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnProperty(name = "crustcaper.payment.provider", havingValue = "flutterwave")
@@ -35,6 +40,7 @@ class PaymentReconciliationConfiguration {
 
 final class PaymentReconciliation {
     private static final int MAX_ATTEMPTS_PER_RUN = 2;
+    private static final Logger LOG = LoggerFactory.getLogger(PaymentReconciliation.class);
 
     private final JdbcClient jdbc;
     private final PaymentGateway gateway;
@@ -91,13 +97,24 @@ final class PaymentReconciliation {
                 count("rejected");
                 return;
             }
-            orders.settlePayment(payment);
-            count("verified");
+            settle(payment);
         } catch (PaymentGatewayException error) {
             count("provider_error");
         } catch (ApiFailure error) {
             count("rejected");
         }
+    }
+
+    private void settle(VerifiedPayment payment) {
+        try {
+            orders.settlePayment(payment);
+        } catch (DataAccessException | TransactionException failure) {
+            // Keep the committed claim and let the next due attempt use the remaining poll budget.
+            LOG.warn("payment_reconciliation_settlement_failed");
+            count("settlement_error");
+            return;
+        }
+        count("verified");
     }
 
     private void count(String result) {
