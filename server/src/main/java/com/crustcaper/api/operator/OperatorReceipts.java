@@ -164,9 +164,14 @@ final class OperatorReceipts {
     }
 
     private UploadableOrder uploadable(String store, UUID id, boolean lock) {
+        if (lock) {
+            // Take the order lock before reading joined attachment rows, so a retry sees the winner's commit.
+            jdbc.sql("SELECT id FROM orders WHERE store_id = ? AND id = ? FOR UPDATE").params(store, id)
+                .query(UUID.class).optional().orElseThrow(OperatorFailure::notFound);
+        }
         return jdbc.sql(ORDER_FIELDS + """
             WHERE o.store_id = ? AND o.id = ? AND (o.payment_status = 'paid' OR f.order_id IS NOT NULL)
-            """ + (lock ? " FOR UPDATE OF o" : ""))
+            """)
             .params(store, id).query((rs, row) -> new UploadableOrder(view(rs, row), rs.getString("receipt_url"),
                 rs.getString("refund_id")))
             .optional().orElseThrow(OperatorFailure::notFound);
