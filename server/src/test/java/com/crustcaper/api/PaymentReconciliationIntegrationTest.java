@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.crustcaper.api.ApiModels.CartLine;
@@ -77,6 +78,9 @@ class PaymentReconciliationIntegrationTest {
 
     @AfterEach
     void cleanup() {
+        jdbc.sql("DELETE FROM operator_sessions WHERE operator_id IN (SELECT id FROM operator_accounts WHERE store_id = ?)")
+            .param(store).update();
+        jdbc.sql("DELETE FROM operator_accounts WHERE store_id = ?").param(store).update();
         jdbc.sql("""
             DELETE FROM payment_exceptions WHERE attempt_id IN (
                 SELECT p.id FROM payment_attempts p JOIN orders o ON o.id = p.order_id WHERE o.store_id = ?
@@ -96,6 +100,55 @@ class PaymentReconciliationIntegrationTest {
     void exposesOnlyThePrivatePaymentReconciliationSnapshotWithLocalWorkerDisabled() throws Exception {
         expectMetrics(processInstance(), false, 0, 0, 0, 0);
         api.perform(get("/actuator/metrics/crustcaper.payments.reconciliation")).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void oneSweepSendsTheEarliestExpiringPaidHoldToTheKitchenAndMakesProgressOnExpiredBacklog() throws Exception {
+        var oldestExpired = order("oldest-expired");
+        var nextExpired = order("next-expired");
+        var laterHold = order("later-hold");
+        var paidHold = order("paid-hold");
+        setTiming(oldestExpired, -180, -60);
+        setTiming(nextExpired, -150, -45);
+        setTiming(laterHold, -120, 240);
+        setTiming(paidHold, -60, 120);
+        var kitchen = get("/api/v1/operator/orders").header("Authorization", kitchenAuthorization());
+        api.perform(kitchen).andExpect(status().isOk()).andExpect(jsonPath("$.orders.length()").value(0));
+        when(gateway.verifyByReference(paidHold.reference())).thenReturn(Optional.of(paidHold.paid("123500001")));
+
+        worker().poll();
+
+        api.perform(kitchen).andExpect(status().isOk())
+            .andExpect(jsonPath("$.orders.length()").value(1))
+            .andExpect(jsonPath("$.orders[0].id").value(paidHold.orderId().toString()))
+            .andExpect(jsonPath("$.orders[0].status").value("accepted"))
+            .andExpect(jsonPath("$.orders[0].paymentStatus").value("paid"));
+        assertThat(jdbc.sql("""
+            SELECT id FROM payment_attempts WHERE order_id = ? AND status = 'paid' AND verified_at IS NOT NULL
+            """).param(paidHold.orderId()).query(UUID.class).list()).containsExactly(paidHold.attemptId());
+        var calls = inOrder(gateway);
+        calls.verify(gateway).verifyByReference(paidHold.reference());
+        calls.verify(gateway).verifyByReference(oldestExpired.reference());
+        verifyNoMoreInteractions(gateway);
+    }
+
+    @Test
+    void expiredAttemptsCanUseBothClaimsWhenThereIsNoEligibleLiveHold() {
+        var oldest = order("expired-oldest");
+        var next = order("expired-next");
+        var coolingDown = order("cooling-down");
+        setTiming(oldest, -180, -60);
+        setTiming(next, -150, -45);
+        setTiming(coolingDown, -120, 240);
+        jdbc.sql("UPDATE payment_attempts SET last_checked_at = now() WHERE id = ?")
+            .param(coolingDown.attemptId()).update();
+
+        worker().poll();
+
+        var calls = inOrder(gateway);
+        calls.verify(gateway).verifyByReference(oldest.reference());
+        calls.verify(gateway).verifyByReference(next.reference());
+        verifyNoMoreInteractions(gateway);
     }
 
     @Test
@@ -266,6 +319,26 @@ class PaymentReconciliationIntegrationTest {
     private void makeDue(Pending payment) {
         jdbc.sql("UPDATE payment_attempts SET last_checked_at = now() - interval '31 seconds' WHERE id = ?")
             .param(payment.attemptId()).update();
+    }
+
+    private void setTiming(Pending payment, int initiatedSecondsFromNow, int expirySecondsFromNow) {
+        jdbc.sql("UPDATE payment_attempts SET initiated_at = now() + make_interval(secs => ?) WHERE id = ?")
+            .params(initiatedSecondsFromNow, payment.attemptId()).update();
+        jdbc.sql("UPDATE orders SET reservation_expires_at = now() + make_interval(secs => ?) WHERE id = ?")
+            .params(expirySecondsFromNow, payment.orderId()).update();
+    }
+
+    private String kitchenAuthorization() {
+        String token = UUID.randomUUID().toString().replace("-", "") + "reconcile01";
+        jdbc.sql("""
+            WITH account AS (
+                INSERT INTO operator_accounts (id, store_id, username, role, password_hash)
+                VALUES (?, ?, ?, 'kitchen', 'unused') RETURNING id
+            )
+            INSERT INTO operator_sessions (token_hash, operator_id, expires_at)
+            SELECT encode(sha256(convert_to(?, 'UTF8')), 'hex'), id, now() + interval '1 hour' FROM account
+            """).params(UUID.randomUUID(), store, store, token).update();
+        return "Bearer " + token;
     }
 
     private UUID processInstance() throws Exception {

@@ -63,7 +63,9 @@ final class PaymentReconciliation {
     void poll() {
         try {
             for (int remaining = MAX_ATTEMPTS_PER_RUN; remaining > 0; remaining--) {
-                Optional<UUID> attempt = claim();
+                // Give an expiring hold the first check and keep the remaining budget in standard due order.
+                Optional<UUID> attempt = remaining == MAX_ATTEMPTS_PER_RUN
+                    ? claim(true).or(() -> claim(false)) : claim(false);
                 if (attempt.isEmpty()) break;
                 verify(attempt.get());
             }
@@ -74,8 +76,10 @@ final class PaymentReconciliation {
         telemetry.completeSweep();
     }
 
-    private Optional<UUID> claim() {
+    private Optional<UUID> claim(boolean liveHoldsOnly) {
         // Commit the claim before contacting the provider. The customer status route uses the same check timestamp.
+        String liveHoldFilter = liveHoldsOnly ? "AND o.status = 'awaiting_payment' AND o.reservation_expires_at > now()" : "";
+        String expiryOrder = liveHoldsOnly ? "o.reservation_expires_at, " : "";
         return jdbc.sql("""
             WITH due AS (
                 SELECT p.id FROM payment_attempts p JOIN orders o ON o.id = p.order_id
@@ -87,12 +91,14 @@ final class PaymentReconciliation {
                       WHEN o.reservation_expires_at > now() - interval '15 minutes' THEN interval '2 minutes'
                       WHEN o.reservation_expires_at > now() - interval '2 hours' THEN interval '15 minutes'
                       ELSE interval '1 hour' END)
-                ORDER BY p.last_checked_at ASC NULLS FIRST, p.initiated_at, p.id
+                  %s
+                ORDER BY %sp.last_checked_at ASC NULLS FIRST, p.initiated_at, p.id
                 LIMIT 1 FOR UPDATE OF p SKIP LOCKED
             )
             UPDATE payment_attempts p SET last_checked_at = now()
             FROM due WHERE p.id = due.id RETURNING p.id
-            """).param(AUTOMATIC_RECONCILIATION_WINDOW_HOURS).query(UUID.class).optional();
+            """.formatted(liveHoldFilter, expiryOrder))
+            .param(AUTOMATIC_RECONCILIATION_WINDOW_HOURS).query(UUID.class).optional();
     }
 
     private void verify(UUID attempt) {
