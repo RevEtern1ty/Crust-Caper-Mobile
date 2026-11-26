@@ -9,7 +9,8 @@ import { ApiError, type CartLine, type Order, type PendingCheckoutRecovery, type
 import { privateStorage } from '../state/private-storage';
 import { useShop } from '../state/shop';
 import { CheckoutController, CheckoutError, type CheckoutContact, type CheckoutJournal } from './controller';
-import { delayedPaymentThresholdMs, nextOrderStatusDelay, nextUncertainPaymentStart, type OrderStatusResult } from './order-status-polling';
+import { delayedPaymentThresholdMs, nextOrderStatusDelay, nextUncertainPayment,
+  type OrderStatusResult, type UncertainPayment } from './order-status-polling';
 import { isExpiredUnpaidHold } from './pickup-hold';
 
 type Context = {
@@ -25,6 +26,7 @@ type Context = {
   beginCheckout: (quote: Quote, cart: CartLine[], contact: CheckoutContact) => Promise<Order>;
   resumeCheckout: (retryDeclined?: boolean, contact?: CheckoutContact) => Promise<Order>;
   finishExpiredHold: (order: Order) => Promise<void>;
+  observePaymentUncertainty: (orderId: string, result: OrderStatusResult) => number | null;
   rememberRecoveredOrder: (orderId: string, sessionRevision: number) => Promise<void>;
   pendingOrderRecoveryChallengeId: string | null;
   requestPendingOrderRecovery?: (phone: string) => Promise<PendingCheckoutRecovery>;
@@ -42,6 +44,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
   const cartRef = useRef(cart);
   const clearCartRef = useRef(clearCart);
   const running = useRef(false);
+  const uncertainPayments = useRef(new Map<string, UncertainPayment>());
   const [journal, setJournal] = useState<CheckoutJournal | null>(null);
   const [requestedOrderId, setRequestedOrderId] = useState<string | null>(null);
   const [restoreFailed, setRestoreFailed] = useState(false);
@@ -72,6 +75,9 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
   }), [api, checkoutStorageKey, demoApi, guestSession]);
 
   const publishJournal = useCallback((saved: CheckoutJournal) => {
+    for (const id of uncertainPayments.current.keys()) {
+      if (!saved.orderIds.includes(id)) uncertainPayments.current.delete(id);
+    }
     setJournal(saved);
     setGuestSessionEndPending(controller.guestSessionEndPending);
     if (controller.guestSessionEndPending) setRequestedOrderId(null);
@@ -110,6 +116,18 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     await run(() => controller.finishExpiredHold(order));
   }, [controller, run]);
 
+  // Payment and Orders share the observation across navigation; only a fresh read can advance it.
+  const observePaymentUncertainty = useCallback((orderId: string, result: OrderStatusResult) => {
+    const observedAt = performance.now();
+    const next = nextUncertainPayment(result, uncertainPayments.current.get(orderId) ?? null, observedAt);
+    if (!next) {
+      uncertainPayments.current.delete(orderId);
+      return null;
+    }
+    uncertainPayments.current.set(orderId, next);
+    return observedAt - next.since;
+  }, []);
+
   const value: Context = {
     journal: endingGuestSession ? null : journal,
     requestedOrderId: endingGuestSession ? null : requestedOrderId,
@@ -138,6 +156,7 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     beginCheckout: (quote, snapshot, contact) => run(async () => controller.begin(quote, await fingerprint(snapshot), contact)),
     resumeCheckout: (retryDeclined, contact) => run(() => controller.resume(retryDeclined, contact)),
     finishExpiredHold,
+    observePaymentUncertainty,
     rememberRecoveredOrder: (orderId, sessionRevision) => run(() => controller.rememberRecoveredOrder(orderId, sessionRevision)),
     pendingOrderRecoveryChallengeId: journal?.active?.phase === 'creating' ? journal.active.recoveryChallengeId ?? null : null,
     requestPendingOrderRecovery: (Platform.OS !== 'web' || webCheckout) && api.requestPendingCheckoutRecovery
@@ -174,7 +193,7 @@ type StatusPolling = {
 
 export function useOrderStatus(orderId: string | null) {
   const { api, mode, pickupNow } = useShop();
-  const { finishExpiredHold } = useCheckout();
+  const { finishExpiredHold, observePaymentUncertainty } = useCheckout();
   const [known, setKnown] = useState<Order | null>(null);
   const [failure, setFailure] = useState<{ orderId: string; error: unknown } | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
@@ -235,16 +254,13 @@ export function useOrderStatus(orderId: string | null) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let attempts = 0;
     let consecutiveFailures = 0;
-    let uncertainSince: number | null = null;
     const monitor: StatusPolling = {
       orderId,
       clearTimer: () => clearTimeout(timer),
       onResult: (result) => {
         if (polling.current !== monitor) return;
         consecutiveFailures = 'error' in result ? consecutiveFailures + 1 : 0;
-        const observedAt = performance.now();
-        uncertainSince = mode === 'connected' ? nextUncertainPaymentStart(result, uncertainSince, observedAt) : null;
-        const uncertainFor = uncertainSince === null ? null : observedAt - uncertainSince;
+        const uncertainFor = mode === 'connected' ? observePaymentUncertainty(orderId, result) : null;
         setDelayedPaymentId(uncertainFor !== null && uncertainFor >= delayedPaymentThresholdMs ? orderId : null);
         const delay = nextOrderStatusDelay(mode, result, ++attempts, consecutiveFailures, pickupClock.current(), uncertainFor);
         if (delay !== null) timer = setTimeout(() => { void refresh(true); }, delay);
@@ -255,8 +271,6 @@ export function useOrderStatus(orderId: string | null) {
       if (polling.current === monitor) return;
       attempts = 0;
       consecutiveFailures = 0;
-      uncertainSince = null;
-      setDelayedPaymentId(null);
       polling.current = monitor;
       void refresh();
     }
@@ -279,7 +293,7 @@ export function useOrderStatus(orderId: string | null) {
       stop();
       subscription.remove();
     };
-  }, [mode, orderId, refresh]));
+  }, [mode, observePaymentUncertainty, orderId, refresh]));
 
   return {
     order: known?.id === orderId ? known : null,

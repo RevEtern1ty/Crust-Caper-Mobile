@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { ApiError, type Order } from '../domain/types';
-import { delayedPaymentThresholdMs, nextOrderStatusDelay, nextUncertainPaymentStart } from './order-status-polling';
+import { delayedPaymentThresholdMs, nextOrderStatusDelay, nextUncertainPayment } from './order-status-polling';
 
 test('connected orders keep checking once ready and stop once picked up', () => {
   const check = (status: Order['status']) =>
@@ -56,27 +56,44 @@ test('connected payment checks slow down based on elapsed uncertainty rather tha
   assert.ok(checks < 80, `expected fewer than 80 checks in the first hour, got ${checks}`);
 });
 
-test('a temporary error preserves the same uncertain payment window and recovery returns to kitchen cadence', () => {
-  const processing = { order: { status: 'awaiting_payment', paymentStatus: 'processing' } } as const;
+test('temporary errors and unreadable attempt identity preserve the observed payment window', () => {
+  const processing = { order: { status: 'awaiting_payment', paymentStatus: 'processing',
+    paymentAttempt: { status: 'processing', id: 'initial-attempt' } } } as const;
   const inconsistent = { order: { status: 'cancelled', paymentStatus: 'unpaid', paymentAttempt: { status: 'processing' } } } as const;
   const offline = { error: new ApiError('network_unavailable') };
   const rateLimited = { error: new ApiError('rate_limited') };
   const paid = { order: { status: 'accepted', paymentStatus: 'paid' } } as const;
   const declined = { order: { status: 'awaiting_payment', paymentStatus: 'declined' } } as const;
 
-  const startedAt = nextUncertainPaymentStart(processing, null, 50_000);
-  assert.equal(startedAt, 50_000);
-  assert.equal(nextUncertainPaymentStart(offline, startedAt, 195_000), startedAt);
+  const observed = nextUncertainPayment(processing, null, 50_000);
+  assert.deepEqual(observed, { since: 50_000, attemptId: 'initial-attempt' });
+  assert.equal(nextUncertainPayment(offline, observed, 195_000), observed);
   assert.equal(nextOrderStatusDelay('connected', offline, 12, 1, 0, 145_000), 60_000);
-  assert.equal(nextUncertainPaymentStart(rateLimited, startedAt, 240_000), startedAt);
+  assert.equal(nextUncertainPayment(rateLimited, observed, 240_000), observed);
   assert.equal(nextOrderStatusDelay('connected', rateLimited, 13, 2, 0, 190_000), 60_000);
-  assert.equal(nextUncertainPaymentStart(inconsistent, startedAt, 260_000), startedAt);
+  assert.deepEqual(nextUncertainPayment(inconsistent, observed, 260_000), observed);
   assert.equal(nextOrderStatusDelay('connected', inconsistent, 14, 0, 0, 210_000), 60_000);
-  assert.equal(nextUncertainPaymentStart(paid, startedAt, 320_000), null);
+  assert.equal(nextUncertainPayment(paid, observed, 320_000), null);
   assert.equal(nextOrderStatusDelay('connected', paid, 15, 0, 0, 270_000), 5000);
-  assert.equal(nextUncertainPaymentStart(declined, startedAt, 320_000), null);
-  assert.equal(nextUncertainPaymentStart({ error: new ApiError('not_found') }, startedAt, 320_000), null);
-  assert.equal(nextUncertainPaymentStart({ error: new ApiError('unauthenticated') }, startedAt, 320_000), null);
+  assert.equal(nextUncertainPayment(declined, observed, 320_000), null);
+  assert.equal(nextUncertainPayment({ error: new ApiError('not_found') }, observed, 320_000), null);
+  assert.equal(nextUncertainPayment({ error: new ApiError('unauthenticated') }, observed, 320_000), null);
+});
+
+test('only a known different attempt starts a new payment polling window', () => {
+  const order = { status: 'awaiting_payment', paymentStatus: 'processing' } as const;
+  const waiting = (id: string) => ({ order: { ...order, paymentAttempt: { status: 'processing' as const, id } } });
+  const unknown = nextUncertainPayment({ order }, null, 10_000);
+  assert.deepEqual(unknown, { since: 10_000, attemptId: null });
+
+  const first = nextUncertainPayment(waiting('first-attempt'), unknown, 170_000);
+  assert.deepEqual(first, { since: 10_000, attemptId: 'first-attempt' });
+  assert.deepEqual(nextUncertainPayment(waiting('first-attempt'), first, 180_000), first);
+  const second = waiting('second-attempt');
+  const renewed = nextUncertainPayment(second, first, 180_000);
+  assert.deepEqual(renewed, { since: 180_000, attemptId: 'second-attempt' });
+  assert.ok(renewed);
+  assert.equal(nextOrderStatusDelay('connected', second, 10, 0, 0, 180_000 - renewed.since), 3000);
 });
 
 test('awaiting unpaid and declined holds refresh infrequently and check again just after the deadline', () => {

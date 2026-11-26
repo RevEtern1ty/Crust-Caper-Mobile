@@ -623,6 +623,122 @@ test('waiting for payment slows status checks while manual refresh and kitchen u
   })).status, 200);
 });
 
+test('a delayed payment keeps its polling window through Orders and Settings', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true,
+    hasTouch: true, serviceWorkers: 'block' });
+  page.setDefaultTimeout(7500);
+  await page.clock.install();
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const apiUrl = new URL(api);
+  const journalKey = 'crustcaper.checkout.v1.local.' + apiUrl.hostname + '.' + apiUrl.port + '.kigali';
+  const orderId = '4c2ef814-5990-4cfa-b445-0b74cb7b3a0d';
+  const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+  const guest = { accessToken: 'fixture_payment_window_access_token_01', refreshToken: 'fixture_payment_window_refresh_token_01',
+    expiresAt, refreshExpiresAt: expiresAt };
+  await page.addInitScript(({ origin, journalKey, orderId, guest }) => {
+    if (location.origin !== origin) return;
+    const active = { phase: 'tracking', orderId, key: 'fixture-payment-window' };
+    sessionStorage.setItem(journalKey, JSON.stringify({ version: 1, active, orderIds: [orderId] }));
+    sessionStorage.setItem(journalKey + '.guest', JSON.stringify(guest));
+  }, { origin, journalKey, orderId, guest });
+
+  const orderUrl = api + '/orders/' + orderId;
+  const menuUrl = api + '/stores/kigali/menu';
+  const attempt = { id: 'e2ca043f-0397-490a-8d17-60cd81440bb9', status: 'processing', checkoutUrl: null };
+  const order = {
+    id: orderId, storeId: 'kigali', slotId: 'fixture-slot',
+    lines: [{ sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: 9200 }],
+    total: 9200, tax: 1400, currency: 'RWF', status: 'awaiting_payment', paymentStatus: 'processing',
+    pickupCode: null, receiptStatus: 'pending', receiptUrl: null, paymentAttempt: attempt,
+    createdAt: '2026-11-24T10:00:00Z', reservationExpiresAt: '2026-11-24T10:10:00Z',
+    pickupStartsAt: '2026-11-24T10:10:00Z', pickupEndsAt: '2026-11-24T10:20:00Z',
+  };
+  const cors = { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Headers': 'Authorization',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS' };
+  const storeLabel = { en: 'Fixture store', rw: 'Fixture store' };
+  const unexpectedWrites = [];
+  let reads = 0;
+  await page.route('**/*', route => {
+    const request = route.request();
+    const url = request.url();
+    const requestOrigin = new URL(url).origin;
+    const method = request.method();
+    if (requestOrigin === origin) return route.continue();
+    if (requestOrigin !== apiUrl.origin) return route.abort();
+    if (method === 'OPTIONS') return route.fulfill({ status: 204, headers: cors });
+    if (method !== 'GET') {
+      unexpectedWrites.push(method);
+      return route.abort();
+    }
+    if (url === orderUrl) {
+      reads++;
+      return route.fulfill({ headers: cors, json: order });
+    }
+    if (url === menuUrl || url.startsWith(menuUrl + '?')) {
+      return route.fulfill({ headers: cors, json: { version: 'fixture', updatedAt: new Date().toISOString(),
+        store: { id: 'kigali', name: storeLabel, area: storeLabel, open: true, hours: storeLabel }, products: [], slots: [] } });
+    }
+    return route.abort();
+  });
+
+  const nextRead = () => page.waitForResponse(response =>
+    response.url() === orderUrl && response.request().method() === 'GET' && response.ok());
+  const english = 'Payment confirmation is taking longer than usual. You can check again now.';
+  const kinyarwanda = 'Kwemeza ubwishyu biratinda kurusha uko bisanzwe. Ushobora kongera kugenzura ubu.';
+  let observed = nextRead();
+  await page.goto(origin + '/payment');
+  assert.equal((await (await observed).json()).paymentAttempt.id, attempt.id);
+  await page.clock.pauseAt(await page.evaluate(() => Date.now()) + 500);
+  observed = nextRead();
+  await page.clock.fastForward(125_000);
+  await observed;
+  await shown(page, english);
+
+  // The customer leaves Payment and opens the same order through the app's normal navigation.
+  observed = nextRead();
+  await button(page, 'Go to Orders').click();
+  await page.waitForURL(origin + '/orders');
+  await observed;
+  await shown(page, english);
+  let before = reads;
+  await page.clock.fastForward(30_000);
+  assert.equal(reads, before, 'Returning to the same payment keeps the slow polling interval');
+
+  await button(page, 'Settings').click();
+  await button(page, 'Kinyarwanda').click();
+  await shown(page, 'Amagenamiterere');
+  before = reads;
+  await page.clock.fastForward(65_000);
+  assert.equal(reads, before, 'The order pauses its polling while Settings has focus');
+  await page.clock.resume();
+  observed = nextRead();
+  await page.getByLabel(/(?:, back|Go back)$/i).click();
+  await page.waitForURL(origin + '/orders');
+  await observed;
+  await shown(page, kinyarwanda);
+  assert.equal(reads, before + 1, 'Returning to the order immediately checks its status');
+  await capture(page, 'payment-window-on-return-rw');
+
+  attempt.id = 'cb6bec87-0d2f-4170-875d-07e8520b6c26';
+  observed = nextRead();
+  await button(page, 'Vugurura uko komande ihagaze').click();
+  assert.equal((await (await observed).json()).paymentAttempt.id, attempt.id);
+  await page.getByText(kinyarwanda, { exact: true }).waitFor({ state: 'hidden' });
+  observed = nextRead();
+  await page.clock.fastForward(3200);
+  await observed;
+  assert.deepEqual(unexpectedWrites, []);
+});
+
 test('open Orders reconciles a declined checkout after its pickup hold expires', { timeout: 50_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const fixturePath = process.env.CRUSTCAPER_EXPIRE_ORDER_FIXTURE;

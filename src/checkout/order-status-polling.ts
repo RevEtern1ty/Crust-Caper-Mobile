@@ -1,8 +1,11 @@
 import { ApiError, type Order } from '../domain/types';
 import { hasInconsistentPayment, isAwaitingUnpaidHold, type HoldState } from './pickup-hold';
 
-type PolledOrder = HoldState & Partial<Pick<Order, 'reservationExpiresAt'>>;
+type PolledOrder = HoldState & Partial<Pick<Order, 'reservationExpiresAt'>> & {
+  paymentAttempt?: { id?: string } | null;
+};
 export type OrderStatusResult = { order: PolledOrder } | { error: unknown };
+export type UncertainPayment = { since: number; attemptId: string | null };
 
 const unpaidHoldCheckIntervalMs = 60_000;
 const overdueHoldCheckIntervalMs = 15_000;
@@ -19,17 +22,22 @@ function paymentCheckDelay(elapsedMs: number): number {
   return 60_000;
 }
 
-export function nextUncertainPaymentStart(
+export function nextUncertainPayment(
   result: OrderStatusResult,
-  since: number | null,
+  previous: UncertainPayment | null,
   observedAt: number,
-): number | null {
-  if ('order' in result) return isPaymentUncertain(result.order) ? since ?? observedAt : null;
+): UncertainPayment | null {
+  if ('order' in result) {
+    if (!isPaymentUncertain(result.order)) return null;
+    const attemptId = result.order.paymentAttempt?.id ?? null;
+    const sameAttempt = previous && (!previous.attemptId || !attemptId || previous.attemptId === attemptId);
+    return { since: sameAttempt ? previous.since : observedAt, attemptId: attemptId ?? previous?.attemptId ?? null };
+  }
   // A temporary failure does not establish a new payment state or renew the fast polling window.
   if (result.error instanceof ApiError && (result.error.code === 'unauthenticated' || result.error.code === 'not_found')) {
     return null;
   }
-  return since;
+  return previous;
 }
 
 export function nextOrderStatusDelay(
