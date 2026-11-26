@@ -3,6 +3,7 @@ package com.crustcaper.api;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -30,6 +31,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -57,14 +59,16 @@ class CommerceIntegrationTest {
     private static final String PHONE = "+250700000000";
     private static final String SLOT = "test-slot";
 
+    private enum OrderRead { OWNER, RECOVERY, CREATE_REPLAY }
+
     @Autowired MockMvc api;
-    @Autowired JdbcClient jdbc;
     @Autowired ObjectMapper json;
     @Autowired Catalog catalog;
     @Autowired CommerceJson commerceJson;
     @Autowired GuestSessions sessions;
     @Autowired OrderService orders;
     @Autowired TransactionTemplate transactions;
+    @MockitoSpyBean JdbcClient jdbc;
     @MockitoSpyBean PaymentGateway gateway;
 
     private String store;
@@ -186,6 +190,43 @@ class CommerceIntegrationTest {
             .andExpect(status().isNotFound());
         Long count = jdbc.sql("SELECT count(*) FROM orders WHERE store_id = ?").param(store).query(Long.class).single();
         assertThat(count).isEqualTo(1);
+    }
+
+    @ParameterizedTest
+    @EnumSource(OrderRead.class)
+    void orderResponseKeepsThePaymentSummaryAndLatestAttemptTogether(OrderRead read) throws Exception {
+        String owner = guest();
+        UUID guestId = sessions.authenticate(owner);
+        String quoteId = quote(owner).path("quoteId").asText();
+        String id = body(create(owner, quoteId, "order").andExpect(status().isOk())).path("id").asText();
+        String first = beginPayment(owner, id, "first");
+        localResult(owner, id, first, "declined").andExpect(status().isOk())
+            .andExpect(jsonPath("$.status").value("awaiting_payment"));
+
+        AtomicReference<UUID> nextAttempt = new AtomicReference<>();
+        doAnswer(invocation -> {
+            // The retry commits in a separate connection before the reader first asks for the latest attempt.
+            // The old split read already saw the declined order at this point.
+            try (var worker = Executors.newSingleThreadExecutor()) {
+                nextAttempt.set(worker.submit(() -> orders.startPayment(guestId, UUID.fromString(id), "retry"))
+                    .get(10, TimeUnit.SECONDS).id());
+            }
+            return invocation.callRealMethod();
+        }).doCallRealMethod().when(jdbc).sql(argThat(sql ->
+            sql.contains("ORDER BY sequence DESC LIMIT 1")));
+
+        ResultActions response = switch (read) {
+            case OWNER -> api.perform(get(orderPath(id)).header(HttpHeaders.AUTHORIZATION, owner));
+            case RECOVERY -> api.perform(get(ROOT + "/orders/recovery")
+                .header(HttpHeaders.AUTHORIZATION, owner).header(KEY, "order"));
+            case CREATE_REPLAY -> create(owner, quoteId, "order");
+        };
+        assertThat(nextAttempt.get()).isNotNull();
+        response.andExpect(status().isOk()).andExpect(jsonPath("$.id").value(id))
+            .andExpect(jsonPath("$.status").value("awaiting_payment"))
+            .andExpect(jsonPath("$.paymentStatus").value("processing"))
+            .andExpect(jsonPath("$.paymentAttempt.id").value(nextAttempt.get().toString()))
+            .andExpect(jsonPath("$.paymentAttempt.status").value("processing"));
     }
 
     @Test

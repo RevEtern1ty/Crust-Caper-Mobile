@@ -94,13 +94,19 @@
             <div class="queue-header">
               <div>
                 <h3 id="payment-exceptions-title" tabindex="-1">Payment exceptions</h3>
-                <p class="payment-review-help">Process the refund in Flutterwave using the provider transaction ID. Enter the refund ID here to verify and record the result.</p>
+                <p class="payment-review-help" id="payment-review-help">Process the refund in Flutterwave using the provider transaction ID. Enter the refund ID here to verify and record the result.</p>
               </div>
               <button class="button button-secondary" id="payment-review-refresh" type="button">Refresh payment review</button>
             </div>
+            <div class="toolbar payment-review-filters" role="group" aria-label="Payment exception view">
+              <button class="button button-secondary" id="payment-review-open" type="button" aria-pressed="true">Open exceptions</button>
+              <button class="button button-secondary" id="payment-review-verified" type="button" aria-pressed="false">Verified history</button>
+            </div>
+            <p class="queue-notice" id="payment-review-notice" role="status" tabindex="-1" hidden></p>
             <p class="problem" id="payment-review-problem" role="alert" hidden></p>
-            <p class="empty-state" id="payment-review-empty" role="status" hidden>No recent payment exceptions.</p>
+            <p class="empty-state" id="payment-review-empty" role="status" hidden></p>
             <ul class="order-list" id="payment-review-list" aria-labelledby="payment-exceptions-title"></ul>
+            <button class="button button-secondary payment-review-more" id="payment-review-more" type="button" hidden>Load more exceptions</button>
           </section>
         </section>
 

@@ -112,6 +112,10 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .payment-review-group + .payment-review-group { border-top: 1px solid var(--border); padding-top: 1.4rem; }
 .payment-review-group h3, .payment-review-group h4 { margin: 0; }
 .payment-review-group .button { overflow-wrap: anywhere; }
+.payment-review-filters { margin-bottom: 1rem; }
+.payment-review-filters > .button { flex: 0 1 auto; }
+.payment-review-filters > .button[aria-pressed="true"] { background: var(--paper); border-color: var(--green); }
+.payment-review-more { margin-top: 1rem; }
 .pending-payments-navigation { margin-block: .9rem; }
 .pending-payments-navigation > .button { flex: 0 1 auto; }
 .payment-identifiers { margin: 0; }

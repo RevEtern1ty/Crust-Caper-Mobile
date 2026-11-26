@@ -50,6 +50,15 @@ public class OrderService {
     private static final String LATEST_ATTEMPT = """
         SELECT * FROM payment_attempts WHERE order_id = ? ORDER BY sequence DESC LIMIT 1
         """;
+    private static final String ORDER_SNAPSHOT = """
+        SELECT orders.*, statement_timestamp() AS checked_at,
+               attempt.id AS attempt_id, attempt.status AS attempt_status, attempt.checkout_url
+        FROM orders
+        LEFT JOIN LATERAL (
+            SELECT id, status, checkout_url FROM payment_attempts
+            WHERE order_id = orders.id ORDER BY sequence DESC LIMIT 1
+        ) attempt ON true
+        """;
     private static final long MAX_PRICE = 1_000_000_000L;
 
     private final JdbcClient jdbc;
@@ -70,6 +79,8 @@ public class OrderService {
         String receiptStatus, String receiptUrl, Instant createdAt, Instant reservationExpiresAt,
         Instant startsAt, Instant endsAt
     ) {}
+
+    private record OrderSnapshot(StoredOrder order, PaymentAttempt attempt, Instant checkedAt) {}
 
     private record Attempt(UUID id, UUID orderId, String status, String checkoutUrl, String providerTransactionId) {
         PaymentAttempt view() {
@@ -137,11 +148,12 @@ public class OrderService {
             SELECT id FROM locked_guest WHERE expires_at > clock_timestamp()
             """)
             .param(guest).query(UUID.class).optional().orElseThrow(ApiFailure::unauthenticated);
-        StoredOrder existing = recoverRecord(guest, key);
+        OrderSnapshot existing = recoverSnapshot(guest, key);
         if (existing != null) {
-            if (!existing.quoteId().equals(quoteId) || !existing.phone().equals(phone)
-                || !Objects.equals(existing.email(), email)) throw ApiFailure.conflict("conflict");
-            return view(existing);
+            StoredOrder order = existing.order();
+            if (!order.quoteId().equals(quoteId) || !order.phone().equals(phone)
+                || !Objects.equals(order.email(), email)) throw ApiFailure.conflict("conflict");
+            return view(existing, true);
         }
         if (jdbc.sql("SELECT 1 FROM orders WHERE quote_id = ? AND guest_session_id = ?")
             .params(quoteId, guest).query(Integer.class).optional().isPresent()) throw ApiFailure.conflict("conflict");
@@ -177,20 +189,21 @@ public class OrderService {
                 json.write(quote.lines()), quote.total(), quote.tax(), dbTime(now), dbTime(hold),
                 dbTime(slot.startsAt()), dbTime(slot.endsAt()))
             .update();
-        return view(owned(guest, id, false));
+        return view(ownedSnapshot(guest, id), true);
     }
 
     public Order recover(UUID guest, String key) {
         validateKey(key);
-        StoredOrder existing = recoverRecord(guest, key);
+        OrderSnapshot existing = recoverSnapshot(guest, key);
         if (existing == null) throw ApiFailure.notFound();
-        return view(existing);
+        return view(existing, true);
     }
 
     public Order getOrder(UUID guest, UUID id) {
-        StoredOrder order = visible(guest, id);
-        if (!order.owner().equals(guest)) return view(order, false);
-        Attempt attempt = latest(id);
+        OrderSnapshot snapshot = jdbc.sql(ORDER_SNAPSHOT + "WHERE orders.id = ? " + VISIBLE_TO_GUEST)
+            .params(id, guest, guest).query(this::snapshotRow).optional().orElseThrow(ApiFailure::notFound);
+        if (!snapshot.order().owner().equals(guest)) return view(snapshot, false);
+        PaymentAttempt attempt = snapshot.attempt();
         if (attempt != null && attempt.status().equals("processing") && !localPayments
             && claimVerification(attempt.id())) {
             try {
@@ -201,9 +214,9 @@ public class OrderService {
                 if (!PAYMENT_MISMATCH.equals(error.code())) throw error;
                 // Reject unrelated money without hiding the order or changing its payment state.
             }
-            order = owned(guest, id, false);
+            snapshot = ownedSnapshot(guest, id);
         }
-        return view(order);
+        return view(snapshot, true);
     }
 
     public Reorder reorder(UUID guest, UUID id) {
@@ -396,9 +409,14 @@ public class OrderService {
             """).params(attempt, AUTOMATIC_RECONCILIATION_WINDOW_HOURS, OVERDUE_PAYMENT_CHECK_COOLDOWN_SECONDS).update() > 0;
     }
 
-    private StoredOrder recoverRecord(UUID guest, String key) {
-        return jdbc.sql("SELECT * FROM orders WHERE guest_session_id = ? AND request_key = ?")
-            .params(guest, key).query(this::orderRow).optional().orElse(null);
+    private OrderSnapshot recoverSnapshot(UUID guest, String key) {
+        return jdbc.sql(ORDER_SNAPSHOT + "WHERE orders.guest_session_id = ? AND orders.request_key = ?")
+            .params(guest, key).query(this::snapshotRow).optional().orElse(null);
+    }
+
+    private OrderSnapshot ownedSnapshot(UUID guest, UUID id) {
+        return jdbc.sql(ORDER_SNAPSHOT + "WHERE orders.id = ? AND orders.guest_session_id = ?")
+            .params(id, guest).query(this::snapshotRow).optional().orElseThrow(ApiFailure::notFound);
     }
 
     private StoredOrder owned(UUID guest, UUID id, boolean lock) {
@@ -413,17 +431,13 @@ public class OrderService {
             .params(id, guest, guest).query(this::orderRow).optional().orElseThrow(ApiFailure::notFound);
     }
 
-    private Order view(StoredOrder order) {
-        return view(order, true);
-    }
-
-    private Order view(StoredOrder order, boolean exposeCheckout) {
-        Attempt attempt = latest(order.id());
-        PaymentAttempt visibleAttempt = attempt == null ? null
-            : exposeCheckout ? attempt.view() : new PaymentAttempt(attempt.id(), attempt.status(), null);
+    private static Order view(OrderSnapshot snapshot, boolean exposeCheckout) {
+        StoredOrder order = snapshot.order();
+        PaymentAttempt attempt = snapshot.attempt();
+        if (attempt != null && !exposeCheckout) attempt = new PaymentAttempt(attempt.id(), attempt.status(), null);
         return new Order(order.id(), order.storeId(), order.slotId(), order.lines(), order.total(), order.tax(),
-            CURRENCY, order.paymentStatus(), statusAt(order, databaseNow()), order.pickupCode(), order.receiptStatus(),
-            order.receiptUrl(), visibleAttempt, order.createdAt(),
+            CURRENCY, order.paymentStatus(), statusAt(order, snapshot.checkedAt()), order.pickupCode(),
+            order.receiptStatus(), order.receiptUrl(), attempt, order.createdAt(),
             order.reservationExpiresAt(), order.startsAt(), order.endsAt());
     }
 
@@ -445,6 +459,13 @@ public class OrderService {
             rs.getString("pickup_code"), rs.getString("receipt_status"), rs.getString("receipt_url"),
             readTime(rs, "created_at"), readTime(rs, "reservation_expires_at"),
             readTime(rs, "pickup_starts_at"), readTime(rs, "pickup_ends_at"));
+    }
+
+    private OrderSnapshot snapshotRow(ResultSet rs, int row) throws SQLException {
+        UUID attemptId = rs.getObject("attempt_id", UUID.class);
+        PaymentAttempt attempt = attemptId == null ? null
+            : new PaymentAttempt(attemptId, rs.getString("attempt_status"), rs.getString("checkout_url"));
+        return new OrderSnapshot(orderRow(rs, row), attempt, readTime(rs, "checked_at"));
     }
 
     private static Attempt attemptRow(ResultSet rs, int row) throws SQLException {

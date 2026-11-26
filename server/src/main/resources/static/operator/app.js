@@ -30,6 +30,11 @@ const confirmCancellationButton = element('confirm-cancellation');
 const paymentReview = element('payment-review');
 const paymentReviewJump = element('payment-review-jump');
 const paymentReviewRefresh = element('payment-review-refresh');
+const paymentReviewOpen = element('payment-review-open');
+const paymentReviewVerified = element('payment-review-verified');
+const paymentReviewMore = element('payment-review-more');
+const paymentReviewHelp = element('payment-review-help');
+const paymentReviewNotice = element('payment-review-notice');
 const paymentReviewProblem = element('payment-review-problem');
 const paymentReviewEmpty = element('payment-review-empty');
 const paymentReviewList = element('payment-review-list');
@@ -96,6 +101,13 @@ let needsQueueRefresh = false;
 let pagePaused = false;
 let refreshing = false;
 let paymentReviewVersion = 0;
+let paymentReviewView = 'open';
+let paymentReviewCursor = null;
+let paymentReviewLoading = false;
+let refundVerificationBusy = false;
+const paymentReviewCards = new Map();
+const unconfirmedRefunds = new Map();
+const unconfirmedRefundNotice = 'Verification could not be confirmed. Retry with the same refund ID or check verified history.';
 let pendingPaymentsLoading = false;
 let pendingPaymentChecking = false;
 let pendingPaymentsCursor = null;
@@ -445,11 +457,36 @@ function closeCancellation(message = '', restoreFocus = true) {
   }
 }
 
-function renderedPaymentException(entry) {
+function refundDescription(refund) {
+  if (typeof refund?.providerRefundId !== 'string' || !providerId.test(refund.providerRefundId)
+    || !Number.isSafeInteger(refund.amount) || refund.amount <= 0 || refund.currency !== 'RWF') {
+    throw new ApiError(502, 'invalid_response');
+  }
+  return `Refund verified · ${integerFormat.format(refund.amount)} RWF · #${refund.providerRefundId}`;
+}
+
+function checkedPaymentException(entry) {
   if (!entry || ![entry.orderId, entry.merchantReference, entry.providerTransactionId, entry.reason]
     .every((value) => typeof value === 'string' && value.length > 0) || !Number.isFinite(Date.parse(entry.createdAt))) {
     throw new ApiError(502, 'invalid_response');
   }
+  if (entry.refund != null) refundDescription(entry.refund);
+  return entry;
+}
+
+function paymentExceptionKey(entry) {
+  return JSON.stringify([entry.merchantReference, entry.providerTransactionId]);
+}
+
+function setUnconfirmedRefund(form, { refundId, message }) {
+  const input = form.elements.namedItem('refundId');
+  input.readOnly = true;
+  input.value = refundId;
+  form.querySelector('button').textContent = 'Retry verification';
+  showMessage(form.querySelector('.manager-problem'), message);
+}
+
+function renderedPaymentException(entry) {
   const card = paymentExceptionTemplate.content.firstElementChild.cloneNode(true);
   card.querySelector('.payment-exception-reason').textContent = Object.hasOwn(paymentReasons, entry.reason)
     ? paymentReasons[entry.reason] : 'Payment exception';
@@ -458,22 +495,38 @@ function renderedPaymentException(entry) {
   card.querySelector('.payment-exception-reference').textContent = entry.merchantReference;
   card.querySelector('.payment-exception-transaction').textContent = entry.providerTransactionId;
   if (entry.refund != null) {
-    const refund = entry.refund;
-    if (typeof refund.providerRefundId !== 'string' || !providerId.test(refund.providerRefundId)
-      || !Number.isSafeInteger(refund.amount) || refund.amount <= 0 || refund.currency !== 'RWF') {
-      throw new ApiError(502, 'invalid_response');
-    }
-    showMessage(card.querySelector('.fiscal-result'),
-      `Refund verified · ${integerFormat.format(refund.amount)} RWF · #${refund.providerRefundId}`);
+    showMessage(card.querySelector('.fiscal-result'), refundDescription(entry.refund));
   } else if (uuid.test(entry.merchantReference) && providerId.test(entry.providerTransactionId)) {
     const form = card.querySelector('.refund-form');
     form.hidden = false;
+    const unconfirmed = unconfirmedRefunds.get(paymentExceptionKey(entry));
+    if (unconfirmed) setUnconfirmedRefund(form, unconfirmed);
     form.addEventListener('submit', (event) => {
       event.preventDefault();
       void verifyRefund(entry, card, form);
     });
   }
   return card;
+}
+
+function syncPaymentReviewControls() {
+  const busy = paymentReviewLoading || refundVerificationBusy;
+  paymentReviewOpen.disabled = refundVerificationBusy;
+  paymentReviewVerified.disabled = refundVerificationBusy;
+  paymentReviewOpen.setAttribute('aria-pressed', String(paymentReviewView === 'open'));
+  paymentReviewVerified.setAttribute('aria-pressed', String(paymentReviewView === 'verified'));
+  paymentReviewRefresh.disabled = busy;
+  paymentReviewMore.disabled = busy;
+  paymentReviewMore.hidden = paymentReviewCursor === null;
+  paymentReviewList.setAttribute('aria-busy', String(paymentReviewLoading));
+  for (const control of paymentReviewList.querySelectorAll('.refund-form input, .refund-form button')) {
+    control.disabled = busy;
+  }
+}
+
+function showPaymentReviewEmpty() {
+  const empty = paymentReviewView === 'open' ? 'No open payment exceptions.' : 'No verified refunds.';
+  showMessage(paymentReviewEmpty, paymentReviewCards.size || paymentReviewCursor !== null ? '' : empty);
 }
 
 function renderedPendingPayment(entry) {
@@ -547,7 +600,7 @@ async function recheckPendingPayment(entry) {
     message = pendingPaymentCheckMessage(error);
   }
   if (session !== current) return;
-  await Promise.all([refreshPendingPayments(), refreshPaymentReview(true)]);
+  await Promise.all([refreshPendingPayments(), refreshPaymentReview({ force: true })]);
   if (session !== current) return;
   pendingPaymentChecking = false;
   syncPendingPaymentControls();
@@ -558,33 +611,55 @@ async function recheckPendingPayment(entry) {
 async function verifyRefund(entry, card, form) {
   const current = availableSession();
   const submit = form.querySelector('button');
-  if (current?.role !== 'manager' || submit.disabled) return;
+  if (current?.role !== 'manager' || paymentReviewView !== 'open' || submit.disabled || refundVerificationBusy) return;
+  const key = paymentExceptionKey(entry);
   const input = form.elements.namedItem('refundId');
-  const refundId = input.value.trim();
+  const refundId = unconfirmedRefunds.get(key)?.refundId ?? input.value.trim();
   if (!providerId.test(refundId)) return;
   const problem = form.querySelector('.manager-problem');
-  submit.disabled = true;
-  input.disabled = true;
+  refundVerificationBusy = true;
+  syncPaymentReviewControls();
   showMessage(problem);
+  showMessage(paymentReviewNotice);
   try {
     const data = await request(`/payment-exceptions/${entry.merchantReference}/${entry.providerTransactionId}/refund`, {
       method: 'POST', token: current.accessToken, body: { providerRefundId: refundId }, timeoutMs: 28_000,
     });
     if (session !== current) return;
     if (data?.providerRefundId !== refundId) throw new ApiError(502, 'invalid_response');
-    const updated = renderedPaymentException({ ...entry, refund: data });
-    card.replaceWith(updated);
-    const status = updated.querySelector('.fiscal-result');
-    status.tabIndex = -1;
-    status.focus();
+    const message = refundDescription(data);
+    unconfirmedRefunds.delete(key);
+    paymentReviewCards.delete(key);
+    card.remove();
+    showPaymentReviewEmpty();
+    showMessage(paymentReviewNotice, message);
+    if (document.activeElement === document.body) paymentReviewNotice.focus();
   } catch (error) {
     if (session !== current) return;
-    if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
-    else showMessage(problem, messageFor(error));
+    if (error instanceof ApiError && error.status === 401) {
+      closeSession('Your staff session expired. Sign in again.');
+      return;
+    }
+    if (!(error instanceof ApiError) || error.status === 408 || error.status >= 500) {
+      const message = error instanceof ApiError && error.requestId
+        ? `${unconfirmedRefundNotice} Support ID ${error.requestId}.` : unconfirmedRefundNotice;
+      const pending = { entry, refundId, message };
+      unconfirmedRefunds.set(key, pending);
+      setUnconfirmedRefund(form, pending);
+    } else {
+      unconfirmedRefunds.delete(key);
+      input.readOnly = false;
+      submit.textContent = 'Verify refund';
+      showMessage(problem, messageFor(error));
+    }
+    if (document.activeElement === document.body) {
+      problem.tabIndex = -1;
+      problem.focus();
+    }
   } finally {
     if (session === current) {
-      submit.disabled = false;
-      input.disabled = false;
+      refundVerificationBusy = false;
+      syncPaymentReviewControls();
     }
   }
 }
@@ -704,8 +779,16 @@ function closeSession(message = '') {
   orderList.replaceChildren();
   paymentReview.hidden = true;
   paymentReviewJump.hidden = true;
+  paymentReviewView = 'open';
+  paymentReviewCursor = null;
+  paymentReviewLoading = false;
+  refundVerificationBusy = false;
+  paymentReviewCards.clear();
+  unconfirmedRefunds.clear();
   paymentReviewList.replaceChildren();
-  paymentReviewRefresh.disabled = false;
+  updatePaymentReviewHelp();
+  syncPaymentReviewControls();
+  showMessage(paymentReviewNotice);
   showMessage(paymentReviewProblem);
   showMessage(paymentReviewEmpty);
   pendingPaymentsLoading = false;
@@ -776,32 +859,102 @@ async function refreshQueue(force = false) {
   }
 }
 
-async function refreshPaymentReview(force = false) {
-  const current = availableSession();
-  if (current?.role !== 'manager' || (paymentReviewRefresh.disabled && !force)) return;
+function addPaymentExceptionCards(entries) {
+  let first;
+  for (const entry of entries) {
+    const key = paymentExceptionKey(entry);
+    if (paymentReviewCards.has(key)) continue;
+    const card = renderedPaymentException(entry);
+    paymentReviewCards.set(key, card);
+    paymentReviewList.append(card);
+    first ??= card;
+  }
+  return first;
+}
 
+function updatePaymentReviewHelp() {
+  paymentReviewHelp.textContent = paymentReviewView === 'open'
+    ? 'Process the refund in Flutterwave using the provider transaction ID. Enter the refund ID here to verify and record the result.'
+    : 'Review refunds already verified and recorded for this restaurant.';
+}
+
+function selectPaymentReview(view) {
+  if (availableSession()?.role !== 'manager' || paymentReviewView === view || refundVerificationBusy) return;
+  paymentReviewView = view;
+  paymentReviewCursor = null;
+  paymentReviewCards.clear();
+  paymentReviewList.replaceChildren();
+  if (view === 'open') addPaymentExceptionCards([...unconfirmedRefunds.values()].map(({ entry }) => entry));
+  updatePaymentReviewHelp();
+  showMessage(paymentReviewNotice);
+  void refreshPaymentReview({ force: true });
+}
+
+async function refreshPaymentReview({ append = false, force = false } = {}) {
+  const current = availableSession();
+  if (current?.role !== 'manager' || refundVerificationBusy || (paymentReviewLoading && !force)) return;
+
+  const after = append ? paymentReviewCursor : null;
+  if (append && after === null) return;
+  const view = paymentReviewView;
+  const params = new URLSearchParams({ state: view });
+  if (after !== null) params.set('after', after);
   const version = ++paymentReviewVersion;
-  paymentReviewRefresh.disabled = true;
+  paymentReviewLoading = true;
+  syncPaymentReviewControls();
   showMessage(paymentReviewProblem);
   showMessage(paymentReviewEmpty, paymentReviewList.childElementCount ? '' : 'Loading payment exceptions…');
   try {
-    const data = await request('/payment-exceptions', { token: current.accessToken });
+    const data = await request(`/payment-exceptions?${params}`, { token: current.accessToken });
     if (session !== current || paymentReviewVersion !== version) return;
-    if (!Array.isArray(data?.exceptions) || data.exceptions.length > 50) throw new ApiError(502, 'invalid_response');
-    paymentReviewList.replaceChildren(...data.exceptions.map(renderedPaymentException));
-    showMessage(paymentReviewEmpty, data.exceptions.length ? '' : 'No recent payment exceptions.');
-    return data.exceptions;
+    if (!Array.isArray(data?.exceptions) || data.exceptions.length > 50 || (data.nextCursor !== null
+      && (typeof data.nextCursor !== 'string' || !data.nextCursor || data.nextCursor.length > 1024
+        || data.nextCursor === after || !data.exceptions.length))) throw new ApiError(502, 'invalid_response');
+    const entries = data.exceptions.map(checkedPaymentException);
+    if (entries.some(entry => (entry.refund != null) !== (view === 'verified'))) throw new ApiError(502, 'invalid_response');
+    if (!append) {
+      paymentReviewCards.clear();
+      paymentReviewList.replaceChildren();
+      if (view === 'open') addPaymentExceptionCards([...unconfirmedRefunds.values()].map(({ entry }) => entry));
+    }
+    if (view === 'verified') {
+      for (const entry of entries) unconfirmedRefunds.delete(paymentExceptionKey(entry));
+    }
+    const first = addPaymentExceptionCards(entries);
+    paymentReviewCursor = data.nextCursor;
+    showPaymentReviewEmpty();
+    if (append && first && (document.activeElement === document.body || document.activeElement === paymentReviewMore)) {
+      const heading = first.querySelector('.payment-exception-reason');
+      heading.tabIndex = -1;
+      heading.focus();
+    }
   } catch (error) {
     if (session !== current || paymentReviewVersion !== version) return;
     if (error instanceof ApiError && error.status === 401) {
       closeSession('Your staff session expired. Sign in again.');
     } else {
-      paymentReviewList.replaceChildren();
       showMessage(paymentReviewEmpty);
-      showMessage(paymentReviewProblem, messageFor(error));
+      showMessage(paymentReviewProblem, messageFor(error, 'Payment exceptions could not be loaded. Try again.'));
     }
   } finally {
-    if (session === current && paymentReviewVersion === version) paymentReviewRefresh.disabled = false;
+    if (session === current && paymentReviewVersion === version) {
+      paymentReviewLoading = false;
+      syncPaymentReviewControls();
+    }
+  }
+}
+
+async function readCancellationExceptions(current) {
+  try {
+    // The most recent exceptions can prove a lost cancellation reply regardless of the manager's current view.
+    const data = await request('/payment-exceptions', { token: current.accessToken });
+    if (session === current && Array.isArray(data?.exceptions) && data.exceptions.length <= 50) {
+      return data.exceptions.map(checkedPaymentException);
+    }
+  } catch (error) {
+    if (session === current && error instanceof ApiError && error.status === 401) {
+      closeSession('Your staff session expired. Sign in again.');
+    }
   }
 }
 
@@ -1070,7 +1223,7 @@ async function submitCancellation() {
   let exceptions;
   if (cancelledOrder || uncertain || (failure instanceof ApiError && [404, 409].includes(failure.status))) {
     showMessage(cancellationProgress, 'Checking the order and payment review…');
-    [, exceptions] = await Promise.all([refreshQueue(true), refreshPaymentReview(true)]);
+    [, exceptions] = await Promise.all([refreshQueue(true), readCancellationExceptions(current), refreshPaymentReview({ force: true })]);
   }
   if (session !== current || cancellation !== selection) return;
 
@@ -1171,6 +1324,9 @@ cancellationDialog.addEventListener('cancel', (event) => {
 });
 paymentReviewJump.addEventListener('click', () => { element('payment-review-title').focus(); });
 paymentReviewRefresh.addEventListener('click', () => { void refreshPaymentReview(); });
+paymentReviewOpen.addEventListener('click', () => selectPaymentReview('open'));
+paymentReviewVerified.addEventListener('click', () => selectPaymentReview('verified'));
+paymentReviewMore.addEventListener('click', () => { void refreshPaymentReview({ append: true }); });
 pendingPaymentsRefresh.addEventListener('click', () => {
   showMessage(pendingPaymentsNotice);
   void refreshPendingPayments();

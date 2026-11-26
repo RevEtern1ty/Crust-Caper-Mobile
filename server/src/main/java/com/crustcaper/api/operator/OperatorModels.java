@@ -41,6 +41,9 @@ final class OperatorModels {
 
     record PaymentReview(List<PaymentExceptionView> exceptions) { }
 
+    record PaymentReviewPage(List<PaymentExceptionView> exceptions,
+                             @JsonInclude(JsonInclude.Include.ALWAYS) String nextCursor) { }
+
     record PendingPaymentAttempt(UUID orderId, UUID merchantReference, Instant reservationExpiresAt,
                                  @JsonInclude(JsonInclude.Include.ALWAYS) Instant lastCheckedAt) { }
 

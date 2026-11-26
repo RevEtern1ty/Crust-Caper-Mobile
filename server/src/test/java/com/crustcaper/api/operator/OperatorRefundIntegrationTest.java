@@ -2,6 +2,7 @@ package com.crustcaper.api.operator;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -38,6 +39,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.transaction.annotation.Transactional;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 @SpringBootTest
@@ -71,6 +73,66 @@ class OperatorRefundIntegrationTest {
     @BeforeEach
     void createFixtureStore() {
         store = newStore();
+    }
+
+    @Test
+    void openRefundReviewReachesOldAndTiedExceptionsEvenAfterTheCursorIsRefunded() throws Exception {
+        var order = newOrder(true);
+        settle(order.attemptId(), LATE_TRANSACTION);
+        jdbc.sql("UPDATE payment_exceptions SET created_at = now() - interval '1 day' WHERE attempt_id = ?")
+            .param(order.attemptId()).update();
+        jdbc.sql("""
+            INSERT INTO payment_exceptions (attempt_id, provider_transaction_id, reason, created_at)
+            SELECT ?, (8000000 + number)::text, 'duplicate_transaction', date_trunc('second', now())
+            FROM generate_series(1, 52) AS series(number)
+            """).param(order.attemptId()).update();
+        String manager = login(staff(store, "manager"));
+        String foreignManager = login(staff(newStore(), "manager"));
+        String kitchen = login(staff(store, "kitchen"));
+
+        review(null, "open", null).andExpect(status().isUnauthorized());
+        review(kitchen, "open", null).andExpect(status().isForbidden());
+        var legacy = body(review(manager, null, null).andExpect(status().isOk()));
+        assertThat(legacy.propertyNames()).containsExactly("exceptions");
+        assertThat(legacy.path("exceptions").size()).isEqualTo(50);
+        assertThat(legacy.path("exceptions").get(0).path("providerTransactionId").asString()).isEqualTo("8000052");
+        for (JsonNode entry : legacy.path("exceptions")) {
+            assertThat(entry.path("providerTransactionId").asString()).isNotEqualTo(LATE_TRANSACTION);
+        }
+        var first = body(review(manager, "open", null).andExpect(status().isOk())
+            .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+            .andExpect(jsonPath("$.exceptions.length()").value(50)));
+        assertThat(first.path("exceptions").get(0).path("providerTransactionId").asString()).isEqualTo(LATE_TRANSACTION);
+        assertThat(first.path("exceptions").get(49).path("providerTransactionId").asString()).isEqualTo("8000049");
+        String after = first.path("nextCursor").asString("");
+        assertThat(after).matches("[A-Za-z0-9_-]+");
+        review(foreignManager, "open", after).andExpect(status().isOk())
+            .andExpect(jsonPath("$.exceptions").isEmpty()).andExpect(jsonPath("$.nextCursor").value(nullValue()));
+        review(manager, "verified", after).andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("invalid_input"));
+        review(manager, "open", "malformed!").andExpect(status().isBadRequest());
+        review(manager, "invalid", null).andExpect(status().isBadRequest());
+        review(manager, null, after).andExpect(status().isBadRequest());
+        verifyNoInteractions(directory);
+
+        confirm(DUPLICATE_REFUND, "8000049");
+        record(manager, order.attemptId(), "8000049", DUPLICATE_REFUND).andExpect(status().isOk());
+        assertThat(orderState(order.id())).isEqualTo("cancelled:refund_pending");
+        confirm(LATE_REFUND, LATE_TRANSACTION);
+        record(manager, order.attemptId(), LATE_TRANSACTION, LATE_REFUND).andExpect(status().isOk());
+        assertThat(orderState(order.id())).isEqualTo("cancelled:refunded");
+        review(manager, "verified", null).andExpect(status().isOk())
+            .andExpect(jsonPath("$.exceptions.length()").value(2))
+            .andExpect(jsonPath("$.exceptions[0].providerTransactionId").value("8000049"))
+            .andExpect(jsonPath("$.exceptions[0].refund.providerRefundId").value(DUPLICATE_REFUND))
+            .andExpect(jsonPath("$.exceptions[1].providerTransactionId").value(LATE_TRANSACTION))
+            .andExpect(jsonPath("$.nextCursor").value(nullValue()));
+        review(manager, "open", after).andExpect(status().isOk())
+            .andExpect(jsonPath("$.exceptions.length()").value(3))
+            .andExpect(jsonPath("$.exceptions[0].providerTransactionId").value("8000050"))
+            .andExpect(jsonPath("$.exceptions[1].providerTransactionId").value("8000051"))
+            .andExpect(jsonPath("$.exceptions[2].providerTransactionId").value("8000052"))
+            .andExpect(jsonPath("$.exceptions[0].refund").doesNotExist())
+            .andExpect(jsonPath("$.nextCursor").value(nullValue()));
     }
 
     @Test
@@ -314,6 +376,18 @@ class OperatorRefundIntegrationTest {
             request.header(HttpHeaders.AUTHORIZATION, authorization);
         }
         return api.perform(request);
+    }
+
+    private ResultActions review(String authorization, String state, String after) throws Exception {
+        var request = get(REVIEW);
+        if (authorization != null) request.header(HttpHeaders.AUTHORIZATION, authorization);
+        if (state != null) request.param("state", state);
+        if (after != null) request.param("after", after);
+        return api.perform(request);
+    }
+
+    private JsonNode body(ResultActions response) throws Exception {
+        return json.readTree(response.andReturn().getResponse().getContentAsByteArray());
     }
 
     private record Staff(UUID id, String username) { }

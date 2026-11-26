@@ -622,16 +622,26 @@ paths:
     get:
       operationId: listOperatorPaymentExceptions
       security: [{ operatorBearer: [] }]
-      description: Read-only payment exceptions for the manager's assigned store, newest first.
+      description: Read-only payment exceptions for the manager's assigned store. Requests without a state return the legacy newest-first list. Open exceptions appear oldest first and verified exceptions appear newest first.
+      parameters:
+        - name: state
+          in: query
+          description: Filter by whether a verified refund is recorded for this exact charge.
+          schema: { type: string, enum: [open, verified] }
+        - name: after
+          in: query
+          description: Use nextCursor from the previous page of the same state. An unavailable cursor returns an empty page.
+          schema: { type: string }
       responses:
         '200':
-          description: Up to 50 persisted late or duplicate payment events for manual verification at the provider.
+          description: Up to 50 persisted payment exceptions. Filtered pages include nextCursor, with null marking the end.
           headers:
             Cache-Control:
               schema: { type: string, const: no-store }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OperatorPaymentReview' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
@@ -1016,6 +1026,9 @@ components:
       additionalProperties: false
       required: [exceptions]
       properties:
+        nextCursor:
+          type: [string, 'null']
+          description: Cursor supplied by the API for the next filtered page. Omitted for legacy requests.
         exceptions:
           type: array
           maxItems: 50

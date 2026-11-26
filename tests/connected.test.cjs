@@ -998,6 +998,8 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   await button(page, 'Confirm local test payment').click();
   await shown(page, 'Order accepted');
   await manager.setViewportSize({ width: 320, height: 844 });
+  await button(manager, 'Payment review').click();
+  await button(manager, 'Verified history').click();
   await button(manager, 'Refresh').click();
   const cancelledShortId = newerOrder.id.slice(-8).toUpperCase();
   const paidCard = manager.getByRole('list', { name: 'Paid orders' }).getByRole('listitem')
@@ -1028,6 +1030,8 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   assert.equal(dispatched[0].body.status, 'cancelled');
   assert.equal(dispatched[0].body.paymentStatus, 'refund_pending');
   await button(manager, 'Payment review').click();
+  assert.equal(await button(manager, 'Verified history').getAttribute('aria-pressed'), 'true');
+  await button(manager, 'Open exceptions').click();
   const exception = manager.getByRole('list', { name: 'Payment exceptions' }).getByRole('listitem')
     .filter({ hasText: newerOrder.id });
   await exception.getByRole('heading', { name: 'Restaurant cancelled' }).waitFor();
@@ -1056,12 +1060,30 @@ test('payment review displays a verified refund only after the API confirms it',
     providerRefundId: '2022002', refundStatus: 'completed-momo', amount: 9200, currency: 'RWF',
     recordedAt: '2026-01-01T12:20:00Z',
   };
+  const open = Array.from({ length: 50 }, (_, index) => ({
+    orderId: `11111111-1111-4111-8111-${String(index).padStart(12, '0')}`,
+    merchantReference: `22222222-2222-4222-8222-${String(index).padStart(12, '0')}`,
+    providerTransactionId: String(1300000 + index),
+    reason: 'duplicate_transaction',
+    createdAt: '2024-01-01T12:00:00Z',
+  }));
+  const verified = open.map((entry, index) => ({
+    ...entry,
+    merchantReference: `33333333-3333-4333-8333-${String(index).padStart(12, '0')}`,
+    providerTransactionId: String(1400000 + index),
+    createdAt: '2026-02-01T12:00:00Z',
+    refund: { ...refund, providerRefundId: String(2000000 + index) },
+  }));
+  const openCursor = 'open-cursor-fixture';
+  const verifiedCursor = 'verified-cursor-fixture';
   let recorded = false;
+  let openPages = 0;
   const requested = [];
   await restrictToOperatorAssets(page);
   await page.route('**/api/v1/operator/**', async route => {
     const request = route.request();
-    const path = new URL(request.url()).pathname;
+    const url = new URL(request.url());
+    const path = url.pathname;
     if (path.endsWith('/sessions')) {
       return route.fulfill({ json: { accessToken: 'fixture-session', role: 'manager', storeId: 'kigali',
         expiresAt: new Date(Date.now() + 60_000).toISOString() } });
@@ -1072,14 +1094,31 @@ test('payment review displays a verified refund only after the API confirms it',
     if (path.endsWith('/availability')) return route.fulfill({ json: { version: 'finance-fixture', open: true, products: [] } });
     if (path.endsWith('/payment-attempts/pending')) return route.fulfill({ json: { attempts: [], hasMore: false } });
     if (path.endsWith('/payment-exceptions')) {
-      return route.fulfill({ json: { exceptions: [recorded ? { ...payment, refund } : payment] } });
+      const state = url.searchParams.get('state');
+      const after = url.searchParams.get('after');
+      if (state === 'open') {
+        if (after === null) return route.fulfill({ json: { exceptions: open, nextCursor: openCursor } });
+        assert.equal(after, openCursor);
+        openPages++;
+        if (openPages === 1) return route.fulfill({ status: 503, json: { code: 'service_unavailable' } });
+        const remaining = recorded ? [] : [payment];
+        return route.fulfill({ json: { exceptions: [open.at(-1), ...remaining], nextCursor: null } });
+      }
+      if (state === 'verified') {
+        if (after === null) return route.fulfill({ json: { exceptions: verified, nextCursor: verifiedCursor } });
+        assert.equal(after, verifiedCursor);
+        return route.fulfill({ json: { exceptions: recorded ? [{ ...payment, refund }] : [], nextCursor: null } });
+      }
+      assert.equal(state, null);
+      return route.fulfill({ json: { exceptions: verified } });
     }
     if (path.endsWith(`/payment-exceptions/${payment.merchantReference}/${payment.providerTransactionId}/refund`)) {
       requested.push(request.postDataJSON().providerRefundId);
       assert.equal(request.method(), 'POST');
       if (requested.at(-1) === refund.providerRefundId) {
+        if (recorded) return route.fulfill({ json: refund });
         recorded = true;
-        return route.fulfill({ json: refund });
+        return route.abort('connectionreset');
       }
       return route.fulfill({ status: 409, json: { code: 'refund_unconfirmed' } });
     }
@@ -1090,22 +1129,73 @@ test('payment review displays a verified refund only after the API confirms it',
   await page.getByLabel('Password', { exact: true }).fill('fixture-only');
   await button(page, 'Sign in').click();
   await button(page, 'Payment review').click();
-  await page.getByLabel('Provider refund ID').fill('2022001');
-  await button(page, 'Verify refund').click();
+  await page.getByRole('link', { name: 'Go to payment exceptions' }).click();
+  const list = page.getByRole('list', { name: 'Payment exceptions' });
+  const rows = list.getByRole('listitem');
+  const more = button(page, 'Load more exceptions');
+  const target = rows.filter({ hasText: payment.orderId });
+  const refundInput = () => target.getByLabel('Provider refund ID');
+  await more.waitFor();
+  assert.equal(await button(page, 'Open exceptions').getAttribute('aria-pressed'), 'true');
+  assert.equal(await rows.count(), 50);
+  assert.equal(await page.getByText(/^Refund verified/).count(), 0);
+  await more.click();
+  await shown(page, 'Payment exceptions could not be loaded. Try again.');
+  assert.equal(await rows.count(), 50);
+  await more.click();
+  await target.waitFor();
+  assert.equal(await rows.count(), 51, 'An overlapping page does not render duplicate exceptions');
+  await refundInput().fill('2022001');
+  await button(target, 'Verify refund').click();
   await shown(page, 'Flutterwave did not confirm a completed full refund for this payment.');
   assert.equal(await page.getByText(/^Refund verified/).count(), 0);
-  await page.getByLabel('Provider refund ID').fill(refund.providerRefundId);
-  await button(page, 'Verify refund').click();
-  await shown(page, 'Refund verified · 9,200 RWF · #2022002');
-  await button(page, 'Refresh payment review').click();
-  await shown(page, 'Refund verified · 9,200 RWF · #2022002');
-  assert.equal(await button(page, 'Verify refund').count(), 0);
-  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 320);
+  await refundInput().fill(refund.providerRefundId);
+  await button(target, 'Verify refund').click();
+  await shown(page, 'Verification could not be confirmed. Retry with the same refund ID or check verified history.');
   assert.deepEqual(requested, ['2022001', '2022002']);
-  await capture(page, 'operator-refund-review');
+  await button(page, 'Refresh payment review').click();
+  await more.waitFor();
+  assert.equal(await refundInput().inputValue(), refund.providerRefundId);
+  assert.equal(await refundInput().getAttribute('readonly'), '');
+  await button(page, 'Verified history').click();
+  await more.waitFor();
+  assert.equal(await button(page, 'Verified history').getAttribute('aria-pressed'), 'true');
+  assert.equal(await button(page, 'Verify refund').count(), 0);
+  assert.equal(await target.count(), 0, 'The committed old refund is on the next history page');
+  await button(page, 'Open exceptions').click();
+  await button(target, 'Retry verification').waitFor();
+  assert.equal(await refundInput().inputValue(), refund.providerRefundId);
+  assert.deepEqual(requested, ['2022001', '2022002']);
+  await button(target, 'Retry verification').click();
+  await shown(page, 'Refund verified · 9,200 RWF · #2022002');
+  assert.equal(await target.count(), 0);
+  assert.deepEqual(requested, ['2022001', '2022002', '2022002']);
+  await button(page, 'Verified history').click();
+  await more.waitFor();
+  await more.click();
+  await target.getByText('Refund verified · 9,200 RWF · #2022002', { exact: true }).waitFor();
+  assert.equal(await button(page, 'Verify refund').count(), 0);
+  for (const width of [320, 390, 430]) {
+    await page.setViewportSize({ width, height: 800 });
+    await target.scrollIntoViewIfNeeded();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+    await capture(page, `operator-refund-history-${width}`);
+    await withLargeText(page, async () => {
+      await target.scrollIntoViewIfNeeded();
+      assert.equal(await target.evaluate(el => el.scrollWidth), await target.evaluate(el => el.clientWidth));
+      await capture(page, `operator-refund-history-${width}-large-text`);
+    }, 'div, span, p, h1, h2, h3, h4, button');
+  }
   await button(page, 'Sign out').click();
   await shown(page, 'Staff sign in');
   assert.equal(await page.getByText(/^Refund verified/).count(), 0);
+  await page.getByLabel('Username', { exact: true }).fill('fixture-manager');
+  await page.getByLabel('Password', { exact: true }).fill('fixture-only');
+  await button(page, 'Sign in').click();
+  await more.waitFor();
+  assert.equal(await button(page, 'Open exceptions').getAttribute('aria-pressed'), 'true');
+  assert.equal(await rows.count(), 50);
+  assert.equal(await button(page, 'Retry verification').count(), 0);
   assert.deepEqual(errors, []);
 });
 
@@ -1164,7 +1254,8 @@ test('manager rechecks overdue payments explicitly and reloads payment records a
     if (path.endsWith('/availability')) return route.fulfill({ json: { version: 'finance-fixture', open: true, products: [] } });
     if (path.endsWith('/payment-exceptions')) {
       exceptionReads++;
-      return route.fulfill({ json: { exceptions: paymentExceptions } });
+      assert.equal(url.searchParams.get('state'), 'open');
+      return route.fulfill({ json: { exceptions: paymentExceptions, nextCursor: null } });
     }
     if (path.endsWith('/payment-attempts/pending')) {
       const after = url.searchParams.get('after');

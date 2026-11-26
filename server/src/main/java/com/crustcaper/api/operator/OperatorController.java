@@ -3,6 +3,7 @@ package com.crustcaper.api.operator;
 import com.crustcaper.api.operator.OperatorModels.Login;
 import com.crustcaper.api.operator.OperatorModels.OrderView;
 import com.crustcaper.api.operator.OperatorModels.PaymentReview;
+import com.crustcaper.api.operator.OperatorModels.PaymentReviewPage;
 import com.crustcaper.api.operator.OperatorModels.PickupStatus;
 import com.crustcaper.api.operator.OperatorModels.Queue;
 import com.crustcaper.api.operator.OperatorModels.Session;
@@ -25,6 +26,7 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
@@ -66,10 +68,19 @@ final class OperatorController {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.pickupStatus(authorization, id));
     }
 
-    @GetMapping("/payment-exceptions")
+    @GetMapping(value = "/payment-exceptions", params = "!state")
     ResponseEntity<PaymentReview> paymentReview(
-            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization) {
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.paymentReview(authorization));
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+            @RequestParam(value = "after", required = false) String after) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.paymentReview(authorization, after));
+    }
+
+    @GetMapping(value = "/payment-exceptions", params = "state")
+    ResponseEntity<PaymentReviewPage> paymentReviewPage(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+            @RequestParam("state") String state,
+            @RequestParam(value = "after", required = false) String after) {
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(orders.paymentReviewPage(authorization, state, after));
     }
 
     @GetMapping("/availability")

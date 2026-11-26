@@ -4,6 +4,7 @@ import com.crustcaper.api.operator.OperatorModels.OrderLine;
 import com.crustcaper.api.operator.OperatorModels.OrderView;
 import com.crustcaper.api.operator.OperatorModels.PaymentExceptionView;
 import com.crustcaper.api.operator.OperatorModels.PaymentReview;
+import com.crustcaper.api.operator.OperatorModels.PaymentReviewPage;
 import com.crustcaper.api.operator.OperatorModels.PickupStatus;
 import com.crustcaper.api.operator.OperatorModels.Queue;
 import com.crustcaper.api.operator.OperatorModels.StatusInput;
@@ -16,6 +17,7 @@ import java.security.MessageDigest;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.OffsetDateTime;
+import java.util.Base64;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -31,6 +33,28 @@ final class OperatorOrders {
     private static final String ORDER_FIELDS = "id, status, payment_status, lines, pickup_starts_at, pickup_ends_at, accepted_at";
     private static final String RESTAURANT_CANCELLED = "restaurant_cancelled";
     private static final int PAYMENT_REVIEW_LIMIT = 50;
+    private static final String PAYMENT_REVIEW_FIELDS = """
+            SELECT o.id AS order_id, pe.attempt_id, pe.provider_transaction_id, pe.reason, pe.created_at,
+                vr.provider_refund_id, vr.refund_status, vr.amount, vr.currency, vr.recorded_at
+            FROM payment_exceptions pe
+            JOIN payment_attempts pa ON pa.id = pe.attempt_id
+            JOIN orders o ON o.id = pa.order_id
+            LEFT JOIN verified_refunds vr ON vr.attempt_id = pe.attempt_id AND vr.provider_transaction_id = pe.provider_transaction_id
+            WHERE o.store_id = ?
+            """;
+    private static final String PAYMENT_REVIEW_AFTER = """
+            AND (pe.created_at, pe.attempt_id, pe.provider_transaction_id) %s (
+                SELECT anchor.created_at, anchor.attempt_id, anchor.provider_transaction_id
+                FROM payment_exceptions anchor
+                JOIN payment_attempts p ON p.id = anchor.attempt_id
+                JOIN orders o ON o.id = p.order_id
+                WHERE anchor.attempt_id = ? AND anchor.provider_transaction_id = ? AND o.store_id = ?
+            )
+            """;
+    private static final String PAYMENT_REVIEW_ORDER = """
+            ORDER BY pe.created_at %s, pe.attempt_id %s, pe.provider_transaction_id %s
+            LIMIT ?
+            """;
     private final JdbcClient jdbc;
     private final OperatorSessions sessions;
     private final TransactionTemplate transactions;
@@ -71,28 +95,72 @@ final class OperatorOrders {
                 .optional().orElseThrow(OperatorFailure::notFound);
     }
 
-    PaymentReview paymentReview(String authorization) {
+    PaymentReview paymentReview(String authorization, String after) {
+        Principal actor = paymentReviewManager(authorization);
+        if (after != null) throw OperatorFailure.invalid();
+        List<PaymentExceptionView> entries = jdbc.sql(PAYMENT_REVIEW_FIELDS + PAYMENT_REVIEW_ORDER.formatted("DESC", "DESC", "DESC"))
+                .params(actor.storeId(), PAYMENT_REVIEW_LIMIT).query(OperatorOrders::paymentExceptionRow).list();
+        return new PaymentReview(entries);
+    }
+
+    PaymentReviewPage paymentReviewPage(String authorization, String state, String after) {
+        Principal actor = paymentReviewManager(authorization);
+        boolean open = switch (state) {
+            case "open" -> true;
+            case "verified" -> false;
+            default -> throw OperatorFailure.invalid();
+        };
+        PaymentReviewCursor cursor = after == null ? null : PaymentReviewCursor.decode(state, after);
+        String refundFilter = open ? "AND vr.provider_refund_id IS NULL\n" : "AND vr.provider_refund_id IS NOT NULL\n";
+        String direction = open ? "ASC" : "DESC";
+        // Resolve the previous row in this store even if a refund moved it from open to verified.
+        String startAfter = cursor == null ? "" : PAYMENT_REVIEW_AFTER.formatted(open ? ">" : "<");
+        var query = jdbc.sql(PAYMENT_REVIEW_FIELDS + refundFilter + startAfter
+                + PAYMENT_REVIEW_ORDER.formatted(direction, direction, direction)).param(actor.storeId());
+        if (cursor != null) query.params(cursor.attemptId(), cursor.transactionId(), actor.storeId());
+        List<PaymentExceptionView> entries = query.param(PAYMENT_REVIEW_LIMIT + 1)
+                .query(OperatorOrders::paymentExceptionRow).list();
+        if (entries.size() <= PAYMENT_REVIEW_LIMIT) return new PaymentReviewPage(entries, null);
+        var last = entries.get(PAYMENT_REVIEW_LIMIT - 1);
+        String nextCursor = new PaymentReviewCursor(last.merchantReference(), last.providerTransactionId()).encode(state);
+        return new PaymentReviewPage(entries.subList(0, PAYMENT_REVIEW_LIMIT), nextCursor);
+    }
+
+    private Principal paymentReviewManager(String authorization) {
         Principal actor = sessions.requirePrincipal(authorization, false);
         if (!actor.role().equals("manager")) {
             throw OperatorFailure.forbidden();
         }
-        List<PaymentExceptionView> entries = jdbc.sql("""
-                SELECT o.id AS order_id, pe.attempt_id, pe.provider_transaction_id, pe.reason, pe.created_at,
-                    vr.provider_refund_id, vr.refund_status, vr.amount, vr.currency, vr.recorded_at
-                FROM payment_exceptions pe
-                JOIN payment_attempts pa ON pa.id = pe.attempt_id
-                JOIN orders o ON o.id = pa.order_id
-                LEFT JOIN verified_refunds vr ON vr.attempt_id = pe.attempt_id AND vr.provider_transaction_id = pe.provider_transaction_id
-                WHERE o.store_id = ?
-                ORDER BY pe.created_at DESC, pe.attempt_id DESC, pe.provider_transaction_id DESC
-                LIMIT ?
-                """).params(actor.storeId(), PAYMENT_REVIEW_LIMIT)
-                .query((row, number) -> new PaymentExceptionView(row.getObject("order_id", UUID.class),
-                        row.getObject("attempt_id", UUID.class), row.getString("provider_transaction_id"),
-                        row.getString("reason"), row.getObject("created_at", OffsetDateTime.class).toInstant(),
-                        row.getString("provider_refund_id") == null ? null : OperatorRefunds.refundRow(row)))
-                .list();
-        return new PaymentReview(entries);
+        return actor;
+    }
+
+    private static PaymentExceptionView paymentExceptionRow(ResultSet row, int number) throws SQLException {
+        return new PaymentExceptionView(row.getObject("order_id", UUID.class), row.getObject("attempt_id", UUID.class),
+                row.getString("provider_transaction_id"), row.getString("reason"),
+                row.getObject("created_at", OffsetDateTime.class).toInstant(),
+                row.getString("provider_refund_id") == null ? null : OperatorRefunds.refundRow(row));
+    }
+
+    private record PaymentReviewCursor(UUID attemptId, String transactionId) {
+        String encode(String state) {
+            String data = state + ":" + attemptId + ":" + transactionId;
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(data.getBytes(StandardCharsets.UTF_8));
+        }
+
+        static PaymentReviewCursor decode(String state, String encoded) {
+            if (encoded.length() > 512) throw OperatorFailure.invalid();
+            try {
+                String data = new String(Base64.getUrlDecoder().decode(encoded), StandardCharsets.UTF_8);
+                String[] parts = data.split(":", 3);
+                if (parts.length == 3 && state.equals(parts[0]) && !parts[2].isBlank() && parts[2].indexOf('\0') < 0) {
+                    var cursor = new PaymentReviewCursor(UUID.fromString(parts[1]), parts[2]);
+                    if (cursor.encode(state).equals(encoded)) return cursor;
+                }
+            } catch (IllegalArgumentException ignored) {
+                // Reject malformed encodings and UUIDs through the standard operator problem response.
+            }
+            throw OperatorFailure.invalid();
+        }
     }
 
     OrderView change(String authorization, String rawId, StatusInput input) {
