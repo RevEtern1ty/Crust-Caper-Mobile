@@ -1,0 +1,13 @@
+services:
+  api:
+    platform: linux/amd64
+    pull_policy: never
+
+  catalog:
+    platform: linux/amd64
+    pull_policy: never
+
+  edge:
+    image: ${CRUSTCAPER_EDGE_IMAGE:?Load and verify the portable deployment images}
+    platform: linux/amd64
+    pull_policy: never
