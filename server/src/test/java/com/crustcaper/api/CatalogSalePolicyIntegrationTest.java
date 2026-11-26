@@ -1,12 +1,14 @@
 package com.crustcaper.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -17,6 +19,7 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -52,6 +55,7 @@ class CatalogSalePolicyIntegrationTest {
     private static final String MOBILE_ONLY = "mobile-recipe";
     private static final String SLOT = "sale-policy-slot";
     private static final String PHONE = "+250700000000";
+    private static final String NEXT_SALE_CHANGE = "X-Next-Sale-Change-At";
     private static final String MONDAY_WINDOW = """
         [{"day":1,"start":"12:00","end":"13:00"}]
         """;
@@ -142,6 +146,71 @@ class CatalogSalePolicyIntegrationTest {
             .andExpect(jsonPath("$.products[1].available").value(false));
         assertThat(after.andReturn().getResponse().getHeader(HttpHeaders.ETAG)).isNotBlank().isNotEqualTo(beforeTag);
         assertThat(body(after).path("version").asString()).isEqualTo(body(before).path("version").asString());
+    }
+
+    @Test
+    void saleChangeHeaderTracksEffectiveAvailabilityAndKeepsTheMenuEtag() throws Exception {
+        channels(WEB_ONLY, "web");
+        channels(MOBILE_ONLY, "mobile");
+        hours(BOTH, """
+            [{"day":1,"start":"12:00","end":"14:00"},{"day":1,"start":"13:00","end":"15:00"},
+             {"day":1,"start":"15:00","end":"16:00"}]
+            """);
+        hours(WEB_ONLY, "[{\"day\":1,\"start\":\"12:20\",\"end\":\"12:30\"}]");
+        hours(MOBILE_ONLY, "[{\"day\":1,\"start\":\"12:05\",\"end\":\"12:10\"}]");
+        jdbc.sql("UPDATE menu_products SET product = jsonb_set(product, '{available}', 'false') WHERE store_id = ? AND sku = ?")
+            .params(store, MOBILE_ONLY).update();
+        checkoutClock("2026-01-05T10:00:00Z");
+
+        String path = ROOT + "/stores/" + store + "/menu";
+        var first = api.perform(get(path).header(HttpHeaders.ORIGIN, "http://127.0.0.1:19006"))
+            .andExpect(status().isOk())
+            .andExpect(header().string(NEXT_SALE_CHANGE, "2026-01-05T14:00:00Z"))
+            .andExpect(header().string(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS, containsString(NEXT_SALE_CHANGE)))
+            .andExpect(jsonPath("$.products[0].available").value(true))
+            .andExpect(jsonPath("$.products[1].available").value(false))
+            .andExpect(jsonPath("$.nextSaleChangeAt").doesNotHaveJsonPath())
+            .andReturn().getResponse();
+        String etag = first.getHeader(HttpHeaders.ETAG);
+        assertThat(etag).isNotBlank();
+
+        api.perform(get(path).param("channel", "web"))
+            .andExpect(status().isOk()).andExpect(header().string(NEXT_SALE_CHANGE, "2026-01-05T10:20:00Z"))
+            .andExpect(jsonPath("$.products[1].available").value(false));
+
+        hours(BOTH, "[{\"day\":1,\"start\":\"12:00\",\"end\":\"17:00\"}]");
+        checkoutClock("2026-01-05T10:01:00Z");
+        api.perform(get(path).header(HttpHeaders.IF_NONE_MATCH, etag))
+            .andExpect(status().isNotModified()).andExpect(header().string(HttpHeaders.ETAG, etag))
+            .andExpect(header().string(ApiModels.AVAILABILITY_CHECKED_AT_HEADER, "2026-01-05T10:01:00Z"))
+            .andExpect(header().string(NEXT_SALE_CHANGE, "2026-01-05T15:00:00Z"));
+
+        hours(BOTH, "[]");
+        api.perform(get(path).header(HttpHeaders.IF_NONE_MATCH, etag))
+            .andExpect(status().isNotModified()).andExpect(header().doesNotExist(NEXT_SALE_CHANGE));
+    }
+
+    @Test
+    void weeklyTransitionsMergeOverMidnightAndSkipAlwaysOpenSchedules() {
+        String splitSundayNight = """
+            [{"day":7,"start":"23:00","end":"24:00"},{"day":1,"start":"00:00","end":"01:00"}]
+            """;
+        assertThat(nextSaleChange(splitSundayNight, "2026-01-04T20:59:59Z")).hasValue(Instant.parse("2026-01-04T21:00:00Z"));
+        assertThat(nextSaleChange(splitSundayNight, "2026-01-04T21:00:00Z")).hasValue(Instant.parse("2026-01-04T23:00:00Z"));
+        assertThat(nextSaleChange(splitSundayNight, "2026-01-04T22:00:00Z")).hasValue(Instant.parse("2026-01-04T23:00:00Z"));
+        assertThat(nextSaleChange(splitSundayNight, "2026-01-04T23:00:00Z")).hasValue(Instant.parse("2026-01-11T21:00:00Z"));
+        assertThat(nextSaleChange("[]", "2026-01-04T23:00:00Z")).isEmpty();
+        String allWeek = jdbc.sql("""
+            SELECT jsonb_agg(jsonb_build_object('day', day, 'start', '00:00', 'end', '24:00'))::text
+            FROM generate_series(1, 7) AS days(day)
+            """).query(String.class).single();
+        assertThat(nextSaleChange(allWeek, "2026-01-04T22:00:00Z")).isEmpty();
+    }
+
+    private Optional<Instant> nextSaleChange(String windows, String checkedAt) {
+        return jdbc.sql("SELECT catalog_next_sale_change(CAST(? AS jsonb), ?)")
+            .params(windows, OffsetDateTime.parse(checkedAt)).query(OffsetDateTime.class).optional()
+            .map(OffsetDateTime::toInstant);
     }
 
     @Test

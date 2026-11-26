@@ -8,6 +8,7 @@ import java.util.UUID;
 
 public final class ApiModels {
     public static final String AVAILABILITY_CHECKED_AT_HEADER = "X-Availability-Checked-At";
+    public static final String NEXT_SALE_CHANGE_AT_HEADER = "X-Next-Sale-Change-At";
     static final String CURRENCY = "RWF";
 
     private ApiModels() {}
@@ -26,7 +27,7 @@ public final class ApiModels {
     ) {}
     public record Slot(String id, Instant startsAt, Instant endsAt, boolean available) {}
     public record Menu(String version, Instant updatedAt, @JsonIgnore Instant availabilityCheckedAt,
-                       Store store, List<Product> products, List<Slot> slots) {}
+                       @JsonIgnore Instant nextSaleChangeAt, Store store, List<Product> products, List<Slot> slots) {}
     public record GuestSession(String accessToken, Instant expiresAt, String refreshToken, Instant refreshExpiresAt,
                                UUID sessionId) {}
     public record GuestRefresh(String refreshToken, @JsonInclude(JsonInclude.Include.NON_NULL) String rotationKey) {

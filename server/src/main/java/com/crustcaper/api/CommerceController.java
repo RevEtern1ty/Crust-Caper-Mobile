@@ -48,6 +48,9 @@ final class CommerceController {
         var response = (notModified ? ResponseEntity.status(304) : ResponseEntity.ok())
             .eTag(tag).cacheControl(CacheControl.noCache())
             .header(AVAILABILITY_CHECKED_AT_HEADER, menu.availabilityCheckedAt().toString());
+        if (menu.nextSaleChangeAt() != null) {
+            response.header(NEXT_SALE_CHANGE_AT_HEADER, menu.nextSaleChangeAt().toString());
+        }
         return notModified ? response.build() : response.body(menu);
     }
 
