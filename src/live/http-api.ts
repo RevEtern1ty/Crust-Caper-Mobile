@@ -2,11 +2,11 @@ import { z } from 'zod';
 import { canStartNewOrder, hasSavedCheckout, parseJournal } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError } from '../domain/types';
-import type { ApiErrorCode, Locale, Order, PaymentAttempt, ShopApi, Storage } from '../domain/types';
+import type { ApiErrorCode, Locale, Order, PaymentAttempt, PendingCheckoutIntent, ShopApi, Storage } from '../domain/types';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import {
   menuResponse, orderAccessChallenge, orderAccessGrant, orderDataExportResponse, orderErasureRequestResponse,
-  orderResponse, paymentResponse, quoteResponse, reorderResponse, sessionResponse,
+  orderResponse, paymentResponse, pendingCheckoutRecovery, quoteResponse, reorderResponse, sessionResponse,
 } from './wire';
 
 type Session = z.infer<typeof sessionResponse>;
@@ -20,6 +20,16 @@ const recoverySession = z.object({
   grants: z.array(z.guid()).max(10),
 });
 type RecoverySession = z.infer<typeof recoverySession>;
+const checkoutRecoveryScope = z.object({
+  quoteId: z.string(), key: z.string(), previous: z.string().nullable(), guest: savedSession,
+});
+const checkoutRecoverySession = z.discriminatedUnion('state', [
+  checkoutRecoveryScope.extend({ state: z.literal('pending') }),
+  checkoutRecoveryScope.extend({ state: z.literal('verify'), challengeId: z.guid() }),
+  checkoutRecoveryScope.extend({ state: z.literal('confirmed'), challengeId: z.guid(), orderId: z.guid() }),
+  checkoutRecoveryScope.extend({ state: z.literal('not_placed') }),
+]);
+type CheckoutRecoverySession = z.infer<typeof checkoutRecoverySession>;
 
 class GuestRejected extends ApiError {
   constructor() { super('unauthenticated'); }
@@ -110,6 +120,7 @@ export function createLiveApi({
   const endpoint = base.origin + '/api/v1';
   const sessionKey = journalKey + '.guest';
   const recoveryKey = journalKey + '.recovery-guest';
+  const checkoutRecoveryKey = journalKey + '.pending-checkout-guest';
   const endKey = journalKey + '.end-guest';
   const installationKey = journalKey + '.installation';
   const hosts = new Set(config.pspHosts);
@@ -252,11 +263,44 @@ export function createLiveApi({
     return refreshed;
   }
 
+  async function loadCheckoutRecovery() {
+    const raw = await readSaved(checkoutRecoveryKey);
+    return raw === null ? null : decodeSaved(raw, checkoutRecoverySession);
+  }
+
+  const saveCheckoutRecovery = (scope: CheckoutRecoverySession) => writeSaved(checkoutRecoveryKey, JSON.stringify(scope));
+
+  async function requirePendingCheckout({ quoteId, key }: PendingCheckoutIntent, scope?: CheckoutRecoverySession) {
+    const { active } = parseJournal(await readSaved(journalKey));
+    if (active?.phase !== 'creating' || active.quoteId !== quoteId || active.key !== key
+      || (scope && (scope.quoteId !== quoteId || scope.key !== key
+        || !matchesGuestSnapshot(await readSaved(sessionKey), scope.previous)))) throw new GuestRejected();
+  }
+
+  async function adoptCheckoutRecovery(rawGuest: string | null): Promise<Session | null> {
+    // An unreadable recovery record must never replace an existing authenticated guest.
+    const scope = await loadCheckoutRecovery().catch(() => null);
+    if (!scope || (scope.state !== 'confirmed' && scope.state !== 'not_placed')
+      || !matchesGuestSnapshot(rawGuest, scope.previous)) return null;
+    const rawJournal = await readSaved(journalKey);
+    const { active } = parseJournal(rawJournal);
+    // The journal transition must outlive a restart before this guest can become the write identity.
+    if (scope.state === 'not_placed' ? active !== null
+      : !active || active.phase === 'creating' || active.orderId !== scope.orderId) return null;
+    if (Date.parse(scope.guest.refreshExpiresAt) <= now()) throw new GuestRejected();
+    const guest = scope.guest.rotationKey || Date.parse(scope.guest.expiresAt) <= now()
+      ? await renewGuest(scope.guest, next => saveCheckoutRecovery({ ...scope, guest: next })) : scope.guest;
+    if (await readSaved(journalKey) !== rawJournal || await readSaved(sessionKey) !== rawGuest) throw new GuestRejected();
+    return durableSession(guest);
+  }
+
   function guestSession(rejectedAccessToken?: string, allowNewGuest = true): Promise<Session> {
     if (activation) return activation.catch(() => undefined).then(() => guestSession(rejectedAccessToken, allowNewGuest));
     if (sessionPromise) return sessionPromise;
     sessionPromise = (async () => {
       const raw = await readSaved(sessionKey);
+      const recovered = await adoptCheckoutRecovery(raw);
+      if (recovered) return recovered;
       if (raw !== null) {
         const existing = decodeSaved(raw, savedSession);
         if (!existing.rotationKey && Date.parse(existing.expiresAt) > now() && existing.accessToken !== rejectedAccessToken) {
@@ -339,16 +383,46 @@ export function createLiveApi({
     pendingRecovery = record;
   }
 
-  async function sendRecovery<T>(options: Parameters<typeof request<T>>[0], record: RecoverySession): Promise<T> {
+  async function sendStoredGuest<T, Record extends { guest: SavedSession }>(
+    options: Parameters<typeof request<T>>[0], record: Record, save: (updated: Record) => Promise<void>,
+  ): Promise<T> {
     async function renewRecovery() {
       if (Date.parse(record.guest.refreshExpiresAt) <= now()) throw new ApiError('unauthenticated');
       return renewGuest(record.guest, async guest => {
-        await saveRecovery({ ...record, guest });
+        await save({ ...record, guest });
         record.guest = guest;
       });
     }
     if (record.guest.rotationKey) await renewRecovery();
     return sendWithGuest(options, record.guest, renewRecovery);
+  }
+
+  function sendRecovery<T>(options: Parameters<typeof request<T>>[0], record: RecoverySession) {
+    return sendStoredGuest(options, record, saveRecovery);
+  }
+
+  async function prepareCheckoutRecovery(intent: PendingCheckoutIntent, rejected?: SavedSession): Promise<CheckoutRecoverySession> {
+    await requirePendingCheckout(intent);
+    const existing = await loadCheckoutRecovery();
+    const rawGuest = await readSaved(sessionKey);
+    if (existing?.quoteId === intent.quoteId && existing.key === intent.key
+      && (!rejected || !sameGuest(existing.guest, rejected)) && matchesGuestSnapshot(rawGuest, existing.previous)
+      && Date.parse(existing.guest.refreshExpiresAt) > now()) return existing;
+    // A healthy original guest can safely use the usual idempotent resume flow and keep its order history.
+    try {
+      await authorized({ path: '/orders/recovery', schema: orderResponse, key: intent.key });
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'not_found') throw new ApiError('conflict');
+      if (!(error instanceof GuestRejected)) throw error;
+      const previous = guestSnapshot(rawGuest);
+      const guest = await request({ path: '/guest-sessions', method: 'POST', schema: sessionResponse });
+      if (Date.parse(guest.expiresAt) <= now() || Date.parse(guest.refreshExpiresAt) <= now()) invalidResponse();
+      const scope = { ...intent, previous, guest, state: 'pending' as const };
+      await requirePendingCheckout(intent, scope);
+      await saveCheckoutRecovery(scope);
+      return scope;
+    }
+    throw new ApiError('conflict');
   }
 
   function activateRecovery(record: RecoverySession, orderId: string, observedOrder?: Order): Promise<boolean> {
@@ -450,15 +524,18 @@ export function createLiveApi({
         await writeSaved(endKey, 'pending');
         const raw = await readSaved(sessionKey);
         const recovery = await loadRecovery();
+        const checkoutRecovery = await loadCheckoutRecovery();
         const primary = raw === null ? null : decodeSaved(raw, savedSession);
-        for (const guest of [primary, recovery?.guest]) {
-          if (guest) await request({ path: '/guest-sessions/revoke', method: 'POST', schema: z.null(), body: refreshInput(guest) });
+        const guests = [primary, recovery?.guest, checkoutRecovery?.guest].filter((guest): guest is SavedSession => !!guest);
+        for (const [index, guest] of guests.entries()) {
+          if (guests.slice(0, index).some(earlier => sameGuest(earlier, guest))) continue;
+          await request({ path: '/guest-sessions/revoke', method: 'POST', schema: z.null(), body: refreshInput(guest) });
         }
         pendingRecovery = null;
         primaryChallenge = null;
         installation = null;
         try {
-          for (const key of [sessionKey, recoveryKey, installationKey, journalKey, endKey]) await storage.removeItem(key);
+          for (const key of [sessionKey, recoveryKey, checkoutRecoveryKey, installationKey, journalKey, endKey]) await storage.removeItem(key);
         } catch {
           throw new ApiError('storage_unavailable');
         }
@@ -502,6 +579,44 @@ export function createLiveApi({
         if (error instanceof ApiError && error.code === 'not_found') return null;
         throw error;
       }
+    },
+    requestPendingCheckoutRecovery(intent, phone) {
+      return queueRecovery(async () => {
+        let scope = await prepareCheckoutRecovery(intent);
+        const begin = () => sendStoredGuest({
+          path: '/checkout-recovery', method: 'POST', schema: pendingCheckoutRecovery,
+          body: { quoteId: intent.quoteId, key: intent.key, phone },
+        }, scope, saveCheckoutRecovery).catch(error => {
+          if (error instanceof ApiError && error.code === 'not_found') throw new ApiError('checkout_recovery_unavailable');
+          throw error;
+        });
+        const result = await begin().catch(async error => {
+          if (!(error instanceof GuestRejected)) throw error;
+          scope = await prepareCheckoutRecovery(intent, scope.guest);
+          return begin();
+        });
+        await requirePendingCheckout(intent, scope);
+        if (result.state === 'verify') await saveCheckoutRecovery({ ...scope, state: 'verify', challengeId: result.challengeId });
+        if (result.state === 'not_placed') await saveCheckoutRecovery({ ...scope, state: 'not_placed' });
+        return result;
+      });
+    },
+    verifyPendingCheckoutRecovery(intent, challengeId, code) {
+      return queueRecovery(async () => {
+        const scope = await loadCheckoutRecovery();
+        if ((scope?.state !== 'verify' && scope?.state !== 'confirmed') || scope.challengeId !== challengeId) throw new GuestRejected();
+        await requirePendingCheckout(intent, scope);
+        const grant = await sendStoredGuest({
+          path: '/order-access/challenges/' + encodeURIComponent(challengeId) + '/verify',
+          method: 'POST', schema: orderAccessGrant, body: { code },
+        }, scope, saveCheckoutRecovery);
+        if (scope.state === 'confirmed' && grant.orderId !== scope.orderId) invalidResponse();
+        const payload = await sendStoredGuest({ path: orderPath(grant.orderId), schema: orderResponse }, scope, saveCheckoutRecovery);
+        const order = checkedOrder(payload, grant.orderId);
+        await requirePendingCheckout(intent, scope);
+        await saveCheckoutRecovery({ ...scope, state: 'confirmed', orderId: order.id });
+        return order;
+      });
     },
     async startPayment(orderId, key) {
       const attempt = await authorized({ path: orderPath(orderId) + '/payments', method: 'POST', schema: paymentResponse, key });

@@ -84,6 +84,9 @@ export function checkoutError(error: unknown, locale: Locale) {
         return copy(locale, 'This order is unavailable on this device.', 'Iyi komande ntiboneka kuri iki gikoresho.');
       case 'storage_unavailable':
         return copy(locale, 'Saved checkout data is unavailable. Try again.', 'Amakuru y’ubwishyu yabitswe ntaboneka. Ongera ugerageze.');
+      case 'checkout_recovery_unavailable':
+        return copy(locale, 'Checkout recovery by phone is unavailable. Your checkout is still saved in Orders.',
+          'Gusubirana ubwishyu ukoresheje telefoni ntibishoboka ubu. Ubwishyu bwawe buracyabitswe muri Komande.');
       case 'unauthenticated':
         return copy(locale, 'We couldn’t verify this order on this device. Try again or contact support.', 'Ntitwashoboye kwemeza iyi komande kuri iki gikoresho. Ongera ugerageze cyangwa usabe ubufasha.');
       case 'network_unavailable':

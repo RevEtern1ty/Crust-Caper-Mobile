@@ -298,6 +298,148 @@ const recoveredOrder = {
   ...order, id: recoveryOrderId, status: 'collected', paymentStatus: 'paid', paymentAttempt: null,
 };
 
+test('a native checkout with a lost create reply recovers on a fresh guest only after OTP and resumes one payment', async () => {
+  for (const primary of [expiredGuest, session]) {
+    const { data, storage } = memory();
+    const intent = { quoteId: '35ec0f83-629a-45e7-bff4-e445cc1e0739', key: 'saved-create-key' };
+    const active = { phase: 'creating', ...intent, cartFingerprint: 'saved-cart' };
+    data.set(journalKey, JSON.stringify({ version: 1, active, orderIds: [] }));
+    data.set(journalKey + '.guest', JSON.stringify(primary));
+    let verified = false;
+    let lostReply = true;
+    let paymentStarted = false;
+    const { calls, fetcher } = transport(call => {
+      const path = new URL(call.url).pathname.slice('/api/v1'.length);
+      if (path === '/orders/recovery' || path === '/guest-sessions/refresh') {
+        assert.notEqual(call.token, 'Bearer ' + recoveryGuest.accessToken);
+        return new Response(null, { status: 401 });
+      }
+      if (path === '/guest-sessions') return Response.json(recoveryGuest);
+      if (call.token === 'Bearer ' + primary.accessToken) return new Response(null, { status: 401 });
+      assert.equal(call.token, 'Bearer ' + recoveryGuest.accessToken);
+      if (path === '/checkout-recovery') {
+        assert.deepEqual(call.body, { ...intent, phone: recoveryContact.phone });
+        return Response.json({ state: 'verify', challengeId: recoveryChallengeId });
+      }
+      if (path === `/order-access/challenges/${recoveryChallengeId}/verify`) {
+        if ((call.body as { code: string }).code !== '418263') return new Response(null, { status: 404 });
+        verified = true;
+        if (lostReply) {
+          lostReply = false;
+          throw new Error('Lost verification reply');
+        }
+        return Response.json({ orderId: recoveryOrderId });
+      }
+      assert.ok(verified);
+      if (path === `/orders/${recoveryOrderId}/payments`) {
+        assert.equal(call.key, 'saved-payment-key');
+        assert.equal(paymentStarted, false);
+        paymentStarted = true;
+        return Response.json(order.paymentAttempt);
+      }
+      assert.equal(path, `/orders/${recoveryOrderId}`);
+      return Response.json({ ...order, id: recoveryOrderId, ...(paymentStarted ? {} : { paymentStatus: 'unpaid', paymentAttempt: null }) });
+    });
+    const restart = () => {
+      const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+      const controller = new CheckoutController({ api, storage, storageKey: journalKey, newKey: () => 'saved-payment-key',
+        guestSession: { end: api.endGuestSession, hasEndPending: api.hasGuestSessionEndPending }, onOrderCreated: async () => {} });
+      return { api, controller };
+    };
+    const first = restart();
+    await assert.rejects(first.controller.resume(), { code: 'unauthenticated' });
+    await assert.rejects(first.controller.endGuestSession(), { code: 'active_checkout' });
+    await assert.rejects(first.api.startPayment(recoveryOrderId, 'forbidden-before-approval'), { code: 'unauthenticated' });
+    assert.deepEqual(await first.controller.requestPendingOrderRecovery(recoveryContact.phone), {
+      state: 'verify', challengeId: recoveryChallengeId,
+    });
+    assert.equal(data.get(journalKey + '.guest'), JSON.stringify(primary));
+    const second = restart();
+    await assert.rejects(second.controller.confirmPendingOrderRecovery(recoveryChallengeId, '000000'), { code: 'not_found' });
+    await assert.rejects(second.controller.confirmPendingOrderRecovery(recoveryChallengeId, '418263'), { code: 'network_unavailable' });
+    assert.equal(data.get(journalKey + '.guest'), JSON.stringify(primary));
+    assert.equal(second.controller.snapshot.active?.phase, 'creating');
+    const third = restart();
+    assert.equal((await third.controller.confirmPendingOrderRecovery(recoveryChallengeId, '418263')).id, recoveryOrderId);
+    assert.equal(third.controller.snapshot.active?.phase, 'paying');
+    assert.equal((await restart().controller.resume()).paymentStatus, 'processing');
+    assert.equal((await restart().controller.resume()).id, recoveryOrderId);
+    assert.deepEqual(JSON.parse(data.get(journalKey + '.guest')!), recoveryGuest);
+    assert.equal(calls.filter(({ url }) => url.endsWith('/guest-sessions')).length, 1);
+    assert.equal(calls.filter(({ url, token }) => url.endsWith('/payments') && token === 'Bearer ' + recoveryGuest.accessToken).length, 1);
+    assert.equal(calls.filter(({ url, method }) => method === 'POST' && url.endsWith('/orders')).length, 0);
+    assert.doesNotMatch(JSON.stringify([...data.values()]), /700000000|418263/);
+  }
+});
+
+test('native recovery preserves a pending intent on an older API and adopts a replacement after durable not-placed', async () => {
+  const { data, storage } = memory();
+  const intent = { quoteId: '35ec0f83-629a-45e7-bff4-e445cc1e0739', key: 'unresolved-create' };
+  const active = { phase: 'creating', ...intent, cartFingerprint: 'saved-cart' };
+  const journal = { version: 1, active, orderIds: [pickupOrderId] };
+  data.set(journalKey, JSON.stringify(journal));
+  data.set(journalKey + '.guest', JSON.stringify(expiredGuest));
+  let response: Response = new Response(null, { status: 404 });
+  const { calls, fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) return Response.json(recoveryGuest);
+    assert.equal(call.token, 'Bearer ' + recoveryGuest.accessToken);
+    if (call.url.endsWith('/checkout-recovery')) {
+      assert.deepEqual(call.body, { ...intent, phone: recoveryContact.phone });
+      return response.clone();
+    }
+    assert.equal(call.url, config.apiBaseUrl + '/orders/' + pickupOrderId);
+    return new Response(null, { status: 404 });
+  });
+  let failJournalWrite = true;
+  const protectedStorage = { ...storage, async setItem(key: string, value: string) {
+    if (failJournalWrite && key === journalKey) throw new Error('Journal write interrupted');
+    await storage.setItem(key, value);
+  } };
+  const restart = () => {
+    const api = createLiveApi({ config, storage: protectedStorage, journalKey, fetcher, now });
+    const controller = new CheckoutController({ api, storage: protectedStorage, storageKey: journalKey,
+      newKey: () => 'payment-key', onOrderCreated: async () => {} });
+    return { api, controller };
+  };
+  const first = restart();
+  await assert.rejects(first.api.requestPendingCheckoutRecovery!({ ...intent, key: 'different-key' }, recoveryContact.phone),
+    { code: 'unauthenticated' });
+  assert.equal(calls.length, 0);
+  await assert.rejects(first.controller.requestPendingOrderRecovery(recoveryContact.phone), { code: 'checkout_recovery_unavailable' });
+  assert.equal(data.get(journalKey), JSON.stringify(journal));
+  response = Response.json({ state: 'waiting', retryAt: expiresAt });
+  assert.deepEqual(await first.controller.requestPendingOrderRecovery(recoveryContact.phone), { state: 'waiting', retryAt: expiresAt });
+  assert.equal(data.get(journalKey), JSON.stringify(journal));
+  response = Response.json({ state: 'not_placed' });
+  await assert.rejects(first.controller.requestPendingOrderRecovery(recoveryContact.phone));
+  await assert.rejects(restart().api.getOrder(pickupOrderId), { code: 'unauthenticated' });
+  assert.equal(data.get(journalKey + '.guest'), JSON.stringify(expiredGuest));
+  failJournalWrite = false;
+  assert.deepEqual(await restart().controller.requestPendingOrderRecovery(recoveryContact.phone), { state: 'not_placed' });
+  assert.deepEqual(JSON.parse(data.get(journalKey)!), { ...journal, active: null });
+  await assert.rejects(restart().api.getOrder(pickupOrderId), { code: 'not_found' });
+  assert.deepEqual(JSON.parse(data.get(journalKey + '.guest')!), recoveryGuest);
+  assert.equal(calls.filter(({ url }) => url.endsWith('/guest-sessions')).length, 1);
+  assert.equal(calls.filter(({ url, method }) => method === 'POST' && url.endsWith('/orders')).length, 0);
+});
+
+test('native recovery cannot substitute a still-valid primary checkout identity', async () => {
+  const { data, storage } = memory();
+  const intent = { quoteId: '35ec0f83-629a-45e7-bff4-e445cc1e0739', key: 'resume-on-original' };
+  data.set(journalKey, JSON.stringify({ version: 1, active: { phase: 'creating', ...intent, cartFingerprint: 'saved-cart' }, orderIds: [] }));
+  data.set(journalKey + '.guest', JSON.stringify(session));
+  const { calls, fetcher } = transport(call => {
+    assert.equal(call.url, config.apiBaseUrl + '/orders/recovery');
+    assert.equal(call.token, 'Bearer ' + session.accessToken);
+    assert.equal(call.key, intent.key);
+    return new Response(null, { status: 404 });
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  await assert.rejects(api.requestPendingCheckoutRecovery!(intent, recoveryContact.phone), { code: 'conflict' });
+  assert.equal(calls.length, 1);
+  assert.equal(data.get(journalKey + '.guest'), JSON.stringify(session));
+});
+
 test('verified recovery of the expired tracked order promotes once and preserves the saved journal', async () => {
   const { data, storage } = memory();
   const oldJournal = JSON.stringify({

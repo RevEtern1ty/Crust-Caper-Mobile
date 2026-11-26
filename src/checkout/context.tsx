@@ -2,7 +2,7 @@ import { CryptoDigestAlgorithm, digestStringAsync, randomUUID } from 'expo-crypt
 import { useFocusEffect } from 'expo-router';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { PropsWithChildren } from 'react';
-import { AppState } from 'react-native';
+import { AppState, Platform } from 'react-native';
 
 import { DEMO_PHONE } from '../domain/demo-api';
 import { ApiError, type CartLine, type Order, type PendingCheckoutRecovery, type Quote } from '../domain/types';
@@ -140,9 +140,9 @@ export function CheckoutProvider({ children }: PropsWithChildren) {
     finishExpiredHold,
     rememberRecoveredOrder: (orderId, sessionRevision) => run(() => controller.rememberRecoveredOrder(orderId, sessionRevision)),
     pendingOrderRecoveryChallengeId: journal?.active?.phase === 'creating' ? journal.active.recoveryChallengeId ?? null : null,
-    requestPendingOrderRecovery: webCheckout && api.requestPendingCheckoutRecovery
+    requestPendingOrderRecovery: (Platform.OS !== 'web' || webCheckout) && api.requestPendingCheckoutRecovery
       ? (phone) => run(() => controller.requestPendingOrderRecovery(phone)) : undefined,
-    confirmPendingOrderRecovery: webCheckout && api.verifyPendingCheckoutRecovery
+    confirmPendingOrderRecovery: (Platform.OS !== 'web' || webCheckout) && api.verifyPendingCheckoutRecovery
       ? (challengeId, code) => run(() => controller.confirmPendingOrderRecovery(challengeId, code)) : undefined,
   };
 

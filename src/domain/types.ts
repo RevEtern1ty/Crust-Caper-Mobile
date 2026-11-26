@@ -160,6 +160,7 @@ export type ApiErrorCode =
   | 'payment_pending'
   | 'pickup_alert_unavailable'
   | 'storage_unavailable'
+  | 'checkout_recovery_unavailable'
   | 'unauthenticated'
   | 'network_unavailable'
   | 'invalid_response'
