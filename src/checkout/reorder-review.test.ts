@@ -1,7 +1,8 @@
 import { deepEqual, equal } from 'node:assert/strict';
 import { test } from 'node:test';
 import type { CartLine } from '../domain/types';
-import { compareReorder } from './reorder-review';
+import { readDraft } from '../state/draft-storage';
+import { compareReorder, reorderOfferForCart } from './reorder-review';
 
 const original: CartLine = { sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: 9200 };
 const withoutPickles: CartLine = { ...original, modifierIds: ['no-pickles'] };
@@ -39,4 +40,24 @@ test('an empty offer leaves all original configurations out of the proposed cart
   deepEqual(review.removed, orderLines);
   equal(review.estimate, 0);
   equal(orderLines.length, 2);
+});
+
+test('reorder previews a quantity change before placing persistable lines in the cart', () => {
+  const largeOrder = { ...original, quantity: 12 };
+  const repricedLargeOrder = { ...largeOrder, unitPrice: 9500 };
+  const offer = {
+    lines: [repricedLargeOrder, withoutPickles],
+    changes: [{ kind: 'price' as const, sku: original.sku, previousPrice: 9200, currentPrice: 9500 }],
+  };
+  const proposal = reorderOfferForCart(offer);
+  const preview = compareReorder([largeOrder, withoutPickles], proposal.lines);
+  const capped = { ...repricedLargeOrder, quantity: 9 };
+  deepEqual(preview.available, [
+    { previous: largeOrder, current: capped },
+    { previous: withoutPickles, current: withoutPickles },
+  ]);
+  equal(preview.estimate, 9 * 9500 + 9200);
+  equal(repricedLargeOrder.quantity, 12);
+  deepEqual(proposal.changes, offer.changes);
+  deepEqual(readDraft(JSON.stringify({ locale: 'rw', cart: proposal.lines })).cart, [capped, withoutPickles]);
 });

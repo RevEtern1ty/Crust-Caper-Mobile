@@ -7,7 +7,14 @@ spring:
     password: ${CRUSTCAPER_DB_PASSWORD}
     hikari:
       connection-timeout: 5000
+      data-source-properties:
+        "[connectTimeout]": "3"
+        "[socketTimeout]": "6"
   flyway:
+    # Startup migrations use their own connection and can run longer than web requests.
+    url: ${spring.datasource.url}
+    user: ${spring.datasource.username}
+    password: ${spring.datasource.password}
     clean-disabled: true
     validate-on-migrate: true
   mvc:

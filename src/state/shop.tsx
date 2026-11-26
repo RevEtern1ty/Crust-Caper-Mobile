@@ -9,16 +9,15 @@ import type { PropsWithChildren } from 'react';
 import { AppState, Platform } from 'react-native';
 import { CHECKOUT_JOURNAL_KEY, type GuestSessionLifecycle } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
-import { lineKey } from '../domain/cart';
+import { lineKey, MAX_QUANTITY } from '../domain/cart';
 import { createDemoApi } from '../domain/demo-api';
 import type { CartLine, DemoApi, Locale, Menu, ShopApi } from '../domain/types';
 import { createLiveApi, type ConnectedConfig, type LiveShopApi } from '../live/http-api';
-import { MAX_QUANTITY, type Draft } from './draft-storage';
+import type { Draft } from './draft-storage';
 import { privateStorage } from './private-storage';
 import { useShopDraft } from './use-shop-draft';
 
-export { lineKey } from '../domain/cart';
-export { MAX_QUANTITY } from './draft-storage';
+export { lineKey, MAX_QUANTITY } from '../domain/cart';
 
 const settings = Constants.expoConfig?.extra?.restaurant as ConnectedConfig | { profile: 'demo' } | undefined;
 if (!settings || !['demo', 'local', 'stage', 'production'].includes(settings.profile)) {
@@ -187,6 +186,7 @@ export function ShopProvider({ children }: PropsWithChildren) {
   const addLine = (line: CartLine) => updateDraft(current => {
     const key = lineKey(line);
     const existing = current.cart.find(item => lineKey(item) === key);
+    if (existing && existing.quantity > MAX_QUANTITY) return current;
     const cart = existing
       ? current.cart.map(item => lineKey(item) === key
         ? { ...line, quantity: Math.min(MAX_QUANTITY, existing.quantity + line.quantity) }
@@ -196,9 +196,8 @@ export function ShopProvider({ children }: PropsWithChildren) {
   });
   const changeQuantity = (key: string, delta: -1 | 1) => updateDraft(current => {
     const target = current.cart.find(item => lineKey(item) === key);
-    if (!target) return current;
-    const quantity = Math.min(MAX_QUANTITY, target.quantity + delta);
-    if (quantity === target.quantity) return current;
+    if (!target || (delta > 0 && target.quantity >= MAX_QUANTITY)) return current;
+    const quantity = target.quantity + delta;
     const cart = quantity <= 0 ? current.cart.filter(item => item !== target)
       : current.cart.map(item => item === target ? { ...item, quantity } : item);
     return { ...current, cart };

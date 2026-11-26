@@ -2,11 +2,19 @@ services:
   api:
     image: ${CRUSTCAPER_API_IMAGE:?Set the verified API image or digest}
     env_file:
-      - ${CRUSTCAPER_API_ENV_FILE:?Set the path to the API secret environment file}
+      - path: ${CRUSTCAPER_API_ENV_FILE:?Set the path to the API secret environment file}
+        format: raw
     environment:
       CRUSTCAPER_PORT: "8080"
     ports:
       - "127.0.0.1:${CRUSTCAPER_HTTP_PORT:-8080}:8080"
+    volumes:
+      - type: bind
+        source: ${CRUSTCAPER_POSTGRES_CA_FILE:?Set the path to the PostgreSQL CA certificate}
+        target: /run/crustcaper/postgres-ca.crt
+        read_only: true
+        bind:
+          create_host_path: false
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m

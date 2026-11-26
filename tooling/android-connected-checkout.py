@@ -2,8 +2,10 @@
 """Run the synthetic pickup journey on one booted, dedicated Android emulator.
 
 Use `python tooling/android-connected-checkout.py APK EVIDENCE_DIR --adb PATH`.
-The local Release APK must use http://10.0.2.2:<api-port>/api/v1. Start the
-matching Spring Boot local API on the host loopback with a fresh test database.
+The local Release APK uses http://10.0.2.2:<api-port>/api/v1 by default.
+Use --adb-reverse for APKs built with http://127.0.0.1:<api-port>/api/v1.
+Use --upgrade-from OLD_APK for an in-place upgrade during a pending checkout.
+Start the matching Spring Boot local API on the host loopback with a fresh test database.
 """
 
 import argparse
@@ -65,7 +67,20 @@ def find_aapt(adb):
                 shutil.which(executable))
 
 
-def verify_apk(apk, aapt, port):
+def apk_signers(apk, aapt):
+    executable = "apksigner.bat" if sys.platform == "win32" else "apksigner"
+    sibling = Path(aapt).resolve().with_name(executable)
+    signer = str(sibling) if sibling.is_file() else shutil.which(executable)
+    require(signer, "Place apksigner alongside aapt or on PATH for upgrade verification")
+    signature = text(run_command([signer, "verify", "--print-certs", str(apk)], "Verify APK signature"))
+    certificates = re.findall(
+        r"^Signer #[0-9]+ certificate SHA-256 digest: ([0-9a-f]{64})$", signature, re.MULTILINE | re.IGNORECASE
+    )
+    require(certificates, "Could not read the APK signing certificates")
+    return sorted(certificate.lower() for certificate in certificates)
+
+
+def verify_apk(apk, aapt, port, *, api_host="10.0.2.2"):
     badging = text(run_command([aapt, "dump", "badging", str(apk)], "Read APK manifest"))
     require(f"package: name='{PACKAGE}'" in badging, "Expected the CrustCaper Local application ID")
     require("application-debuggable" not in badging, "Expected a non-debuggable Release APK")
@@ -79,7 +94,7 @@ def verify_apk(apk, aapt, port):
     require(bundle_size > 0, "APK must contain JavaScript for startup without Metro")
     require(restaurant == {
         "profile": "local",
-        "apiBaseUrl": f"http://10.0.2.2:{port}/api/v1",
+        "apiBaseUrl": f"http://{api_host}:{port}/api/v1",
         "storeId": "kigali",
         "pspHosts": [],
     }, "APK must point to the matching local emulator API fixture")
@@ -160,6 +175,7 @@ class Emulator:
         self.install_attempted = False
         self.remote_dir = None
         self.component = None
+        self.reverse_port = None
         self.pids = []
         require(text(self.shell("getprop", "ro.kernel.qemu")) == "1"
                 or text(self.shell("getprop", "ro.boot.qemu")) == "1", "Expected an Android emulator build")
@@ -167,7 +183,7 @@ class Emulator:
         require(text(self.shell("am", "get-current-user")) == "0", "Expected the emulator owner profile")
         self.api_level = text(self.shell("getprop", "ro.build.version.sdk"))
         require(self.api_level.isdecimal() and int(self.api_level) >= 28, "Android 9 or newer is required")
-        require(not text(self.adb_run("reverse", "--list")), "Remove ADB reverse mappings before this checkout test")
+        require(not self.reverse_mappings(), "Expected an emulator with no preexisting ADB reverse mappings")
         require(not self.package_installed(), "CrustCaper Local is already installed. Use a fresh emulator")
 
     def adb_run(self, *args, timeout=12):
@@ -181,9 +197,36 @@ class Emulator:
         packages = text(self.shell("pm", "list", "packages", "--user", "0", PACKAGE)).splitlines()
         return f"package:{PACKAGE}" in packages
 
-    def install(self, apk, expected_hash):
+    def reverse_mappings(self):
+        records = [line.split() for line in text(self.adb_run("reverse", "--list")).splitlines() if line.strip()]
+        require(all(len(record) in (2, 3) for record in records), "Could not identify ADB reverse mappings")
+        return [tuple(record[-2:]) for record in records]
+
+    def connect_loopback(self, port):
+        require(not self.reverse_mappings(), "Expected an emulator with no preexisting ADB reverse mappings")
+        endpoint = f"tcp:{port}"
+        self.adb_run("reverse", "--no-rebind", endpoint, endpoint)
+        self.reverse_port = endpoint
+        require(self.reverse_mappings() == [(endpoint, endpoint)], "Could not verify the checkout ADB reverse mapping")
+
+    def disconnect_loopback(self):
+        if not self.reverse_port:
+            return
+        endpoint = self.reverse_port
+        routes = self.reverse_mappings()
+        if (endpoint, endpoint) in routes:
+            self.adb_run("reverse", "--remove", endpoint)
+        require(not any(device == endpoint for device, _ in self.reverse_mappings()),
+                "Could not remove the task-owned ADB reverse mapping")
+        self.reverse_port = None
+
+    def install(self, apk, expected_hash, *, replace=False):
+        if replace:
+            require(self.install_attempted and self.package_installed(),
+                    "An in-place upgrade requires the installed fixture app")
+        options = ["-r"] if replace else []
         self.install_attempted = True
-        result = text(self.adb_run("install", str(apk), timeout=120))
+        result = text(self.adb_run("install", *options, str(apk), timeout=120))
         require("Success" in result.splitlines() and self.package_installed(), "Failed to install the fixture APK")
         path = text(self.shell("pm", "path", "--user", "0", PACKAGE))
         match = re.fullmatch(r"package:(/data/app/[A-Za-z0-9_./=~+-]+/base\.apk)", path)
@@ -199,21 +242,25 @@ class Emulator:
         require(re.fullmatch(re.escape(PACKAGE) + r"/[A-Za-z0-9_.]+", component),
                 "Could not resolve the launcher belonging to CrustCaper Local")
         self.component = component
-        directory = text(self.shell("mktemp", "-d", "/data/local/tmp/crustcaper-connected.XXXXXXXX"))
-        require(re.fullmatch(r"/data/local/tmp/crustcaper-connected\.[A-Za-z0-9]+", directory),
-                "Could not allocate a private emulator scratch directory")
-        self.remote_dir = directory
+        if not self.remote_dir:
+            directory = text(self.shell("mktemp", "-d", "/data/local/tmp/crustcaper-connected.XXXXXXXX"))
+            require(re.fullmatch(r"/data/local/tmp/crustcaper-connected\.[A-Za-z0-9]+", directory),
+                    "Could not allocate a private emulator scratch directory")
+            self.remote_dir = directory
 
     def cleanup(self):
         try:
-            if self.remote_dir:
-                # The UiAutomator dump may contain fixture contact or pickup code.
-                self.shell("rm", "-f", self.remote_dir + "/window.xml")
-                self.shell("rmdir", self.remote_dir)
+            try:
+                if self.remote_dir:
+                    # The UiAutomator dump may contain fixture contact or pickup code.
+                    self.shell("rm", "-f", self.remote_dir + "/window.xml")
+                    self.shell("rmdir", self.remote_dir)
+            finally:
+                if self.install_attempted and self.package_installed():
+                    self.adb_run("uninstall", PACKAGE, timeout=20)
+                    require(not self.package_installed(), "Could not remove the task-owned APK")
         finally:
-            if self.install_attempted and self.package_installed():
-                self.adb_run("uninstall", PACKAGE, timeout=20)
-                require(not self.package_installed(), "Could not remove the task-owned APK")
+            self.disconnect_loopback()
 
     def launch(self):
         self.shell("input", "keyevent", "KEYCODE_WAKEUP")
@@ -312,19 +359,33 @@ def checkout(args, evidence):
     api = LocalApi(args.api)
     aapt = args.aapt or find_aapt(args.adb)
     require(aapt, "Specify --aapt or put Android SDK build-tools next to --adb")
-    summary = verify_apk(args.apk, aapt, api.port)
+    api_host = "127.0.0.1" if args.adb_reverse else "10.0.2.2"
+    summary = verify_apk(args.apk, aapt, api.port, api_host=api_host)
+    previous = None
+    if args.upgrade_from:
+        previous = verify_apk(args.upgrade_from, aapt, api.port, api_host=api_host)
+        require(previous["apkSha256"] != summary["apkSha256"], "The previous APK must differ from the candidate APK")
+        certificates = apk_signers(args.upgrade_from, aapt)
+        require(certificates == apk_signers(args.apk, aapt), "The previous and candidate APKs must have the same signing certificates")
+        summary["upgradeFrom"] = {**previous, "signingCertificatesSha256": certificates}
     api.check_ready()
     device = Emulator(args.adb)
     sessions = []
     try:
+        if args.adb_reverse:
+            device.connect_loopback(api.port)
         kitchen = api.login("demo-kitchen", "kitchen")
         sessions.append(kitchen)
         pickup = api.login("demo-pickup", "pickup")
         sessions.append(pickup)
         require(not api.queue(kitchen), "Use a fresh fixture database with an empty paid kitchen queue")
 
-        print("Install and launch the exact local APK", flush=True)
-        device.install(args.apk, summary["apkSha256"])
+        if previous:
+            print("Install and launch the previous local APK", flush=True)
+            device.install(args.upgrade_from, previous["apkSha256"])
+        else:
+            print("Install and launch the exact local APK", flush=True)
+            device.install(args.apk, summary["apkSha256"])
         device.launch()
         device.wait_label("CrustCaper")
         device.matching_label(re.compile(r"Double Smash, .+"), "the Double Smash menu item")
@@ -345,11 +406,17 @@ def checkout(args, evidence):
         device.wait_label("Checking payment")
         reference = device.matching_label(REFERENCE, "the pending order reference")
 
+        if previous:
+            device.capture(evidence / "pending-before-upgrade.png")
+            print("Install the exact candidate over the pending checkout", flush=True)
+            device.install(args.apk, summary["apkSha256"], replace=True)
         print("Restore the same pending order after a cold launch", flush=True)
         device.launch()
         device.tap_label("Orders")
         device.wait_label(reference)
         device.wait_label("Checking payment")
+        if previous:
+            device.capture(evidence / "pending-after-upgrade.png")
         device.tap_label("Open payment", scroll="down")
         device.wait_label(reference)
         device.tap_label("Confirm local test payment", scroll="down")
@@ -379,6 +446,10 @@ def checkout(args, evidence):
         device.collected(reference, code)
         checks = ["exact installed APK", "same pending order after force-stop", "synthetic payment",
                   "paid kitchen order", "ready and collected updates without refresh", "collected order after force-stop"]
+        if previous:
+            checks.insert(1, "in-place upgrade preserved the pending checkout and authorized order access")
+        if args.adb_reverse:
+            checks.insert(1, "local checkout through the task-owned ADB reverse mapping")
         if args.check_session_end:
             print("End the guest session and verify cleared order access after a cold launch", flush=True)
             device.tap_label("Settings", scroll="up")
@@ -394,6 +465,7 @@ def checkout(args, evidence):
         summary.update({
             "profile": "local",
             "androidApi": int(device.api_level),
+            "apiTransport": "adb-reverse" if args.adb_reverse else "emulator-host-alias",
             "emulator": device.serial,
             "orderReference": reference,
             "coldLaunchPids": list(map(int, device.pids)),
@@ -419,12 +491,18 @@ def main():
     parser.add_argument("--api", default="http://127.0.0.1:18080/api/v1")
     parser.add_argument("--adb", default=shutil.which("adb") or "adb")
     parser.add_argument("--aapt")
+    parser.add_argument("--upgrade-from", type=lambda path: Path(path).resolve(), metavar="OLD_APK",
+                        help="Preserve a pending checkout when installing the candidate over this local APK")
+    parser.add_argument("--adb-reverse", action="store_true",
+                        help="Use a local APK built for 127.0.0.1 and map the API port on the dedicated emulator")
     parser.add_argument("--check-session-end", action="store_true",
                         help="End the guest session on builds with the order-access settings screen")
     args = parser.parse_args()
 
     try:
         require(args.apk.is_file(), "The APK must be an existing file")
+        if args.upgrade_from:
+            require(args.upgrade_from.is_file(), "The previous APK must be an existing file")
         args.evidence.mkdir(parents=True, exist_ok=True)
         require(not any(args.evidence.iterdir()), "Use an empty evidence directory")
     except (OSError, SmokeFailure) as error:

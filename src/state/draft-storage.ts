@@ -1,7 +1,7 @@
+import { MAX_SHARED_QUANTITY } from '../domain/cart';
 import type { CartLine, Locale } from '../domain/types';
 
 export const DRAFT_KEY = 'crustcaper.draft.v1';
-export const MAX_QUANTITY = 9;
 const LOCALE_KEY = 'crustcaper.locale.v1';
 
 export type Draft = { locale: Locale; cart: CartLine[] };
@@ -16,7 +16,7 @@ export function readDraft(raw: string | null): Draft {
     const cart = Array.isArray(value.cart) ? value.cart.filter(line =>
       line && typeof line.sku === 'string' && Array.isArray(line.modifierIds)
       && line.modifierIds.every(id => typeof id === 'string')
-      && Number.isSafeInteger(line.quantity) && line.quantity > 0 && line.quantity <= MAX_QUANTITY
+      && Number.isSafeInteger(line.quantity) && line.quantity > 0 && line.quantity <= MAX_SHARED_QUANTITY
       && Number.isSafeInteger(line.unitPrice) && line.unitPrice >= 0,
     ) : [];
     return { locale: value.locale === 'rw' ? 'rw' : 'en', cart };

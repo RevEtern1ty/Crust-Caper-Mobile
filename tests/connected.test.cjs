@@ -55,18 +55,18 @@ async function operator(username) {
   return (await response.json()).accessToken;
 }
 
-async function readyForPickup(kitchen) {
+async function readyForPickup(kitchen, { buyer = contact, guestToken, quantity = 1 } = {}) {
   const { products, slots, store } = await send('/stores/kigali/menu').then(response => response.json());
   const product = products.find(item => item.name.en === 'Double Smash' && item.available);
   const slot = slots.findLast(item => item.available);
   assert.ok(product && slot);
-  const { accessToken: token } = await send('/guest-sessions', { method: 'POST' }).then(response => response.json());
+  const token = guestToken ?? (await send('/guest-sessions', { method: 'POST' }).then(response => response.json())).accessToken;
   const quote = await send('/quotes', { method: 'POST', token, data: {
-    storeId: store.id, slotId: slot.id, lines: [{ sku: product.sku, modifierIds: [], quantity: 1, unitPrice: product.price }],
+    storeId: store.id, slotId: slot.id, lines: [{ sku: product.sku, modifierIds: [], quantity, unitPrice: product.price }],
   } });
   assert.equal(quote.status, 200);
   const { quoteId } = await quote.json();
-  const placed = await send('/orders', { method: 'POST', token, key: randomUUID(), data: { quoteId, ...contact } });
+  const placed = await send('/orders', { method: 'POST', token, key: randomUUID(), data: { quoteId, ...buyer } });
   assert.equal(placed.status, 200);
   const { id } = await placed.json();
   const started = await send(`/orders/${id}/payments`, { method: 'POST', token, key: randomUUID() });
@@ -199,6 +199,152 @@ async function placeBrowserOrder(page, origin, buyer, screenshot) {
   return { order, attempt };
 }
 
+test('a shared order previews the mobile cart limit before saving it', { timeout: 40_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const buyer = { ...contact, email: 'reorder-fixture@example.test' };
+  const kitchen = await operator('demo-kitchen');
+  const pickup = await operator('demo-pickup');
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  await page.goto(origin);
+  await button(page, /^Double Smash,/).click();
+  await button(page, /^Add to cart/).click();
+  await button(page, /^View cart/).click();
+  await button(page, 'Choose pickup time').click();
+  await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { disabled: false }).first().click();
+  await page.getByLabel('Phone number', { exact: true }).fill(buyer.phone);
+  await page.getByLabel('Email address', { exact: true }).fill(buyer.email);
+  const openedGuest = page.waitForResponse(response =>
+    response.url() === api + '/guest-sessions' && response.request().method() === 'POST' && response.ok());
+  await button(page, 'Review order').click();
+  const { accessToken: guestToken } = await (await openedGuest).json();
+  await shown(page, 'Included tax');
+
+  const { id, pickupCode } = await readyForPickup(kitchen, { buyer, guestToken, quantity: 12 });
+  t.after(async () => {
+    const collected = await send(`/operator/orders/${id}/status`, {
+      method: 'POST', token: pickup, data: { status: 'collected', pickupCode },
+    });
+    assert.equal(collected.status, 200);
+  });
+  const order = await send(`/orders/${id}`, { token: guestToken }).then(response => response.json());
+  const [originalLine] = order.lines;
+  assert.equal(originalLine.quantity, 12);
+  await page.evaluate(orderId => {
+    const guestKey = Object.keys(sessionStorage).find(key => key.startsWith('crustcaper.checkout.v1.') && key.endsWith('.guest'));
+    if (!guestKey) throw new Error('Expected the live browser guest session');
+    sessionStorage.setItem(guestKey.slice(0, -'.guest'.length), JSON.stringify({
+      version: 1, active: null, orderIds: [orderId],
+    }));
+  }, id);
+  await page.goto(origin + '/orders');
+  const savedLines = () => page.evaluate(() => {
+    const key = Object.keys(sessionStorage).find(key => key.startsWith('crustcaper.draft.v1.'));
+    return key ? JSON.parse(sessionStorage.getItem(key)).cart : [];
+  });
+
+  const reorderResponse = page.waitForResponse(response =>
+    response.url() === api + `/orders/${order.id}/reorder` && response.ok());
+  await button(page, 'Review reorder').click();
+  assert.equal((await (await reorderResponse).json()).lines[0].quantity, 12);
+  await shown(page, 'Quantity · 12 → 9');
+  const format = value => new Intl.NumberFormat('en-RW', { maximumFractionDigits: 0 }).format(value) + ' RWF';
+  await shown(page, format(9 * originalLine.unitPrice));
+  assert.deepEqual(await savedLines(), [{ ...originalLine, quantity: 1 }]);
+  await inspectReorderLimit(page, 'en', 'Quantity · 12 → 9', 'Replace cart with these items');
+
+  await page.goto(origin + '/settings');
+  await button(page, 'Kinyarwanda').click();
+  await shown(page, 'Amagenamiterere');
+  await page.goto(origin + '/orders');
+  await button(page, 'Reba komande nshya isa n’iyi').click();
+  await shown(page, 'Umubare · 12 → 9');
+  assert.deepEqual(await savedLines(), [{ ...originalLine, quantity: 1 }]);
+  await inspectReorderLimit(page, 'rw', 'Umubare · 12 → 9', 'Simbuza ibiri mu gatebo ibi biribwa');
+  await button(page, 'Simbuza ibiri mu gatebo ibi biribwa').click();
+  await shown(page, 'Igitebo cyawe');
+  const expected = [{ ...originalLine, quantity: 9 }];
+  assert.deepEqual(await savedLines(), expected);
+  await page.reload();
+  await shown(page, 'Double Smash');
+  await shown(page, format(9 * originalLine.unitPrice));
+  assert.deepEqual(await savedLines(), expected);
+  const removeOne = button(page, 'Kuramo imwe muri Double Smash');
+  await removeOne.click();
+  await shown(page, format(8 * originalLine.unitPrice));
+  assert.deepEqual(await savedLines(), [{ ...expected[0], quantity: 8 }]);
+
+  await page.evaluate(line => {
+    const key = Object.keys(sessionStorage).find(key => key.startsWith('crustcaper.draft.v1.'));
+    const previousDraft = JSON.parse(sessionStorage.getItem(key));
+    sessionStorage.setItem(key, JSON.stringify({ ...previousDraft, cart: [line] }));
+  }, originalLine);
+  await page.reload();
+  await shown(page, format(12 * originalLine.unitPrice));
+  assert.deepEqual(await savedLines(), [originalLine]);
+  assert.equal(await button(page, 'Ongeramo imwe muri Double Smash').isDisabled(), true);
+  await removeOne.click();
+  await shown(page, format(11 * originalLine.unitPrice));
+  assert.deepEqual(await savedLines(), [{ ...originalLine, quantity: 11 }]);
+});
+
+async function withLargeText(page, inspect) {
+  await page.evaluate(() => {
+    for (const node of document.querySelectorAll('div, span, p, h1, h2, h3')) {
+      if (node.children.length || !node.textContent.trim() || node.closest('[aria-hidden=true], [hidden]')) continue;
+      const { fontSize, lineHeight } = getComputedStyle(node);
+      node.dataset.testZoomStyles = JSON.stringify([node.style.fontSize, node.style.lineHeight]);
+      node.style.fontSize = `${parseFloat(fontSize) * 2}px`;
+      if (Number.isFinite(parseFloat(lineHeight))) node.style.lineHeight = `${parseFloat(lineHeight) * 2}px`;
+    }
+  });
+  try {
+    await inspect();
+  } finally {
+    await page.evaluate(() => {
+      for (const node of document.querySelectorAll('[data-test-zoom-styles]')) {
+        const [fontSize, lineHeight] = JSON.parse(node.dataset.testZoomStyles);
+        node.style.fontSize = fontSize;
+        node.style.lineHeight = lineHeight;
+        delete node.dataset.testZoomStyles;
+      }
+    });
+  }
+}
+
+async function inspectReorderLimit(page, locale, changeLabel, approveLabel) {
+  const change = page.getByText(changeLabel, { exact: true }).filter({ visible: true });
+  const approve = button(page, approveLabel);
+  const reachable = async locator => {
+    await locator.scrollIntoViewIfNeeded();
+    return locator.evaluate(element => {
+      const { left, right, top, bottom } = element.getBoundingClientRect();
+      const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+      return left >= 0 && top >= 0 && right <= window.innerWidth && bottom <= window.innerHeight
+        && element.contains(hit);
+    });
+  };
+  for (const width of [320, 390, 430]) {
+    await page.setViewportSize({ width, height: 800 });
+    const inspect = async size => {
+      assert.ok(await reachable(change), `Quantity change must be visible at ${width}px in ${locale}, ${size}`);
+      await capture(page, `connected-reorder-limit-${locale}-${width}-${size}`);
+      assert.ok(await reachable(approve), `Approval must be reachable at ${width}px in ${locale}, ${size}`);
+    };
+    await inspect('normal');
+    await withLargeText(page, () => inspect('large-text'));
+  }
+}
+
 async function inspectCartHeader(page, cart, locale) {
   const fits = () => cart.evaluate(element => {
     const { left, top, right, bottom, width, height } = element.getBoundingClientRect();
@@ -210,28 +356,10 @@ async function inspectCartHeader(page, cart, locale) {
     await page.setViewportSize({ width, height: 800 });
     assert.ok(await fits(), `Cart control must fit at ${width}px in ${locale}`);
     await capture(page, `connected-product-cart-${locale}-${width}`);
-    await page.evaluate(() => {
-      for (const node of document.querySelectorAll('div, span, p, h1, h2, h3')) {
-        if (node.children.length || !node.textContent.trim() || node.closest('[aria-hidden=true], [hidden]')) continue;
-        const { fontSize, lineHeight } = getComputedStyle(node);
-        node.dataset.cartZoomStyles = JSON.stringify([node.style.fontSize, node.style.lineHeight]);
-        node.style.fontSize = `${parseFloat(fontSize) * 2}px`;
-        if (Number.isFinite(parseFloat(lineHeight))) node.style.lineHeight = `${parseFloat(lineHeight) * 2}px`;
-      }
-    });
-    try {
+    await withLargeText(page, async () => {
       assert.ok(await fits(), `Cart control must fit at ${width}px in ${locale} with 200% text`);
       await capture(page, `connected-product-cart-${locale}-${width}-large-text`);
-    } finally {
-      await page.evaluate(() => {
-        for (const node of document.querySelectorAll('[data-cart-zoom-styles]')) {
-          const [fontSize, lineHeight] = JSON.parse(node.dataset.cartZoomStyles);
-          node.style.fontSize = fontSize;
-          node.style.lineHeight = lineHeight;
-          delete node.dataset.cartZoomStyles;
-        }
-      });
-    }
+    });
   }
 }
 

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MAX_SHARED_QUANTITY } from '../domain/cart';
 
 const identifier = z.string().min(1).max(128);
 const timestamp = z.iso.datetime({ offset: true });
@@ -41,7 +42,7 @@ export const menuResponse = z.object({
 const cartLine = z.object({
   sku: identifier,
   modifierIds: z.array(identifier),
-  quantity: z.int().min(1).max(99),
+  quantity: z.int().min(1).max(MAX_SHARED_QUANTITY),
   unitPrice: amount,
 });
 const change = z.object({

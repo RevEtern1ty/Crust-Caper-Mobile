@@ -1,16 +1,6 @@
 services:
   api:
     ports: !reset []
-    env_file: !override
-      - path: ${CRUSTCAPER_API_ENV_FILE:?Set the path to the API secret environment file}
-        format: raw
-    volumes:
-      - type: bind
-        source: ${CRUSTCAPER_POSTGRES_CA_FILE:?Set the path to the PostgreSQL CA certificate}
-        target: /run/crustcaper/postgres-ca.crt
-        read_only: true
-        bind:
-          create_host_path: false
 
   edge:
     image: caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0

@@ -6,6 +6,7 @@ import { useCheckout, useOrderStatus, useRouteActionGuard } from '../../src/chec
 import { CheckoutError } from '../../src/checkout/controller';
 import { checkoutError, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
 import { ReorderPanel } from '../../src/checkout/reorder-panel';
+import { reorderOfferForCart } from '../../src/checkout/reorder-review';
 import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
 import { PickupAlertPanel } from '../../src/checkout/pickup-alert';
 import { shareReceipt } from '../../src/checkout/receipt-sharing';
@@ -246,7 +247,8 @@ export default function OrdersScreen() {
             {!order.recoveryReadOnly && (order.paymentStatus === 'paid' || order.status === 'cancelled') ? (
               <Button label={t('Review reorder', 'Reba komande nshya isa n’iyi')} variant="secondary" busy={action === 'reorder'} disabled={!!action} onPress={() => {
                 void run('reorder', async () => {
-                  setPreview({ orderId: order.id, result: await api.reorder(order.id) });
+                  const offer = await api.reorder(order.id);
+                  setPreview({ orderId: order.id, result: reorderOfferForCart(offer) });
                 });
               }} />
             ) : null}

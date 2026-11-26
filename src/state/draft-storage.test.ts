@@ -1,7 +1,7 @@
 import { deepEqual, equal, throws } from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { DRAFT_KEY, readBrowserDraft, writeBrowserDraft, type Draft } from './draft-storage';
+import { DRAFT_KEY, readBrowserDraft, readDraft, writeBrowserDraft, type Draft } from './draft-storage';
 
 const burger = { sku: 'double-smash', unitPrice: 9200, modifierIds: [], quantity: 1 };
 const fries = { sku: 'fries', unitPrice: 2500, modifierIds: [], quantity: 1 };
@@ -14,6 +14,14 @@ function storage() {
     removeItem: (key: string) => { values.delete(key); },
   };
 }
+
+test('draft restore preserves shared orders saved before the mobile reorder limit was applied', () => {
+  const prior = { ...burger, quantity: 12 };
+  const maximum = { ...fries, quantity: 99 };
+  const corrupt = { ...fries, quantity: 100 };
+  const raw = JSON.stringify({ locale: 'rw', cart: [prior, maximum, corrupt] });
+  deepEqual(readDraft(raw), { locale: 'rw', cart: [prior, maximum] });
+});
 
 test('browser tabs retain separate carts and cart writes preserve the shared language', () => {
   const shared = storage();
