@@ -161,6 +161,7 @@ async function readMenu(request, reader, metrics) {
     reader.etag = etag;
   }
   metrics.latencies.push(response.durationMs);
+  metrics.statusLatencies[response.status].push(response.durationMs);
 }
 
 function stats(values) {
@@ -306,7 +307,10 @@ async function main() {
   const interrupt = () => controller.abort();
   for (const event of ['SIGINT', 'SIGTERM']) process.on(event, interrupt);
   const agent = new Agent({ keepAlive: true, maxSockets: 64 });
-  const metrics = { menu: { latencies: [], statuses: {} }, order_create: { latencies: [], statuses: {} } };
+  const metrics = {
+    menu: { latencies: [], statuses: {}, statusLatencies: { 200: [], 304: [] } },
+    order_create: { latencies: [], statuses: {} },
+  };
   const request = transport(ca, agent, controller.signal, metrics);
   const report = {
     mode: smoke ? 'smoke' : 'full', recordedAt: new Date().toISOString(), plannedWindowMs: durationMs,
@@ -333,6 +337,8 @@ async function main() {
     Object.assign(report, measurement);
     report.requests = Object.fromEntries(Object.entries(metrics).map(([name, value]) =>
       [name, { ...stats(value.latencies), statuses: value.statuses }]));
+    report.requests.menu.byStatus = Object.fromEntries(Object.entries(metrics.menu.statusLatencies)
+      .map(([status, values]) => [status, stats(values)]));
     if (controller.signal.aborted) throw new LoadFailure('interrupted');
     try {
       report.kitchen = await kitchen.finish();
@@ -363,6 +369,8 @@ async function main() {
       const observed = report.requests[name];
       if (observed.samples !== expected || observed.p95Ms > targets[name]) report.errors.push(`${name}_target_failed`);
     }
+    const freshMenu = report.requests.menu.byStatus[200];
+    if (freshMenu.samples < readerCount || freshMenu.p95Ms > targets.menu) report.errors.push('menu_fresh_target_failed');
     if (report.kitchen?.samples !== orders.length || report.kitchen.missed || report.kitchen.errors
       || !Number.isFinite(report.kitchen.maxMs) || report.kitchen.maxMs > targets.kitchen) {
       report.errors.push('kitchen_visibility_target_failed');
