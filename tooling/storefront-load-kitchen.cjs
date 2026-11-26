@@ -61,22 +61,36 @@ function provisionKitchen(project) {
   return { username, password, authenticatorCode };
 }
 
-async function openKitchenMonitor({ request, project }) {
+async function openKitchenSession({ request, project }) {
   const signedIn = await request('/api/v1/operator/sessions', { method: 'POST', body: provisionKitchen(project) });
   assert.equal(signedIn.status, 201, 'Could not authenticate the synthetic kitchen');
   assert.ok(signedIn.data?.storeId === 'kigali' && signedIn.data.role === 'kitchen'
     && typeof signedIn.data.accessToken === 'string', 'Unexpected kitchen session metadata');
 
   const headers = { Authorization: 'Bearer ' + signedIn.data.accessToken };
+  return {
+    async readQueue() {
+      const response = await request('/api/v1/operator/orders', { headers });
+      if (response.status !== 200 || !Array.isArray(response.data?.orders)) throw new Error('Kitchen queue unavailable');
+      return response.data.orders;
+    },
+    async close() {
+      const response = await request('/api/v1/operator/sessions/current', { method: 'DELETE', headers });
+      assert.equal(response.status, 204, 'Could not revoke the synthetic kitchen session');
+    },
+  };
+}
+
+async function openKitchenMonitor(options) {
+  const kitchen = await openKitchenSession(options);
   const paid = new Map();
   const visible = new Map();
   let inFlight;
   let errors = 0;
   async function readQueue() {
-    const response = await request('/api/v1/operator/orders', { headers });
-    if (response.status !== 200 || !Array.isArray(response.data?.orders)) throw new Error('Kitchen queue unavailable');
+    const orders = await kitchen.readQueue();
     const receivedAt = performance.now();
-    for (const order of response.data.orders) {
+    for (const order of orders) {
       if (order.paymentStatus === 'paid' && typeof order.id === 'string' && !visible.has(order.id)) {
         visible.set(order.id, receivedAt);
       }
@@ -113,10 +127,9 @@ async function openKitchenMonitor({ request, project }) {
     async close() {
       clearInterval(timer);
       await inFlight;
-      const response = await request('/api/v1/operator/sessions/current', { method: 'DELETE', headers });
-      assert.equal(response.status, 204, 'Could not revoke the synthetic kitchen session');
+      await kitchen.close();
     },
   };
 }
 
-module.exports = { openKitchenMonitor };
+module.exports = { openKitchenSession, openKitchenMonitor };

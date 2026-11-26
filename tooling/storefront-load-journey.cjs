@@ -84,8 +84,7 @@ async function readPaidOrder(request, orderPath, headers, orderId, quote, attemp
   ensure(false, 'checkout_payment_timeout');
 }
 
-async function runCheckout({ request, index, menu }) {
-  const slotId = 'fixture-load-' + (index % 8);
+async function beginCheckout({ request, menu, slotId }) {
   const { quote, headers, place } = await prepareOrder(request, menu, slotId);
   const [first, replay] = await Promise.all([place('order_create'), place('order_replay')]);
   const { id: orderId } = placedOrder(first, quote);
@@ -107,8 +106,17 @@ async function runCheckout({ request, index, menu }) {
   });
   const returnUrl = storefront + '/web-payment-return?orderId=' + orderId + '&status=successful&transaction_id=1';
   ensure(paid.status === 303 && paid.headers?.location === returnUrl, 'checkout_hosted_return');
-  await readPaidOrder(request, orderPath, headers, orderId, quote, attemptId);
-  return { orderId, quoteId: quote.quoteId, attemptId, total: quote.total, slotId };
+  return {
+    order: { orderId, quoteId: quote.quoteId, attemptId, total: quote.total, slotId },
+    waitForPaid: () => readPaidOrder(request, orderPath, headers, orderId, quote, attemptId),
+  };
+}
+
+async function runCheckout({ request, index, menu }) {
+  const slotId = 'fixture-load-' + (index % 8);
+  const checkout = await beginCheckout({ request, menu, slotId });
+  await checkout.waitForPaid();
+  return checkout.order;
 }
 
 function fixtureRows(project, sql) {
@@ -176,4 +184,4 @@ async function runCapacityWave({ request, menu, project }) {
   return { offered: contenders, accepted: accepted.length, rejected: contenders - accepted.length };
 }
 
-module.exports = { runCheckout, verifyPersisted, runCapacityWave };
+module.exports = { beginCheckout, runCheckout, verifyPersisted, runCapacityWave };
