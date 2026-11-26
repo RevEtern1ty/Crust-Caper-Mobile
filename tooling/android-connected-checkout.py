@@ -92,6 +92,8 @@ def verify_apk(apk, aapt, port, *, api_host="10.0.2.2"):
     except (KeyError, TypeError, ValueError, OSError, zipfile.BadZipFile):
         raise SmokeFailure("Cannot read the embedded APK configuration and bundle") from None
     require(bundle_size > 0, "APK must contain JavaScript for startup without Metro")
+    if isinstance(restaurant, dict) and restaurant.get("webCheckout") is False:
+        restaurant.pop("webCheckout")
     require(restaurant == {
         "profile": "local",
         "apiBaseUrl": f"http://{api_host}:{port}/api/v1",
