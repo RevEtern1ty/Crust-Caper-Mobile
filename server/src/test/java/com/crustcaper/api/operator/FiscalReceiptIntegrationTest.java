@@ -148,9 +148,11 @@ class FiscalReceiptIntegrationTest {
         upload(manager.bearer(), issued.id(), "EBM-ISSUED", "9200", PDF).andExpect(status().isOk());
 
         api.perform(get(OPERATOR + "/receipts").header(HttpHeaders.AUTHORIZATION, manager.bearer()))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$[*].orderId").value(List.of(earlierHandoff.id().toString(),
-                laterHandoff.id().toString(), pending.id().toString(), issued.id().toString())));
+            .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(4))
+            .andExpect(jsonPath("$[0].orderId").value(earlierHandoff.id().toString()))
+            .andExpect(jsonPath("$[1].orderId").value(laterHandoff.id().toString()))
+            .andExpect(jsonPath("$[2].orderId").value(pending.id().toString()))
+            .andExpect(jsonPath("$[3].orderId").value(issued.id().toString()));
 
         jdbc.sql("UPDATE pickup_slots SET capacity = 104 WHERE store_id = ? AND id = 'receipt'").param(store).update();
         for (int i = 0; i < 100; i++) order(store, true);
