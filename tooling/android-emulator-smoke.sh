@@ -210,13 +210,19 @@ original_wifi=$(wifi_state) || fail 'Unable to read emulator Wi-Fi state.'
 radios_owned=true
 if [[ "$original_airplane" == disabled ]]; then device 8s shell cmd connectivity airplane-mode enable; fi
 if [[ $(wifi_state) != disabled ]]; then set_wifi_state disabled; fi
+consecutive_offline=0
 for ((attempt = 0; attempt < 10; attempt++)); do
-  if [[ $(wifi_state) == disabled ]] && network_is_offline; then break; fi
+  # The radios and default route update asynchronously after a mode change.
+  if [[ $(wifi_state) == disabled ]] && airplane_state=$(device_text 8s shell cmd connectivity airplane-mode) \
+      && [[ $airplane_state == enabled ]] && network_is_offline; then
+    ((consecutive_offline += 1))
+    if ((consecutive_offline == 2)); then break; fi
+  else
+    consecutive_offline=0
+  fi
   sleep 1
 done
-network_is_offline || fail 'The emulator still has an active default network.'
-[[ $(device_text 8s shell cmd connectivity airplane-mode) == enabled && $(wifi_state) == disabled ]] \
-  || fail 'The emulator did not enter airplane mode with Wi-Fi disabled.'
+((consecutive_offline == 2)) || fail 'The emulator did not sustain airplane mode with Wi-Fi disabled and no default network.'
 
 phase_start 'Install the verified Release APK'
 install_attempted=true
