@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { Buffer } = require('node:buffer');
 const { spawnSync } = require('node:child_process');
-const { createHash, X509Certificate } = require('node:crypto');
+const { createHash, randomUUID, X509Certificate } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const { mkdir, readFile, writeFile } = require('node:fs/promises');
 const { setTimeout: delay } = require('node:timers/promises');
@@ -886,16 +886,21 @@ async function checkPrivacyLayout(page, locale) {
   await page.evaluate(() => { document.documentElement.style.fontSize = ''; });
 }
 
+async function signInManager(staff) {
+  const credentials = provisionStaffCredentials(project, 'manager');
+  await staff.goto(origin + '/operator/index.html');
+  await staff.getByLabel('Username', { exact: true }).fill(credentials.username);
+  await staff.getByLabel('Password', { exact: true }).fill(credentials.password);
+  await staff.locator('#authenticator-code').fill(credentials.authenticatorCode);
+  await button(staff, 'Sign in').click();
+  return credentials.username;
+}
+
 async function checkPrivacyStaff(browser, orderId, accepted) {
   const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
   try {
     const staff = await context.newPage();
-    const credentials = provisionStaffCredentials(project, 'manager');
-    await staff.goto(origin + '/operator/index.html');
-    await staff.getByLabel('Username', { exact: true }).fill(credentials.username);
-    await staff.getByLabel('Password', { exact: true }).fill(credentials.password);
-    await staff.locator('#authenticator-code').fill(credentials.authenticatorCode);
-    await button(staff, 'Sign in').click();
+    await signInManager(staff);
     await button(staff, 'Data requests').click();
     const region = staff.getByRole('region', { name: 'Order data requests' });
     const card = region.getByRole('listitem').filter({ hasText: accepted.requestId });
@@ -910,6 +915,117 @@ async function checkPrivacyStaff(browser, orderId, accepted) {
     await button(region, 'In review').click();
     await card.getByText(/^Review started /).waitFor();
     await capture(staff, 'order-privacy-manager-review');
+    await button(staff, 'Sign out').click();
+    await staff.getByLabel('Username', { exact: true }).waitFor();
+  } finally {
+    await context.close();
+  }
+}
+
+function verifyRecipeApprovalRow(proposal, username, expected) {
+  const bindings = {
+    store_id: proposal.storeId,
+    expected_version: proposal.expectedVersion,
+    catalog_version: proposal.catalogVersion,
+    sku: proposal.sku,
+    facts: Buffer.from(JSON.stringify(proposal.facts)).toString('base64'),
+    manager: username,
+  };
+  const sql = `SELECT count(*), count(*) FILTER (WHERE approval.applied_at IS NULL
+    AND approval.facts = convert_from(decode(:'facts', 'base64'), 'UTF8')::jsonb
+    AND account.store_id = approval.store_id AND account.role = 'manager' AND account.enabled
+    AND account.username = :'manager'
+    AND EXISTS (SELECT FROM operator_sessions staff_session
+      WHERE staff_session.operator_id = account.id AND staff_session.mfa_verified AND staff_session.expires_at > now()))
+    FROM catalog_recipe_approvals approval JOIN operator_accounts account ON account.id = approval.operator_id
+    WHERE approval.store_id = :'store_id' AND approval.expected_version = :'expected_version'
+      AND approval.catalog_version = :'catalog_version' AND approval.sku = :'sku';`;
+  const query = spawnSync('docker', ['exec', '-i', fixtureDatabase(), 'psql', '-XAtq', '-v', 'ON_ERROR_STOP=1',
+    '-U', 'storefront_fixture', '-d', 'storefront_fixture',
+    ...Object.entries(bindings).flatMap(([name, value]) => ['-v', name + '=' + value]), '-f', '-',
+  ], { encoding: 'utf8', input: sql + '\n', timeout: 10000 });
+  assert.equal(query.status, 0, 'fixture recipe approval query failed');
+  assert.equal(query.stdout.trim(), expected);
+}
+
+async function checkRecipeApproval(browser, ca) {
+  const menuPath = '/api/v1/stores/kigali/menu';
+  const current = await request(ca, menuPath);
+  assert.equal(current.status, 200);
+  const { store, version, products } = JSON.parse(current.body);
+  const item = products.find(({ sku }) => sku === 'double-smash');
+  assert.ok(item, 'fixture menu must contain Double Smash');
+  const catalogVersion = 'recipe-ui-' + randomUUID();
+  const facts = {
+    recipeVersion: 'recipe-' + catalogVersion,
+    allergenVersion: 'allergens-' + catalogVersion,
+    ingredients: [...item.ingredients, { en: 'Test kitchen seasoning', rw: 'Ibirungo by’igerageza' }],
+    allergens: [...item.allergens, { en: 'Soy', rw: 'Soya' }],
+  };
+  const approvalBody = {
+    storeId: store.id, expectedVersion: version, catalogVersion, sku: item.sku, crossContactConfirmed: true, facts,
+  };
+  const { store: sampleStore } = JSON.parse(readFileSync(require.resolve('../server/tooling/catalog.example.json'), 'utf8'));
+  const manifest = {
+    expectedVersion: version,
+    store: { ...sampleStore, ...store, version: catalogVersion },
+    products: [{ ...item, ...facts }],
+    slots: [],
+  };
+  const approvalUrl = origin + '/api/v1/operator/catalog/recipe-approvals';
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  try {
+    const staff = await context.newPage();
+    let approvalPosts = 0;
+    staff.on('request', sent => {
+      if (sent.method() === 'POST' && sent.url() === approvalUrl) approvalPosts++;
+    });
+    const username = await signInManager(staff);
+    await staff.locator('#recipe-approval-jump').click();
+    await staff.locator('#recipe-approval-file').setInputFiles({
+      name: 'fixture-catalog-proposal.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(manifest)),
+    });
+    await staff.locator('#recipe-approval-item').selectOption(item.sku);
+    await shown(staff.locator('#recipe-approval-ingredients'), 'Test kitchen seasoning');
+    await shown(staff.locator('#recipe-approval-ingredients'), 'Ibirungo by’igerageza');
+    await shown(staff.locator('#recipe-approval-allergens'), 'Soy');
+    await shown(staff.locator('#recipe-approval-allergens'), 'Soya');
+    const confirm = staff.locator('#recipe-approval-confirm');
+    const submit = staff.locator('#recipe-approval-submit');
+    assert.equal(await confirm.isChecked(), false);
+    assert.equal(await submit.isDisabled(), true);
+    await staff.locator('#recipe-approval-form').evaluate(form => form.requestSubmit());
+    verifyRecipeApprovalRow(approvalBody, username, '0|0');
+    assert.equal(approvalPosts, 0, 'review without explicit confirmation cannot post an approval');
+
+    await confirm.check();
+    assert.equal(approvalPosts, 0, 'checking the confirmation cannot submit the approval');
+    const [saved] = await Promise.all([
+      staff.waitForResponse(response => response.url() === approvalUrl && response.request().method() === 'POST'),
+      submit.click(),
+    ]);
+    assert.equal(saved.status(), 200);
+    assert.equal(saved.headers()['cache-control'], 'no-store');
+    assert.deepEqual(saved.request().postDataJSON(), approvalBody);
+    const { approvedAt, appliedAt, ...receipt } = await saved.json();
+    assert.equal(typeof approvedAt, 'string');
+    assert.ok(Number.isFinite(Date.parse(approvedAt)));
+    assert.equal(appliedAt ?? null, null);
+    assert.deepEqual(receipt, { storeId: store.id, expectedVersion: version, catalogVersion, sku: item.sku,
+      recipeVersion: facts.recipeVersion, allergenVersion: facts.allergenVersion });
+    const status = staff.locator('#recipe-approval-status');
+    await status.filter({ hasText: /Ready for the catalog importer\./ }).waitFor();
+    assert.equal(await submit.isDisabled(), true);
+    assert.equal(approvalPosts, 1);
+    verifyRecipeApprovalRow(approvalBody, username, '1|1');
+    await status.scrollIntoViewIfNeeded();
+    await capture(staff, 'recipe-approval-manager-receipt');
+
+    const after = await request(ca, menuPath);
+    assert.equal(after.status, 200);
+    const menu = JSON.parse(after.body);
+    assert.equal(menu.version, version);
+    assert.deepEqual(menu.products.find(({ sku }) => sku === item.sku), item);
     await button(staff, 'Sign out').click();
     await staff.getByLabel('Username', { exact: true }).waitFor();
   } finally {
@@ -954,4 +1070,8 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   await checkContactLayout(browser);
   await checkLegalLayout(browser);
   await checkGuestCheckout(browser, ca);
+  if (catalogPhotos) {
+    await t.test('a named manager with MFA confirms an exact recipe approval without publishing it',
+      () => checkRecipeApproval(browser, ca));
+  }
 });
