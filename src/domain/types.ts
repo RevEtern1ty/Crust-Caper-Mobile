@@ -41,6 +41,7 @@ export type PickupSlot = {
 export type Menu = {
   version: string
   updatedAt: string
+  availabilityCheckedAt?: string
   store: Store
   products: Product[]
   slots: PickupSlot[]

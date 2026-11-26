@@ -1,11 +1,13 @@
 package com.crustcaper.api;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
 public final class ApiModels {
+    public static final String AVAILABILITY_CHECKED_AT_HEADER = "X-Availability-Checked-At";
     static final String CURRENCY = "RWF";
 
     private ApiModels() {}
@@ -23,7 +25,8 @@ public final class ApiModels {
         @JsonInclude(JsonInclude.Include.NON_NULL) String directionsUrl
     ) {}
     public record Slot(String id, Instant startsAt, Instant endsAt, boolean available) {}
-    public record Menu(String version, Instant updatedAt, Store store, List<Product> products, List<Slot> slots) {}
+    public record Menu(String version, Instant updatedAt, @JsonIgnore Instant availabilityCheckedAt,
+                       Store store, List<Product> products, List<Slot> slots) {}
     public record GuestSession(String accessToken, Instant expiresAt, String refreshToken, Instant refreshExpiresAt,
                                UUID sessionId) {}
     public record GuestRefresh(String refreshToken, @JsonInclude(JsonInclude.Include.NON_NULL) String rotationKey) {

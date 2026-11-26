@@ -296,6 +296,106 @@ test('the buyer can open the cart from product details and return to their selec
   await shown(page, 'Double Smash');
 });
 
+test('an open checkout clears an expired pickup window and waits for an explicit replacement', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const menuPath = '/stores/kigali/menu?channel=mobile';
+  const menu = await send(menuPath).then(response => response.json());
+  const burger = menu.products.find(item => item.sku === 'double-smash' && item.available);
+  const windows = menu.slots.filter(slot => slot.available && Date.parse(slot.startsAt) > Date.now() + 60_000);
+  const [selected, replacement] = windows.sort((a, b) => Date.parse(a.startsAt) - Date.parse(b.startsAt));
+  assert.ok(burger && selected && replacement, 'The local menu must offer Double Smash and two future pickup windows');
+  const expiredAt = Date.parse(selected.startsAt) + 2_000;
+  assert.ok(Date.parse(replacement.startsAt) > expiredAt);
+
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+  await page.clock.install();
+
+  let clockAdvanced = false;
+  let refreshedMenus = 0;
+  await page.route(api + menuPath, async route => {
+    if (!clockAdvanced) return route.continue();
+    const response = await route.fetch();
+    // The real server clock has not advanced, as with a pre-cutoff snapshot arriving late.
+    refreshedMenus++;
+    await route.fulfill({ response });
+  });
+  const quoteInputs = [];
+  const orderWrites = [];
+  page.on('request', request => {
+    if (request.method() !== 'POST' || !request.url().startsWith(api + '/')) return;
+    const path = request.url().slice(api.length);
+    if (path === '/quotes') quoteInputs.push(request.postDataJSON());
+    if (/^\/orders(?:\/[^/]+\/payments)?$/.test(path)) orderWrites.push(path);
+  });
+
+  const date = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kigali', day: 'numeric', month: 'short' });
+  const time = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kigali', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  const slotName = slot => {
+    const start = new Date(slot.startsAt);
+    return `${date.format(start)} · ${time.format(start)}–${time.format(new Date(slot.endsAt))}`;
+  };
+  const pickupTimes = page.getByRole('radiogroup', { name: 'Pickup time' });
+  const option = slot => pickupTimes.getByRole('radio', { name: slotName(slot), exact: true });
+  const review = button(page, 'Review order');
+  const quoteResponse = () => page.waitForResponse(response =>
+    response.url() === api + '/quotes' && response.request().method() === 'POST' && response.ok());
+
+  await page.goto('http://127.0.0.1:' + server.address().port);
+  await button(page, /^Double Smash,/).click();
+  await button(page, /^Add to cart/).click();
+  await button(page, /^View cart/).click();
+  await button(page, 'Choose pickup time').click();
+  await option(selected).click();
+  await page.getByLabel('Phone number', { exact: true }).fill(contact.phone);
+  await page.getByLabel('Email address', { exact: true }).fill(contact.email);
+  const firstQuote = quoteResponse();
+  await review.click();
+  assert.equal((await (await firstQuote).json()).slotId, selected.id);
+  await shown(page, 'Included tax');
+  assert.equal(quoteInputs.length, 1);
+
+  const jump = expiredAt - await page.evaluate(() => Date.now());
+  assert.ok(jump > 0, 'The window must expire as the test advances the browser clock');
+  clockAdvanced = true;
+  const refreshed = page.waitForResponse(response => response.url() === api + menuPath && response.ok());
+  await page.clock.fastForward(jump);
+  await Promise.all([shown(page, 'Your selected pickup time has passed. Choose another time.'), refreshed]);
+  assert.ok(refreshedMenus >= 1);
+  assert.equal(await button(page, /^Confirm .*RWF/).count(), 0);
+  assert.equal(await pickupTimes.getByRole('radio', { checked: true }).count(), 0);
+  const expiredOption = pickupTimes.getByRole('radio', { disabled: false }).filter({ hasText: slotName(selected) });
+  assert.equal(await expiredOption.count(), 0);
+  await option(replacement).waitFor();
+  assert.equal(await review.isDisabled(), true);
+  assert.equal(await page.getByLabel('Phone number', { exact: true }).inputValue(), contact.phone);
+  assert.equal(await page.getByLabel('Email address', { exact: true }).inputValue(), contact.email);
+  await shown(page, '1 × Double Smash');
+  await capture(page, 'connected-slot-expired-en-390');
+  assert.equal(quoteInputs.length, 1);
+  assert.deepEqual(orderWrites, []);
+
+  await option(replacement).click();
+  assert.equal(await option(replacement).getAttribute('aria-checked'), 'true');
+  const secondQuote = quoteResponse();
+  await review.click();
+  assert.equal((await (await secondQuote).json()).slotId, replacement.id);
+  const lines = [{ sku: burger.sku, modifierIds: [], quantity: 1, unitPrice: burger.price }];
+  assert.deepEqual(quoteInputs, [
+    { storeId: menu.store.id, slotId: selected.id, lines },
+    { storeId: menu.store.id, slotId: replacement.id, lines },
+  ]);
+  assert.deepEqual(orderWrites, []);
+});
+
 test('guest rotation and logout recover from committed responses lost by the browser', { timeout: 65_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const server = createPreviewServer(dist);

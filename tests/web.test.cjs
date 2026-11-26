@@ -35,7 +35,7 @@ async function newContext(t, width = 390, height = 844) {
   return context;
 }
 
-async function newPage(context, setClock = true) {
+async function newPage(context, clock = 'fixed') {
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push({ kind: 'page', message: error.message }));
@@ -43,7 +43,9 @@ async function newPage(context, setClock = true) {
     if (item.type() === 'error') errors.push({ kind: 'console', message: item.text(), url: item.location().url });
   });
   page.setDefaultTimeout(7500);
-  if (setClock) await page.clock.setFixedTime(new Date('2026-06-15T10:02:00Z'));
+  const demoTime = new Date('2026-06-15T10:02:00Z');
+  if (clock === 'fixed') await page.clock.setFixedTime(demoTime);
+  if (clock === 'installed') await page.clock.install({ time: demoTime });
   await page.goto(base);
   await shown(page, 'Double Smash');
   return { page, errors };
@@ -215,7 +217,7 @@ test('guest pickup survives reload, failed payment, retry and reorder', async t 
 test('concurrent browser tabs can recover their own orders independently', async t => {
   const context = await newContext(t);
   const first = await newPage(context);
-  const second = await newPage(context, false);
+  const second = await newPage(context, 'system');
   for (const { page } of [first, second]) {
     await page.bringToFront();
     await fillCart(page);
@@ -436,18 +438,39 @@ test('menu header controls and tab labels remain usable at 200% text size', asyn
 });
 
 
-test('expired review keeps the cart and requires a new quote', async t => {
-  const { page, errors } = await newPage(await newContext(t, 320, 568));
+test('an expired quote keeps the selected future pickup window and requires a new review', async t => {
+  const { page, errors } = await newPage(await newContext(t, 320, 568), 'installed');
   await fillCart(page);
   await reviewCheckout(page);
-  await page.clock.setFixedTime(new Date('2026-06-15T10:09:00Z'));
-  await button(page, /^Confirm 9,200 RWF/).click();
+  const ledger = () => page.evaluate(() => JSON.parse(sessionStorage.getItem('crustcaper.demo.v1')));
+  const before = await ledger();
+  const [originalQuote] = before.quotes;
+  const afterQuoteExpiry = Date.parse(originalQuote.expiresAt) + 1_000;
+  assert.ok(afterQuoteExpiry < Date.parse(originalQuote.pickupStartsAt), 'Only the quote must reach its deadline');
+  const jump = afterQuoteExpiry - await page.evaluate(() => Date.now());
+  assert.ok(jump > 0);
+  await page.clock.fastForward(jump);
+
   const alert = page.getByRole('alert').filter({ hasText: 'Your quote changed or expired. Review the order again.' });
   await alert.waitFor({ state: 'visible' });
-  assert.equal(await isInViewport(alert), true, 'Checkout must surface a failed confirmation without scrolling');
+  assert.equal(await isInViewport(alert), true, 'Checkout must surface expiration without scrolling');
+  assert.equal(await button(page, /^Confirm 9,200 RWF/).count(), 0);
+  const selection = page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { checked: true });
+  assert.equal(await selection.count(), 1);
+  assert.equal(await selection.isEnabled(), true);
+  assert.equal(await page.getByLabel('Demo phone number', { exact: true }).inputValue(), '+250 700 000 000');
+  assert.equal(await savedCartQuantity(page), 1);
   assert.equal(await lastOrderId(page), undefined);
-  await page.goto(base + '/cart');
-  await shown(page, '9,200 RWF');
+  assert.deepEqual(await ledger(), before);
+
+  await button(page, 'Review order').click();
+  await shown(page, 'Included tax');
+  const renewed = await ledger();
+  assert.deepEqual(renewed.orders, []);
+  assert.equal(renewed.quotes.length, 1);
+  assert.notEqual(renewed.quotes[0].id, originalQuote.id);
+  assert.equal(renewed.quotes[0].slotId, originalQuote.slotId);
+  assert.deepEqual(renewed.quotes[0].lines, originalQuote.lines);
   assert.deepEqual(errors, []);
 });
 

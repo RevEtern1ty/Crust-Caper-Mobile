@@ -42,11 +42,12 @@ final class CommerceController {
             || (locale != null && !locale.equals("en") && !locale.equals("rw"))) throw ApiFailure.invalid();
         Menu menu = catalog.menu(id);
         String tag = tag(menu);
-        if (currentTag != null && java.util.Arrays.stream(currentTag.split(","))
-            .map(String::strip).anyMatch(value -> value.equals("*") || value.equals(tag) || value.equals("W/" + tag))) {
-            return ResponseEntity.status(304).eTag(tag).cacheControl(CacheControl.noCache()).build();
-        }
-        return ResponseEntity.ok().eTag(tag).cacheControl(CacheControl.noCache()).body(menu);
+        boolean notModified = currentTag != null && java.util.Arrays.stream(currentTag.split(","))
+            .map(String::strip).anyMatch(value -> value.equals("*") || value.equals(tag) || value.equals("W/" + tag));
+        var response = (notModified ? ResponseEntity.status(304) : ResponseEntity.ok())
+            .eTag(tag).cacheControl(CacheControl.noCache())
+            .header(AVAILABILITY_CHECKED_AT_HEADER, menu.availabilityCheckedAt().toString());
+        return notModified ? response.build() : response.body(menu);
     }
 
     @PostMapping("/guest-sessions")

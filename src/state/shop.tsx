@@ -116,6 +116,7 @@ type Shop = Draft & {
   replaceCart: (lines: CartLine[]) => void;
   clearCart: (snapshot: CartLine[]) => Promise<void>;
   refreshMenu: () => Promise<void>;
+  pickupNow: () => number;
 };
 
 const ShopContext = createContext<Shop | null>(null);
@@ -125,6 +126,7 @@ export function ShopProvider({ children }: PropsWithChildren) {
   const [menu, setMenu] = useState<Menu | null>(null);
   const [status, setStatus] = useState<MenuStatus>('loading');
   const [refreshing, setRefreshing] = useState(false);
+  const [pickupClock, setPickupClock] = useState<{ checkedAt: number; receivedAt: number } | null>(null);
   const cachedMenu = useRef<Menu | null>(null);
   const request = useRef<Promise<void> | null>(null);
 
@@ -132,6 +134,14 @@ export function ShopProvider({ children }: PropsWithChildren) {
     if (request.current) return request.current;
     setRefreshing(true);
     const load = api.getMenu().then(next => {
+      const checkedAt = Date.parse(next.availabilityCheckedAt ?? '');
+      if (Number.isFinite(checkedAt)) {
+        const receivedAt = performance.now();
+        setPickupClock(previous => ({
+          receivedAt,
+          checkedAt: previous ? Math.max(checkedAt, previous.checkedAt + Math.max(0, receivedAt - previous.receivedAt)) : checkedAt,
+        }));
+      }
       cachedMenu.current = next;
       setMenu(next);
       setStatus(next.orderingUnavailable ? 'stale' : 'ready');
@@ -145,6 +155,10 @@ export function ShopProvider({ children }: PropsWithChildren) {
     request.current = load;
     return load;
   }, []);
+
+  const pickupNow = useCallback(() => pickupClock
+    ? pickupClock.checkedAt + Math.max(0, performance.now() - pickupClock.receivedAt)
+    : Date.now(), [pickupClock]);
 
   useEffect(() => {
     let active = true;
@@ -216,7 +230,7 @@ export function ShopProvider({ children }: PropsWithChildren) {
       pushProjectId,
       fixturePhotos: !connected || connected.profile === 'local',
       menu, status, refreshing, hydrated, draftSaving, draftStorageError, retryDraftStorage, total, count,
-      setLocale, addLine, changeQuantity, editLine, replaceCart, clearCart, refreshMenu,
+      setLocale, addLine, changeQuantity, editLine, replaceCart, clearCart, refreshMenu, pickupNow,
     }}>
       {children}
     </ShopContext.Provider>

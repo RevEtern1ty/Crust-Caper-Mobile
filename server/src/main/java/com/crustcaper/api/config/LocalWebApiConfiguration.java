@@ -1,5 +1,7 @@
 package com.crustcaper.api.config;
 
+import static com.crustcaper.api.ApiModels.AVAILABILITY_CHECKED_AT_HEADER;
+
 import com.crustcaper.api.ApiRequestDiagnostics;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
@@ -15,7 +17,7 @@ class LocalWebApiConfiguration implements WebMvcConfigurer {
             .allowedOriginPatterns("http://127.0.0.1:[*]", "http://localhost:[*]")
             .allowedMethods("GET", "POST")
             .allowedHeaders("Content-Type", "Authorization", "Idempotency-Key")
-            .exposedHeaders(ApiRequestDiagnostics.HEADER)
+            .exposedHeaders(ApiRequestDiagnostics.HEADER, AVAILABILITY_CHECKED_AT_HEADER)
             .maxAge(600);
     }
 }

@@ -58,7 +58,8 @@ class Catalog {
             .query((rs, row) -> new Slot(rs.getString("id"), readTime(rs, "starts_at"), readTime(rs, "ends_at"),
                 rs.getBoolean("available")))
             .list();
-        return new Menu(store.version(), store.updatedAt(), store.store(), products(storeId, false), slots);
+        return new Menu(store.version(), store.updatedAt(), checkedAt.toInstant(),
+            store.store(), products(storeId, false), slots);
     }
 
     StoreData store(String id, boolean lock) {

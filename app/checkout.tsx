@@ -1,6 +1,6 @@
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Platform, Pressable, StyleSheet, type Text as NativeText, TextInput, View } from 'react-native';
+import { AppState, Platform, Pressable, StyleSheet, type Text as NativeText, TextInput, View } from 'react-native';
 
 import { reviewCheckoutCart } from '../src/checkout/cart-review';
 import { useCheckout, useRouteActionGuard } from '../src/checkout/context';
@@ -8,19 +8,22 @@ import { normalizePhone } from '../src/checkout/contact';
 import type { CheckoutContact } from '../src/checkout/controller';
 import { checkoutError, changeLabel, itemName, itemOptions } from '../src/checkout/labels';
 import { DEMO_PHONE } from '../src/domain/demo-api';
-import { ApiError, type Quote } from '../src/domain/types';
+import { ApiError, type PickupSlot, type Quote } from '../src/domain/types';
 import { useShop } from '../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../src/ui/core';
 import { copy, money, slotLabel } from '../src/ui/format';
 
 const demoPhoneLabel = '+250 700 000 000';
+const pickupWindowKey = ({ id, startsAt, endsAt }: PickupSlot) => JSON.stringify([id, startsAt, endsAt]);
+type Expiry = 'pickup_started' | 'slot_unavailable' | 'quote_expired';
 
 export default function CheckoutScreen() {
   const { resume } = useLocalSearchParams<{ resume?: string }>();
-  const { api, mode, checkoutAllowed, locale, menu, status, cart, total, hydrated, draftSaving, draftStorageError, refreshing, refreshMenu } = useShop();
+  const { api, mode, checkoutAllowed, locale, menu, status, cart, total, hydrated, draftSaving, draftStorageError, refreshing, refreshMenu, pickupNow } = useShop();
   const { beginCheckout, resumeCheckout, journal, busy, restoreFailed } = useCheckout();
   const guardNavigation = useRouteActionGuard();
-  const [selectedSlot, setSlot] = useState('');
+  const [selectedSlot, setSlot] = useState<PickupSlot | null>(null);
+  const [clockTick, setClockTick] = useState(0);
   const [phone, setPhone] = useState('');
   const [email, setEmail] = useState('');
   const [phoneInvalid, setPhoneInvalid] = useState(false);
@@ -32,16 +35,22 @@ export default function CheckoutScreen() {
   const phoneInput = useRef<TextInput>(null);
   const emailInput = useRef<TextInput>(null);
   const stepHeading = useRef<NativeText>(null);
+  const pickupHeading = useRef<NativeText>(null);
+  const restorePickerFocus = useRef(false);
   const previousStepWasReview = useRef(false);
   const slotButtons = useRef(new Map<string, View>());
   const t = (en: string, rw: string) => copy(locale, en, rw);
 
   const closed = status === 'ready' && menu?.store.open === false;
-  const availableSlots = closed ? [] : menu?.slots.filter((option) => option.available) ?? [];
-  const slot = availableSlots.find((option) => option.id === selectedSlot);
-  const slotKey = slot ? JSON.stringify([slot.id, slot.startsAt, slot.endsAt]) : '';
+  const now = pickupNow();
+  const futureSlots = closed ? [] : menu?.slots.filter((option) => Date.parse(option.startsAt) > now) ?? [];
+  const availableSlots = futureSlots.filter((option) => option.available);
+  const slotKey = selectedSlot ? pickupWindowKey(selectedSlot) : '';
+  const slot = availableSlots.find((option) => pickupWindowKey(option) === slotKey);
   const cartKey = JSON.stringify(cart);
-  const quote = review && review.cartKey === cartKey && review.slotKey === slotKey ? review.quote : null;
+  const matchingReview = slot && review && review.cartKey === cartKey && review.slotKey === slotKey ? review.quote : null;
+  const quoteExpiresAt = matchingReview ? Date.parse(matchingReview.expiresAt) : Infinity;
+  const quote = quoteExpiresAt > now ? matchingReview : null;
   const quotedCart = quote ? reviewCheckoutCart(cart, quote) : null;
   const requiresCartEdit = quotedCart?.requiresCartEdit ?? false;
   const reviewedLines = quotedCart?.available ?? cart.map((current) => ({ current, previous: current }));
@@ -52,12 +61,75 @@ export default function CheckoutScreen() {
   const noAvailableSlots = availableSlots.length === 0;
   const controlsLocked = requestingQuote || busy;
   const reviewing = quote !== null;
+  const watchingWindows = checkoutAllowed && !restoringContact && !unfinished && !busy && !restoreFailed && cart.length > 0;
+  const nextWindowStartsAt = Math.min(...futureSlots.map((option) => Date.parse(option.startsAt)));
+  const nextDeadline = Math.min(nextWindowStartsAt, quoteExpiresAt > now ? quoteExpiresAt : Infinity);
+  const selectionExpired = selectedSlot && Date.parse(selectedSlot.startsAt) <= now;
+  const expiredSelection = selectionExpired ? 'pickup_started'
+    : selectedSlot && !slot && status === 'ready' && !closed ? 'slot_unavailable' : null;
   const reviewedSlot = quote?.pickupStartsAt && quote.pickupEndsAt
     ? { startsAt: quote.pickupStartsAt, endsAt: quote.pickupEndsAt } : slot;
 
   useFocusEffect(useCallback(() => {
     void refreshMenu();
   }, [refreshMenu]));
+
+  const invalidate = useCallback((reason: Expiry) => {
+    setReview(null);
+    if (reason !== 'quote_expired') setSlot(null);
+    setProblem({
+      message: reason === 'pickup_started'
+        ? copy(locale, 'Your selected pickup time has passed. Choose another time.',
+          'Igihe wahisemo cyo gufata komande cyarangiye. Hitamo ikindi.')
+        : checkoutError(new ApiError(reason), locale),
+      canEditCart: false,
+    });
+  }, [locale]);
+
+  useFocusEffect(useCallback(() => {
+    if (!watchingWindows) return;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    function checkClock() {
+      clearTimeout(timer);
+      const currentTime = pickupNow();
+      if (currentTime >= nextWindowStartsAt) {
+        if (Platform.OS === 'web') {
+          restorePickerFocus.current = menu?.slots.some(option =>
+            Date.parse(option.startsAt) <= currentTime && Object.is(slotButtons.current.get(option.id), document.activeElement),
+          ) ?? false;
+        }
+        void refreshMenu();
+      }
+      setClockTick(currentTime);
+      if (Number.isFinite(nextDeadline) && nextDeadline > currentTime) {
+        timer = setTimeout(checkClock, Math.min(2_147_483_647, Math.ceil(nextDeadline - currentTime)));
+      }
+    }
+
+    if (AppState.currentState !== 'background' && AppState.currentState !== 'inactive') checkClock();
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') checkClock();
+      else clearTimeout(timer);
+    });
+    return () => {
+      clearTimeout(timer);
+      subscription.remove();
+    };
+  }, [menu, nextDeadline, nextWindowStartsAt, pickupNow, refreshMenu, watchingWindows]));
+
+  useEffect(() => {
+    if (!watchingWindows) return;
+    if (expiredSelection) invalidate(expiredSelection);
+    else if (quoteExpiresAt <= now) invalidate('quote_expired');
+  }, [expiredSelection, invalidate, now, quoteExpiresAt, watchingWindows]);
+
+  useEffect(() => {
+    if (Platform.OS === 'web' && restorePickerFocus.current && document.activeElement === document.body) {
+      pickupHeading.current?.focus();
+    }
+    restorePickerFocus.current = false;
+  }, [clockTick]);
 
   useEffect(() => {
     if (Platform.OS === 'web' && previousStepWasReview.current !== reviewing) {
@@ -90,7 +162,9 @@ export default function CheckoutScreen() {
   }
 
   function chooseSlot(id: string) {
-    setSlot(id);
+    const option = availableSlots.find(item => item.id === id);
+    if (!option || Date.parse(option.startsAt) <= pickupNow()) return;
+    setSlot(option);
     setReview(null);
     setProblem(null);
   }
@@ -121,6 +195,15 @@ export default function CheckoutScreen() {
   async function submit() {
     if (!checkoutAllowed || checking.current || busy || !journal || draftSaving || draftStorageError) return;
     if (!restoringContact && (!menu || !slot || !cart.length || requiresCartEdit)) return;
+    if (!restoringContact && slot && Date.parse(slot.startsAt) <= pickupNow()) {
+      invalidate('pickup_started');
+      void refreshMenu();
+      return;
+    }
+    if (!restoringContact && quote && Date.parse(quote.expiresAt) <= pickupNow()) {
+      invalidate('quote_expired');
+      return;
+    }
     const contact = readContact();
     if (!contact) return;
 
@@ -137,14 +220,22 @@ export default function CheckoutScreen() {
         if (shouldNavigate()) router.replace(order.paymentStatus === 'processing' ? '/payment' : '/(tabs)/orders');
       } else if (menu && slot) {
         const result = await api.createQuote({ storeId: menu.store.id, slotId: slot.id, lines: cart });
-        if (shouldNavigate()) setReview({ quote: result, cartKey, slotKey });
+        if (!shouldNavigate()) return;
+        const receivedAt = pickupNow();
+        if (Date.parse(slot.startsAt) <= receivedAt) {
+          invalidate('pickup_started');
+        } else if (Date.parse(result.expiresAt) <= receivedAt) {
+          invalidate('quote_expired');
+        } else {
+          setReview({ quote: result, cartKey, slotKey });
+        }
       }
     } catch (error) {
       const canEditCart = error instanceof ApiError && ['quote_changed', 'slot_unavailable'].includes(error.code);
       setProblem({ message: checkoutError(error, locale), canEditCart });
       if (error instanceof ApiError && ['quote_expired', 'quote_changed', 'slot_unavailable', 'reservation_expired'].includes(error.code)) {
         setReview(null);
-        if (error.code === 'slot_unavailable' || error.code === 'reservation_expired') setSlot('');
+        if (error.code === 'slot_unavailable' || error.code === 'reservation_expired') setSlot(null);
         await refreshMenu().catch(() => {});
       }
     } finally {
@@ -284,9 +375,10 @@ export default function CheckoutScreen() {
 
       {!quote && <>
       <Card>
-        <Text variant="heading" accessibilityRole="header">{t('Pickup time', 'Igihe cyo gufata')}</Text>
+        <Text ref={pickupHeading} tabIndex={Platform.OS === 'web' ? -1 : undefined}
+          variant="heading" accessibilityRole="header">{t('Pickup time', 'Igihe cyo gufata')}</Text>
         <View accessibilityRole="radiogroup" accessibilityLabel={t('Pickup time', 'Igihe cyo gufata')} style={styles.slotGroup}>
-          {!closed && menu?.slots.map((option) => {
+          {futureSlots.map((option) => {
             const checked = option.id === slot?.id;
             const disabled = !option.available || controlsLocked;
             const webKeyboard = Platform.OS === 'web' ? {
@@ -321,7 +413,9 @@ export default function CheckoutScreen() {
               ? t('Pickup orders are closed right now. You can still edit your cart.', 'Kwakira komande zo gufata byafunzwe ubu. Uracyashobora guhindura agatebo kawe.')
               : refreshing
               ? t('Checking pickup times…', 'Turimo kugenzura ibihe byo gufata…')
-              : t('No pickup times are available right now.', 'Nta gihe cyo gufata komande kiboneka ubu.')}</Text>
+              : status === 'ready'
+                ? t('No pickup times are available right now.', 'Nta gihe cyo gufata komande kiboneka ubu.')
+                : t('Pickup availability unconfirmed.', 'Igihe cyo gufata komande ntikiramenyekana.')}</Text>
             <Button label={t('Refresh pickup times', 'Vugurura ibihe byo gufata')} variant="secondary" busy={refreshing} onPress={() => { void refreshMenu(); }} />
           </>
         )}

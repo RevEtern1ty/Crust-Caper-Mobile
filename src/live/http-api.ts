@@ -130,7 +130,7 @@ export function createLiveApi({
   };
 
   async function request<T>({
-    path, schema, method = 'GET', token, key, body, pdf = false, installationId,
+    path, schema, method = 'GET', token, key, body, pdf = false, installationId, onHeaders,
   }: {
     path: string;
     schema: z.ZodType<T>;
@@ -140,6 +140,7 @@ export function createLiveApi({
     body?: unknown;
     pdf?: boolean;
     installationId?: string;
+    onHeaders?: (headers: Headers) => void;
   }): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -168,6 +169,7 @@ export function createLiveApi({
       if (!response.ok) throw new ApiError(errorCode(response.status, payload));
       const parsed = schema.safeParse(payload);
       if (!parsed.success) invalidResponse();
+      onHeaders?.(response.headers);
       return parsed.data;
     } catch (error) {
       controller.abort();
@@ -426,12 +428,18 @@ export function createLiveApi({
       return ending;
     },
     async getMenu() {
+      let availabilityCheckedAt: string | undefined;
       const menu = await request({
         path: '/stores/' + encodeURIComponent(config.storeId) + '/menu?channel=mobile', schema: menuResponse,
+        onHeaders: (headers) => {
+          const checkedAt = headers.get('X-Availability-Checked-At');
+          if (checkedAt && Number.isFinite(Date.parse(checkedAt))) availabilityCheckedAt = checkedAt;
+        },
       });
       if (menu.store.id !== config.storeId) invalidResponse();
       return {
         ...menu,
+        availabilityCheckedAt,
         store: {
           ...menu.store,
           supportUrl: safeHttps(menu.store.supportUrl) ?? undefined,

@@ -1,14 +1,18 @@
 package com.crustcaper.api;
 
+import static com.crustcaper.api.ApiModels.AVAILABILITY_CHECKED_AT_HEADER;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.verify;
 import static org.hamcrest.Matchers.contains;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import java.time.Instant;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -16,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
@@ -96,15 +101,30 @@ class CatalogSnapshotIntegrationTest {
         insertAvailabilityFixture();
         clearInvocations(jdbc);
 
-        api.perform(get("/api/v1/stores/{id}/menu", store))
+        Instant requestStartedAt = Instant.now();
+        var response = api.perform(get("/api/v1/stores/{id}/menu", store))
             .andExpect(status().isOk())
+            .andExpect(header().exists(AVAILABILITY_CHECKED_AT_HEADER))
+            .andExpect(jsonPath("$.availabilityCheckedAt").doesNotHaveJsonPath())
             .andExpect(jsonPath("$.slots[*].id", contains("snapshot-slot", "tie-a", "tie-b", "cancelled",
                 "expired", "held", "paid", "zero-capacity", "extra-1", "extra-2", "extra-3", "extra-4")))
             .andExpect(jsonPath("$.slots[*].available", contains(true, true, true, true, true, false, false,
-                false, true, true, true, true)));
+                false, true, true, true, true)))
+            .andReturn().getResponse();
+        assertThat(Instant.parse(response.getHeader(AVAILABILITY_CHECKED_AT_HEADER)))
+            .isBetween(requestStartedAt, Instant.now());
 
         verify(jdbc).sql(argThat(query -> query.contains("FROM pickup_slots")
             || query.contains("pickup_reservation_occupies_slot")));
+
+        String etag = response.getHeader(HttpHeaders.ETAG);
+        Instant revalidationStartedAt = Instant.now();
+        var revalidated = api.perform(get("/api/v1/stores/{id}/menu", store).header(HttpHeaders.IF_NONE_MATCH, etag))
+            .andExpect(status().isNotModified()).andExpect(header().string(HttpHeaders.ETAG, etag))
+            .andExpect(header().exists(AVAILABILITY_CHECKED_AT_HEADER))
+            .andReturn().getResponse();
+        assertThat(Instant.parse(revalidated.getHeader(AVAILABILITY_CHECKED_AT_HEADER)))
+            .isBetween(revalidationStartedAt, Instant.now());
 
         jdbc.sql("UPDATE stores SET open = false WHERE id = ?").param(store).update();
         api.perform(get("/api/v1/stores/{id}/menu", store))

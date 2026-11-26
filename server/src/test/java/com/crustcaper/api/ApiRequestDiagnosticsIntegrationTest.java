@@ -1,6 +1,8 @@
 package com.crustcaper.api;
 
+import static com.crustcaper.api.ApiModels.AVAILABILITY_CHECKED_AT_HEADER;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.mockito.Mockito.doThrow;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
@@ -57,7 +59,8 @@ class ApiRequestDiagnosticsIntegrationTest {
             .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
             .andExpect(header().exists(REQUEST_ID))
             .andExpect(header().string(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN))
-            .andExpect(header().string(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS, REQUEST_ID))
+            .andExpect(header().string(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS, containsString(REQUEST_ID)))
+            .andExpect(header().string(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS, containsString(AVAILABILITY_CHECKED_AT_HEADER)))
             .andExpect(jsonPath("$.code").value("service_unavailable"))
             .andReturn().getResponse();
 
