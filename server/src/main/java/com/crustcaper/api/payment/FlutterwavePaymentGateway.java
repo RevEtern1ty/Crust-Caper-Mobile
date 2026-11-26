@@ -22,6 +22,8 @@ import java.net.URI;
 import java.net.UnknownHostException;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
@@ -39,18 +41,21 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
     private static final Pattern CURRENCY = Pattern.compile("[A-Z]{3}");
     private static final Pattern PHONE = Pattern.compile("\\+[1-9][0-9]{6,14}");
     private static final Pattern CHECKOUT_PATH = Pattern.compile("/v3/hosted/pay/[A-Za-z0-9_-]{1,256}");
+    private static final Set<String> RWANDA_PAYMENT_OPTIONS = Set.of("card", "mobilemoneyrwanda");
     private static final Set<String> NOT_FOUND_MESSAGES = Set.of("transaction not found", "no transaction found");
 
     private final URI apiOrigin;
     private final URI returnUrl;
     private final URI webReturnUrl;
     private final String secretKey;
+    private final String paymentOptions;
     private final ObjectMapper mapper;
     private final ObjectReader responseReader;
     private final Clock clock;
     private final int connectTimeoutMs;
     private final int readTimeoutMs;
 
+    // The fixture overloads preserve both methods. The configured gateway uses the explicit allowlist.
     FlutterwavePaymentGateway(URI apiOrigin, URI returnUrl, String secretKey, ObjectMapper mapper,
                              Clock clock, int connectTimeoutMs, int readTimeoutMs) {
         this(apiOrigin, returnUrl, null, secretKey, mapper, clock, connectTimeoutMs, readTimeoutMs);
@@ -58,6 +63,12 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
 
     FlutterwavePaymentGateway(URI apiOrigin, URI returnUrl, URI webReturnUrl, String secretKey,
                               ObjectMapper mapper, Clock clock, int connectTimeoutMs, int readTimeoutMs) {
+        this(apiOrigin, returnUrl, webReturnUrl, secretKey, "card, mobilemoneyrwanda",
+                mapper, clock, connectTimeoutMs, readTimeoutMs);
+    }
+
+    FlutterwavePaymentGateway(URI apiOrigin, URI returnUrl, URI webReturnUrl, String secretKey, String paymentOptions,
+                             ObjectMapper mapper, Clock clock, int connectTimeoutMs, int readTimeoutMs) {
         if (!isHttpsUrl(returnUrl) || !PAYMENT_RETURN_PATH.equals(returnUrl.getRawPath()) || returnUrl.getRawQuery() != null) {
             throw new IllegalStateException("CRUST_PAYMENT_RETURN_URL must be an absolute HTTPS URL at "
                     + PAYMENT_RETURN_PATH + " without a query or fragment");
@@ -73,6 +84,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
         this.returnUrl = returnUrl;
         this.webReturnUrl = webReturnUrl;
         this.secretKey = secretKey;
+        this.paymentOptions = parsePaymentOptions(paymentOptions);
         this.mapper = mapper;
         this.responseReader = mapper.readerFor(JsonNode.class)
                 .with(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY, DeserializationFeature.FAIL_ON_TRAILING_TOKENS,
@@ -80,6 +92,17 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
         this.clock = clock;
         this.connectTimeoutMs = connectTimeoutMs;
         this.readTimeoutMs = readTimeoutMs;
+    }
+
+    private static String parsePaymentOptions(String value) {
+        List<String> options = value == null ? List.of()
+                : Arrays.stream(value.split(",", -1)).map(String::strip).toList();
+        if (options.isEmpty() || options.size() > RWANDA_PAYMENT_OPTIONS.size()
+                || !RWANDA_PAYMENT_OPTIONS.containsAll(options) || Set.copyOf(options).size() != options.size()) {
+            throw new IllegalStateException("CRUSTCAPER_FLUTTERWAVE_PAYMENT_OPTIONS must list "
+                    + "card, mobilemoneyrwanda or both without duplicates");
+        }
+        return String.join(", ", options);
     }
 
     @Override
@@ -95,7 +118,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
                 .put("amount", request.amount())
                 .put("currency", request.currency())
                 .put("redirect_url", checkoutReturn.toASCIIString() + "?orderId=" + request.orderId())
-                .put("payment_options", "card,mobilemoneyrwanda")
+                .put("payment_options", paymentOptions)
                 .put("link_expiration", request.expiresAt().toString());
         ObjectNode customer = payload.putObject("customer").put("email", request.email());
         if (request.phone() != null && !request.phone().isBlank()) {

@@ -29,6 +29,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -74,10 +75,41 @@ class FlutterwavePaymentGatewayTest {
         assertThat(json.path("amount").longValue()).isEqualTo(9_200);
         assertThat(json.path("currency").asString("")).isEqualTo("RWF");
         assertThat(json.path("redirect_url").asString("")).isEqualTo(RETURN + "?orderId=order-1");
-        assertThat(json.path("payment_options").asString("")).isEqualTo("card,mobilemoneyrwanda");
+        assertThat(json.path("payment_options").asString("")).isEqualTo("card, mobilemoneyrwanda");
         assertThat(json.path("link_expiration").asString("")).isEqualTo(EXPIRY.toString());
         assertThat(json.path("customer").path("email").asString("")).isEqualTo(EMAIL);
         assertThat(json.path("customer").path("phone_number").asString("")).isEqualTo("+250700000000");
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+        "card | card",
+        "mobilemoneyrwanda | mobilemoneyrwanda",
+        "'  card,mobilemoneyrwanda  ' | 'card, mobilemoneyrwanda'",
+        "mobilemoneyrwanda, card | mobilemoneyrwanda, card",
+    })
+    void sendsOnlyConfiguredOptionsToHostedCheckoutOnBothChannels(String options, String expected) throws IOException {
+        fixtureResponse(200, hostedLink(PAYMENT_LINK));
+        PaymentGateway configured = gatewayWithPaymentOptions(options);
+        for (CheckoutChannel channel : CheckoutChannel.values()) {
+            var request = new PaymentRequest("attempt-1", "order-1", 9_200, "RWF", "+250700000000",
+                    EMAIL, EXPIRY, channel);
+            assertThat(configured.open(request).checkoutUrl()).isEqualTo(PAYMENT_LINK);
+            assertThat(mapper.readTree(recorded.get().body()).path("payment_options").asString("")).isEqualTo(expected);
+        }
+        assertThat(requestCount.get()).isEqualTo(CheckoutChannel.values().length);
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {
+        "", "  ", "card,", ",mobilemoneyrwanda", "card, ,mobilemoneyrwanda", "card, card",
+        "mobilemoneyrwanda, mobilemoneyrwanda", "card, mobilemoneyrwanda, card", "CARD", "card, unknown-option",
+    })
+    void failsStartupForMissingOrInvalidPaymentOptions(String options) {
+        var failure = assertThrows(IllegalStateException.class, () -> gatewayWithPaymentOptions(options));
+        assertThat(failure).hasMessage("CRUSTCAPER_FLUTTERWAVE_PAYMENT_OPTIONS must list card, mobilemoneyrwanda or both without duplicates");
+        assertThat(requestCount.get()).isZero();
     }
 
     @ParameterizedTest
@@ -327,6 +359,12 @@ class FlutterwavePaymentGatewayTest {
     private PaymentGateway gatewayWithReturnUrl(String returnUrl, int readTimeoutMs) {
         return new FlutterwavePaymentGateway(fixtureOrigin(), URI.create(returnUrl), KEY, mapper,
                 Clock.fixed(NOW, ZoneOffset.UTC), 1_000, readTimeoutMs);
+    }
+
+    private PaymentGateway gatewayWithPaymentOptions(String options) {
+        return new FlutterwavePaymentGateway(fixtureOrigin(), URI.create(RETURN),
+                URI.create("https://storefront.example.test/web-payment-return"), KEY, options, mapper,
+                Clock.fixed(NOW, ZoneOffset.UTC), 1_000, 1_000);
     }
 
     private static PaymentRequest paymentRequest(String email, Instant expiresAt) {
