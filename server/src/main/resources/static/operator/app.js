@@ -67,6 +67,7 @@ const roles = {
   manager: { name: 'Manager', heading: 'Order queue' },
 };
 const statuses = { accepted: 'New', preparing: 'Preparing', ready: 'Ready for pickup' };
+const deliveryProgress = { accepted: 0, preparing: 1, ready: 2 };
 const paymentReasons = {
   duplicate_transaction: 'Duplicate payment',
   restaurant_cancelled: 'Restaurant cancelled',
@@ -92,6 +93,7 @@ const overdueMs = 60_000;
 const cards = new Map();
 const kitchenTransitions = new Set();
 const pickupChecks = new Map();
+const knownExternalOrders = new Set();
 
 let session = null;
 let orders = [];
@@ -458,15 +460,24 @@ function renderOrders() {
 }
 
 function updateExternalOrder(order) {
+  const latest = externalOrders.find(({ id }) => id === order.id);
+  const active = Object.hasOwn(deliveryProgress, order.status);
+  // An active response cannot undo observed progress or restore an order that left the active queue.
+  if (active && (latest ? deliveryProgress[latest.status] > deliveryProgress[order.status] : knownExternalOrders.has(order.id))) {
+    void refreshQueue(true);
+    return latest;
+  }
   // Discard a queue read that started before a write or a separately confirmed status.
   refreshVersion++;
   refreshing = false;
   refreshButton.disabled = false;
   externalOrders = externalOrders.filter(({ id }) => id !== order.id);
-  if (Object.hasOwn(statuses, order.status)) externalOrders.push(order);
+  if (active) externalOrders.push(order);
+  knownExternalOrders.add(order.id);
   sawExternalOrders = true;
   renderOrders();
   void refreshQueue(true);
+  return order;
 }
 
 function isCurrentCancellation(selection) {
@@ -824,6 +835,7 @@ function closeSession(message = '') {
   orderSound.mute();
   orders = [];
   externalOrders = [];
+  knownExternalOrders.clear();
   sawExternalOrders = false;
   cards.clear();
   orderList.replaceChildren();
@@ -895,6 +907,7 @@ async function refreshQueue(force = false) {
     if (new Set(nextExternal.map(({ id }) => id)).size !== nextExternal.length) throw new ApiError(502, 'invalid_response');
     orders = nextOrders;
     externalOrders = nextExternal;
+    for (const order of nextExternal) knownExternalOrders.add(order.id);
     sawExternalOrders ||= externalOrders.length !== 0;
     queueSnapshot = { serverTime, receivedAt: performance.now() };
     needsQueueRefresh = false;

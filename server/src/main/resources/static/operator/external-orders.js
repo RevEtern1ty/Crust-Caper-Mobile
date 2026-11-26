@@ -213,9 +213,7 @@ export function mountExternalOrders({
         || JSON.stringify(order.lines) !== JSON.stringify(payload.lines)) throw new Error('Unexpected delivery order response');
       pendingOrder = null;
       resetForm();
-      onOrder(order);
-      showMessage(notice, `Delivery order ${order.externalReference} is ${labels[order.status]}.`);
-      notice.focus();
+      reportOutcome(order, null, true);
     } catch (error) {
       if (currentSession() !== current || expired(error)) return;
       if (error.code === 'external_reference_conflict') {
@@ -246,11 +244,16 @@ export function mountExternalOrders({
   }
 
   function reportOutcome(order, wanted, focus) {
-    onOrder(order);
+    const current = onOrder(order);
     const name = `Delivery order ${order.externalReference}`;
-    const message = order.status === 'collected' && wanted === 'collected'
-      ? order.confirmedByCurrentOperator ? `Handoff for ${order.externalReference} was confirmed by this account.` : `${name} was already handed off.`
-      : `${name} is ${labels[order.status]}.`;
+    let message = `${name} is no longer in the active queue.`;
+    if (current) {
+      message = `${name} is ${labels[current.status]}.`;
+      if (current.status === 'collected' && wanted === 'collected') {
+        message = current.confirmedByCurrentOperator ? `Handoff for ${current.externalReference} was confirmed by this account.`
+          : `${name} was already handed off.`;
+      }
+    }
     showMessage(notice, message);
     if (focus) notice.focus();
   }

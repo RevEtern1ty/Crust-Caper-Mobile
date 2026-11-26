@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { Buffer } = require('node:buffer');
 const { randomUUID } = require('node:crypto');
 const { mkdir } = require('node:fs/promises');
-const { resolve } = require('node:path');
+const { dirname, resolve } = require('node:path');
 const { test } = require('node:test');
 const { setTimeout: delay } = require('node:timers/promises');
 const { chromium } = require('playwright-core');
@@ -234,6 +234,91 @@ test('delivery intake and handoff recover lost replies alongside a paid direct o
   await button(staffPage, 'Reload delivery platforms').waitFor();
   assert.equal(await unavailableReference.isEditable(), true);
   assert.equal(await unavailableReference.inputValue(), 'UNAVAILABLE-' + reference);
+});
+
+test('a delayed delivery preparation response preserves the newer queue through an outage', { timeout: 25_000 }, async t => {
+  let origin;
+  if (process.env.CRUSTCAPER_API_BASE_URL) {
+    assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+    origin = new URL(api).origin;
+  } else {
+    const server = createPreviewServer(resolve(dirname(module.filename), '../server/src/main/resources/static'));
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    origin = `http://127.0.0.1:${server.address().port}`;
+  }
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const order = {
+    id: 'c6d94914-6a8d-4f7b-8353-8772685a9b65', channel: 'test-platform', channelLabel: 'Test delivery',
+    externalReference: 'KITCHEN-41', status: 'accepted', confirmedByCurrentOperator: false,
+    acceptedAt: '2031-01-01T12:00:00Z', scheduledAt: '2031-01-01T12:10:00Z',
+    lines: [{ name: 'Fixture sandwich', quantity: 1, modifiers: [] }],
+  };
+  const ordersUrl = origin + '/api/v1/operator/orders';
+  const orderUrl = origin + '/api/v1/operator/external-orders/' + order.id;
+  const transitionUrl = orderUrl + '/status';
+  for (const removed of [false, true]) {
+    const delayedUrl = removed ? orderUrl : transitionUrl;
+    await t.test(removed ? 'terminal order and delayed recovery read' : 'ready order and delayed write reply', async t => {
+      const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+      t.after(() => page.close());
+      page.setDefaultTimeout(6500);
+      const releasePreparation = Promise.withResolvers();
+      let queueUnavailable = false;
+      let externalOrders = [order];
+      await page.route(origin + '/api/v1/operator/**', async route => {
+        const request = route.request();
+        if (request.url() === origin + '/api/v1/operator/sessions') {
+          return route.fulfill({ status: 201, json: { accessToken: 'fixture-token', role: 'kitchen', storeId: 'kigali',
+            expiresAt: new Date(Date.now() + 120_000).toISOString() } });
+        }
+        if (request.url() === ordersUrl) {
+          return queueUnavailable ? route.fulfill({ status: 503, json: { code: 'service_unavailable' } })
+            : route.fulfill({ json: { orders: [], externalOrders, serverTime: '2031-01-01T12:00:05Z' } });
+        }
+        if (request.url() === delayedUrl) {
+          await releasePreparation.promise;
+          return route.fulfill({ json: { ...order, status: 'preparing' } });
+        }
+        return route.abort();
+      });
+
+      try {
+        await page.goto(origin + '/operator/index.html');
+        await page.getByLabel('Username', { exact: true }).fill('fixture-kitchen');
+        await page.getByLabel('Password', { exact: true }).fill('fixture-only');
+        await button(page, 'Sign in').click();
+        const card = page.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem')
+          .filter({ hasText: order.externalReference });
+        const preparation = page.waitForRequest(request => request.url() === transitionUrl && request.method() === 'POST');
+        const pending = page.waitForRequest(request => request.url() === delayedUrl);
+        await button(card, 'Start preparing').click();
+        assert.deepEqual((await preparation).postDataJSON(), { status: 'preparing' });
+        await pending;
+
+        // A second operator advances or hands off the order while the first response is in flight.
+        externalOrders = removed ? [] : [{ ...order, status: 'ready' }];
+        await button(page, 'Refresh').click();
+        if (removed) await shown(page, 'No orders are waiting.');
+        else await shown(card, 'Ready for handoff');
+
+        queueUnavailable = true;
+        releasePreparation.resolve();
+        await shown(page, 'The order queue could not be refreshed. Try again.');
+        if (removed) assert.equal(await card.count(), 0);
+        else assert.equal(await card.locator('.order-status').textContent(), 'Ready for handoff');
+        assert.equal(await button(card, 'Mark ready').count(), 0);
+        const expectedNotice = removed ? 'no longer in the active queue' : 'ready for handoff';
+        assert.equal(await page.locator('#external-queue-notice').textContent(), `Delivery order KITCHEN-41 is ${expectedNotice}.`);
+      } finally {
+        releasePreparation.resolve();
+      }
+    });
+  }
 });
 
 test('pickup is checked against the server after a lost reply or a concurrent cancellation', { timeout: 35_000 }, async t => {
