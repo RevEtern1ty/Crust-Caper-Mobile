@@ -35,6 +35,8 @@ dependencies {
 
 tasks.named('test') {
     useJUnitPlatform()
+    // Keep cached Spring test contexts within the shared PostgreSQL connection limit.
+    systemProperty 'spring.datasource.hikari.maximum-pool-size', '4'
 }
 
 tasks.named('bootJar') {

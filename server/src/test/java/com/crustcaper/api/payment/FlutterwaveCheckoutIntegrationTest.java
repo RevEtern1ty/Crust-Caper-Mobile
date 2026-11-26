@@ -23,10 +23,13 @@ import java.time.Clock;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -56,7 +59,6 @@ class FlutterwaveCheckoutIntegrationTest {
     private static final String STORE_PREFIX = "provider-fixture-";
     private static final String SKU = "fixture-burger";
     private static final String SLOT = "fixture-slot";
-    private static final String TRANSACTION = "8292017";
     private static final long TOTAL = 9200;
     private static final String KEY = "Idempotency-Key";
     private static final String FIXTURE_KEY = "checkout-wire-fixture";
@@ -66,8 +68,13 @@ class FlutterwaveCheckoutIntegrationTest {
     private static final AtomicReference<JsonNode> OPEN_BODY = new AtomicReference<>();
     private static final AtomicInteger OPENS = new AtomicInteger();
     private static final AtomicInteger VERIFICATIONS = new AtomicInteger();
-    private static final AtomicLong CHARGED = new AtomicLong(TOTAL - 1);
+    private static final AtomicLong CHARGED = new AtomicLong();
+    private static final AtomicLong TRANSACTION = new AtomicLong();
     private static HttpServer provider;
+
+    private final String store = STORE_PREFIX + UUID.randomUUID();
+    private final UUID operator = UUID.randomUUID();
+    private UUID guestSession;
 
     @Autowired MockMvc api;
     @Autowired JdbcClient jdbc;
@@ -100,6 +107,35 @@ class FlutterwaveCheckoutIntegrationTest {
         return new FlutterwaveWebhookSignature(WEBHOOK_SECRET);
     }
 
+    @BeforeEach
+    void resetProviderFixture() {
+        OPEN_BODY.set(null);
+        OPENS.set(0);
+        VERIFICATIONS.set(0);
+        CHARGED.set(TOTAL - 1);
+        TRANSACTION.set(ThreadLocalRandom.current().nextLong(1_000_000_000_000_000L, Long.MAX_VALUE));
+    }
+
+    @AfterEach
+    void removeFixtureRows() {
+        jdbc.sql("""
+            DELETE FROM payment_exceptions WHERE attempt_id IN (
+                SELECT p.id FROM payment_attempts p JOIN orders o ON o.id = p.order_id WHERE o.store_id = ?
+            )
+            """).param(store).update();
+        jdbc.sql("DELETE FROM payment_attempts WHERE order_id IN (SELECT id FROM orders WHERE store_id = ?)")
+            .param(store).update();
+        for (String table : List.of("orders", "quotes", "pickup_slots", "menu_products")) {
+            jdbc.sql("DELETE FROM " + table + " WHERE store_id = ?").param(store).update();
+        }
+        if (guestSession != null) {
+            jdbc.sql("DELETE FROM guest_sessions WHERE id = ?").param(guestSession).update();
+        }
+        jdbc.sql("DELETE FROM operator_sessions WHERE operator_id = ?").param(operator).update();
+        jdbc.sql("DELETE FROM operator_accounts WHERE id = ? AND store_id = ?").params(operator, store).update();
+        jdbc.sql("DELETE FROM stores WHERE id = ?").param(store).update();
+    }
+
     @AfterAll
     static void stopProvider() {
         if (provider != null) provider.stop(0);
@@ -112,7 +148,8 @@ class FlutterwaveCheckoutIntegrationTest {
     private static void verify(HttpExchange exchange) throws IOException {
         try (exchange) {
             JsonNode payment = OPEN_BODY.get();
-            boolean byId = ("/v3/transactions/" + TRANSACTION + "/verify").equals(exchange.getRequestURI().getPath());
+            long transaction = TRANSACTION.get();
+            boolean byId = ("/v3/transactions/" + transaction + "/verify").equals(exchange.getRequestURI().getPath());
             boolean byReference = payment != null && "/v3/transactions/verify_by_reference".equals(exchange.getRequestURI().getPath())
                 && ("tx_ref=" + payment.path("tx_ref").asString()).equals(exchange.getRequestURI().getRawQuery());
             if (!authorized(exchange) || !"GET".equals(exchange.getRequestMethod()) || payment == null || !(byId || byReference)) {
@@ -121,7 +158,7 @@ class FlutterwaveCheckoutIntegrationTest {
             }
             VERIFICATIONS.incrementAndGet();
             byte[] body = WIRE_JSON.writeValueAsBytes(WIRE_JSON.createObjectNode().put("status", "success").set("data",
-                WIRE_JSON.createObjectNode().put("id", Long.parseLong(TRANSACTION)).put("status", "successful")
+                WIRE_JSON.createObjectNode().put("id", transaction).put("status", "successful")
                     .put("tx_ref", payment.path("tx_ref").asString()).put("currency", "RWF")
                     .put("amount", TOTAL).put("charged_amount", CHARGED.get())));
             exchange.getResponseHeaders().set("Content-Type", "application/json");
@@ -132,10 +169,11 @@ class FlutterwaveCheckoutIntegrationTest {
 
     @Test
     void lostCheckoutLinkReplaysTheSameAttemptAndOnlyVerifiedFullPaymentReachesKitchen() throws Exception {
-        String store = STORE_PREFIX + UUID.randomUUID();
-        String kitchen = seedStoreAndKitchen(store);
-        String guest = json.readTree(api.perform(post(API + "/guest-sessions")).andExpect(status().isOk())
-            .andReturn().getResponse().getContentAsByteArray()).path("accessToken").asString();
+        String kitchen = seedStoreAndKitchen();
+        JsonNode session = json.readTree(api.perform(post(API + "/guest-sessions")).andExpect(status().isOk())
+            .andReturn().getResponse().getContentAsByteArray());
+        guestSession = UUID.fromString(session.path("sessionId").asString());
+        String guest = session.path("accessToken").asString();
         var quoteInput = new QuoteInput(store, SLOT, List.of(new CartLine(SKU, List.of(), 1, TOTAL)));
         String quote = json.readTree(api.perform(post(API + "/quotes").header(HttpHeaders.AUTHORIZATION, "Bearer " + guest)
             .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(quoteInput)))
@@ -165,7 +203,8 @@ class FlutterwaveCheckoutIntegrationTest {
         assertThat(OPENS.get()).isEqualTo(1);
 
         String webhook = API + "/webhooks/flutterwave";
-        String event = "{\"event\":\"charge.completed\",\"data\":{\"id\":" + TRANSACTION + "}}";
+        String transaction = Long.toString(TRANSACTION.get());
+        String event = "{\"event\":\"charge.completed\",\"data\":{\"id\":" + transaction + "}}";
         api.perform(post(webhook).header("verif-hash", "fixture-wrong").contentType(MediaType.APPLICATION_JSON).content(event))
             .andExpect(status().isUnauthorized());
         assertThat(VERIFICATIONS.get()).isZero();
@@ -193,13 +232,13 @@ class FlutterwaveCheckoutIntegrationTest {
             .andExpect(status().isOk()).andExpect(jsonPath("$.orders.length()").value(1))
             .andExpect(jsonPath("$.orders[0].id").value(order));
         assertThat(jdbc.sql("SELECT provider_transaction_id FROM payment_attempts WHERE order_id = ? AND status = 'paid'")
-            .param(UUID.fromString(order)).query(String.class).list()).containsExactly(TRANSACTION);
+            .param(UUID.fromString(order)).query(String.class).list()).containsExactly(transaction);
         assertThat(jdbc.sql("SELECT count(*) FROM payment_attempts WHERE order_id = ?")
             .param(UUID.fromString(order)).query(Integer.class).single()).isEqualTo(1);
         assertThat(OPENS.get()).isEqualTo(1);
     }
 
-    private String seedStoreAndKitchen(String store) throws Exception {
+    private String seedStoreAndKitchen() throws Exception {
         String text = json.writeValueAsString(new Localized("Provider fixture", "Provider fixture"));
         jdbc.sql("""
             INSERT INTO stores (id, name, area, hours, open, tax_basis_points, version)
@@ -213,7 +252,6 @@ class FlutterwaveCheckoutIntegrationTest {
             INSERT INTO pickup_slots (store_id, id, starts_at, ends_at, capacity)
             VALUES (?, ?, now() + interval '20 minutes', now() + interval '30 minutes', 1)
             """).params(store, SLOT).update();
-        UUID operator = UUID.randomUUID();
         String token = "x" + UUID.randomUUID().toString().replace("-", "") + "testAbCdEf";
         String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
             .digest(token.getBytes(StandardCharsets.US_ASCII)));

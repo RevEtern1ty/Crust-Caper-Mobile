@@ -2,7 +2,7 @@ package com.crustcaper.api;
 
 import java.util.UUID;
 
-final class ApiFailure extends RuntimeException {
+public final class ApiFailure extends RuntimeException {
     private final int status;
     private final String code;
 
@@ -12,11 +12,11 @@ final class ApiFailure extends RuntimeException {
         this.code = code;
     }
 
-    int status() {
+    public int status() {
         return status;
     }
 
-    String code() {
+    public String code() {
         return code;
     }
 

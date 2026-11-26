@@ -27,6 +27,14 @@ async function capture(page, name) {
   await page.screenshot({ path: resolve(directory, name + '.png'), animations: 'disabled' });
 }
 
+async function restrictToOperatorAssets(page) {
+  const origin = new URL(api).origin;
+  await page.route('**/*', route => {
+    const url = new URL(route.request().url());
+    return url.origin === origin && url.pathname.startsWith('/operator/') ? route.continue() : route.abort();
+  });
+}
+
 async function send(path, { method = 'GET', token, data, key, installationId } = {}) {
   const headers = {};
   if (token) headers.Authorization = 'Bearer ' + token;
@@ -572,6 +580,7 @@ test('payment review displays a verified refund only after the API confirms it',
   };
   let recorded = false;
   const requested = [];
+  await restrictToOperatorAssets(page);
   await page.route('**/api/v1/operator/**', async route => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -583,6 +592,7 @@ test('payment review displays a verified refund only after the API confirms it',
     if (path.endsWith('/orders')) return route.fulfill({ json: { orders: [], serverTime: new Date().toISOString() } });
     if (path.endsWith('/receipts')) return route.fulfill({ json: [] });
     if (path.endsWith('/availability')) return route.fulfill({ json: { version: 'finance-fixture', open: true, products: [] } });
+    if (path.endsWith('/payment-attempts/pending')) return route.fulfill({ json: { attempts: [], hasMore: false } });
     if (path.endsWith('/payment-exceptions')) {
       return route.fulfill({ json: { exceptions: [recorded ? { ...payment, refund } : payment] } });
     }
@@ -618,6 +628,180 @@ test('payment review displays a verified refund only after the API confirms it',
   await button(page, 'Sign out').click();
   await shown(page, 'Staff sign in');
   assert.equal(await page.getByText(/^Refund verified/).count(), 0);
+  assert.deepEqual(errors, []);
+});
+
+test('manager rechecks overdue payments explicitly and reloads payment records after a lost reply', { timeout: 30_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const attempt = {
+    orderId: '84e40bb7-09b4-4a87-9027-f51487fcaf66',
+    merchantReference: '98fd88b0-01a4-4df4-97fd-e61d7c8aa7c5',
+    reservationExpiresAt: '2026-01-01T12:00:00Z',
+    lastCheckedAt: null,
+  };
+  const firstPage = [attempt, ...Array.from({ length: 49 }, (_, index) => ({
+    ...attempt,
+    orderId: `11111111-1111-4111-8111-${String(index).padStart(12, '0')}`,
+    merchantReference: `22222222-2222-4222-8222-${String(index).padStart(12, '0')}`,
+  }))];
+  const last = firstPage.at(-1).merchantReference;
+  const later = {
+    ...attempt,
+    orderId: '7643a790-ef8b-43bd-8867-bf72a227b93e',
+    merchantReference: '49851290-bdb8-4c9c-86b6-2449822092de',
+  };
+  const paymentExceptions = [{
+    orderId: '8e7b4721-c0c5-48c1-b3ad-e788388c6dfa',
+    merchantReference: 'cb9d9c54-0638-4361-adf0-4fe7abbb0195',
+    providerTransactionId: '1011001',
+    reason: 'duplicate_transaction',
+    createdAt: '2026-01-01T12:30:00Z',
+  }];
+  const checkPath = `/api/v1/operator/payment-attempts/${attempt.merchantReference}/recheck`;
+  const pendingReads = [];
+  let exceptionReads = 0;
+  let checks = 0;
+  let completeFirstCheck;
+  const firstCheck = new Promise(resolve => { completeFirstCheck = resolve; });
+  t.after(completeFirstCheck);
+  await restrictToOperatorAssets(page);
+  await page.route('**/api/v1/operator/**', async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    if (path.endsWith('/sessions')) {
+      const role = request.postDataJSON().username === 'fixture-manager' ? 'manager' : 'kitchen';
+      return route.fulfill({ json: { accessToken: 'fixture-session', role, storeId: 'kigali',
+        expiresAt: new Date(Date.now() + 60_000).toISOString() } });
+    }
+    if (path.endsWith('/sessions/current')) return route.fulfill({ status: 204, body: '' });
+    if (path.endsWith('/orders')) return route.fulfill({ json: { orders: [], serverTime: new Date().toISOString() } });
+    if (path.endsWith('/receipts')) return route.fulfill({ json: [] });
+    if (path.endsWith('/availability')) return route.fulfill({ json: { version: 'finance-fixture', open: true, products: [] } });
+    if (path.endsWith('/payment-exceptions')) {
+      exceptionReads++;
+      return route.fulfill({ json: { exceptions: paymentExceptions } });
+    }
+    if (path.endsWith('/payment-attempts/pending')) {
+      const after = url.searchParams.get('after');
+      pendingReads.push(after);
+      if (pendingReads.length === 1) return route.fulfill({ status: 503, json: { code: 'unavailable' } });
+      if (after === last) return route.fulfill({ json: { attempts: [later], hasMore: false } });
+      assert.equal(after, null);
+      return route.fulfill({ json: { attempts: checks === 3 ? [] : firstPage, hasMore: checks < 3 } });
+    }
+    if (path === checkPath) {
+      assert.equal(request.method(), 'POST');
+      assert.equal(request.postData(), null);
+      checks++;
+      if (checks === 1) {
+        await firstCheck;
+        attempt.lastCheckedAt = '2026-01-01T12:35:00Z';
+        return route.fulfill({ json: { status: 'pending' } });
+      }
+      if (checks === 2) return route.fulfill({ status: 409, json: { code: 'payment_check_cooldown' } });
+      paymentExceptions.push({
+        orderId: attempt.orderId, merchantReference: attempt.merchantReference,
+        providerTransactionId: '2022002', reason: 'unavailable_reservation', createdAt: '2026-01-01T12:40:00Z',
+      });
+      return route.abort('connectionreset');
+    }
+    return route.abort();
+  });
+
+  const signIn = async username => {
+    await page.getByLabel('Username', { exact: true }).fill(username);
+    await page.getByLabel('Password', { exact: true }).fill('fixture-only');
+    await button(page, 'Sign in').click();
+  };
+  await page.goto(new URL('/operator/index.html', api).href);
+  await signIn('fixture-kitchen');
+  await shown(page, 'Kitchen queue');
+  assert.equal(await button(page, 'Payment review').isVisible(), false);
+  assert.equal(await page.locator('#payment-review').isVisible(), false);
+  await button(page, 'Sign out').click();
+  await signIn('fixture-manager');
+  await button(page, 'Payment review').click();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'payment-review-title');
+  await shown(page, 'Unresolved payments could not be loaded. Select Refresh unresolved payments.');
+  await shown(page, 'Duplicate payment');
+  assert.equal(exceptionReads, 1);
+  assert.equal(checks, 0);
+
+  const pending = page.getByRole('list', { name: 'Unresolved payments' });
+  const recheck = button(pending, 'Recheck payment for order #87FCAF66');
+  const card = pending.getByRole('listitem').filter({ has: button(page, 'Recheck payment for order #87FCAF66') });
+  await button(page, 'Refresh unresolved payments').click();
+  await recheck.waitFor();
+  assert.equal(await card.locator('.pending-payment-reference').textContent(), attempt.merchantReference);
+  assert.equal(await card.locator('.pending-payment-order').textContent(), attempt.orderId);
+  await shown(page, 'Awaiting first check');
+  for (const width of [320, 390, 430]) {
+    await page.setViewportSize({ width, height: 800 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+    await card.scrollIntoViewIfNeeded();
+    await capture(page, `operator-pending-payment-review-${width}`);
+    await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+    assert.equal(await card.evaluate(el => el.scrollWidth), await card.evaluate(el => el.clientWidth));
+    assert.equal(await pending.evaluate(el => el.scrollWidth), await pending.evaluate(el => el.clientWidth));
+    await recheck.scrollIntoViewIfNeeded();
+    await capture(page, `operator-pending-payment-review-${width}-large-text`);
+    await page.evaluate(() => { document.documentElement.style.fontSize = ''; });
+  }
+  await page.setViewportSize({ width: 320, height: 800 });
+  await page.getByRole('link', { name: 'Go to payment exceptions' }).click();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'payment-exceptions-title');
+  await shown(page, 'Duplicate payment');
+
+  await button(page, 'Next 50 payments').click();
+  await shown(page, 'Order #A227B93E');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'pending-payments-title');
+  assert.equal(await recheck.count(), 0);
+  const pageReloaded = page.waitForResponse(response => new URL(response.url()).searchParams.get('after') === last);
+  await button(page, 'Refresh unresolved payments').click();
+  await pageReloaded;
+  await button(page, 'First page').click();
+  await recheck.waitFor();
+  assert.deepEqual(pendingReads, [null, null, last, last, null]);
+
+  const posted = page.waitForRequest(request => new URL(request.url()).pathname === checkPath && request.method() === 'POST');
+  await recheck.click();
+  await posted;
+  await shown(page, 'Checking payment for order #87FCAF66…');
+  assert.equal(await recheck.isDisabled(), true);
+  assert.equal(await page.getByText(/Payment check completed/).count(), 0);
+  assert.equal(pendingReads.length, 5);
+  assert.equal(exceptionReads, 1);
+  completeFirstCheck();
+  await shown(page, 'Payment for order #87FCAF66 is still unresolved.');
+  assert.equal(await card.getByText('Awaiting first check').count(), 0);
+  assert.match(await card.locator('.pending-payment-checked').textContent(), /14:35/);
+  assert.deepEqual([pendingReads.length, exceptionReads, checks], [6, 2, 1]);
+
+  await recheck.click();
+  await shown(page, 'This payment was checked recently. Wait before rechecking.');
+  assert.deepEqual([pendingReads.length, exceptionReads, checks], [7, 3, 2]);
+
+  await recheck.click();
+  await shown(page, 'The payment check could not be confirmed. Review the payment lists before trying again.');
+  await shown(page, 'No unresolved payments with an expired reservation.');
+  await shown(page, 'Payment after reservation ended');
+  assert.equal(await page.getByText(/Payment check completed/).count(), 0);
+  assert.equal(await recheck.count(), 0);
+  assert.deepEqual([pendingReads.length, exceptionReads, checks], [8, 4, 3]);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'pending-payments-notice');
+  await button(page, 'Refresh unresolved payments').click();
+  await shown(page, 'No unresolved payments with an expired reservation.');
+  assert.deepEqual([pendingReads.length, exceptionReads, checks], [9, 4, 3]);
+  await button(page, 'Sign out').click();
+  await shown(page, 'Staff sign in');
+  assert.equal(await pending.getByText(attempt.merchantReference).count(), 0);
   assert.deepEqual(errors, []);
 });
 

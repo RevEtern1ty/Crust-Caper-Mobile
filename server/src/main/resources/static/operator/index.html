@@ -70,15 +70,38 @@
 
         <section class="payment-review" id="payment-review" aria-labelledby="payment-review-title" hidden>
           <div class="queue-header">
-            <div>
-              <h2 id="payment-review-title" tabindex="-1">Payment review</h2>
-              <p class="payment-review-help">Process the refund in Flutterwave using the provider transaction ID. Enter the refund ID here to verify and record the result.</p>
-            </div>
-            <button class="button button-secondary" id="payment-review-refresh" type="button">Refresh payment review</button>
+            <h2 id="payment-review-title" tabindex="-1">Payment review</h2>
+            <a class="payment-review-link" href="#payment-exceptions-title">Go to payment exceptions</a>
           </div>
-          <p class="problem" id="payment-review-problem" role="alert" hidden></p>
-          <p class="empty-state" id="payment-review-empty" role="status" hidden>No recent payment exceptions.</p>
-          <ul class="order-list" id="payment-review-list" aria-label="Payment exceptions"></ul>
+          <section class="payment-review-group" aria-labelledby="pending-payments-title">
+            <div class="queue-header">
+              <div>
+                <h3 id="pending-payments-title" tabindex="-1">Unresolved payments</h3>
+                <p class="payment-review-help">Recheck Flutterwave for a payment whose reservation expired. Use the merchant reference to find the attempt in Flutterwave.</p>
+              </div>
+              <button class="button button-secondary" id="pending-payments-refresh" type="button">Refresh unresolved payments</button>
+            </div>
+            <p class="queue-notice" id="pending-payments-notice" role="status" tabindex="-1" hidden></p>
+            <p class="problem" id="pending-payments-problem" role="alert" hidden></p>
+            <p class="empty-state" id="pending-payments-empty" role="status" hidden></p>
+            <nav class="toolbar pending-payments-navigation" id="pending-payments-navigation" aria-label="Unresolved payment pages" hidden>
+              <button class="button button-secondary" id="pending-payments-first" type="button" hidden>First page</button>
+              <button class="button button-secondary" id="pending-payments-next" type="button" hidden>Next 50 payments</button>
+            </nav>
+            <ul class="order-list" id="pending-payments-list" aria-labelledby="pending-payments-title"></ul>
+          </section>
+          <section class="payment-review-group" aria-labelledby="payment-exceptions-title">
+            <div class="queue-header">
+              <div>
+                <h3 id="payment-exceptions-title" tabindex="-1">Payment exceptions</h3>
+                <p class="payment-review-help">Process the refund in Flutterwave using the provider transaction ID. Enter the refund ID here to verify and record the result.</p>
+              </div>
+              <button class="button button-secondary" id="payment-review-refresh" type="button">Refresh payment review</button>
+            </div>
+            <p class="problem" id="payment-review-problem" role="alert" hidden></p>
+            <p class="empty-state" id="payment-review-empty" role="status" hidden>No recent payment exceptions.</p>
+            <ul class="order-list" id="payment-review-list" aria-labelledby="payment-exceptions-title"></ul>
+          </section>
         </section>
 
         <section class="payment-review" id="fiscal-receipts" aria-labelledby="fiscal-receipts-title" hidden>
@@ -161,9 +184,23 @@
         <p class="problem order-problem" role="alert" hidden></p>
       </li>
     </template>
+    <template id="pending-payment-template">
+      <li class="order-card">
+        <h4 class="order-title pending-payment-title"></h4>
+        <dl class="payment-identifiers">
+          <dt>Order ID</dt><dd class="pending-payment-order"></dd>
+          <dt>Flutterwave merchant reference (tx_ref)</dt><dd class="pending-payment-reference"></dd>
+          <dt>Reservation expired (Kigali time)</dt><dd class="pending-payment-expires"></dd>
+          <dt>Last checked (Kigali time)</dt><dd class="pending-payment-checked"></dd>
+        </dl>
+        <div class="order-actions">
+          <button class="button button-secondary pending-payment-recheck" type="button">Recheck payment</button>
+        </div>
+      </li>
+    </template>
     <template id="payment-exception-template">
       <li class="order-card">
-        <h3 class="order-title payment-exception-reason"></h3>
+        <h4 class="order-title payment-exception-reason"></h4>
         <p class="pickup-window payment-exception-time"></p>
         <dl class="payment-identifiers">
           <dt>Order ID</dt><dd class="payment-exception-order"></dd>

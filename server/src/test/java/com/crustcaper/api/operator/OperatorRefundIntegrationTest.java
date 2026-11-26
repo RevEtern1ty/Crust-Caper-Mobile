@@ -74,6 +74,20 @@ class OperatorRefundIntegrationTest {
     }
 
     @Test
+    void localModeNeverOffersManualProviderVerification() throws Exception {
+        var order = newOrder(true);
+        jdbc.sql("UPDATE orders SET reservation_expires_at = now() - interval '49 hours' WHERE id = ?")
+            .param(order.id()).update();
+        String manager = login(staff(store, "manager"));
+        String attempts = OPERATOR + "/payment-attempts";
+        api.perform(get(attempts + "/pending").header(HttpHeaders.AUTHORIZATION, manager))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.attempts").isEmpty()).andExpect(jsonPath("$.hasMore").value(false));
+        api.perform(post(attempts + "/{reference}/recheck", order.attemptId()).header(HttpHeaders.AUTHORIZATION, manager))
+            .andExpect(status().isNotFound());
+        assertThat(orderState(order.id())).isEqualTo("awaiting_payment:processing");
+    }
+
+    @Test
     void onlyTheOriginalLateChargeClosesRefundPendingAndTheSameRefundReplaysWithoutNewLookup() throws Exception {
         OrderFixture order = newOrder(true);
         settle(order.attemptId(), LATE_TRANSACTION);

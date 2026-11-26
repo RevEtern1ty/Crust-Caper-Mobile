@@ -613,6 +613,62 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/payment-attempts/pending:
+    get:
+      operationId: listOperatorPendingPaymentAttempts
+      security: [{ operatorBearer: [] }]
+      description: Unresolved Flutterwave attempts for the manager's store after 48 hours from reservation expiration.
+      parameters:
+        - name: after
+          in: query
+          required: false
+          description: Merchant reference of the last attempt on the previous page. An unavailable cursor returns an empty page.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Up to 50 eligible attempts, oldest expired reservations first. Local payment mode returns an empty list.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorPendingPaymentAttempts' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { description: The cursor is malformed. }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/payment-attempts/{merchantReference}/recheck:
+    post:
+      operationId: recheckOperatorPendingPaymentAttempt
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: merchantReference
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Existing attempt rechecked by reference. A verified late payment is recorded for refund review.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status: { type: string, enum: [pending, settled] }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { description: The reference is invalid or no eligible unresolved attempt with that reference belongs to the manager's store. }
+        '409':
+          description: The last verification claim is less than 60 seconds old (payment_check_cooldown), or the provider payment does not match the stored attempt (payment_mismatch).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/payment-exceptions/{merchantReference}/{providerTransactionId}/refund:
     post:
       operationId: verifyOperatorRefund
@@ -952,6 +1008,28 @@ components:
               refund: { $ref: '#/components/schemas/VerifiedRefund' }
               reason: { type: string, enum: [duplicate_transaction, unavailable_reservation, superseded_attempt, restaurant_cancelled] }
               createdAt: { $ref: '#/components/schemas/Timestamp' }
+    OperatorPendingPaymentAttempts:
+      type: object
+      additionalProperties: false
+      required: [attempts, hasMore]
+      properties:
+        attempts:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            additionalProperties: false
+            required: [orderId, merchantReference, reservationExpiresAt, lastCheckedAt]
+            properties:
+              orderId: { type: string, format: uuid }
+              merchantReference: { type: string, format: uuid, description: Merchant payment reference sent as tx_ref. }
+              reservationExpiresAt: { $ref: '#/components/schemas/Timestamp' }
+              lastCheckedAt:
+                description: Most recent verification claim time. A claim does not establish the result.
+                oneOf:
+                  - $ref: '#/components/schemas/Timestamp'
+                  - type: 'null'
+        hasMore: { type: boolean, description: More eligible attempts follow this page. }
     ProblemDetails:
       type: object
       required: [type, title, status, code]

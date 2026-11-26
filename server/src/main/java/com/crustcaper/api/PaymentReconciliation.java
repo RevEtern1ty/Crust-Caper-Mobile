@@ -1,5 +1,7 @@
 package com.crustcaper.api;
 
+import static com.crustcaper.api.OrderService.AUTOMATIC_RECONCILIATION_WINDOW_HOURS;
+
 import com.crustcaper.api.payment.PaymentGateway;
 import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGatewayException;
@@ -62,7 +64,7 @@ final class PaymentReconciliation {
                 SELECT p.id FROM payment_attempts p JOIN orders o ON o.id = p.order_id
                 WHERE p.status = 'processing'
                   AND p.initiated_at < now() - interval '30 seconds'
-                  AND o.reservation_expires_at > now() - interval '48 hours'
+                  AND o.reservation_expires_at > now() - make_interval(hours => ?)
                   AND (p.last_checked_at IS NULL OR p.last_checked_at < now() - CASE
                       WHEN o.reservation_expires_at > now() THEN interval '30 seconds'
                       WHEN o.reservation_expires_at > now() - interval '15 minutes' THEN interval '2 minutes'
@@ -73,7 +75,7 @@ final class PaymentReconciliation {
             )
             UPDATE payment_attempts p SET last_checked_at = now()
             FROM due WHERE p.id = due.id RETURNING p.id
-            """).query(UUID.class).optional();
+            """).param(AUTOMATIC_RECONCILIATION_WINDOW_HOURS).query(UUID.class).optional();
     }
 
     private void verify(UUID attempt) {

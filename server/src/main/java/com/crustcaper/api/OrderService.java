@@ -32,6 +32,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
 public class OrderService {
+    public static final int AUTOMATIC_RECONCILIATION_WINDOW_HOURS = 48;
+    public static final int OVERDUE_PAYMENT_CHECK_COOLDOWN_SECONDS = 60;
+    public static final String PAYMENT_MISMATCH = "payment_mismatch";
+
     private static final Pattern KEY = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
     private static final Pattern CATALOG_ID = Pattern.compile("[A-Za-z0-9._:-]{1,100}");
     private static final Pattern PHONE = Pattern.compile("\\+[1-9][0-9]{7,14}");
@@ -46,7 +50,6 @@ public class OrderService {
     private static final String LATEST_ATTEMPT = """
         SELECT * FROM payment_attempts WHERE order_id = ? ORDER BY sequence DESC LIMIT 1
         """;
-    private static final String PAYMENT_MISMATCH = "payment_mismatch";
     private static final long MAX_PRICE = 1_000_000_000L;
 
     private final JdbcClient jdbc;
@@ -379,10 +382,13 @@ public class OrderService {
 
     private boolean claimVerification(UUID attempt) {
         return jdbc.sql("""
-            UPDATE payment_attempts SET last_checked_at = now()
-            WHERE id = ? AND status = 'processing'
-              AND (last_checked_at IS NULL OR last_checked_at < now() - interval '15 seconds')
-            """).param(attempt).update() > 0;
+            UPDATE payment_attempts p SET last_checked_at = now()
+            FROM orders o
+            WHERE p.order_id = o.id AND p.id = ? AND p.status = 'processing'
+              AND (p.last_checked_at IS NULL OR p.last_checked_at <= now() - CASE
+                  WHEN o.reservation_expires_at <= now() - make_interval(hours => ?) THEN make_interval(secs => ?)
+                  ELSE interval '15 seconds' END)
+            """).params(attempt, AUTOMATIC_RECONCILIATION_WINDOW_HOURS, OVERDUE_PAYMENT_CHECK_COOLDOWN_SECONDS).update() > 0;
     }
 
     private StoredOrder recoverRecord(UUID guest, String key) {

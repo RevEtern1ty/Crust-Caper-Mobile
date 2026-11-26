@@ -106,6 +106,14 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .payment-review .queue-header > div { flex: 1 1 28rem; }
 .payment-review-help { margin-top: .45rem; color: var(--muted); }
 .payment-review .problem { margin-bottom: 1rem; }
+.payment-review-link { color: var(--green); font-weight: 720; text-underline-offset: .16em; overflow-wrap: anywhere; }
+.payment-review-link:focus-visible { outline: .19rem solid var(--green); outline-offset: .15rem; }
+.payment-review-group { margin-top: 1.4rem; }
+.payment-review-group + .payment-review-group { border-top: 1px solid var(--border); padding-top: 1.4rem; }
+.payment-review-group h3, .payment-review-group h4 { margin: 0; }
+.payment-review-group .button { overflow-wrap: anywhere; }
+.pending-payments-navigation { margin-block: .9rem; }
+.pending-payments-navigation > .button { flex: 0 1 auto; }
 .payment-identifiers { margin: 0; }
 .payment-identifiers dt { margin-top: .65rem; color: var(--muted); font-size: .85rem; font-weight: 700; }
 .payment-identifiers dd { margin: .12rem 0 0; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }

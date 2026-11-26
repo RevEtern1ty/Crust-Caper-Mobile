@@ -41,6 +41,13 @@ final class OperatorModels {
 
     record PaymentReview(List<PaymentExceptionView> exceptions) { }
 
+    record PendingPaymentAttempt(UUID orderId, UUID merchantReference, Instant reservationExpiresAt,
+                                 @JsonInclude(JsonInclude.Include.ALWAYS) Instant lastCheckedAt) { }
+
+    record PendingPaymentAttempts(List<PendingPaymentAttempt> attempts, boolean hasMore) { }
+
+    record PaymentRecheck(String status) { }
+
     record RefundInput(String providerRefundId) { }
 
     record RefundView(String providerRefundId, String refundStatus, long amount, String currency, Instant recordedAt) { }

@@ -34,6 +34,15 @@ const paymentReviewProblem = element('payment-review-problem');
 const paymentReviewEmpty = element('payment-review-empty');
 const paymentReviewList = element('payment-review-list');
 const paymentExceptionTemplate = element('payment-exception-template');
+const pendingPaymentsRefresh = element('pending-payments-refresh');
+const pendingPaymentsNotice = element('pending-payments-notice');
+const pendingPaymentsProblem = element('pending-payments-problem');
+const pendingPaymentsEmpty = element('pending-payments-empty');
+const pendingPaymentsNavigation = element('pending-payments-navigation');
+const pendingPaymentsFirst = element('pending-payments-first');
+const pendingPaymentsNext = element('pending-payments-next');
+const pendingPaymentsList = element('pending-payments-list');
+const pendingPaymentTemplate = element('pending-payment-template');
 const fiscalReceipts = element('fiscal-receipts');
 const fiscalReceiptsJump = element('fiscal-receipts-jump');
 const fiscalReceiptsRefresh = element('fiscal-receipts-refresh');
@@ -87,6 +96,10 @@ let needsQueueRefresh = false;
 let pagePaused = false;
 let refreshing = false;
 let paymentReviewVersion = 0;
+let pendingPaymentsLoading = false;
+let pendingPaymentChecking = false;
+let pendingPaymentsCursor = null;
+let pendingPaymentsNextCursor = null;
 let authVersion = 0;
 let cancellation = null;
 const availability = mountAvailability({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
@@ -463,6 +476,85 @@ function renderedPaymentException(entry) {
   return card;
 }
 
+function renderedPendingPayment(entry) {
+  if (!entry || typeof entry.orderId !== 'string' || !uuid.test(entry.orderId)
+    || typeof entry.merchantReference !== 'string' || !uuid.test(entry.merchantReference)
+    || typeof entry.reservationExpiresAt !== 'string' || !Number.isFinite(Date.parse(entry.reservationExpiresAt))
+    || (entry.lastCheckedAt !== null
+      && (typeof entry.lastCheckedAt !== 'string' || !Number.isFinite(Date.parse(entry.lastCheckedAt))))) {
+    throw new ApiError(502, 'invalid_response');
+  }
+  const card = pendingPaymentTemplate.content.firstElementChild.cloneNode(true);
+  const number = orderNumber(entry.orderId);
+  card.querySelector('.pending-payment-title').textContent = `Order ${number}`;
+  card.querySelector('.pending-payment-order').textContent = entry.orderId;
+  card.querySelector('.pending-payment-reference').textContent = entry.merchantReference;
+  card.querySelector('.pending-payment-expires').textContent = reviewTimeFormat.format(new Date(entry.reservationExpiresAt));
+  card.querySelector('.pending-payment-checked').textContent = entry.lastCheckedAt === null
+    ? 'Awaiting first check' : reviewTimeFormat.format(new Date(entry.lastCheckedAt));
+  const button = card.querySelector('.pending-payment-recheck');
+  button.setAttribute('aria-label', `Recheck payment for order ${number}`);
+  button.addEventListener('click', () => { void recheckPendingPayment(entry); });
+  return card;
+}
+
+function syncPendingPaymentControls() {
+  const busy = pendingPaymentsLoading || pendingPaymentChecking;
+  pendingPaymentsRefresh.disabled = busy;
+  pendingPaymentsFirst.disabled = busy;
+  pendingPaymentsNext.disabled = busy;
+  pendingPaymentsFirst.hidden = pendingPaymentsCursor === null;
+  pendingPaymentsNext.hidden = pendingPaymentsNextCursor === null;
+  pendingPaymentsNavigation.hidden = pendingPaymentsFirst.hidden && pendingPaymentsNext.hidden;
+  pendingPaymentsList.setAttribute('aria-busy', String(pendingPaymentsLoading));
+  for (const button of pendingPaymentsList.querySelectorAll('.pending-payment-recheck')) button.disabled = busy;
+}
+
+function pendingPaymentCheckMessage(error) {
+  const unconfirmed = 'The payment check could not be confirmed. Review the payment lists before trying again.';
+  if (!(error instanceof ApiError)) return unconfirmed;
+  if (error.code === 'payment_check_cooldown') return 'This payment was checked recently. Wait before rechecking.';
+  if (error.status === 404) return 'The attempt changed. Review the payment lists for its current status.';
+  if (error.status === 409) return 'Flutterwave verification requires review. Use the merchant reference to check the payment in Flutterwave.';
+  if (error.status === 503) {
+    return messageFor(error, 'Payment verification is temporarily unavailable. Review the payment lists and recheck later.');
+  }
+  return messageFor(error, unconfirmed);
+}
+
+async function recheckPendingPayment(entry) {
+  const current = availableSession();
+  if (current?.role !== 'manager' || pendingPaymentsLoading || pendingPaymentChecking) return;
+
+  const number = orderNumber(entry.orderId);
+  pendingPaymentChecking = true;
+  syncPendingPaymentControls();
+  showMessage(pendingPaymentsNotice, `Checking payment for order ${number}…`);
+  let message;
+  try {
+    const data = await request(`/payment-attempts/${entry.merchantReference}/recheck`, {
+      method: 'POST', token: current.accessToken, timeoutMs: 28_000,
+    });
+    if (data?.status === 'pending') message = `Payment for order ${number} is still unresolved.`;
+    else if (data?.status === 'settled') message = `Payment check completed for order ${number}. Review the payment exceptions for any required refund.`;
+    else throw new ApiError(502, 'invalid_response');
+  } catch (error) {
+    if (session !== current) return;
+    if (error instanceof ApiError && error.status === 401) {
+      closeSession('Your staff session expired. Sign in again.');
+      return;
+    }
+    message = pendingPaymentCheckMessage(error);
+  }
+  if (session !== current) return;
+  await Promise.all([refreshPendingPayments(), refreshPaymentReview(true)]);
+  if (session !== current) return;
+  pendingPaymentChecking = false;
+  syncPendingPaymentControls();
+  showMessage(pendingPaymentsNotice, message);
+  if (document.activeElement === document.body) pendingPaymentsNotice.focus();
+}
+
 async function verifyRefund(entry, card, form) {
   const current = availableSession();
   const submit = form.querySelector('button');
@@ -616,6 +708,15 @@ function closeSession(message = '') {
   paymentReviewRefresh.disabled = false;
   showMessage(paymentReviewProblem);
   showMessage(paymentReviewEmpty);
+  pendingPaymentsLoading = false;
+  pendingPaymentChecking = false;
+  pendingPaymentsCursor = null;
+  pendingPaymentsNextCursor = null;
+  pendingPaymentsList.replaceChildren();
+  syncPendingPaymentControls();
+  showMessage(pendingPaymentsNotice);
+  showMessage(pendingPaymentsProblem);
+  showMessage(pendingPaymentsEmpty);
   receipts = [];
   fiscalReceipts.hidden = true;
   fiscalReceiptsJump.hidden = true;
@@ -701,6 +802,53 @@ async function refreshPaymentReview(force = false) {
     }
   } finally {
     if (session === current && paymentReviewVersion === version) paymentReviewRefresh.disabled = false;
+  }
+}
+
+async function refreshPendingPayments(after = pendingPaymentsCursor) {
+  const current = availableSession();
+  if (current?.role !== 'manager' || pendingPaymentsLoading) return;
+
+  const moving = after !== pendingPaymentsCursor;
+  let moved = false;
+  pendingPaymentsLoading = true;
+  syncPendingPaymentControls();
+  showMessage(pendingPaymentsProblem);
+  showMessage(pendingPaymentsEmpty, pendingPaymentsList.childElementCount ? '' : 'Loading unresolved payments…');
+  try {
+    const query = after === null ? '' : `?after=${after}`;
+    const data = await request(`/payment-attempts/pending${query}`, { token: current.accessToken });
+    if (session !== current) return;
+    if (!Array.isArray(data?.attempts) || data.attempts.length > 50
+      || typeof data.hasMore !== 'boolean' || (data.hasMore && !data.attempts.length)) {
+      throw new ApiError(502, 'invalid_response');
+    }
+    pendingPaymentsList.replaceChildren(...data.attempts.map(renderedPendingPayment));
+    pendingPaymentsCursor = after;
+    pendingPaymentsNextCursor = data.hasMore ? data.attempts.at(-1).merchantReference : null;
+    const empty = after === null ? 'No unresolved payments with an expired reservation.' : 'No unresolved payments on this page.';
+    showMessage(pendingPaymentsEmpty, data.attempts.length ? '' : empty);
+    moved = moving;
+  } catch (error) {
+    if (session !== current) return;
+    if (error instanceof ApiError && error.status === 401) {
+      closeSession('Your staff session expired. Sign in again.');
+    } else {
+      if (!moving) {
+        pendingPaymentsList.replaceChildren();
+        pendingPaymentsNextCursor = null;
+      }
+      showMessage(pendingPaymentsEmpty);
+      showMessage(pendingPaymentsProblem, messageFor(error, 'Unresolved payments could not be loaded. Select Refresh unresolved payments.'));
+    }
+  } finally {
+    if (session === current) {
+      pendingPaymentsLoading = false;
+      syncPendingPaymentControls();
+      if (moved && (document.activeElement === document.body || pendingPaymentsNavigation.contains(document.activeElement))) {
+        element('pending-payments-title').focus();
+      }
+    }
   }
 }
 
@@ -988,6 +1136,7 @@ loginForm.addEventListener('submit', async (event) => {
     syncKitchenSignal();
     void refreshQueue();
     if (data.role === 'manager') {
+      void refreshPendingPayments();
       void refreshPaymentReview();
       void refreshReceipts();
       availability.show();
@@ -1022,6 +1171,19 @@ cancellationDialog.addEventListener('cancel', (event) => {
 });
 paymentReviewJump.addEventListener('click', () => { element('payment-review-title').focus(); });
 paymentReviewRefresh.addEventListener('click', () => { void refreshPaymentReview(); });
+pendingPaymentsRefresh.addEventListener('click', () => {
+  showMessage(pendingPaymentsNotice);
+  void refreshPendingPayments();
+});
+pendingPaymentsFirst.addEventListener('click', () => {
+  showMessage(pendingPaymentsNotice);
+  void refreshPendingPayments(null);
+});
+pendingPaymentsNext.addEventListener('click', () => {
+  if (pendingPaymentsNextCursor === null) return;
+  showMessage(pendingPaymentsNotice);
+  void refreshPendingPayments(pendingPaymentsNextCursor);
+});
 fiscalReceiptsJump.addEventListener('click', () => { element('fiscal-receipts-title').focus(); });
 fiscalReceiptsRefresh.addEventListener('click', () => { void refreshReceipts(); });
 fiscalReceiptsFilter.addEventListener('input', renderReceipts);
