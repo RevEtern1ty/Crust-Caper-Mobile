@@ -12,6 +12,7 @@ const database = 'storefront_fixture';
 const testMain = 'com.crustcaper.api.payment.WebCheckoutFixture';
 const scratchPrefix = 'cc-storefront-';
 const fixturePhoto = { sku: 'double-smash', file: 'double-smash-r39.jpg' };
+const errorRehearsalLabel = { 'crustcaper.fixture.error-rehearsal': '1' };
 const postgresImage = 'postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193';
 const fixtureEntrypoint = ['java', '-Dloader.path=/fixture/classes/', `-Dloader.main=${testMain}`,
   '-cp', '/app/app.jar', 'org.springframework.boot.loader.launch.PropertiesLauncher'];
@@ -82,7 +83,7 @@ const mount = (source, target) => ({
   bind: { create_host_path: false },
 });
 
-async function prepareFixture(directory, testClasses, { load, paymentRestart }) {
+async function prepareFixture(directory, testClasses, { load, paymentRestart, errorRehearsal }) {
   const fixturePassword = randomBytes(24).toString('hex');
   const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
@@ -130,6 +131,7 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart }) 
     services: {
       api: {
         pull_policy: 'never',
+        ...(errorRehearsal && { labels: errorRehearsalLabel }),
         entrypoint: fixtureEntrypoint,
         depends_on: {
           postgres: { condition: 'service_healthy' },
@@ -157,6 +159,7 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart }) 
       edge: { volumes: [mount(caddyfile, '/etc/caddy/Caddyfile')] },
       postgres: {
         image: postgresImage,
+        ...(errorRehearsal && { labels: errorRehearsalLabel }),
         environment: { POSTGRES_USER: database, POSTGRES_DB: database, POSTGRES_PASSWORD: fixturePassword },
         healthcheck: {
           test: ['CMD', 'pg_isready', '-U', database, '-d', database],
@@ -210,12 +213,14 @@ async function main() {
   const webPerf = mode === '--web-perf';
   const catalogPhotos = mode === '--catalog-photos';
   const availability = mode === '--availability';
+  const errorRehearsal = mode === '--error-rehearsal';
   const kitchenRestart = mode === '--kitchen-restart';
   const paymentRestart = mode === '--payment-restart' || kitchenRestart;
-  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart && !availability)) {
-    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart | --availability]');
+  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart && !availability && !errorRehearsal)) {
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart | --availability | --error-rehearsal]');
   }
-  const script = availability ? 'tooling/storefront-availability-rehearsal.cjs'
+  const script = errorRehearsal ? 'tooling/storefront-error-rehearsal.cjs'
+    : availability ? 'tooling/storefront-availability-rehearsal.cjs'
     : paymentRestart ? 'tooling/storefront-payment-restart.cjs' : load ? 'tooling/storefront-load.cjs' : null;
   const scenarios = script
     ? [script, ...(mode === '--load-smoke' ? ['--smoke'] : [])]
@@ -245,7 +250,7 @@ async function main() {
       await copyFile(join(root, 'assets', 'menu', `${fixturePhoto.sku}.jpg`), join(photos, fixturePhoto.file));
       await writeFile(join(photos, 'double-smash-r39.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
     }
-    const settings = await prepareFixture(directory, testClasses, { load, paymentRestart });
+    const settings = await prepareFixture(directory, testClasses, { load, paymentRestart, errorRehearsal });
     const env = {
       ...hostEnv,
       CRUSTCAPER_API_IMAGE: apiImage,
@@ -292,6 +297,7 @@ async function main() {
         ...(paymentRestart && { CRUSTCAPER_HTTPS_TEST_PAYMENT_RESTART: '1' }),
         ...(kitchenRestart && { CRUSTCAPER_HTTPS_TEST_KITCHEN_RESTART: '1' }),
         ...(availability && { CRUSTCAPER_HTTPS_TEST_AVAILABILITY: '1', NODE_EXTRA_CA_CERTS: browserCa }),
+        ...(errorRehearsal && { CRUSTCAPER_HTTPS_TEST_ERROR_REHEARSAL: '1' }),
       },
       timeout: { '--load': 300000, '--payment-restart': 160000, '--kitchen-restart': 190000 }[mode] ?? 180000,
     });
