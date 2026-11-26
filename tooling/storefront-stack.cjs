@@ -13,6 +13,8 @@ const testMain = 'com.crustcaper.api.payment.WebCheckoutFixture';
 const scratchPrefix = 'cc-storefront-';
 const fixturePhoto = { sku: 'double-smash', file: 'double-smash-r39.jpg' };
 const postgresImage = 'postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193';
+const fixtureEntrypoint = ['java', '-Dloader.path=/fixture/classes/', `-Dloader.main=${testMain}`,
+  '-cp', '/app/app.jar', 'org.springframework.boot.loader.launch.PropertiesLauncher'];
 
 let active;
 let interrupted = false;
@@ -80,7 +82,7 @@ const mount = (source, target) => ({
   bind: { create_host_path: false },
 });
 
-async function prepareFixture(directory, testClasses, load) {
+async function prepareFixture(directory, testClasses, { load, paymentRestart }) {
   const fixturePassword = randomBytes(24).toString('hex');
   const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
@@ -90,12 +92,16 @@ async function prepareFixture(directory, testClasses, load) {
   const overlay = join(directory, 'fixture.json');
   await writeFile(apiEnvironment, [
     'SPRING_PROFILES_ACTIVE=stage',
-    'CRUSTCAPER_PAYMENT_PROVIDER=fixture',
+    `CRUSTCAPER_PAYMENT_PROVIDER=${paymentRestart ? 'flutterwave' : 'fixture'}`,
     'CRUSTCAPER_ORDER_ACCESS_PROVIDER=disabled',
     `CRUSTCAPER_DB_URL=jdbc:postgresql://postgres:5432/${database}`,
     `CRUSTCAPER_DB_USER=${database}`,
     `CRUSTCAPER_DB_PASSWORD=${fixturePassword}`,
     `CRUSTCAPER_OPERATOR_MFA_KEY=${fixtureMfaKey}`,
+    ...(paymentRestart ? [
+      'FLUTTERWAVE_WEBHOOK_SECRET=fixture-restart-webhook-v1',
+      `CRUST_PAYMENT_RETURN_URL=https://${fixtureHost}/payment-return`,
+    ] : []),
     '',
   ].join('\n'), { mode: 0o600 });
   // Bind the same CA mount as deployed Compose, using a private fixture network for PostgreSQL.
@@ -105,12 +111,13 @@ async function prepareFixture(directory, testClasses, load) {
   const site = 'https://{$CRUSTCAPER_HTTPS_HOST} {';
   const deployedCaddyfile = await readFile(join(deploy, 'Caddyfile'), 'utf8');
   if (deployedCaddyfile.split(site).length !== 2) throw new Error('Could not locate the deployed Caddy HTTPS site');
+  const hostedUpstream = paymentRestart ? 'provider' : 'api';
   const providerSite = [
     '',
     'https://checkout.flutterwave.com {',
     '\ttls internal',
     '\troute {',
-    '\t\treverse_proxy /v3/hosted/pay/* api:18432',
+    `\t\treverse_proxy /v3/hosted/pay/* ${hostedUpstream}:18432`,
     '\t\trespond 404',
     '\t}',
     '}',
@@ -118,15 +125,34 @@ async function prepareFixture(directory, testClasses, load) {
   ].join('\n');
   await writeFile(caddyfile, deployedCaddyfile.replace(site, site + '\n\ttls internal') + providerSite);
 
+  const fixtureClasses = mount(testClasses, '/fixture/classes');
   await writeFile(overlay, JSON.stringify({
     services: {
       api: {
         pull_policy: 'never',
-        entrypoint: ['java', '-Dloader.path=/fixture/classes/', `-Dloader.main=${testMain}`,
-          '-cp', '/app/app.jar', 'org.springframework.boot.loader.launch.PropertiesLauncher'],
-        depends_on: { postgres: { condition: 'service_healthy' } },
-        volumes: [mount(testClasses, '/fixture/classes')],
+        entrypoint: fixtureEntrypoint,
+        depends_on: {
+          postgres: { condition: 'service_healthy' },
+          ...(paymentRestart && { provider: { condition: 'service_started' } }),
+        },
+        volumes: [fixtureClasses],
+        ...(paymentRestart && { command: ['--restart-api'], restart: 'no' }),
       },
+      ...(paymentRestart && { provider: {
+        image: '${CRUSTCAPER_API_IMAGE:?Set the verified API image or digest}',
+        pull_policy: 'never',
+        entrypoint: fixtureEntrypoint,
+        command: ['--provider'],
+        environment: { CRUSTCAPER_STOREFRONT_RESTART_PROVIDER: '1' },
+        networks: ['default'],
+        volumes: [fixtureClasses],
+        read_only: true,
+        tmpfs: ['/tmp:rw,noexec,nosuid,size=16m'],
+        cap_drop: ['ALL'],
+        security_opt: ['no-new-privileges:true'],
+        init: true,
+        restart: 'no',
+      } }),
       catalog: { pull_policy: 'never' },
       edge: { volumes: [mount(caddyfile, '/etc/caddy/Caddyfile')] },
       postgres: {
@@ -138,7 +164,8 @@ async function prepareFixture(directory, testClasses, load) {
         },
         volumes: [
           mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
-          ...(load ? [mount(join(root, 'server', 'tooling', 'operator-accounts.psql'), '/fixture/operator-accounts.psql')] : []),
+          ...(load || paymentRestart
+            ? [mount(join(root, 'server', 'tooling', 'operator-accounts.psql'), '/fixture/operator-accounts.psql')] : []),
         ],
       },
     },
@@ -182,13 +209,15 @@ async function main() {
   const load = mode === '--load' || mode === '--load-smoke';
   const webPerf = mode === '--web-perf';
   const catalogPhotos = mode === '--catalog-photos';
-  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos)) {
-    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos]');
+  const paymentRestart = mode === '--payment-restart';
+  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart)) {
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart]');
   }
-  const scenarios = load
-    ? ['tooling/storefront-load.cjs', ...(mode === '--load-smoke' ? ['--smoke'] : [])]
+  const script = paymentRestart ? 'tooling/storefront-payment-restart.cjs' : load ? 'tooling/storefront-load.cjs' : null;
+  const scenarios = script
+    ? [script, ...(mode === '--load-smoke' ? ['--smoke'] : [])]
     : ['--test', 'tests/storefront-https.test.cjs'];
-  if (load) await access(join(root, 'tooling', 'storefront-load.cjs'));
+  if (script) await access(join(root, script));
   const apiImage = candidateImage('CRUSTCAPER_FIXTURE_API_IMAGE', process.env.CRUSTCAPER_FIXTURE_API_IMAGE);
   const catalogImage = candidateImage('CRUSTCAPER_FIXTURE_CATALOG_IMAGE', process.env.CRUSTCAPER_FIXTURE_CATALOG_IMAGE);
   const web = resolve(root, process.env.CRUSTCAPER_FIXTURE_STOREFRONT_DIR ?? 'dist-storefront-test');
@@ -196,7 +225,7 @@ async function main() {
     ? resolve(root, process.env.CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR) : undefined;
   const testClasses = join(root, 'server', 'build', 'classes', 'java', 'test');
   const hostEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
-    !/^(?:CRUSTCAPER_|FLUTTERWAVE_|SPRING_|COMPOSE_)/i.test(name)));
+    !/^(?:CRUSTCAPER_|FLUTTERWAVE_|SPRING_|COMPOSE_|CRUST_PAYMENT_RETURN_URL$)/i.test(name)));
   await Promise.all([access(join(web, 'index.html')), access(join(testClasses, ...testMain.split('.')) + '.class')]);
   await requireLocalDocker(hostEnv);
 
@@ -213,7 +242,7 @@ async function main() {
       await copyFile(join(root, 'assets', 'menu', `${fixturePhoto.sku}.jpg`), join(photos, fixturePhoto.file));
       await writeFile(join(photos, 'double-smash-r39.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
     }
-    const settings = await prepareFixture(directory, testClasses, load);
+    const settings = await prepareFixture(directory, testClasses, { load, paymentRestart });
     const env = {
       ...hostEnv,
       CRUSTCAPER_API_IMAGE: apiImage,
@@ -251,11 +280,12 @@ async function main() {
         CRUSTCAPER_HTTPS_TEST_CA: browserCa,
         CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT: project,
         ...(evidence && { CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: evidence }),
-        ...(load && { CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY: settings.fixtureMfaKey }),
+        ...((load || paymentRestart) && { CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY: settings.fixtureMfaKey }),
         ...(webPerf && { CRUSTCAPER_HTTPS_TEST_WEB_PERF: '1' }),
         ...(catalogPhotos && { CRUSTCAPER_HTTPS_TEST_CATALOG_PHOTOS: '1' }),
+        ...(paymentRestart && { CRUSTCAPER_HTTPS_TEST_PAYMENT_RESTART: '1' }),
       },
-      timeout: mode === '--load' ? 300000 : 180000,
+      timeout: { '--load': 300000, '--payment-restart': 160000 }[mode] ?? 180000,
     });
   } finally {
     if (stop) await stop();
