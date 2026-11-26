@@ -171,7 +171,7 @@ const supportRequestIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 
 export class ApiError extends Error {
   readonly code: ApiErrorCode
-  declare readonly requestId?: string
+  readonly requestId?: string
 
   constructor(code: ApiErrorCode, options?: ErrorOptions & { requestId?: string | null }) {
     super(code, options)
