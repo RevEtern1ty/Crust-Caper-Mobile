@@ -12,7 +12,7 @@ export function reorderOfferForCart(offer: ReorderResult): ReorderResult {
   };
 }
 
-export function compareReorder(original: readonly CartLine[], offer: readonly CartLine[]) {
+export function compareReorder<Original extends CartLine>(original: readonly Original[], offer: readonly CartLine[]) {
   const remaining = [...original];
   const available = offer.map((current) => {
     const key = lineKey(current);

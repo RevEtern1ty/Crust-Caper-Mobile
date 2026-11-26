@@ -1,7 +1,8 @@
-import { deepEqual, equal } from 'node:assert/strict';
+import { deepEqual, equal, ok } from 'node:assert/strict';
 import { test } from 'node:test';
-import type { CartLine } from '../domain/types';
+import type { CartLine, OrderLine } from '../domain/types';
 import { readDraft } from '../state/draft-storage';
+import { orderItemLabels } from './labels';
 import { compareReorder, reorderOfferForCart } from './reorder-review';
 
 const original: CartLine = { sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: 9200 };
@@ -40,6 +41,23 @@ test('an empty offer leaves all original configurations out of the proposed cart
   deepEqual(review.removed, orderLines);
   equal(review.estimate, 0);
   equal(orderLines.length, 2);
+});
+
+test('removed repeat candidates retain their historical configuration for display', () => {
+  const previous: OrderLine = {
+    ...withoutPickles,
+    soldItem: {
+      catalogVersion: 'sale-1', name: { en: 'Original burger', rw: 'Burgeri ya mbere' },
+      ingredients: [], allergens: [],
+      modifiers: [{ id: 'no-pickles', name: { en: 'No pickles', rw: 'Nta concombre' }, price: 0 }],
+    },
+  };
+  const { available, removed } = compareReorder([previous], [original]);
+  const [historical] = removed;
+  ok(historical);
+  deepEqual(historical.soldItem, previous.soldItem);
+  deepEqual(orderItemLabels(historical, 'en', null), { name: 'Original burger', options: 'No pickles' });
+  deepEqual(available, [{ current: original, previous: undefined }]);
 });
 
 test('reorder previews a quantity change before placing persistable lines in the cart', () => {

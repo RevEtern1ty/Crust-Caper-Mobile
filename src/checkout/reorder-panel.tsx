@@ -1,13 +1,13 @@
 import { useEffect, useRef } from 'react';
 import { Platform, StyleSheet, type Text as NativeText, View } from 'react-native';
-import type { CartLine, Locale, Menu, ReorderResult } from '../domain/types';
+import type { Locale, Menu, OrderLine, ReorderResult } from '../domain/types';
 import { Button, Card, colors, Text } from '../ui/core';
 import { copy, money } from '../ui/format';
-import { changeLabel, itemName, itemOptions } from './labels';
+import { changeLabel, itemName, itemOptions, orderItemLabels } from './labels';
 import { compareReorder } from './reorder-review';
 
 type Props = {
-  original: CartLine[];
+  original: OrderLine[];
   offer: ReorderResult;
   menu: Menu | null;
   locale: Locale;
@@ -17,11 +17,10 @@ type Props = {
   onCancel: () => void;
 };
 
-function ItemDescription({ line, menu, locale }: Pick<Props, 'menu' | 'locale'> & { line: CartLine }) {
-  const options = itemOptions(line, locale, menu);
+function ItemDescription({ quantity, name, options }: { quantity: number; name: string; options: string }) {
   return (
     <View style={styles.itemDescription}>
-      <Text variant="label">{line.quantity} × {itemName(line.sku, locale, menu)}</Text>
+      <Text variant="label">{quantity} × {name}</Text>
       {options && <Text variant="small" tone="muted">{options}</Text>}
     </View>
   );
@@ -44,7 +43,8 @@ export function ReorderPanel({ original, offer, menu, locale, replacesCart, disa
       {available.map(({ current, previous }, index) => (
         <View key={index} style={styles.item}>
           <View style={styles.row}>
-            <ItemDescription line={current} locale={locale} menu={menu} />
+            <ItemDescription quantity={current.quantity} name={itemName(current.sku, locale, menu)}
+              options={itemOptions(current, locale, menu)} />
             <Text style={styles.amount}>{money(current.quantity * current.unitPrice)}</Text>
           </View>
           {!previous && <Text tone="green" variant="small">{t('New configuration', 'Uburyo bushya bwo gutegura')}</Text>}
@@ -66,7 +66,7 @@ export function ReorderPanel({ original, offer, menu, locale, replacesCart, disa
           <Text variant="label" tone="red" accessibilityRole="header">
             {t('Unavailable from your previous order', 'Ibitakiboneka muri komande yawe yabanje')}
           </Text>
-          {removed.map((line, index) => <ItemDescription key={index} line={line} locale={locale} menu={menu} />)}
+          {removed.map((line, index) => <ItemDescription key={index} quantity={line.quantity} {...orderItemLabels(line, locale, menu)} />)}
         </View>
       )}
       {offer.changes.filter(({ kind }) => kind === 'slot').map((change, index) => (
