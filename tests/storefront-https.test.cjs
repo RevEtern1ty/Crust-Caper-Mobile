@@ -341,10 +341,71 @@ async function checkGuestCheckout(browser, ca) {
     if (project) verifyPaymentRow(order.id);
     await capture(page, 'catalog-to-paid');
     if (catalogPhotos) await checkOrderPrivacy(browser, ca, order, session.sessionId, cookie);
+    else await checkSettledOrderRecovery(page, context, order, session.sessionId);
     assert.deepEqual(failures, []);
   } finally {
     await context.close();
   }
+}
+
+async function checkSettledOrderRecovery(page, context, order, oldSessionId) {
+  const responseFor = (path, method) => page.waitForResponse(response =>
+    response.request().method() === method && new URL(response.url()).pathname === path);
+  // Model expiry of only the HttpOnly cookie. Keep the original tab and its checkout journal.
+  await context.clearCookies({ name: guestCookie });
+  await page.reload();
+  await button(page, 'Verify this order by phone').click();
+  assert.equal(await page.getByLabel('Order number', { exact: true }).inputValue(), order.id.slice(-8).toUpperCase());
+  await page.getByLabel('Phone number', { exact: true }).fill('+250700000000');
+  await button(page, 'Request verification code').click();
+  await shown(page, 'Verify your phone');
+  const codeInput = page.getByLabel('Verification code', { exact: true });
+  let verified;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await codeInput.fill('418263');
+    assert.equal(await codeInput.inputValue(), '418263');
+    const result = page.waitForResponse(response => response.request().method() === 'POST'
+      && /\/api\/v1\/web\/order-access\/challenges\/[^/]+\/verify$/.test(new URL(response.url()).pathname));
+    await button(page, 'Verify and open order').click();
+    try {
+      verified = await result;
+    } catch (error) {
+      if (evidence) await page.screenshot({ path: resolve(evidence, 'order-recovery-verification-failed.png'),
+        mask: [codeInput, page.getByLabel('Phone number', { exact: true })], animations: 'disabled' });
+      throw error;
+    }
+    if (verified.ok()) break;
+    assert.equal(verified.status(), 404);
+    await delay(500);
+  }
+  assert.ok(verified?.ok(), 'the returning browser must recover the paid order by phone');
+  assert.equal((await verified.json()).orderId, order.id);
+  const recoveredSessionId = (await verified.request().allHeaders())['x-crustcaper-session'];
+  assert.ok(uuid.test(recoveredSessionId) && recoveredSessionId !== oldSessionId);
+  await page.waitForURL(origin + '/orders');
+  await shown(page, 'Paid');
+
+  await page.goto(origin + '/product/double-smash?storefrontLocale=en');
+  await button(page, /Add to cart/).click();
+  await page.goto(origin + '/cart');
+  await button(page, 'Choose pickup time').click();
+  await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { disabled: false }).nth(2).click();
+  await page.getByLabel('Phone number', { exact: true }).fill('+250700000000');
+  await page.getByLabel('Email address', { exact: true }).fill('next-storefront-order@example.test');
+  const quote = responseFor('/api/v1/web/quotes', 'POST');
+  await button(page, 'Review order').click();
+  const quoted = await quote;
+  assert.equal(quoted.status(), 200, 'a new quote must use the recovered browser session');
+  assert.equal((await quoted.request().allHeaders())['x-crustcaper-session'], recoveredSessionId);
+  await shown(page, 'Included tax');
+  const placed = responseFor('/api/v1/web/orders', 'POST');
+  await button(page, /^Confirm .*RWF/).click();
+  const created = await placed;
+  assert.equal(created.status(), 200, 'the reviewed new order must be creatable after recovery');
+  assert.equal((await created.request().allHeaders())['x-crustcaper-session'], recoveredSessionId);
+  const replacement = await created.json();
+  assert.ok(uuid.test(replacement.id) && replacement.id !== order.id);
+  verifyPaymentRow(order.id);
 }
 
 async function checkOrderPrivacy(browser, ca, order, sessionId, cookie) {
