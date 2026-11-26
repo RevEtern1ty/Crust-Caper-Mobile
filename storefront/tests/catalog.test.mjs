@@ -2,13 +2,36 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
-import { catalogSite, isCatalogSku, isLocale, loadCatalog } from '../lib/catalog.ts';
+import { catalogConfigured, catalogSite, isCatalogSku, isLocale, loadCatalog } from '../lib/catalog.ts';
 
 const publicOrigin = 'https://menu.example.test';
 const firstTag = '"menu-revision-1"';
 const secondTag = '"menu-revision-2"';
 const firstCheckedAt = '2026-11-26T08:45:00Z';
 const secondCheckedAt = '2026-11-26T08:45:03Z';
+
+test('checks startup configuration without querying the API', t => {
+  useCatalogEnv(t, {
+    CRUSTCAPER_CATALOG_API_ORIGIN: 'http://api:8080',
+    CRUSTCAPER_STORE_ID: 'kigali',
+    CRUSTCAPER_PUBLIC_ORIGIN: publicOrigin,
+    CRUSTCAPER_STOREFRONT_PROFILE: 'stage',
+  });
+  const fetch = t.mock.method(globalThis, 'fetch');
+  assert.equal(catalogConfigured(), true);
+  process.env.CRUSTCAPER_STOREFRONT_PROFILE = 'stgae';
+  assert.equal(catalogConfigured(), false);
+  process.env.CRUSTCAPER_STOREFRONT_PROFILE = 'production';
+  process.env.CRUSTCAPER_CATALOG_API_ORIGIN = 'http://api:8080/api/v1';
+  assert.equal(catalogConfigured(), false);
+  process.env.CRUSTCAPER_CATALOG_API_ORIGIN = 'http://api:8080';
+  process.env.CRUSTCAPER_STORE_ID = '';
+  assert.equal(catalogConfigured(), false);
+  process.env.CRUSTCAPER_STORE_ID = 'kigali';
+  process.env.CRUSTCAPER_PUBLIC_ORIGIN = 'http://menu.example.test';
+  assert.equal(catalogConfigured(), false);
+  assert.equal(fetch.mock.callCount(), 0);
+});
 
 function catalogPayload() {
   return {

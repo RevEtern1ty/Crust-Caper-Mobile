@@ -4,6 +4,27 @@
 
 Зафиксируйте общий SHA сервера, OpenAPI и мобильного клиента. Прогон `Connected commerce CI` проверяет реальную PostgreSQL, гостевые сессии и обновление токена, цены, идемпотентность, авторизацию, локальную сверку оплаты и выдачу. `Mobile CI` проверяет отдельный демонстрационный профиль, экспорт и штатные нативные сборки. Фиксируйте результаты по конкретному SHA.
 
+Задача `Public catalog and HTTPS checkout` собирает оба образа и запускает PostgreSQL, Caddy, сервер каталога и Spring Boot в отдельном проекте Compose. Chrome проверяет меню EN/RW, открытие заказа, защиту гостевой cookie и прохождение через тестовую платёжную страницу. Проверка подтверждает, что заявленный успех в URL сам по себе оставляет платёж в ожидании. После проверки сервером в базе остаётся одна оплаченная попытка.
+
+### Локальный прогон HTTPS
+
+Понадобятся Node.js 24, Java 21, Google Chrome, локальный Docker и свободные loopback-порты 80 и 443. Запустите из корня того же кандидата.
+
+```sh
+npm ci
+npm --prefix storefront ci
+npm --prefix storefront test
+npm run build:storefront-test
+(cd server && ./gradlew --no-daemon testClasses)
+docker build -t crustcaper-api:storefront-test ./server
+docker build -f storefront/Dockerfile -t crustcaper-catalog:storefront-test .
+CRUSTCAPER_FIXTURE_API_IMAGE=crustcaper-api:storefront-test \
+CRUSTCAPER_FIXTURE_CATALOG_IMAGE=crustcaper-catalog:storefront-test \
+npm run test:storefront
+```
+
+На Windows используйте `gradlew.bat testClasses` из `server` и задайте две переменные образов через `$env:` перед запуском npm. Прогон сам останавливает и удаляет свою базу и контейнеры. Имитаторы оплаты и SMS находятся в тестовых классах. На этом прогоне используются синтетический каталог и локальный сертификат. Для внешнего стенда дополнительно выполните проверки ниже с выделенными тестовыми аккаунтами.
+
 ## Конфигурация стенда
 
 - Разверните API с профилем Spring `stage` за HTTPS и отдельной PostgreSQL. Проверьте readiness, создайте именных сотрудников, загрузите утверждённый каталог и проверьте через публичный API, что ожидаемая версия точки доступна для заказа. [Запуск сервера](../../server/README.md) · [Проверка каталога](../../server/docs/CATALOG.md#проверка-перед-приёмом-заказов)

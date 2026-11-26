@@ -18,3 +18,4 @@ coverage/
 /server/.gradle/
 /server/build/
 /dist-connected/
+/dist-storefront-test/

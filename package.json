@@ -21,7 +21,9 @@
     "sbom": "npm sbom --sbom-format cyclonedx",
     "test:web": "node --test tests/web.test.cjs",
     "build:connected-web": "expo export --platform web --output-dir dist-connected",
+    "build:storefront-test": "node tooling/build-storefront-test.cjs",
     "test:connected": "node --test tests/connected.test.cjs",
+    "test:storefront": "node tooling/storefront-stack.cjs",
     "start:local-stack": "node tooling/local-stack.cjs"
   },
   "dependencies": {

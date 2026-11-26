@@ -146,14 +146,27 @@ export function catalogSite(): CatalogSite | null {
   };
 }
 
-export async function loadCatalog(locale: Locale): Promise<CatalogResult> {
-  const site = catalogSite();
-  if (!site) return { status: 'unavailable', site };
-
-  const { publicOrigin } = site;
+function catalogSource() {
+  const profile = process.env.CRUSTCAPER_STOREFRONT_PROFILE ?? 'stage';
   const apiOrigin = parseOrigin(process.env.CRUSTCAPER_CATALOG_API_ORIGIN, false);
   const storeId = process.env.CRUSTCAPER_STORE_ID;
-  if (!apiOrigin || !storeId || !storeIdPattern.test(storeId)) return { status: 'unavailable', site };
+  if ((profile !== 'stage' && profile !== 'production') || !apiOrigin || !storeId || !storeIdPattern.test(storeId)) {
+    return null;
+  }
+  return { apiOrigin, storeId };
+}
+
+export function catalogConfigured(): boolean {
+  return catalogSite() !== null && catalogSource() !== null;
+}
+
+export async function loadCatalog(locale: Locale): Promise<CatalogResult> {
+  const site = catalogSite();
+  const source = catalogSource();
+  if (!site || !source) return { status: 'unavailable', site };
+
+  const { publicOrigin } = site;
+  const { apiOrigin, storeId } = source;
 
   const url = new URL(`/api/v1/stores/${encodeURIComponent(storeId)}/menu`, apiOrigin);
   url.searchParams.set('channel', 'web');
