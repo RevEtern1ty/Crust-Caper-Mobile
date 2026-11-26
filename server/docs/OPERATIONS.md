@@ -17,7 +17,7 @@
 ## API и сессия
 
 - `POST /api/v1/operator/sessions` принимает `{username,password,authenticatorCode}` и возвращает `201 {accessToken,expiresAt,storeId,role}`. Код состоит из шести цифр и передаётся строкой. Bearer действует один час. Пять последовательных неудачных попыток ограничивают вход на две минуты. У синтетических сотрудников локального стенда поле кода можно оставить пустым.
-- `GET /api/v1/operator/orders` с `Authorization: Bearer …` возвращает `{serverTime,orders:[{id,status,paymentStatus,lines,pickupStartsAt,pickupEndsAt,acceptedAt}]}`. При наличии активных заказов площадок сервер добавляет `externalOrders`. Телефон, email, суммы, чеки и код выдачи не выдаются.
+- `GET /api/v1/operator/orders` с `Authorization: Bearer …` возвращает `{serverTime,orders:[{id,status,paymentStatus,lines,total,currency,pickupStartsAt,pickupEndsAt,acceptedAt}]}`. В карточке прямого заказа отображается сохранённая сумма заказа в RWF. Для заказов площадок сохраняется их внешний номер. Телефон, email, чек и код выдачи исключены из ответа.
 - `POST /api/v1/operator/orders/{id}/status` с bearer принимает `{status,pickupCode?}` и возвращает обновлённый заказ в том же формате. Код требуется для `collected`. При обновлении из устаревшей карточки сервер возвращает `409 invalid_transition`. Для действующей карточки с неверным кодом ответ `409 pickup_code_mismatch`.
 - `POST /api/v1/operator/orders/{id}/cancel` с bearer менеджера отменяет оплаченный заказ его точки на стадиях `accepted`, `preparing` и `ready`. Повтор возвращает актуальное состояние уже отменённого рестораном заказа. Ответ `409 payment_reference_unavailable` означает, что исходную транзакцию требуется сначала сверить.
 - `DELETE /api/v1/operator/sessions/current` с bearer отзывает эту сессию. Ответ `204`.
