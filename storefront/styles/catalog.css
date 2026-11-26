@@ -106,6 +106,7 @@ h3 { font-size: 1.3rem; line-height: 1.28; }
 }
 @media (max-width: 30rem) {
   .site-nav { flex: 0 0 100%; justify-content: flex-end; border-top: 1px solid #624960; padding-block-start: .3rem; }
-  .hero-copy { padding-block: 1.6rem; }
+  .hero-copy { padding-block: 1.6rem; padding-inline: min(1.35rem, 5vw); }
+  .hero h1 { font-size: clamp(1.75rem, 9vw, 3rem); }
   .cards { grid-template-columns: minmax(0, 1fr); }
 }
