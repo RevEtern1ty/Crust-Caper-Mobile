@@ -270,6 +270,42 @@ test('OTP recovers the same settled tab order after a lost cookie and allows a f
   ]);
 });
 
+test('a settled recovery keeps read-only presentation unless the locked cookie check succeeds', async t => {
+  const cases = [
+    { name: 'ended', replacement: null },
+    { name: 'replaced', replacement: second },
+    { name: 'session check unavailable', replacement: first, checkUnavailable: true },
+  ];
+  for (const { name, replacement, checkUnavailable } of cases) {
+    await t.test(name, async () => {
+      const { storage, saved } = memory([
+        [journalKey, trackedJournal], [journalKey + '.context', first],
+        [journalKey + '.verified', JSON.stringify({ sessionId: first, orderIds: [orderId], owned: true })],
+      ]);
+      const path = '/web/orders/' + orderId;
+      const transport = fixture(first, (call) => {
+        assert.equal(call.path, path);
+        assert.equal(call.context, first);
+        transport.setCookie(replacement);
+        return Response.json(collectedOrder);
+      });
+      const fetcher: typeof fetch = async (input, options) => {
+        const response = await transport.fetcher(input, options);
+        return checkUnavailable && new URL(String(input)).pathname.endsWith(sessionPath)
+          ? new Response(null, { status: 503 }) : response;
+      };
+      const api = createWebLiveApi({ config, storage, journalKey, browser, fetcher });
+
+      const observed = await api.getOrder(orderId);
+      assert.equal(observed.status, 'collected');
+      assert.equal(observed.recoveryReadOnly, true);
+      assert.equal(saved.get(journalKey), trackedJournal);
+      assert.equal(saved.get(journalKey + '.context'), first);
+      assert.deepEqual(transport.calls.map(call => [call.method, call.path]), [['GET', path], ['GET', sessionPath]]);
+    });
+  }
+});
+
 test('settled verification only promotes the same tracked checkout and its own unchanged cookie', async t => {
   const concurrentJournal = JSON.stringify(pendingCreation);
   const cases = [

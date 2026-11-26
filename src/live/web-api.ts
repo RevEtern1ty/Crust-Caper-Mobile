@@ -420,7 +420,9 @@ export function createWebLiveApi({
         const saved = await savedContext();
         if (!saved) return false;
         const recovery = await savedRecovery();
-        if (recovery?.owned && recovery.sessionId === saved && recovery.orderIds.includes(orderId)) return true;
+        if (recovery?.owned && recovery.sessionId === saved && recovery.orderIds.includes(orderId)) {
+          return await currentCookieContext() === saved && !ending;
+        }
         return alternateContext && !!await promoteSettledRecovery(saved, await read(journalKey), orderId);
       }).catch(() => false);
       // The prior order can seed a fresh cart using the sanitized payment projection above.
