@@ -1,0 +1,11 @@
+**
+!assets/
+!assets/**
+!storefront/
+!storefront/**
+storefront/.next/
+storefront/node_modules/
+storefront/next-env.d.ts
+storefront/*.tsbuildinfo
+storefront/**/.env*
+storefront/**/*.log
