@@ -28,6 +28,8 @@ The customer app opens on port 47867 and the operator console on port 18080 unde
 
 Build the Linux container with `docker build -t crustcaper-api ./server` or deploy the JAR on Java 21. Use a private PostgreSQL instance and apply Flyway on the release candidate before switching traffic. Set the environment variables for the target deployment.
 
+The Gradle suite exercises both a fresh schema and an upgrade from populated V22. To run the upgrade alone from `server/`, use `./gradlew test --tests 'com.crustcaper.api.PopulatedDatabaseMigrationTest'` against the disposable loopback test database. The test creates a temporary schema, applies V22, seeds synthetic payments and a fiscal receipt, then starts the candidate on the same schema. It checks the migration history, existing data, and recovery of the original mobile order and payment attempt. Repeat the upgrade on a protected staging copy before migrating a pilot database. Verify rollback separately with the previous candidate and the migrated staging schema.
+
 | Variable | Value |
 | --- | --- |
 | `SPRING_PROFILES_ACTIVE` | Explicitly select `stage` for Flutterwave Test or `production` (alias `prod`) for Flutterwave Live. |
@@ -51,7 +53,7 @@ Optional pickup notifications use Expo. Set the provider and server credentials 
 
 ### Single-host HTTPS staging
 
-The [HTTPS overlay](deploy/compose.https.yml) runs Caddy and the API on a Linux Docker host. It publishes only TCP ports 80 and 443. Caddy redirects HTTP to HTTPS, renews the certificate for the staging hostname, and stores TLS state in the `edge_data` volume. Keep that volume across container updates. When the host already has HTTPS ingress, use the [base Compose file](deploy/compose.yml) alone and route traffic to its loopback API port (`CRUSTCAPER_HTTP_PORT`, default 8080). Both modes use Docker Compose 2.30 or newer and take the same API environment file and PostgreSQL CA settings below. [Docker Compose env files and bind mounts](https://docs.docker.com/reference/compose-file/container-spec/)
+The [HTTPS overlay](deploy/compose.https.yml) runs Caddy and the API on a Linux Docker host. It publishes only TCP ports 80 and 443. Caddy redirects HTTP to HTTPS, renews the certificate for the staging hostname, and stores TLS state in the `edge_data` volume. Keep that volume across container updates. When the host already has HTTPS ingress, use the [base Compose file](deploy/compose.yml) alone and route traffic to its loopback API port (`CRUSTCAPER_HTTP_PORT`, default 8080). `docker compose up -d --wait --wait-timeout 90` waits for API readiness in both modes, including PostgreSQL. Both modes use Docker Compose 2.30 or newer and take the same API environment file and PostgreSQL CA settings below. [Docker Compose env files and bind mounts](https://docs.docker.com/reference/compose-file/container-spec/)
 
 Set an A record for the staging hostname and allow TCP 80 and 443 through the host firewall. If the hostname also has an AAAA record, verify that IPv6 reaches the ingress as well before certificate issuance. Supply a dedicated private PostgreSQL database, its PEM CA certificate, Flutterwave Test credentials and the signed staging application identities. Use the same hostname for the native client's API and return origin. [Caddy HTTPS requirements](https://caddyserver.com/docs/automatic-https)
 
