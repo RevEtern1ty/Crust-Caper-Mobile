@@ -9,6 +9,7 @@ paths:
   /stores/{id}/menu:
     get:
       operationId: getMenu
+      description: Products are filtered by the selected sales channel. Products sold on that channel outside their Kigali sales hours remain listed as unavailable. The representation is evaluated at the server time returned in X-Availability-Checked-At.
       parameters:
         - name: id
           in: path
@@ -16,7 +17,7 @@ paths:
           schema: { type: string }
         - name: channel
           in: query
-          schema: { type: string, enum: [mobile, web] }
+          schema: { type: string, enum: [mobile, web], default: mobile }
         - name: locale
           in: query
           schema: { type: string, enum: [en, rw] }
@@ -30,7 +31,7 @@ paths:
             ETag:
               schema: { type: string }
             X-Availability-Checked-At:
-              description: Server time used to evaluate pickup slot availability. The catalog revision time is reported in updatedAt.
+              description: Server time used to evaluate sales hours and pickup slot availability. The catalog revision time is reported in updatedAt.
               schema: { $ref: '#/components/schemas/Timestamp' }
           content:
             application/json:
@@ -39,7 +40,7 @@ paths:
           description: Cached representation is current.
           headers:
             X-Availability-Checked-At:
-              description: Server time used to revalidate pickup slot availability.
+              description: Server time used to revalidate product and pickup slot availability.
               schema: { $ref: '#/components/schemas/Timestamp' }
         '400': { $ref: '#/components/responses/InvalidInput' }
         '404': { $ref: '#/components/responses/StoreUnavailable' }
@@ -84,6 +85,7 @@ paths:
   /quotes:
     post:
       operationId: createQuote
+      description: Evaluate purchase eligibility for the mobile channel at the time of this request. Existing quote change rules cover unavailable items.
       security: [{ guestOrAccount: [] }]
       requestBody:
         required: true
@@ -104,6 +106,7 @@ paths:
   /orders:
     post:
       operationId: createOrder
+      description: Create a reservation against a mobile quote. The server rechecks product eligibility at confirmation. An exact retry of an already accepted reservation returns the existing order.
       security: [{ guestOrAccount: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -437,6 +440,7 @@ paths:
   /web/quotes:
     post:
       operationId: createWebQuote
+      description: Evaluate purchase eligibility for the web channel at the time of this request. Existing quote change rules cover unavailable items.
       security: [{ webGuest: [] }]
       parameters:
         - $ref: '#/components/parameters/WebOrigin'
@@ -465,6 +469,7 @@ paths:
   /web/orders:
     post:
       operationId: createWebOrder
+      description: Create a reservation against a web quote. The server rechecks product eligibility at confirmation. An exact retry of an already accepted reservation returns the existing order.
       security: [{ webGuest: [] }]
       parameters:
         - $ref: '#/components/parameters/WebOrigin'

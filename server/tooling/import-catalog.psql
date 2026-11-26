@@ -77,6 +77,13 @@ CREATE FUNCTION pg_temp.catalog_timestamp(value jsonb) RETURNS boolean LANGUAGE 
         AND (value #>> '{}') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$'
 $$;
 
+CREATE FUNCTION pg_temp.catalog_sale_channels(value jsonb) RETURNS text[]
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE WHEN jsonb_typeof(value) = 'array'
+        THEN ARRAY(SELECT jsonb_array_elements_text(value))
+    END
+$$;
+
 DO $import$
 DECLARE
     source text;
@@ -128,7 +135,7 @@ BEGIN
     FOR product IN SELECT value FROM jsonb_array_elements(payload->'products') LOOP
         PERFORM pg_temp.catalog_assert(pg_temp.catalog_fields(product,
             ARRAY['sku','name','description','ingredients','allergens','category','price','available','modifiers'],
-            ARRAY['photoUrl','recipeVersion','allergenVersion'])
+            ARRAY['photoUrl','recipeVersion','allergenVersion','saleChannels','saleHours'])
             AND pg_temp.catalog_id(product->'sku') AND pg_temp.catalog_localized(product->'name')
             AND pg_temp.catalog_localized(product->'description')
             AND product->>'category' IN ('burgers','combos','sides','drinks')
@@ -139,6 +146,12 @@ BEGIN
             AND (NOT (product ?| ARRAY['recipeVersion','allergenVersion'])
                 OR (pg_temp.catalog_id(product->'recipeVersion') AND pg_temp.catalog_id(product->'allergenVersion'))),
             'Product contains invalid or missing fields');
+        PERFORM pg_temp.catalog_assert(NOT product ? 'saleChannels'
+            OR public.catalog_sale_channels_valid(pg_temp.catalog_sale_channels(product->'saleChannels')),
+            'Product saleChannels must contain distinct mobile and/or web values');
+        PERFORM pg_temp.catalog_assert(NOT product ? 'saleHours'
+            OR public.catalog_sale_hours_valid(product->'saleHours'),
+            'Product saleHours must contain same-day ISO weekday intervals with HH:MM start and end');
         PERFORM pg_temp.catalog_assert(NOT EXISTS (
             SELECT FROM jsonb_array_elements((product->'ingredients') || (product->'allergens')) AS element(value)
             WHERE pg_temp.catalog_localized(element.value) IS DISTINCT FROM true
@@ -281,14 +294,20 @@ BEGIN
         open = excluded.open, tax_basis_points = excluded.tax_basis_points, version = excluded.version,
         updated_at = excluded.updated_at, support_url = excluded.support_url, directions_url = excluded.directions_url;
 
-    INSERT INTO public.menu_products AS saved (store_id, sku, position, product, recipe_version, allergen_version)
+    INSERT INTO public.menu_products AS saved (store_id, sku, position, product, recipe_version, allergen_version,
+        sale_channels, sale_hours)
     SELECT target_store_id, entry.value->>'sku', entry.position::integer,
-        entry.value - ARRAY['recipeVersion','allergenVersion'], entry.value->>'recipeVersion', entry.value->>'allergenVersion'
+        entry.value - ARRAY['recipeVersion','allergenVersion','saleChannels','saleHours'],
+        entry.value->>'recipeVersion', entry.value->>'allergenVersion',
+        COALESCE(pg_temp.catalog_sale_channels(entry.value->'saleChannels'), prior.sale_channels, ARRAY['mobile','web']),
+        COALESCE(entry.value->'saleHours', prior.sale_hours, '[]'::jsonb)
     FROM jsonb_array_elements(payload->'products') WITH ORDINALITY AS entry(value, position)
+    LEFT JOIN public.menu_products prior ON prior.store_id = target_store_id AND prior.sku = entry.value->>'sku'
     ON CONFLICT ON CONSTRAINT menu_products_pkey DO UPDATE
         SET position = excluded.position, product = excluded.product,
             recipe_version = COALESCE(excluded.recipe_version, saved.recipe_version),
-            allergen_version = COALESCE(excluded.allergen_version, saved.allergen_version);
+            allergen_version = COALESCE(excluded.allergen_version, saved.allergen_version),
+            sale_channels = excluded.sale_channels, sale_hours = excluded.sale_hours;
 
     INSERT INTO public.pickup_slots (store_id, id, starts_at, ends_at, capacity)
     SELECT target_store_id, entry.value->>'id', (entry.value->>'startsAt')::timestamptz,

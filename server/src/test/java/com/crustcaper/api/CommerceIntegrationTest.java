@@ -17,6 +17,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 import com.crustcaper.api.payment.PaymentGateway;
+import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import com.crustcaper.api.payment.PaymentGateway.HostedPayment;
 import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
@@ -292,7 +293,7 @@ class CommerceIntegrationTest {
     @Test
     void storedSoldItemIsDerivedFromTheCatalogAndSurvivesLaterCatalogChanges() throws Exception {
         String owner = guest();
-        var product = catalog.products(store, false).getFirst();
+        var product = catalog.menu(store, CheckoutChannel.MOBILE).products().getFirst();
         String version = catalog.store(store, false).version();
         JsonNode expected = json.readTree(json.writeValueAsBytes(new ApiModels.SoldItem(
             version, product.name(), product.ingredients(), product.allergens(), List.of(product.modifiers().getFirst()))));

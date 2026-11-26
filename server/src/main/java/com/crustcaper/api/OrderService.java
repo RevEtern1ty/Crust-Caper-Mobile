@@ -16,7 +16,6 @@ import tools.jackson.core.type.TypeReference;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
-import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.HashSet;
 import java.util.List;
@@ -119,18 +118,18 @@ public class OrderService {
 
     @Transactional
     public Quote createQuote(UUID guest, QuoteInput input) {
-        return createQuote(guest, input, false);
+        return createQuote(guest, input, CheckoutChannel.MOBILE);
     }
 
     @Transactional
     public Quote createWebQuote(UUID guest, QuoteInput input) {
-        return createQuote(guest, input, true);
+        return createQuote(guest, input, CheckoutChannel.WEB);
     }
 
-    private Quote createQuote(UUID guest, QuoteInput input, boolean webCheckout) {
+    private Quote createQuote(UUID guest, QuoteInput input, CheckoutChannel channel) {
         validateQuote(input);
-        Instant now = databaseNow();
-        Catalog.QuoteCatalog quotedCatalog = catalog.quoteCatalog(input.storeId(), input.lines());
+        Instant now = catalog.databaseNow();
+        Catalog.QuoteCatalog quotedCatalog = catalog.quoteCatalog(input.storeId(), input.lines(), channel, now);
         Catalog.StoreData store = quotedCatalog.store();
         Catalog.SlotData slot = catalog.slot(input.storeId(), input.slotId(), false);
         if (!catalog.available(store.store(), slot, now)) throw ApiFailure.conflict("slot_unavailable");
@@ -147,7 +146,7 @@ public class OrderService {
             VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?)
             """)
             .params(id, guest, input.storeId(), slot.id(), dbTime(slot.startsAt()), dbTime(slot.endsAt()),
-                json.write(current.lines()), total, tax, dbTime(expiresAt), webCheckout)
+                json.write(current.lines()), total, tax, dbTime(expiresAt), channel == CheckoutChannel.WEB)
             .update();
         return new Quote(id, input.storeId(), slot.id(), current.lines(), total - tax, tax, total, CURRENCY,
             expiresAt, current.changes(), slot.startsAt(), slot.endsAt());
@@ -193,19 +192,19 @@ public class OrderService {
         if (jdbc.sql("SELECT 1 FROM orders WHERE quote_id = ? AND guest_session_id = ?")
             .params(quoteId, guest).query(Integer.class).optional().isPresent()) throw ApiFailure.conflict("conflict");
 
-        StoredQuote quote = jdbc.sql("SELECT * FROM quotes WHERE id = ? AND guest_session_id = ?")
-            .params(quoteId, guest).query(this::quoteRow)
+        StoredQuote quote = jdbc.sql("SELECT * FROM quotes WHERE id = ? AND guest_session_id = ? AND web_checkout = ?")
+            .params(quoteId, guest, channel == CheckoutChannel.WEB).query(this::quoteRow)
             .optional().orElseThrow(() -> ApiFailure.conflict("quote_expired"));
         requireSupportedTotal(quote.total());
         Catalog.StoreData store = catalog.store(quote.storeId(), true);
         Catalog.SlotData slot = catalog.slot(quote.storeId(), quote.slotId(), true);
-        Instant now = databaseNow();
+        Instant now = catalog.databaseNow();
         if (!quote.expiresAt().isAfter(now)) throw ApiFailure.conflict("quote_expired");
         if (!slot.startsAt().equals(quote.startsAt()) || !slot.endsAt().equals(quote.endsAt())) {
             throw ApiFailure.conflict("quote_changed");
         }
         if (!catalog.available(store.store(), slot, now)) throw ApiFailure.conflict("slot_unavailable");
-        Reorder current = Catalog.reconcile(quote.lines(), catalog.products(quote.storeId(), true), store.version());
+        Reorder current = Catalog.reconcile(quote.lines(), catalog.products(quote.storeId(), channel, now, true), store.version());
         long divisor = 10_000L + store.taxBasisPoints();
         long tax = (quote.total() * store.taxBasisPoints() + divisor / 2) / divisor;
         if (quote.total() <= 0 || !current.changes().isEmpty() || tax != quote.tax()
@@ -309,9 +308,9 @@ public class OrderService {
         return new ReadOrder(view(snapshot, true), null);
     }
 
-    public Reorder reorder(UUID guest, UUID id) {
+    public Reorder reorder(UUID guest, UUID id, CheckoutChannel channel) {
         StoredOrder order = visible(guest, id);
-        return Catalog.reconcile(order.lines(), catalog.products(order.storeId(), false));
+        return Catalog.reconcile(order.lines(), catalog.products(order.storeId(), channel, catalog.databaseNow(), false));
     }
 
     byte[] receiptDocument(UUID guest, UUID id) {
@@ -389,7 +388,7 @@ public class OrderService {
 
     private boolean rejectUndispatchedPayment(Attempt attempt, boolean invalidRequest) {
         StoredOrder order = owned(null, attempt.orderId(), true);
-        boolean expired = !order.reservationExpiresAt().isAfter(databaseNow());
+        boolean expired = !order.reservationExpiresAt().isAfter(catalog.databaseNow());
         Attempt current = latest(order.id());
         if (current == null || !current.id().equals(attempt.id()) || !order.paymentStatus().equals("processing")
             || !order.status().equals("awaiting_payment")) return expired;
@@ -410,7 +409,7 @@ public class OrderService {
         Attempt existing = jdbc.sql("SELECT * FROM payment_attempts WHERE order_id = ? AND request_key = ?")
             .params(id, key).query(OrderService::attemptRow).optional().orElse(null);
         if (existing != null) return new PaymentStart(existing, order, false);
-        if (statusAt(order, databaseNow()).equals("cancelled")) throw ApiFailure.conflict("reservation_expired");
+        if (statusAt(order, catalog.databaseNow()).equals("cancelled")) throw ApiFailure.conflict("reservation_expired");
         if (order.paymentStatus().equals("processing")) throw ApiFailure.conflict("payment_pending");
         if (!order.status().equals("awaiting_payment")) throw ApiFailure.conflict("conflict");
 
@@ -484,7 +483,7 @@ public class OrderService {
         // Check the hold with PostgreSQL's clock after acquiring the slot lock used by reservations and imports.
         Catalog.SlotData slot = catalog.slot(order.storeId(), order.slotId(), true);
         return order.startsAt().equals(slot.startsAt()) && order.endsAt().equals(slot.endsAt())
-            && statusAt(order, databaseNow()).equals("awaiting_payment");
+            && statusAt(order, catalog.databaseNow()).equals("awaiting_payment");
     }
 
     private void recordPaymentException(UUID attempt, String transaction, String reason) {
@@ -585,10 +584,6 @@ public class OrderService {
     private static Attempt attemptRow(ResultSet rs, int row) throws SQLException {
         return new Attempt(rs.getObject("id", UUID.class), rs.getObject("order_id", UUID.class),
             rs.getString("status"), rs.getString("provider_transaction_id"));
-    }
-
-    private Instant databaseNow() {
-        return jdbc.sql("SELECT clock_timestamp()").query(OffsetDateTime.class).single().toInstant();
     }
 
     private static String statusAt(StoredOrder order, Instant now) {

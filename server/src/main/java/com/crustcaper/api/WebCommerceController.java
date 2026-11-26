@@ -4,6 +4,7 @@ import static com.crustcaper.api.ApiModels.*;
 import static com.crustcaper.api.CommerceController.privateResponse;
 import static com.crustcaper.api.WebCommerceAccess.GUEST_ATTRIBUTE;
 
+import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -89,7 +90,7 @@ final class WebCommerceController {
 
     @PostMapping("/orders/{id}/reorder")
     ResponseEntity<Reorder> reorder(@RequestAttribute(GUEST_ATTRIBUTE) UUID guest, @PathVariable String id) {
-        return privateResponse(orders.reorder(guest, orderId(id)));
+        return privateResponse(orders.reorder(guest, orderId(id), CheckoutChannel.WEB));
     }
 
     @GetMapping("/orders/{id}/receipt")

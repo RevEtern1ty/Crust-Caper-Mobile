@@ -2,6 +2,7 @@ package com.crustcaper.api;
 
 import static com.crustcaper.api.ApiModels.*;
 
+import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -40,7 +41,7 @@ final class CommerceController {
         @RequestHeader(value = HttpHeaders.IF_NONE_MATCH, required = false) String currentTag) {
         if ((channel != null && !channel.equals("mobile") && !channel.equals("web"))
             || (locale != null && !locale.equals("en") && !locale.equals("rw"))) throw ApiFailure.invalid();
-        Menu menu = catalog.menu(id);
+        Menu menu = catalog.menu(id, "web".equals(channel) ? CheckoutChannel.WEB : CheckoutChannel.MOBILE);
         String tag = tag(menu);
         boolean notModified = currentTag != null && java.util.Arrays.stream(currentTag.split(","))
             .map(String::strip).anyMatch(value -> value.equals("*") || value.equals(tag) || value.equals("W/" + tag));
@@ -93,7 +94,8 @@ final class CommerceController {
     @PostMapping("/orders/{id}/reorder")
     ResponseEntity<Reorder> reorder(@RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String bearer,
         @PathVariable String id) {
-        return privateResponse(orders.reorder(sessions.authenticate(bearer), ApiFailure.uuid(id, ApiFailure.notFound())));
+        return privateResponse(orders.reorder(sessions.authenticate(bearer), ApiFailure.uuid(id, ApiFailure.notFound()),
+            CheckoutChannel.MOBILE));
     }
 
     @PostMapping("/orders/{id}/payments")

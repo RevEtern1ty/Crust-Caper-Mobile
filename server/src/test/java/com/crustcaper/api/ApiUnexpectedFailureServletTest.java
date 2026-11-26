@@ -3,6 +3,7 @@ package com.crustcaper.api;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.doThrow;
 
+import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -33,7 +34,7 @@ class ApiUnexpectedFailureServletTest {
         String suppliedId = "00000000-0000-4000-8000-000000000042";
         String origin = "http://127.0.0.1:41233";
         Catalog target = AopTestUtils.getUltimateTargetObject(catalog);
-        doThrow(new IllegalStateException(exception)).when(target).menu(store);
+        doThrow(new IllegalStateException(exception)).when(target).menu(store, CheckoutChannel.MOBILE);
 
         var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port
                 + "/api/v1/stores/" + store + "/menu?diagnostic=" + query))

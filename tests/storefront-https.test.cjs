@@ -1126,6 +1126,99 @@ async function checkRecipeApproval(browser, ca) {
   }
 }
 
+function publishProductSaleRules(catalog, product, rules) {
+  const { store: exampleStore } = JSON.parse(readFileSync(require.resolve('../server/tooling/catalog.example.json'), 'utf8'));
+  const version = 'sale-ui-' + randomUUID();
+  const manifest = {
+    expectedVersion: catalog.version,
+    store: { ...exampleStore, ...catalog.store, version },
+    products: [{ ...product, ...rules }],
+    slots: [],
+  };
+  const imported = spawnSync('docker', ['exec', '-i', fixtureDatabase(), 'psql', '-Xq', '--no-password',
+    '-U', 'storefront_fixture', '-d', 'storefront_fixture', '-v', 'catalog_database=storefront_fixture',
+    '-v', 'catalog_apply=true', '-f', '/fixture/import-catalog.psql',
+  ], { encoding: 'utf8', input: Buffer.from(JSON.stringify(manifest)).toString('base64') + '\n', timeout: 10000 });
+  assert.equal(imported.status, 0, imported.stderr || 'fixture catalog import failed');
+  return version;
+}
+
+async function checkProductSaleRules(ca) {
+  const api = '/api/v1/stores/kigali/menu';
+  const webMenu = api + '?channel=web';
+  const mobileMenu = api + '?channel=mobile';
+  const getMenu = (path, tag) => request(ca, path, { headers: tag ? { 'If-None-Match': tag } : {} });
+  const findProduct = menu => menu.products.find(({ sku }) => sku === 'double-smash');
+  const assertMenu = (response, version, available) => {
+    assert.equal(response.status, 200);
+    const menu = JSON.parse(response.body);
+    assert.equal(menu.version, version);
+    assert.equal(findProduct(menu)?.available, available);
+    return menu;
+  };
+
+  const baseline = await getMenu(webMenu);
+  assert.equal(baseline.status, 200);
+  assert.ok(baseline.headers.etag);
+  const original = JSON.parse(baseline.body);
+  const item = findProduct(original);
+  assert.equal(item?.available, true);
+
+  const mobileOnly = publishProductSaleRules(original, item, { saleChannels: ['mobile'] });
+  const [byDefault, forMobile, forWeb] = await Promise.all([
+    getMenu(api), getMenu(mobileMenu), getMenu(webMenu, baseline.headers.etag),
+  ]);
+  const current = assertMenu(byDefault, mobileOnly, true);
+  assertMenu(forMobile, mobileOnly, true);
+  assertMenu(forWeb, mobileOnly, undefined);
+  assert.ok(forWeb.headers.etag);
+  assert.notEqual(forWeb.headers.etag, baseline.headers.etag);
+  assert.notEqual(forWeb.headers.etag, forMobile.headers.etag);
+  assert.equal((await getMenu(webMenu, forWeb.headers.etag)).status, 304);
+
+  for (const [locale, detailsPath] of [['en', product], ['rw', translatedProduct]]) {
+    const listing = await request(ca, '/menu/' + locale);
+    assert.equal(listing.status, 200);
+    assert.equal(listing.headers['x-crustcaper-catalog-version'], mobileOnly);
+    assert.ok(!listing.body.includes('href="' + detailsPath + '"'), 'mobile-only item appeared on the Web menu');
+    assert.equal((await request(ca, detailsPath)).status, 404);
+  }
+
+  const checkedAt = Date.parse(forWeb.headers['x-availability-checked-at']);
+  assert.ok(Number.isFinite(checkedAt), 'menu must include the confirmed availability timestamp');
+  const weekday = new Intl.DateTimeFormat('en-US', { timeZone: 'Africa/Kigali', weekday: 'short' }).format(checkedAt);
+  const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const today = weekdays.indexOf(weekday);
+  assert.notEqual(today, -1);
+  const offHours = publishProductSaleRules(current, item, {
+    saleChannels: ['mobile', 'web'],
+    saleHours: [{ day: (today + 2) % 7 + 1, start: '00:00', end: '24:00' }],
+  });
+  const [offMobile, offWeb] = await Promise.all([
+    getMenu(mobileMenu, forMobile.headers.etag), getMenu(webMenu, forWeb.headers.etag),
+  ]);
+  assertMenu(offMobile, offHours, false);
+  assertMenu(offWeb, offHours, false);
+  assert.ok(offWeb.headers.etag);
+  assert.notEqual(offWeb.headers.etag, forWeb.headers.etag);
+  assert.equal((await getMenu(webMenu, offWeb.headers.etag)).status, 304);
+
+  for (const [locale, detailsPath, unavailable] of [
+    ['en', product, 'Currently unavailable'], ['rw', translatedProduct, 'Ntikiboneka ubu'],
+  ]) {
+    const [listing, details] = await Promise.all([request(ca, '/menu/' + locale), request(ca, detailsPath)]);
+    assert.equal(listing.status, 200);
+    assert.equal(listing.headers['x-crustcaper-catalog-version'], offHours);
+    const cards = listing.body.match(/<article\b[^>]*>[\s\S]*?<\/article>/g) ?? [];
+    const card = cards.find(html => html.includes('href="' + detailsPath + '"'));
+    const status = '<p class="item-status">' + unavailable + '</p>';
+    assert.ok(card?.includes(status), 'off-hours product is visible with its localized availability');
+    assert.equal(details.status, 200);
+    assert.ok(details.body.includes(status));
+    assert.ok(!details.body.includes('href="/product/double-smash?storefrontLocale=' + locale + '"'));
+  }
+}
+
 const scenario = webPerf ? 'HTTPS catalog captures cold mobile web performance'
   : catalogPhotos ? 'HTTPS storefront renders the approved photo and preserves a single verified guest payment'
     : 'HTTPS storefront renders public pages and preserves a single verified guest payment';
@@ -1166,5 +1259,7 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   if (catalogPhotos) {
     await t.test('a named manager with MFA confirms an exact recipe approval without publishing it',
       () => checkRecipeApproval(browser, ca));
+    await t.test('published sale rules update channel visibility and localized availability over HTTPS',
+      () => checkProductSaleRules(ca));
   }
 });

@@ -13,6 +13,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
@@ -62,7 +63,8 @@ class ApiRequestDiagnosticsIntegrationTest {
         String authorization = "private-authorization-marker";
         String exceptionMessage = "private-database-exception-marker";
         Catalog target = AopTestUtils.getUltimateTargetObject(catalog);
-        doThrow(new TransientDataAccessResourceException(exceptionMessage)).when(target).menu(store);
+        doThrow(new TransientDataAccessResourceException(exceptionMessage)).when(target)
+            .menu(store, CheckoutChannel.MOBILE);
 
         var response = api.perform(get(MENU_ROUTE, store)
                 .header(REQUEST_ID, suppliedId)
@@ -131,7 +133,8 @@ class ApiRequestDiagnosticsIntegrationTest {
 
         String store = "private-snapshot-store";
         Catalog target = AopTestUtils.getUltimateTargetObject(catalog);
-        doThrow(new TransientDataAccessResourceException("private-snapshot-exception")).when(target).menu(store);
+        doThrow(new TransientDataAccessResourceException("private-snapshot-exception")).when(target)
+            .menu(store, CheckoutChannel.MOBILE);
         api.perform(get(MENU_ROUTE, store).header(HttpHeaders.AUTHORIZATION, "Bearer private-snapshot-authorization")
                 .queryParam("customer", "private-snapshot-query"))
             .andExpect(status().isServiceUnavailable());
@@ -144,7 +147,8 @@ class ApiRequestDiagnosticsIntegrationTest {
         Snapshot before = snapshot();
         String store = "private-unhandled-store";
         Catalog target = AopTestUtils.getUltimateTargetObject(catalog);
-        doThrow(new IllegalStateException("private-unhandled-exception")).when(target).menu(store);
+        doThrow(new IllegalStateException("private-unhandled-exception")).when(target)
+            .menu(store, CheckoutChannel.MOBILE);
         api.perform(get(MENU_ROUTE, store)).andExpect(status().isInternalServerError())
             .andExpect(jsonPath("$.code").value("service_unavailable"));
         assertCounts(before, 1, 1);

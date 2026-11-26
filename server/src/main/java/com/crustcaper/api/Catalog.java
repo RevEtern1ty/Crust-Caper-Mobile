@@ -2,6 +2,7 @@ package com.crustcaper.api;
 
 import static com.crustcaper.api.ApiModels.*;
 
+import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
@@ -9,6 +10,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
@@ -18,6 +20,10 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 class Catalog {
     private static final int MENU_SLOT_LIMIT = 12;
+    private static final String SALE_PRODUCT = """
+        CASE WHEN catalog_sale_active(p.sale_hours, :soldAt) THEN p.product
+            ELSE jsonb_set(p.product, '{available}', 'false'::jsonb) END AS product
+        """;
     private static final String SLOT_QUERY = """
         SELECT id, starts_at, ends_at, capacity FROM pickup_slots WHERE store_id = ?
         """;
@@ -67,8 +73,8 @@ class Catalog {
     }
 
     @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
-    public Menu menu(String storeId) {
-        OffsetDateTime checkedAt = dbTime(Instant.now());
+    public Menu menu(String storeId, CheckoutChannel channel) {
+        OffsetDateTime checkedAt = dbTime(databaseNow());
         StoreData store = store(storeId, false);
         List<Slot> slots = jdbc.sql(UPCOMING_SLOTS_QUERY)
             .params(store.store().open(), checkedAt, storeId, checkedAt)
@@ -86,7 +92,7 @@ class Catalog {
             }
         }
         return new Menu(store.version(), store.updatedAt(), checkedAt.toInstant(),
-            store.store(), products(storeId, false), slots);
+            store.store(), products(storeId, channel, checkedAt.toInstant(), false), slots);
     }
 
     private static Slot menuSlotRow(ResultSet rs, int row) throws SQLException {
@@ -100,14 +106,18 @@ class Catalog {
             .optional().orElseThrow(ApiFailure::notFound);
     }
 
-    QuoteCatalog quoteCatalog(String storeId, List<CartLine> lines) {
+    QuoteCatalog quoteCatalog(String storeId, List<CartLine> lines, CheckoutChannel channel, Instant now) {
         // One statement ties the version and selected products to the same catalog snapshot.
         return jdbc.sql("""
-            SELECT s.*, p.product FROM stores s
+            SELECT s.*,
+            """ + SALE_PRODUCT + """
+            FROM stores s
             LEFT JOIN menu_products p ON p.store_id = s.id AND p.sku IN (:skus)
+                AND :channel = ANY(p.sale_channels)
             WHERE s.id = :storeId ORDER BY p.position, p.sku
             """)
             .param("storeId", storeId).param("skus", lines.stream().map(CartLine::sku).distinct().toList())
+            .param("channel", channel.name().toLowerCase(Locale.ROOT)).param("soldAt", dbTime(now))
             .query(rs -> {
                 if (!rs.next()) throw ApiFailure.notFound();
                 StoreData store = storeRow(rs);
@@ -129,10 +139,13 @@ class Catalog {
             rs.getString("version"), readTime(rs, "updated_at"), rs.getInt("tax_basis_points"));
     }
 
-    List<Product> products(String storeId, boolean lock) {
-        return jdbc.sql("SELECT product FROM menu_products WHERE store_id = ? ORDER BY position, sku"
-                + (lock ? " FOR SHARE" : ""))
-            .param(storeId)
+    List<Product> products(String storeId, CheckoutChannel channel, Instant now, boolean lock) {
+        return jdbc.sql("SELECT " + SALE_PRODUCT + """
+                FROM menu_products p WHERE p.store_id = :storeId AND :channel = ANY(p.sale_channels)
+                ORDER BY p.position, p.sku
+                """ + (lock ? " FOR SHARE" : ""))
+            .param("storeId", storeId).param("channel", channel.name().toLowerCase(Locale.ROOT))
+            .param("soldAt", dbTime(now))
             .query((rs, n) -> json.read(rs.getString("product"), Product.class))
             .list();
     }
@@ -186,6 +199,10 @@ class Catalog {
 
     static OffsetDateTime dbTime(Instant instant) {
         return OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
+    }
+
+    Instant databaseNow() {
+        return jdbc.sql("SELECT clock_timestamp()").query(OffsetDateTime.class).single().toInstant();
     }
 
     static Instant readTime(ResultSet rs, String name) throws SQLException {
