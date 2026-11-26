@@ -101,7 +101,8 @@ class CatalogSnapshotIntegrationTest {
         insertAvailabilityFixture();
         clearInvocations(jdbc);
 
-        Instant requestStartedAt = Instant.now();
+        // The availability timestamp comes from PostgreSQL, which can run on another clock.
+        Instant requestStartedAt = catalog.databaseNow();
         var response = api.perform(get("/api/v1/stores/{id}/menu", store))
             .andExpect(status().isOk())
             .andExpect(header().exists(AVAILABILITY_CHECKED_AT_HEADER))
@@ -112,19 +113,19 @@ class CatalogSnapshotIntegrationTest {
                 false, true, true, true, true)))
             .andReturn().getResponse();
         assertThat(Instant.parse(response.getHeader(AVAILABILITY_CHECKED_AT_HEADER)))
-            .isBetween(requestStartedAt, Instant.now());
+            .isBetween(requestStartedAt, catalog.databaseNow());
 
         verify(jdbc).sql(argThat(query -> query.contains("FROM pickup_slots")
             || query.contains("pickup_reservation_occupies_slot")));
 
         String etag = response.getHeader(HttpHeaders.ETAG);
-        Instant revalidationStartedAt = Instant.now();
+        Instant revalidationStartedAt = catalog.databaseNow();
         var revalidated = api.perform(get("/api/v1/stores/{id}/menu", store).header(HttpHeaders.IF_NONE_MATCH, etag))
             .andExpect(status().isNotModified()).andExpect(header().string(HttpHeaders.ETAG, etag))
             .andExpect(header().exists(AVAILABILITY_CHECKED_AT_HEADER))
             .andReturn().getResponse();
         assertThat(Instant.parse(revalidated.getHeader(AVAILABILITY_CHECKED_AT_HEADER)))
-            .isBetween(revalidationStartedAt, Instant.now());
+            .isBetween(revalidationStartedAt, catalog.databaseNow());
 
         jdbc.sql("UPDATE stores SET open = false WHERE id = ?").param(store).update();
         api.perform(get("/api/v1/stores/{id}/menu", store))
