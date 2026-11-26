@@ -1,0 +1,41 @@
+services:
+  api:
+    networks: [default, catalog_private]
+
+  edge:
+    depends_on:
+      catalog:
+        condition: service_healthy
+    environment:
+      CRUSTCAPER_CATALOG_ENABLED: "1"
+    networks: [default, catalog_private]
+
+  catalog:
+    image: ${CRUSTCAPER_CATALOG_IMAGE:?Set the verified catalog image or digest}
+    depends_on:
+      - api
+    environment:
+      CRUSTCAPER_CATALOG_API_ORIGIN: http://api:8080
+      CRUSTCAPER_PUBLIC_ORIGIN: https://${CRUSTCAPER_HTTPS_HOST:?Set the public storefront hostname}
+      CRUSTCAPER_STORE_ID: ${CRUSTCAPER_STORE_ID:?Set the public catalog store ID}
+      CRUSTCAPER_STOREFRONT_PROFILE: ${CRUSTCAPER_STOREFRONT_PROFILE:-stage}
+    networks: [catalog_private]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/catalog-health', {signal: AbortSignal.timeout(2000)}).then(res => { if(!res.ok) process.exitCode=1 }).catch(() => { process.exitCode=1 })"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+networks:
+  catalog_private:
+    internal: true

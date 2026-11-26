@@ -1,7 +1,9 @@
-import type { GetServerSideProps } from 'next';
+import type { GetServerSideProps, PageConfig } from 'next';
 import { CatalogProblem, MenuPage, ProductPage, type MenuItem } from '../../components/CatalogPages';
 import { menuPath } from '../../components/copy';
 import { isCatalogSku, isLocale, loadCatalog, type CatalogMenu, type CatalogSite, type Locale } from '../../lib/catalog';
+
+export const config: PageConfig = { unstable_runtimeJS: false };
 
 type PageData = { locale: Locale; site: CatalogSite; store: CatalogMenu['store']; startsAt: string | null };
 type Props =

@@ -29,6 +29,28 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 	@local path /api/v1/local /api/v1/local/*
 	@operatorHome path /operator /operator/
 	@publicRoutes path /api/v1 /api/v1/* /operator/* /payment-return /.well-known/apple-app-site-association /.well-known/assetlinks.json
+	@catalogEnglish {
+		method GET HEAD
+		path / /en /menu /menu/
+		expression "{$CRUSTCAPER_CATALOG_ENABLED:0}" == "1"
+	}
+	@catalogKinyarwanda {
+		method GET HEAD
+		path /rw
+		expression "{$CRUSTCAPER_CATALOG_ENABLED:0}" == "1"
+	}
+	@catalogLegacyProduct {
+		method GET HEAD
+		path_regexp catalogProduct ^/menu/([A-Za-z0-9][A-Za-z0-9._-]{0,99})$
+		not path /menu/en /menu/rw
+		expression "{$CRUSTCAPER_CATALOG_ENABLED:0}" == "1"
+	}
+	@catalogDocuments {
+		method GET HEAD
+		path /menu/* /robots.txt /sitemap.xml /_next/static/*
+		not path *.map
+		expression "{$CRUSTCAPER_CATALOG_ENABLED:0}" == "1"
+	}
 	@storefrontPages {
 		method GET HEAD
 		path / /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery /product/*
@@ -42,7 +64,7 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 		path /favicon.ico /_expo/static/* /assets/*
 		not path *.map
 	}
-	@storefrontPrivate path /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery
+	@storefrontPrivate path /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery /product/*
 	@receiptUpload {
 		method PUT
 		path_regexp ^/api/v1/operator/orders/[0-9a-fA-F-]{36}/receipt$
@@ -54,6 +76,9 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 	route {
 		respond @local 404
 		redir @operatorHome /operator/index.html 308
+		redir @catalogEnglish /menu/en 308
+		redir @catalogKinyarwanda /menu/rw 308
+		redir @catalogLegacyProduct /menu/en/{re.catalogProduct.1} 308
 		handle @publicRoutes {
 			request_body @receiptUpload {
 				max_size 1MiB
@@ -68,6 +93,28 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 				transport http {
 					dial_timeout 3s
 					response_header_timeout 30s
+				}
+			}
+		}
+		handle @catalogDocuments {
+			header {
+				-Server
+				-X-Powered-By
+				Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+			}
+			request_body {
+				max_size 1KiB
+			}
+			rewrite /robots.txt /api/catalog-robots
+			rewrite /sitemap.xml /api/catalog-sitemap
+			reverse_proxy catalog:3000 {
+				header_up -Cookie
+				header_up -Authorization
+				header_up -X-CrustCaper-Session
+				header_down -Set-Cookie
+				transport http {
+					dial_timeout 2s
+					response_header_timeout 7s
 				}
 			}
 		}

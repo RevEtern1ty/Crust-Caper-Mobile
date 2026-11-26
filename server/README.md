@@ -102,3 +102,17 @@ Set `CRUSTCAPER_STOREFRONT_DIR` in the Compose environment file to the absolute 
 Browser guest credentials are set through a first-party HttpOnly cookie. Checkout and recovery use the browser session, the server-confirmed order and the payment provider's verified result. Test the hosted flow in the same tab over HTTPS, including a failed payment and recovery after reopening the browser, with Flutterwave Test before admitting recipients to the storefront.
 
 When the browser still has an unfinished checkout but lost the cookie and order response, recovery uses the original quote and creation key. Customers verify their checkout phone through the configured SMS provider. A verified customer can complete payment for the same order. If checkout never committed, the API releases the saved attempt only after the quote can no longer be used. Include both cases and a lost verification response in the pilot recovery test.
+
+### Public menu
+
+The Next.js catalog renders public menu and product HTML before JavaScript runs. It reads the same Spring Boot catalog used by checkout. The `/en` and `/rw` entry points lead to language-specific menus. `/menu/<sku>` leads to the English product page. The checkout client uses `/product/<sku>`, `/cart` and `/orders` on the same origin.
+
+Build the catalog image from the same candidate checkout as the API and checkout client.
+
+```sh
+docker build -f storefront/Dockerfile -t crustcaper-catalog:stage .
+```
+
+Set `CRUSTCAPER_CATALOG_IMAGE` to the verified catalog image and `CRUSTCAPER_STORE_ID` to the public store ID in the Compose environment file. Add `-f server/deploy/compose.catalog.yml` after the HTTPS and storefront overlays. Run the same Compose validation and startup commands with all four files. Caddy forwards public content to the catalog on a private network and drops cookies and authorization headers from those requests. The catalog needs no API credential and exposes no host port.
+
+The default `CRUSTCAPER_STOREFRONT_PROFILE=stage` prevents indexing. Enable `production` only when the domain, published store data, imagery and customer-facing content have been approved. Verify localized deep links, robots and sitemap on the target hostname. If the API cannot confirm the menu, the catalog returns an unavailable page and preserves the checkout client's separate order routes. [Next.js self-hosting](https://nextjs.org/docs/pages/guides/self-hosting)

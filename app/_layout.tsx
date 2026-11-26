@@ -13,7 +13,22 @@ import { copy } from '../src/ui/format';
 export const unstable_settings = { anchor: '(tabs)' };
 
 function Routes() {
-  const { locale, mode } = useShop();
+  const { hydrated, locale, mode, setLocale, webCheckout } = useShop();
+  useEffect(() => {
+    if (!webCheckout || !hydrated || typeof window === 'undefined') return;
+
+    const url = new URL(window.location.href);
+    if (url.pathname !== '/cart' && url.pathname !== '/orders' && !url.pathname.startsWith('/product/')) return;
+    const handoff = url.searchParams.getAll('storefrontLocale');
+    if (handoff.length !== 1) return;
+    const next = handoff[0];
+    if (next !== 'en' && next !== 'rw') return;
+
+    // Catalog links open a new document. Consume the language hint once and keep other route parameters.
+    url.searchParams.delete('storefrontLocale');
+    window.history.replaceState(window.history.state, '', url);
+    if (next !== locale) setLocale(next);
+  }, [hydrated, locale, setLocale, webCheckout]);
   useEffect(() => {
     if (Platform.OS === 'web' && typeof document !== 'undefined') {
       document.documentElement.lang = locale;
