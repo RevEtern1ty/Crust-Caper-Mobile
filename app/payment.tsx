@@ -4,7 +4,7 @@ import { useRef, useState } from 'react';
 import { Platform, StyleSheet, View } from 'react-native';
 
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../src/checkout/context';
-import { checkoutError, displayOrderId, paymentLabel } from '../src/checkout/labels';
+import { checkoutError, delayedPaymentLabel, displayOrderId, paymentLabel } from '../src/checkout/labels';
 import { hasInconsistentPayment } from '../src/checkout/pickup-hold';
 import type { DemoPaymentResult } from '../src/domain/types';
 import { useShop } from '../src/state/shop';
@@ -18,7 +18,7 @@ export default function PaymentScreen() {
   const guardNavigation = useRouteActionGuard();
   const active = journal?.active;
   const orderId = active && active.phase !== 'creating' ? active.orderId : null;
-  const { order, failed, error, loading, refresh } = useOrderStatus(orderId);
+  const { order, failed, error, loading, refresh, delayedPayment } = useOrderStatus(orderId);
   const [busy, setBusy] = useState<DemoPaymentResult | 'browser' | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const running = useRef(false);
@@ -134,6 +134,7 @@ export default function PaymentScreen() {
             'The pickup hold ended. Refresh to check this payment, or follow it later in Orders.',
             'Igihe cyabikiwe komande cyarangiye. Vugurura uko ubu bwishyu buhagaze cyangwa ubukurikirane nyuma muri Komande.',
           )}</Text>}
+          {delayedPayment && !failed && <Text tone="muted" accessibilityLiveRegion="polite">{delayedPaymentLabel(locale)}</Text>}
           {(problem || failed) && <Text tone="red" accessibilityRole="alert">{problem ?? checkoutError(error, locale)}</Text>}
           {orderId && <Button label={t('Refresh payment status', 'Vugurura uko ubwishyu buhagaze')} variant="secondary"
             onPress={() => { setProblem(null); void refresh(); }} busy={loading} disabled={!!busy} />}

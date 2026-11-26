@@ -1,5 +1,8 @@
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const { mkdtempSync, rmdirSync, unlinkSync, writeFileSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const { join } = require('node:path');
 
 const expoCli = require.resolve('expo/bin/cli');
 const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('CRUSTCAPER_')));
@@ -12,22 +15,69 @@ const fixture = {
   CRUSTCAPER_IOS_BUNDLE_ID: 'org.crustcaper.civerification',
 };
 const pushProjectId = '9afd8de1-0758-4bfe-9ccc-12589d6a62dc';
+const fixtureApiKey = 'A' + 'x'.repeat(38);
 
-function inspect(profile, overrides = {}, json = true) {
+function environment(profile, overrides) {
   const env = { ...inherited, EXPO_NO_TELEMETRY: '1', EXPO_NO_DOTENV: '1', ...fixture, CRUSTCAPER_BUILD_PROFILE: profile };
   for (const [name, value] of Object.entries(overrides)) {
     if (value === undefined) delete env[name];
     else env[name] = value;
   }
+  return env;
+}
+
+function inspect(profile, overrides = {}, json = true) {
   const argumentsList = [expoCli, 'config', '--type', 'introspect'];
   if (json) argumentsList.push('--json');
   const result = spawnSync(process.execPath, argumentsList, {
-    env,
+    env: environment(profile, overrides),
     encoding: 'utf8',
     timeout: 30_000,
   });
   if (result.error) throw result.error;
   return result;
+}
+
+function inspectIosOnly(profile) {
+  const script = `
+    const { createRequire } = require('node:module');
+    const { dirname } = require('node:path');
+    const sdk = createRequire(require.resolve('@expo/cli', { paths: [dirname(require.resolve('expo/bin/cli'))] }));
+    const { getPrebuildConfigAsync } = sdk('@expo/prebuild-config');
+    const { compileModsAsync } = sdk('@expo/config-plugins/build/plugins/mod-compiler.js');
+    (async () => {
+      const projectRoot = process.cwd();
+      const platforms = ['ios'];
+      const { exp } = await getPrebuildConfigAsync(projectRoot, { platforms });
+      await compileModsAsync(exp, { projectRoot, platforms, introspect: true, assertMissingModProviders: false });
+      const entitlement = exp._internal.modResults.ios.entitlements['aps-environment'];
+      if (entitlement !== 'production') throw new Error('APNs entitlement was not configured');
+    })().catch(error => { console.error(error); process.exitCode = 1; });`;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    env: environment(profile, { CRUSTCAPER_PUSH_PROJECT_ID: pushProjectId }),
+    encoding: 'utf8', timeout: 30_000,
+  });
+  if (result.error) throw result.error;
+  return result;
+}
+
+function inspectPushWithFixture(profile, clients, json = true, keys = [fixtureApiKey]) {
+  const directory = mkdtempSync(join(tmpdir(), 'crustcaper-firebase-fixture-'));
+  const file = join(directory, 'google-services.json');
+  try {
+    const data = clients === null ? 'invalid JSON fixture' : JSON.stringify({
+      project_info: { project_number: '123456', project_id: 'crustcaper-fixture' },
+      client: clients.map(packageId => ({
+        client_info: { mobilesdk_app_id: '1:123456:android:00112233', android_client_info: { package_name: packageId } },
+        api_key: keys.map(current_key => ({ current_key })),
+      })),
+    });
+    writeFileSync(file, data);
+    return inspect(profile, { CRUSTCAPER_PUSH_PROJECT_ID: pushProjectId, CRUSTCAPER_ANDROID_GOOGLE_SERVICES_FILE: file }, json);
+  } finally {
+    unlinkSync(file);
+    rmdirSync(directory);
+  }
 }
 
 for (const profile of ['stage', 'production']) {
@@ -73,7 +123,13 @@ for (const profile of ['stage', 'production']) {
   });
   console.log(`${profile} Android manifest and iOS entitlements match the connected configuration`);
 
-  const pushResult = inspect(profile, { CRUSTCAPER_PUSH_PROJECT_ID: pushProjectId });
+  const iosOnly = inspectIosOnly(profile);
+  assert.equal(iosOnly.status, 0, iosOnly.stderr);
+  const noFirebase = inspect(profile, { CRUSTCAPER_PUSH_PROJECT_ID: pushProjectId }, false);
+  assert.notEqual(noFirebase.status, 0);
+  assert.match(noFirebase.stderr + noFirebase.stdout, /Set CRUSTCAPER_ANDROID_GOOGLE_SERVICES_FILE/);
+
+  const pushResult = inspectPushWithFixture(profile, [packageId]);
   assert.equal(pushResult.status, 0, pushResult.stderr);
   const pushConfig = JSON.parse(pushResult.stdout);
   assert.equal(pushConfig.extra.restaurant.pushProjectId, pushProjectId);
@@ -113,3 +169,15 @@ for (const [overrides, cause] of rejectedProductionConfigs) {
   assert.ok((result.stderr + result.stdout).includes(cause), `Expo failed for a reason other than: ${cause}`);
 }
 console.log(`Production rejected ${rejectedProductionConfigs.length} invalid configurations`);
+
+for (const [clients, reason, keys] of [
+  [['org.crustcaper.different'], /exactly one Firebase client/],
+  [[fixture.CRUSTCAPER_ANDROID_PACKAGE, fixture.CRUSTCAPER_ANDROID_PACKAGE], /exactly one Firebase client/],
+  [null, /readable google-services\.json/],
+  [[fixture.CRUSTCAPER_ANDROID_PACKAGE], /missing or invalid Firebase project or Android client/, ['invalid-key', fixtureApiKey]],
+]) {
+  const result = inspectPushWithFixture('production', clients, false, keys);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr + result.stdout, reason);
+}
+console.log('Android push rejects missing, mismatched, duplicate, unreadable and malformed Firebase client configuration; iOS-only introspection works independently.');

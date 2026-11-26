@@ -7,6 +7,30 @@ export type OrderStatusResult = { order: PolledOrder } | { error: unknown };
 const unpaidHoldCheckIntervalMs = 60_000;
 const overdueHoldCheckIntervalMs = 15_000;
 const holdDeadlineGraceMs = 1000;
+export const delayedPaymentThresholdMs = 18_000;
+
+function isPaymentUncertain(order: PolledOrder): boolean {
+  return order.paymentStatus === 'processing' || hasInconsistentPayment(order);
+}
+
+function paymentCheckDelay(elapsedMs: number): number {
+  if (elapsedMs < delayedPaymentThresholdMs) return 3000;
+  if (elapsedMs < 120_000) return 15_000;
+  return 60_000;
+}
+
+export function nextUncertainPaymentStart(
+  result: OrderStatusResult,
+  since: number | null,
+  observedAt: number,
+): number | null {
+  if ('order' in result) return isPaymentUncertain(result.order) ? since ?? observedAt : null;
+  // A temporary failure does not establish a new payment state or renew the fast polling window.
+  if (result.error instanceof ApiError && (result.error.code === 'unauthenticated' || result.error.code === 'not_found')) {
+    return null;
+  }
+  return since;
+}
 
 export function nextOrderStatusDelay(
   mode: 'demo' | 'connected',
@@ -14,19 +38,19 @@ export function nextOrderStatusDelay(
   attempts: number,
   consecutiveFailures: number,
   now = Date.now(),
+  uncertainForMs: number | null = null,
 ): number | null {
   if ('error' in result) {
     const code = result.error instanceof ApiError ? result.error.code : null;
     if (code === 'unauthenticated' || code === 'not_found') return null;
     if (mode === 'demo') return attempts < 9 ? 3000 : null;
-    if (code === 'rate_limited') return 15_000;
+    const paymentDelay = uncertainForMs === null ? 0 : paymentCheckDelay(uncertainForMs);
+    if (code === 'rate_limited') return Math.max(15_000, paymentDelay);
     if (code === 'network_unavailable' || code === 'service_unavailable') {
-      return 5000 * Math.min(consecutiveFailures, 3);
+      return Math.max(5000 * Math.min(consecutiveFailures, 3), paymentDelay);
     }
     return null;
   }
-
-  if (hasInconsistentPayment(result.order)) return mode === 'demo' && attempts >= 9 ? null : 3000;
 
   if (isAwaitingUnpaidHold(result.order)) {
     const remainingMs = Date.parse(result.order.reservationExpiresAt ?? '') - now;
@@ -38,11 +62,12 @@ export function nextOrderStatusDelay(
 
   const { status, paymentStatus } = result.order;
   const inKitchen = status === 'accepted' || status === 'preparing';
+  const uncertain = isPaymentUncertain(result.order);
   if (mode === 'demo') {
-    return attempts < 9 && (inKitchen || paymentStatus === 'processing') ? 3000 : null;
+    return attempts < 9 && (inKitchen || uncertain) ? 3000 : null;
   }
+  if (uncertain) return paymentCheckDelay(uncertainForMs ?? 0);
   if (inKitchen || status === 'ready') return 5000;
-  if (paymentStatus === 'processing') return 3000;
   if (paymentStatus === 'refund_pending') return 15_000;
   return null;
 }

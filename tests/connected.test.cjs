@@ -353,6 +353,78 @@ async function placeBrowserOrder(page, origin, buyer, screenshot) {
   return { order, attempt };
 }
 
+test('waiting for payment slows status checks while manual refresh and kitchen updates stay responsive', { timeout: 30_000 }, async t => {
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(7500);
+  await page.clock.install();
+  const reads = [];
+  const writes = [];
+  page.on('request', request => {
+    if (!request.url().startsWith(`${api}/`)) return;
+    if (request.method() === 'GET') reads.push(request.url());
+    if (request.method() === 'POST' && /\/api\/v1\/orders(?:\/[^/]+\/payments)?$/.test(request.url())) writes.push(request.url());
+  });
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const { order } = await placeBrowserOrder(page, origin, { ...contact, email: 'payment-wait-fixture@example.test' });
+  const orderUrl = `${api}/orders/${order.id}`;
+  const readCount = () => reads.filter(url => url === orderUrl).length;
+  const waitForRead = () => page.waitForResponse(response => response.url() === orderUrl && response.request().method() === 'GET' && response.ok());
+  const advanceAndRead = async interval => {
+    const reply = waitForRead();
+    await page.clock.fastForward(interval);
+    return (await reply).json();
+  };
+  const note = 'Payment confirmation is taking longer than usual. You can check again now.';
+
+  await page.clock.pauseAt(await page.evaluate(() => Date.now()) + 500);
+  assert.equal((await advanceAndRead(3200)).paymentStatus, 'processing');
+  assert.equal(await page.getByText(note, { exact: true }).count(), 0);
+  assert.equal((await advanceAndRead(20_000)).paymentStatus, 'processing');
+  await shown(page, note);
+  await capture(page, 'payment-delayed-390');
+  const slowed = readCount();
+  await page.clock.fastForward(10_000);
+  assert.equal(readCount(), slowed, 'the short payment interval must stop once confirmation is delayed');
+
+  const manual = waitForRead();
+  await button(page, 'Refresh payment status').click();
+  assert.equal((await (await manual).json()).paymentStatus, 'processing');
+  await shown(page, note);
+  assert.equal(readCount(), slowed + 1);
+
+  assert.equal((await advanceAndRead(125_000)).paymentStatus, 'processing');
+  const extended = readCount();
+  await page.clock.fastForward(30_000);
+  assert.equal(readCount(), extended, 'the long wait must not renew the fast interval');
+  assert.deepEqual(writes, [`${api}/orders`, `${orderUrl}/payments`]);
+
+  await button(page, 'Confirm local test payment').click();
+  await shown(page, 'Order accepted');
+  assert.equal(await page.getByText(note, { exact: true }).count(), 0);
+  const kitchen = await operator('demo-kitchen');
+  const pickup = await operator('demo-pickup');
+  t.after(async () => {
+    for (const token of [kitchen, pickup]) await send('/operator/sessions/current', { method: 'DELETE', token });
+  });
+  for (const status of ['preparing', 'ready']) {
+    assert.equal((await send(`/operator/orders/${order.id}/status`, { method: 'POST', token: kitchen, data: { status } })).status, 200);
+  }
+  const ready = await advanceAndRead(5200);
+  assert.equal(ready.status, 'ready');
+  await shown(page, 'Ready for pickup');
+  assert.equal((await send(`/operator/orders/${order.id}/status`, {
+    method: 'POST', token: pickup, data: { status: 'collected', pickupCode: ready.pickupCode },
+  })).status, 200);
+});
+
 test('open Orders reconciles a declined checkout after its pickup hold expires', { timeout: 50_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const fixturePath = process.env.CRUSTCAPER_EXPIRE_ORDER_FIXTURE;

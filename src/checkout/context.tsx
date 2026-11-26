@@ -9,7 +9,7 @@ import { ApiError, type CartLine, type Order, type Quote } from '../domain/types
 import { privateStorage } from '../state/private-storage';
 import { useShop } from '../state/shop';
 import { CheckoutController, CheckoutError, type CheckoutContact, type CheckoutJournal } from './controller';
-import { nextOrderStatusDelay, type OrderStatusResult } from './order-status-polling';
+import { delayedPaymentThresholdMs, nextOrderStatusDelay, nextUncertainPaymentStart, type OrderStatusResult } from './order-status-polling';
 import { isExpiredUnpaidHold } from './pickup-hold';
 
 type Context = {
@@ -170,6 +170,7 @@ export function useOrderStatus(orderId: string | null) {
   const [known, setKnown] = useState<Order | null>(null);
   const [failure, setFailure] = useState<{ orderId: string; error: unknown } | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
+  const [delayedPaymentId, setDelayedPaymentId] = useState<string | null>(null);
   const version = useRef(0);
   const pending = useRef<Promise<Order | null> | null>(null);
   const polling = useRef<StatusPolling | null>(null);
@@ -226,13 +227,18 @@ export function useOrderStatus(orderId: string | null) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let attempts = 0;
     let consecutiveFailures = 0;
+    let uncertainSince: number | null = null;
     const monitor: StatusPolling = {
       orderId,
       clearTimer: () => clearTimeout(timer),
       onResult: (result) => {
         if (polling.current !== monitor) return;
         consecutiveFailures = 'error' in result ? consecutiveFailures + 1 : 0;
-        const delay = nextOrderStatusDelay(mode, result, ++attempts, consecutiveFailures, pickupClock.current());
+        const observedAt = performance.now();
+        uncertainSince = mode === 'connected' ? nextUncertainPaymentStart(result, uncertainSince, observedAt) : null;
+        const uncertainFor = uncertainSince === null ? null : observedAt - uncertainSince;
+        setDelayedPaymentId(uncertainFor !== null && uncertainFor >= delayedPaymentThresholdMs ? orderId : null);
+        const delay = nextOrderStatusDelay(mode, result, ++attempts, consecutiveFailures, pickupClock.current(), uncertainFor);
         if (delay !== null) timer = setTimeout(() => { void refresh(true); }, delay);
       },
     };
@@ -241,6 +247,8 @@ export function useOrderStatus(orderId: string | null) {
       if (polling.current === monitor) return;
       attempts = 0;
       consecutiveFailures = 0;
+      uncertainSince = null;
+      setDelayedPaymentId(null);
       polling.current = monitor;
       void refresh();
     }
@@ -270,6 +278,7 @@ export function useOrderStatus(orderId: string | null) {
     failed: failure !== null && failure.orderId === orderId,
     error: failure?.orderId === orderId ? failure.error : null,
     loading: loadingId !== null && loadingId === orderId,
+    delayedPayment: delayedPaymentId !== null && delayedPaymentId === orderId,
     refresh,
   };
 }

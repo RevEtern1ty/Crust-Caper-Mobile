@@ -4,7 +4,7 @@ import { Platform, Pressable, StyleSheet, View } from 'react-native';
 
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../../src/checkout/context';
 import { CheckoutError } from '../../src/checkout/controller';
-import { checkoutError, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
+import { checkoutError, delayedPaymentLabel, displayOrderId, itemName, itemOptions, kitchenLabel, paymentLabel } from '../../src/checkout/labels';
 import { ReorderPanel } from '../../src/checkout/reorder-panel';
 import { reorderOfferForCart } from '../../src/checkout/reorder-review';
 import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
@@ -30,8 +30,9 @@ export default function OrdersScreen() {
   const running = useRef(false);
   const linkedOrderId = savedPaymentReturnOrderId(requestedOrderId ?? undefined, journal?.orderIds ?? []);
   const orderId = linkedOrderId ?? (choice?.latest === latestId ? choice.id : latestId);
-  const { order, loading, failed, error: statusError, refresh } = useOrderStatus(orderId);
+  const { order, loading, failed, error: statusError, refresh, delayedPayment } = useOrderStatus(orderId);
   const t = (en: string, rw: string) => copy(locale, en, rw);
+  const showDelayedPayment = !!order && delayedPayment && !failed;
   const needsPhoneVerification = mode === 'connected' && !!orderId
     && statusError instanceof ApiError && statusError.code === 'unauthenticated';
 
@@ -186,6 +187,14 @@ export default function OrdersScreen() {
 
           {!order.recoveryReadOnly && <PickupAlertPanel key={order.id} order={order} />}
 
+          {showDelayedPayment && (
+            <Card>
+              <Text accessibilityLiveRegion="polite">{delayedPaymentLabel(locale)}</Text>
+              <Button label={t('Refresh order status', 'Vugurura uko komande ihagaze')} onPress={() => { void refresh(); }}
+                busy={loading} variant="secondary" />
+            </Card>
+          )}
+
           {activeOrder && order.paymentStatus === 'processing' && (
             <Card>
               <Text>{mode === 'connected' && order.status === 'cancelled'
@@ -302,7 +311,7 @@ export default function OrdersScreen() {
       {(problem || failed) && <Text accessibilityRole="alert" tone="red">{problem ?? (needsPhoneVerification
         ? t('Verify your phone number to open this saved order.', 'Emeza nimero ya telefoni kugira ngo ufungure iyi komande yabitswe.')
         : checkoutError(statusError, locale))}</Text>}
-      {orderId && <Button label={t('Refresh order status', 'Vugurura uko komande ihagaze')} onPress={() => { void refresh(); }} busy={loading} variant="secondary" />}
+      {orderId && !showDelayedPayment && <Button label={t('Refresh order status', 'Vugurura uko komande ihagaze')} onPress={() => { void refresh(); }} busy={loading} variant="secondary" />}
 
       {journal && journal.orderIds.length > 1 && (
         <Card>

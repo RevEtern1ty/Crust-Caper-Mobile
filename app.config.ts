@@ -1,11 +1,53 @@
 import type { ConfigContext, ExpoConfig } from 'expo/config';
-import { createRunOncePlugin } from 'expo/config-plugins';
+import { createRunOncePlugin, withAndroidManifest, type ConfigPlugin } from 'expo/config-plugins';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 const domainName = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const projectIdPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const firebaseApiKeyPattern = /^A[\w-]{38}$/;
 
 // Expo Prebuild otherwise applies the installed notifications plugin automatically.
 const withoutPickupAlertEntitlement = createRunOncePlugin(config => config, 'expo-notifications');
+
+type FirebaseConfig = {
+  project_info?: { project_number?: string; project_id?: string };
+  client?: Array<{
+    client_info?: { mobilesdk_app_id?: string; android_client_info?: { package_name?: string } };
+    api_key?: Array<{ current_key?: string }>;
+  }>;
+};
+
+// Run on Android prebuild and introspection without requiring Firebase for an iOS-only build.
+const withFirebasePickupAlerts: ConfigPlugin = config => withAndroidManifest(config, mod => {
+  const file = mod.android?.googleServicesFile;
+  if (!file) throw new Error('Set CRUSTCAPER_ANDROID_GOOGLE_SERVICES_FILE for Android pickup notifications.');
+
+  let firebase: FirebaseConfig;
+  try {
+    firebase = JSON.parse(readFileSync(resolve(mod.modRequest.projectRoot, file), 'utf8').replace(/^\uFEFF/, ''));
+  } catch {
+    throw new Error('CRUSTCAPER_ANDROID_GOOGLE_SERVICES_FILE must point to a readable google-services.json file.');
+  }
+  const projectNumber = firebase?.project_info?.project_number;
+  const projectName = firebase?.project_info?.project_id;
+  const clients = Array.isArray(firebase?.client) ? firebase.client.filter(client =>
+    client?.client_info?.android_client_info?.package_name === mod.android?.package) : [];
+  if (clients.length !== 1) {
+    throw new Error('google-services.json must contain exactly one Firebase client for the Android package of this profile.');
+  }
+  const appId = clients[0]?.client_info?.mobilesdk_app_id;
+  const keys = clients[0]?.api_key;
+  // The Google Services Gradle plugin selects the first current_key in the matching client.
+  const apiKey = Array.isArray(keys) ? keys.find(key => key && Object.hasOwn(key, 'current_key'))?.current_key : undefined;
+  if (typeof projectNumber !== 'string' || !/^[0-9]+$/.test(projectNumber)
+    || typeof projectName !== 'string' || !projectName.trim()
+    || typeof appId !== 'string' || !appId.startsWith(`1:${projectNumber}:android:`)
+    || appId === `1:${projectNumber}:android:` || typeof apiKey !== 'string' || !firebaseApiKeyPattern.test(apiKey)) {
+    throw new Error('google-services.json has missing or invalid Firebase project or Android client fields for pickup notifications.');
+  }
+  return mod;
+});
 
 function required(value: string | undefined, name: string): string {
   if (!value?.trim()) throw new Error(`Set ${name} for this CrustCaper build profile.`);
@@ -116,5 +158,5 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       restaurant: { profile, apiBaseUrl: api.origin + '/api/v1', storeId, pspHosts, pushProjectId },
     },
   };
-  return pushProjectId ? resolved : withoutPickupAlertEntitlement(resolved);
+  return pushProjectId ? withFirebasePickupAlerts(resolved) : withoutPickupAlertEntitlement(resolved);
 };

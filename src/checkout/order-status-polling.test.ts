@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { ApiError, type Order } from '../domain/types';
-import { nextOrderStatusDelay } from './order-status-polling';
+import { delayedPaymentThresholdMs, nextOrderStatusDelay, nextUncertainPaymentStart } from './order-status-polling';
 
 test('connected orders keep checking once ready and stop once picked up', () => {
   const check = (status: Order['status']) =>
@@ -26,12 +26,56 @@ test('connected status checks recover from repeated temporary failures without b
 
 test('connected pending payments and refunds remain open to updates', () => {
   const check = (paymentStatus: Order['paymentStatus']) => nextOrderStatusDelay(
-    'connected', { order: { status: 'cancelled', paymentStatus } }, 12, 0,
+    'connected', { order: { status: 'cancelled', paymentStatus } }, 12, 0, 0, 120_000,
   );
 
-  assert.equal(check('processing'), 3000);
+  assert.equal(check('processing'), 60_000);
   assert.equal(check('refund_pending'), 15_000);
   assert.equal(check('refunded'), null);
+});
+
+test('connected payment checks slow down based on elapsed uncertainty rather than request count', () => {
+  const result = { order: { status: 'awaiting_payment', paymentStatus: 'processing' } } as const;
+  const interval = (elapsedMs: number, attempts = 12) =>
+    nextOrderStatusDelay('connected', result, attempts, 0, 0, elapsedMs);
+
+  assert.equal(interval(0, 250), 3000);
+  assert.equal(interval(delayedPaymentThresholdMs - 1), 3000);
+  assert.equal(interval(delayedPaymentThresholdMs), 15_000);
+  assert.equal(interval(119_999), 15_000);
+  assert.equal(interval(120_000), 60_000);
+
+  let elapsed = 0;
+  let checks = 0;
+  while (elapsed < 60 * 60_000) {
+    const delay = interval(elapsed, ++checks);
+    assert.ok(delay);
+    elapsed += delay;
+  }
+  assert.ok(checks < 80, `expected fewer than 80 checks in the first hour, got ${checks}`);
+});
+
+test('a temporary error preserves the same uncertain payment window and recovery returns to kitchen cadence', () => {
+  const processing = { order: { status: 'awaiting_payment', paymentStatus: 'processing' } } as const;
+  const inconsistent = { order: { status: 'cancelled', paymentStatus: 'unpaid', paymentAttempt: { status: 'processing' } } } as const;
+  const offline = { error: new ApiError('network_unavailable') };
+  const rateLimited = { error: new ApiError('rate_limited') };
+  const paid = { order: { status: 'accepted', paymentStatus: 'paid' } } as const;
+  const declined = { order: { status: 'awaiting_payment', paymentStatus: 'declined' } } as const;
+
+  const startedAt = nextUncertainPaymentStart(processing, null, 50_000);
+  assert.equal(startedAt, 50_000);
+  assert.equal(nextUncertainPaymentStart(offline, startedAt, 195_000), startedAt);
+  assert.equal(nextOrderStatusDelay('connected', offline, 12, 1, 0, 145_000), 60_000);
+  assert.equal(nextUncertainPaymentStart(rateLimited, startedAt, 240_000), startedAt);
+  assert.equal(nextOrderStatusDelay('connected', rateLimited, 13, 2, 0, 190_000), 60_000);
+  assert.equal(nextUncertainPaymentStart(inconsistent, startedAt, 260_000), startedAt);
+  assert.equal(nextOrderStatusDelay('connected', inconsistent, 14, 0, 0, 210_000), 60_000);
+  assert.equal(nextUncertainPaymentStart(paid, startedAt, 320_000), null);
+  assert.equal(nextOrderStatusDelay('connected', paid, 15, 0, 0, 270_000), 5000);
+  assert.equal(nextUncertainPaymentStart(declined, startedAt, 320_000), null);
+  assert.equal(nextUncertainPaymentStart({ error: new ApiError('not_found') }, startedAt, 320_000), null);
+  assert.equal(nextUncertainPaymentStart({ error: new ApiError('unauthenticated') }, startedAt, 320_000), null);
 });
 
 test('awaiting unpaid and declined holds refresh infrequently and check again just after the deadline', () => {

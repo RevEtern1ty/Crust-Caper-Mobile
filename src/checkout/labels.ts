@@ -28,6 +28,11 @@ export function paymentLabel(status: PaymentStatus, locale: Locale) {
   return copy(locale, ...paymentStatus[status]);
 }
 
+export function delayedPaymentLabel(locale: Locale) {
+  return copy(locale, 'Payment confirmation is taking longer than usual. You can check again now.',
+    'Kwemeza ubwishyu biratinda kurusha uko bisanzwe. Ushobora kongera kugenzura ubu.');
+}
+
 export function itemName(sku: string, locale: Locale, menu: Menu | null) {
   return menu?.products.find((product) => product.sku === sku)?.name[locale] ?? sku;
 }
