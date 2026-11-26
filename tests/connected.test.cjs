@@ -171,6 +171,25 @@ test('an earlier order retains its sold names after the public menu is renamed',
   await shown(page, '1 × ' + product.name.rw);
   await shown(page, cheese.name.rw);
   await checkDetailsLayout('rw');
+
+  const staff = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  staff.setDefaultTimeout(6500);
+  await staff.goto(new URL('/operator/index.html', api).href);
+  await staff.getByLabel('Username', { exact: true }).fill('demo-kitchen');
+  await staff.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(staff, 'Sign in').click();
+  const card = staff.locator('#order-list > li').filter({
+    has: staff.getByRole('heading', { name: 'Order ' + order.number, exact: true }),
+  });
+  await shown(card, product.name.en);
+  await shown(card, cheese.name.en);
+  await staff.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+  for (const width of [320, 390, 430]) {
+    await staff.setViewportSize({ width, height: 844 });
+    assert.ok(await card.locator('.order-lines').evaluate(element => element.scrollWidth <= element.clientWidth + 1));
+    await card.locator('.order-lines').scrollIntoViewIfNeeded();
+    await capture(staff, `sold-item-kitchen-${width}`);
+  }
 });
 
 test('delivery intake and handoff recover lost replies alongside a paid direct order', { timeout: 35_000 }, async t => {
