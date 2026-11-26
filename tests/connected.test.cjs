@@ -1176,6 +1176,143 @@ test('guest rotation and logout recover from committed responses lost by the bro
   await shown(page, 'No orders yet');
 });
 
+test('fiscal receipt attachment survives a filter change and an older list response', { timeout: 40_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const kitchen = await operator('demo-kitchen');
+  const pickup = await operator('demo-pickup');
+  const managerToken = await operator('demo-manager');
+  const order = await readyForPickup(kitchen);
+  t.after(async () => {
+    await send(`/operator/orders/${order.id}/status`, {
+      method: 'POST', token: pickup, data: { status: 'collected', pickupCode: order.pickupCode },
+    });
+    for (const token of [kitchen, pickup, managerToken]) await send('/operator/sessions/current', { method: 'DELETE', token });
+  });
+
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, serviceWorkers: 'block' });
+  page.setDefaultTimeout(6500);
+  const origin = new URL(api).origin;
+  await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-manager');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(page, 'Sign in').click();
+  await button(page, 'Fiscal receipts').click();
+
+  const shortId = order.number.slice(1);
+  const search = page.getByLabel('Filter by order number');
+  const refresh = button(page, 'Refresh fiscal receipts');
+  await search.fill(shortId);
+  const card = page.getByRole('list', { name: 'Orders for fiscal receipts' }).getByRole('listitem')
+    .filter({ has: page.getByRole('heading', { name: `Order ${order.number}`, exact: true }) });
+  await card.getByText('Awaiting receipt', { exact: true }).waitFor();
+  const receiptQuote = await send(`/orders/${order.id}`, { token: order.token });
+  assert.equal(receiptQuote.status, 200);
+  const { total } = await receiptQuote.json();
+  const reference = `RACE-${shortId}`;
+  const pdf = testReceipt();
+  const referenceInput = card.getByLabel('EBM receipt reference');
+  const totalInput = card.getByLabel('Total printed on receipt (RWF)');
+  const document = card.getByLabel('EBM receipt PDF');
+  const attach = button(card, 'Attach receipt');
+  await referenceInput.fill(reference);
+  await totalInput.fill(String(total));
+  await document.setInputFiles({ name: 'synthetic-ebm-fixture.pdf', mimeType: 'application/pdf', buffer: pdf });
+
+  const listUrl = api + '/operator/receipts';
+  const writeUrl = api + `/operator/orders/${order.id}/receipt`;
+  const readSnapshot = Promise.withResolvers();
+  const committed = Promise.withResolvers();
+  const releaseRead = Promise.withResolvers();
+  const releaseWrite = Promise.withResolvers();
+  const visibleRecord = entries => entries.filter(entry => entry.orderId === order.id);
+  let listRequests = 0;
+  let writeAttempts = 0;
+  let forwardedWrites = 0;
+  await page.route(listUrl, async route => {
+    if (route.request().method() !== 'GET' || ++listRequests !== 1) return route.continue();
+    const response = await route.fetch({ timeout: 8_000 });
+    readSnapshot.resolve({ status: response.status(), entries: visibleRecord(await response.json()) });
+    await releaseRead.promise;
+    await route.fulfill({ response });
+  });
+  await page.route(writeUrl, async route => {
+    const request = route.request();
+    if (request.method() !== 'PUT') return route.continue();
+    writeAttempts++;
+    assert.equal(await request.headerValue('x-receipt-reference'), reference);
+    assert.equal(await request.headerValue('x-receipt-total-rwf'), String(total));
+    assert.ok(request.postDataBuffer()?.equals(pdf));
+    if (writeAttempts === 1) return route.fulfill({ status: 503, json: { code: 'service_unavailable' } });
+    forwardedWrites++;
+    const response = await route.fetch({ timeout: 8_000 });
+    committed.resolve({ status: response.status(), record: await response.json() });
+    await releaseWrite.promise;
+    await route.fulfill({ response });
+  });
+
+  const attached = card.getByText('Attached', { exact: true });
+  const issuedReference = card.getByText(`EBM reference ${reference}`, { exact: true });
+  try {
+    await attach.click();
+    await card.getByRole('alert').filter({ hasText: 'The server could not complete this request. Try again.' }).waitFor();
+    assert.equal(await referenceInput.inputValue(), reference);
+    assert.equal(await totalInput.inputValue(), String(total));
+    assert.equal(await document.evaluate(input => input.files.length), 1);
+    assert.equal(forwardedWrites, 0);
+
+    await refresh.click();
+    const stale = await readSnapshot.promise;
+    assert.equal(stale.status, 200);
+    assert.deepEqual(stale.entries.map(entry => entry.receiptStatus), ['pending']);
+    await attach.click();
+    const result = await committed.promise;
+    assert.equal(result.status, 200);
+    assert.equal(result.record.orderId, order.id);
+    assert.equal(result.record.receiptStatus, 'issued');
+    assert.equal(result.record.receiptReference, reference);
+
+    await search.fill('Z');
+    assert.equal(await card.count(), 0);
+    await search.fill(order.number);
+    const disabledDuringWrite = await attach.isDisabled();
+    releaseWrite.resolve();
+    await attached.waitFor();
+    await issuedReference.waitFor();
+    assert.equal(disabledDuringWrite, true, 'Refiltering a pending upload must keep its submit button disabled');
+    assert.equal(await search.evaluate(input => input === document.activeElement), true);
+
+    releaseRead.resolve();
+    await refresh.click({ trial: true });
+    assert.equal(await attached.isVisible(), true, 'The earlier list response must not roll back the attached receipt');
+    assert.equal(await issuedReference.isVisible(), true);
+    assert.equal(await search.evaluate(input => input === document.activeElement), true);
+  } finally {
+    releaseRead.resolve();
+    releaseWrite.resolve();
+  }
+
+  const fresh = page.waitForResponse(response => response.url() === listUrl && response.request().method() === 'GET' && response.ok());
+  await refresh.click();
+  const [freshRecord] = visibleRecord(await (await fresh).json());
+  assert.equal(freshRecord?.receiptReference, reference);
+  assert.equal(await attached.isVisible(), true);
+  assert.equal(await issuedReference.isVisible(), true);
+  assert.equal(writeAttempts, 2, 'One fixture failure and one retry should be the only browser uploads');
+  assert.equal(forwardedWrites, 1, 'Only one logical upload should reach the real API');
+
+  const authoritative = await send('/operator/receipts', { token: managerToken });
+  assert.equal(authoritative.status, 200);
+  const records = visibleRecord(await authoritative.json());
+  assert.deepEqual(records.map(entry => [entry.receiptStatus, entry.receiptReference]), [['issued', reference]]);
+  const stored = await send(`/orders/${order.id}/receipt`, { token: order.token });
+  assert.equal(stored.status, 200);
+  assert.ok(Buffer.from(await stored.arrayBuffer()).equals(pdf));
+  await capture(page, 'connected-fiscal-receipt-race');
+});
+
 test('connected checkout, receipt, pickup, recovery, payment return and restaurant cancellation', { timeout: 70_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/, 'Run only against a local integration API');
   const server = createPreviewServer(dist);
