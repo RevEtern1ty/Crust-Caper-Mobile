@@ -297,6 +297,8 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
+      - name: Verify iOS sharing completion in Swift
+        run: node --import tsx --test src/checkout/receipt-sharing-ios.test.ts
       - name: Build unsigned Release and verify simulator launch
         id: simulator_smoke
         shell: bash

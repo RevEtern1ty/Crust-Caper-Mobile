@@ -102,6 +102,16 @@ ADB_SERVER_SOCKET=tcp:127.0.0.1:15042 python3 tooling/android-order-privacy.py "
 
 На iOS откройте чек синтетического заказа, выберите **Print** и отмените печать. Действия экрана должны снова стать доступны. Откройте тот же чек ещё раз, сохраните PDF в Files и сверьте его с исходным файлом. Для экспорта данных заказа отмените выбранное действие при доступности такого сценария и снова откройте JSON. Зафиксируйте версию iOS, SHA сборки и исход обоих повторов. Используйте синтетические документы для снимков и журналов.
 
+Для этой проверки на Mac с Apple Silicon запустите локальный API с синтетическим каталогом и предварительно загрузите выделенный симулятор iPhone. В корне чистой копии кандидата укажите UUID этого симулятора. Скрипт оставит предварительно загруженный симулятор открытым для проверки чека.
+
+```sh
+npm ci
+evidence_dir=$(mktemp -d)
+CRUSTCAPER_IOS_SIMULATOR_UDID='<iPhone-simulator-UUID>' \
+CRUSTCAPER_API_BASE_URL=http://127.0.0.1:18080/api/v1 \
+  bash tooling/ios-simulator-smoke.sh "$evidence_dir" local
+```
+
 ## Закрытые сборки для Play Internal и TestFlight
 
 Профиль `stage` предназначен для прямой установки APK и iOS-сборки с внутренним профилем подписи. `stage-store` наследует окружение EAS `preview` и настройки приложения `stage`, выпускает AAB для Play Internal и IPA для TestFlight. У обеих stage-сборок идентификатор `com.crustcaper.mobile.stage`. Для публичной раскатки используйте профиль `production` с его окружением и идентификаторами. Все профили EAS используют версию Node.js из `.nvmrc`. [Профили Expo Build](https://docs.expo.dev/build/eas-json/) · [Внутренняя раздача](https://docs.expo.dev/build/internal-distribution/)
