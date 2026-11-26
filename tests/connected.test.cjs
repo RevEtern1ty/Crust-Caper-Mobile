@@ -721,6 +721,106 @@ async function placeBrowserOrder(page, origin, buyer, screenshot) {
   return { order, attempt };
 }
 
+test('an open product refreshes at sales hours after a transient failure and stays quiet while hidden', { timeout: 25_000 }, async t => {
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(5000);
+  await page.clock.install();
+
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const start = Date.parse('2026-01-05T11:00:00Z');
+  const instant = ms => new Date(start + ms).toISOString();
+  const localized = { en: 'Synthetic sales fixture', rw: 'Icyitegererezo' };
+  const observations = [
+    { available: false, checkedAt: 0, next: 10_000 },
+    { available: true, checkedAt: 11_000, next: 21_000 },
+    null,
+    { available: false, checkedAt: 21_050, next: 31_050 },
+    { available: false, checkedAt: 25_050, next: 31_050, slow: true },
+    { available: true, checkedAt: 31_100 },
+  ];
+  const menuUrl = api + '/stores/kigali/menu?channel=mobile';
+  const slowMenuRequest = Promise.withResolvers();
+  const releaseSlowMenu = Promise.withResolvers();
+  t.after(() => { releaseSlowMenu.resolve(); });
+  let reads = 0;
+  await page.route(menuUrl, async route => {
+    const observation = observations[Math.min(reads++, observations.length - 1)];
+    if (!observation) return route.abort('failed');
+    const { available, checkedAt, next, slow } = observation;
+    if (slow) {
+      slowMenuRequest.resolve();
+      await releaseSlowMenu.promise;
+    }
+    return route.fulfill({
+      json: {
+        version: 'sale-fixture', updatedAt: instant(0), slots: [],
+        store: { id: 'kigali', name: localized, area: localized, hours: localized, open: true },
+        products: [{
+          sku: 'test-sale', name: localized, description: localized, ingredients: [], allergens: [],
+          category: 'burgers', price: 1500, available, modifiers: [],
+        }],
+      },
+      headers: {
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Expose-Headers': 'X-Availability-Checked-At, X-Next-Sale-Change-At',
+        'X-Availability-Checked-At': instant(checkedAt),
+        ...(next === undefined ? {} : { 'X-Next-Sale-Change-At': instant(next) }),
+      },
+    });
+  });
+  const setVisible = visible => page.evaluate(value => {
+    if (value) Reflect.deleteProperty(document, 'visibilityState');
+    else Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, visible);
+  await page.goto(origin + '/product/test-sale');
+  const add = button(page, /^Add to cart/);
+  await shown(page, 'Currently unavailable');
+  assert.equal(await add.isDisabled(), true);
+  await page.clock.pauseAt(await page.evaluate(() => Date.now()) + 250);
+  await page.clock.fastForward(4000);
+  assert.equal(reads, 1, 'the client uses the server interval even when local wall time is different');
+
+  await setVisible(false);
+  await page.clock.fastForward(7000);
+  assert.equal(reads, 1, 'the expired schedule does not send a request from a hidden app');
+  await setVisible(true);
+  await page.getByRole('button', { name: /^Add to cart/, disabled: false }).waitFor();
+  assert.equal(await add.isDisabled(), false);
+  assert.equal(reads, 2);
+
+  await page.clock.fastForward(4000);
+  const interruptedRefresh = page.waitForEvent('requestfailed', request => request.url() === menuUrl);
+  await setVisible(false);
+  await setVisible(true);
+  await interruptedRefresh;
+  assert.equal(reads, 3);
+  await page.clock.fastForward(7000);
+  await shown(page, 'Currently unavailable');
+  assert.equal(await add.isDisabled(), true);
+  assert.equal(reads, 4, 'a failed pre-boundary refresh preserves the observed deadline');
+
+  await page.clock.fastForward(4000);
+  await setVisible(false);
+  await setVisible(true);
+  await slowMenuRequest.promise;
+  await page.clock.fastForward(7000);
+  assert.equal(reads, 5, 'the scheduled refresh waits for the previous request');
+  releaseSlowMenu.resolve();
+  await page.getByRole('button', { name: /^Add to cart/, disabled: false }).waitFor();
+  assert.equal(reads, 6, 'a late response with the previous availability triggers immediate revalidation');
+  await page.clock.fastForward(60_000);
+  assert.equal(reads, 6, 'a response without a new change leaves no scheduled refresh');
+});
+
 test('waiting for payment slows status checks while manual refresh and kitchen updates stay responsive', { timeout: 30_000 }, async t => {
   const server = createPreviewServer(dist);
   await new Promise((resolve, reject) => {

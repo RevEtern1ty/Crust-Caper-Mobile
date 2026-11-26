@@ -13,6 +13,7 @@ import { lineKey, MAX_QUANTITY } from '../domain/cart';
 import { createDemoApi } from '../domain/demo-api';
 import type { CartLine, DemoApi, Locale, Menu, ShopApi } from '../domain/types';
 import { createLiveApi, type ConnectedConfig, type LiveShopApi } from '../live/http-api';
+import { saleRefreshDelay } from '../live/menu-availability';
 import { createWebLiveApi, webCheckoutAvailable } from '../live/web-api';
 import type { Draft } from './draft-storage';
 import { privateStorage } from './private-storage';
@@ -65,6 +66,7 @@ const guestSession: GuestSessionLifecycle | undefined = liveApi && (!httpsWeb ||
 } : undefined;
 
 type MenuStatus = 'loading' | 'ready' | 'stale' | 'unavailable';
+const saleBoundaryRoundingMs = 1;
 
 function readMenu(raw: string | null): Menu | null {
   if (!raw) return null;
@@ -131,7 +133,11 @@ export function ShopProvider({ children }: PropsWithChildren) {
   const [menu, setMenu] = useState<Menu | null>(null);
   const [status, setStatus] = useState<MenuStatus>('loading');
   const [refreshing, setRefreshing] = useState(false);
+  const [foreground, setForeground] = useState(
+    () => AppState.currentState !== 'background' && AppState.currentState !== 'inactive');
   const [pickupClock, setPickupClock] = useState<{ checkedAt: number; receivedAt: number } | null>(null);
+  const [saleRefresh, setSaleRefresh] = useState<{ changeAt: string; dueAt: number } | null>(null);
+  const attemptedSaleChange = useRef<string | null>(null);
   const cachedMenu = useRef<Menu | null>(null);
   const request = useRef<Promise<void> | null>(null);
 
@@ -139,14 +145,21 @@ export function ShopProvider({ children }: PropsWithChildren) {
     if (request.current) return request.current;
     setRefreshing(true);
     const load = api.getMenu().then(next => {
+      const receivedAt = performance.now();
       const checkedAt = Date.parse(next.availabilityCheckedAt ?? '');
       if (Number.isFinite(checkedAt)) {
-        const receivedAt = performance.now();
         setPickupClock(previous => ({
           receivedAt,
           checkedAt: previous ? Math.max(checkedAt, previous.checkedAt + Math.max(0, receivedAt - previous.receivedAt)) : checkedAt,
         }));
       }
+      const delay = saleRefreshDelay(next);
+      const changeAt = next.nextSaleChangeAt;
+      setSaleRefresh(previous => {
+        if (next.orderingUnavailable || delay === null || !changeAt || changeAt === attemptedSaleChange.current) return null;
+        const dueAt = receivedAt + delay + saleBoundaryRoundingMs;
+        return previous?.changeAt === changeAt && previous.dueAt <= dueAt ? previous : { changeAt, dueAt };
+      });
       cachedMenu.current = next;
       setMenu(next);
       setStatus(next.orderingUnavailable ? 'stale' : 'ready');
@@ -179,6 +192,7 @@ export function ShopProvider({ children }: PropsWithChildren) {
       if (active) void refreshMenu();
     });
     const handle = AppState.addEventListener('change', state => {
+      setForeground(state === 'active');
       if (state === 'active') void refreshMenu();
     });
     return () => {
@@ -186,6 +200,30 @@ export function ShopProvider({ children }: PropsWithChildren) {
       handle.remove();
     };
   }, [refreshMenu]);
+
+  useEffect(() => {
+    if (!foreground || !saleRefresh) return;
+    const { changeAt, dueAt } = saleRefresh;
+    let disposed = false;
+
+    function refreshAtDeadline() {
+      if (disposed || attemptedSaleChange.current === changeAt) return;
+      if (AppState.currentState === 'background' || AppState.currentState === 'inactive') return;
+      if (request.current) {
+        // A request started before the boundary may still carry the old availability.
+        void request.current.then(refreshAtDeadline, refreshAtDeadline);
+        return;
+      }
+      attemptedSaleChange.current = changeAt;
+      void refreshMenu();
+    }
+
+    const timer = setTimeout(refreshAtDeadline, Math.max(0, Math.ceil(dueAt - performance.now())));
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+    };
+  }, [foreground, saleRefresh, refreshMenu]);
 
   const setLocale = (locale: Locale) => updateDraft(current => ({ ...current, locale }));
   const replaceCart = (cart: CartLine[]) => updateDraft(current => ({ ...current, cart }));

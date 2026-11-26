@@ -42,6 +42,7 @@ export type Menu = {
   version: string
   updatedAt: string
   availabilityCheckedAt?: string
+  nextSaleChangeAt?: string
   store: Store
   products: Product[]
   slots: PickupSlot[]

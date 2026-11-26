@@ -4,6 +4,7 @@ import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError } from '../domain/types';
 import type { ApiErrorCode, Locale, Order, PaymentAttempt, PendingCheckoutIntent, ReceiptDocument, ShopApi, Storage } from '../domain/types';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
+import { menuAvailability } from './menu-availability';
 import {
   menuResponse, orderAccessChallenge, orderAccessGrant, orderDataExportResponse, orderErasureRequestResponse,
   orderResponse, paymentResponse, pendingCheckoutRecovery, quoteResponse, reorderResponse, sessionResponse,
@@ -582,18 +583,17 @@ export function createLiveApi({
       return ending;
     },
     async getMenu() {
-      let availabilityCheckedAt: string | undefined;
+      let availability: ReturnType<typeof menuAvailability> = {};
       const menu = await request({
         path: '/stores/' + encodeURIComponent(config.storeId) + '/menu?channel=mobile', schema: menuResponse,
         onHeaders: (headers) => {
-          const checkedAt = headers.get('X-Availability-Checked-At');
-          if (checkedAt && Number.isFinite(Date.parse(checkedAt))) availabilityCheckedAt = checkedAt;
+          availability = menuAvailability(headers);
         },
       });
       if (menu.store.id !== config.storeId) invalidResponse();
       return {
         ...menu,
-        availabilityCheckedAt,
+        ...availability,
         store: {
           ...menu.store,
           supportUrl: safeHttps(menu.store.supportUrl) ?? undefined,

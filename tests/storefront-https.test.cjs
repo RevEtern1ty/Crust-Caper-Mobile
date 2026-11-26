@@ -1199,9 +1199,14 @@ async function checkProductSaleRules(browser, ca) {
   ]);
   assertMenu(offMobile, offHours, false);
   assertMenu(offWeb, offHours, false);
+  const nextSaleChange = offWeb.headers['x-next-sale-change-at'];
+  assert.ok(Date.parse(nextSaleChange) > Date.parse(offWeb.headers['x-availability-checked-at']));
+  assert.equal(offMobile.headers['x-next-sale-change-at'], nextSaleChange);
   assert.ok(offWeb.headers.etag);
   assert.notEqual(offWeb.headers.etag, forWeb.headers.etag);
-  assert.equal((await getMenu(webMenu, offWeb.headers.etag)).status, 304);
+  const unchanged = await getMenu(webMenu, offWeb.headers.etag);
+  assert.equal(unchanged.status, 304);
+  assert.equal(unchanged.headers['x-next-sale-change-at'], nextSaleChange);
 
   for (const [locale, detailsPath, unavailable] of [
     ['en', product, 'Currently unavailable'], ['rw', translatedProduct, 'Ntikiboneka ubu'],

@@ -33,6 +33,8 @@ paths:
             X-Availability-Checked-At:
               description: Server time used to evaluate sales hours and pickup slot availability. The catalog revision time is reported in updatedAt.
               schema: { $ref: '#/components/schemas/Timestamp' }
+            X-Next-Sale-Change-At:
+              $ref: '#/components/headers/NextSaleChangeAt'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Menu' }
@@ -42,6 +44,8 @@ paths:
             X-Availability-Checked-At:
               description: Server time used to revalidate product and pickup slot availability.
               schema: { $ref: '#/components/schemas/Timestamp' }
+            X-Next-Sale-Change-At:
+              $ref: '#/components/headers/NextSaleChangeAt'
         '400': { $ref: '#/components/responses/InvalidInput' }
         '404': { $ref: '#/components/responses/StoreUnavailable' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
@@ -1526,6 +1530,10 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 components:
+  headers:
+    NextSaleChangeAt:
+      description: Earliest upcoming availability change caused by the published sales hours of a product in this channel. Omitted when no product has a scheduled change. Clients can calculate the delay from X-Availability-Checked-At.
+      schema: { $ref: '#/components/schemas/Timestamp' }
   securitySchemes:
     webGuest:
       type: apiKey
