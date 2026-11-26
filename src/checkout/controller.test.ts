@@ -2,7 +2,7 @@ import { deepEqual, equal, ok, rejects } from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { createDemoApi, DEMO_PHONE } from '../domain/demo-api';
-import { ApiError, type CartLine, type OrderInput } from '../domain/types';
+import { ApiError, type CartLine, type Order, type OrderInput } from '../domain/types';
 import { CHECKOUT_JOURNAL_KEY, CheckoutController, type CheckoutContact, type GuestSessionLifecycle } from './controller';
 
 const line: CartLine = { sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: 9200 };
@@ -18,6 +18,7 @@ function fixture() {
   let failJournalWrite = false;
   let failOrderRead = false;
   let readOnlyRecovery = false;
+  let observeOrder = (order: Order) => order;
   const data = new Map<string, string>();
   const journal = new Map<string, string>();
   const orderCalls: string[] = [];
@@ -41,7 +42,7 @@ function fixture() {
       ...api,
       async getOrder(orderId) {
         if (failOrderRead) throw new Error('Temporarily unavailable');
-        const order = await api.getOrder(orderId);
+        const order = observeOrder(await api.getOrder(orderId));
         return readOnlyRecovery ? { ...order, recoveryReadOnly: true } : order;
       },
       async createOrder(input, idempotencyKey) {
@@ -107,6 +108,7 @@ function fixture() {
     blockJournal: () => { failJournalWrite = true; },
     blockOrderReads: () => { failOrderRead = true; },
     readOrderAsRecoveryGuest: () => { readOnlyRecovery = true; },
+    observeOrders: (observe: (order: Order) => Order) => { observeOrder = observe; },
     resetDemoStorage: () => { data.clear(); },
     removeJournal: () => { journal.clear(); },
     corruptDemoStorage: () => { data.set('crustcaper.demo.v1', 'invalid-demo-data'); },
@@ -165,6 +167,9 @@ test('a confirmed expired unpaid hold retires only its own pending intent withou
   await controller.finishExpiredHold({ ...expired, recoveryReadOnly: true });
   await controller.finishExpiredHold({ ...expired, paymentStatus: 'processing' });
   await controller.finishExpiredHold({ ...expired, paymentStatus: 'refund_pending' });
+  ok(expired.paymentAttempt);
+  await controller.finishExpiredHold({ ...expired, paymentAttempt: { ...expired.paymentAttempt, status: 'processing' } });
+  await controller.finishExpiredHold({ ...expired, paymentAttempt: { ...expired.paymentAttempt, status: 'paid' } });
   deepEqual(f.savedJournal(), saved);
 
   await controller.finishExpiredHold(expired);
@@ -179,6 +184,36 @@ test('a confirmed expired unpaid hold retires only its own pending intent withou
   ok(replacement.id !== order.id);
   deepEqual(f.orderCalls, ['key-1', 'key-3']);
   deepEqual(f.paymentCalls, ['key-2', 'key-4']);
+});
+
+test('an inconsistent payment observation preserves the saved intent and does not create a replacement', async () => {
+  const f = fixture();
+  f.observeOrders(order => ({ ...order, paymentStatus: 'unpaid' }));
+  const controller = f.restart();
+  const started = await controller.begin(await f.quote(), 'original-cart');
+  equal(started.paymentStatus, 'unpaid');
+  equal(started.paymentAttempt?.status, 'processing');
+  const paying = f.savedJournal();
+  equal(paying.active.phase, 'paying');
+  deepEqual(f.cartClears, []);
+
+  f.observeOrders(order => {
+    ok(order.paymentAttempt);
+    return { ...order, status: 'cancelled', paymentStatus: 'declined', paymentAttempt: { ...order.paymentAttempt, status: 'paid' } };
+  });
+  const contradictory = await controller.resume(true);
+  equal(contradictory.paymentAttempt?.status, 'paid');
+  deepEqual(f.savedJournal(), paying);
+
+  f.restoreLegacyJournal({
+    ...paying, active: { phase: 'tracking', orderId: started.id, key: paying.active.key },
+  });
+  const tracking = f.savedJournal();
+  await rejects(f.restart().begin(await f.quote(), 'new-cart'), { code: 'active_checkout' });
+  deepEqual(f.savedJournal(), tracking);
+  deepEqual(f.orderCalls, ['key-1']);
+  deepEqual(f.paymentCalls, ['key-2']);
+  deepEqual(f.cartClears, []);
 });
 
 test('a cancelled hold lets a guest start a separate order while the old payment is still checked', async () => {

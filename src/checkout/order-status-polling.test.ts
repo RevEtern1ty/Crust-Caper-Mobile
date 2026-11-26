@@ -51,6 +51,21 @@ test('awaiting unpaid and declined holds refresh infrequently and check again ju
   }
 });
 
+test('an order contradicting its latest payment attempt keeps the processing read cadence', () => {
+  for (const status of ['awaiting_payment', 'cancelled'] as const) {
+    for (const paymentStatus of ['unpaid', 'declined'] as const) {
+      for (const attemptStatus of ['processing', 'paid'] as const) {
+        const result = { order: { status, paymentStatus, paymentAttempt: { status: attemptStatus } } };
+        assert.equal(nextOrderStatusDelay('connected', result, 12, 0), 3000);
+        assert.equal(nextOrderStatusDelay('demo', result, 8, 0), 3000);
+        assert.equal(nextOrderStatusDelay('demo', result, 9, 0), null);
+      }
+    }
+  }
+  const coherent = { order: { status: 'cancelled', paymentStatus: 'declined', paymentAttempt: { status: 'declined' } } } as const;
+  assert.equal(nextOrderStatusDelay('connected', coherent, 12, 0), null);
+});
+
 test('the demo retains its bounded polling window', () => {
   const result = { order: { status: 'awaiting_payment', paymentStatus: 'processing' } } as const;
   assert.equal(nextOrderStatusDelay('demo', result, 8, 0), 3000);

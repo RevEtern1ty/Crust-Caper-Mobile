@@ -243,10 +243,23 @@ test('open Orders reconciles a declined checkout after its pickup hold expires',
   assert.deepEqual(writes, initialWrites);
 
   const orderUrl = api + orderPath;
+  const openOrdersUrl = page.url();
+  const readCancelledWithAttempt = attemptStatus => page.waitForResponse(async response => {
+    if (response.url() !== orderUrl || response.request().method() !== 'GET' || !response.ok()) return false;
+    const record = await response.json();
+    return record.status === 'cancelled' && record.paymentAttempt?.status === attemptStatus;
+  });
+  let expiredOrder;
   if (expireOrder) {
     await expireOrder({ orderId: order.id, expectedReservationExpiresAt: declined.reservationExpiresAt });
+    const automatedRead = readCancelledWithAttempt('declined');
+    await page.clock.fastForward(65_000);
+    expiredOrder = await (await automatedRead).json();
   } else {
     // The standard browser suite has no database admin access. Project only this declined order past its hold.
+    const reservationExpiresAt = new Date(Date.now() - 1000).toISOString();
+    let projectedReads = 0;
+    await page.clock.pauseAt(await page.evaluate(() => Date.now()) + 2000);
     await page.route(orderUrl, async route => {
       if (route.request().method() !== 'GET') return route.continue();
       const response = await route.fetch();
@@ -255,17 +268,33 @@ test('open Orders reconciles a declined checkout after its pickup hold expires',
       assert.equal(record.id, order.id);
       assert.equal(record.paymentStatus, 'declined');
       assert.equal(record.paymentAttempt.id, attempt.id);
-      const reservationExpiresAt = new Date(Date.now() - 1000).toISOString();
-      await route.fulfill({ response, json: { ...record, status: 'cancelled', reservationExpiresAt } });
+      const paymentAttempt = projectedReads++ === 0
+        ? { ...record.paymentAttempt, status: 'processing' }
+        : record.paymentAttempt;
+      await route.fulfill({ response, json: { ...record, status: 'cancelled', reservationExpiresAt, paymentAttempt } });
     });
+    const mixedRead = readCancelledWithAttempt('processing');
+    await page.clock.fastForward(65_000);
+    const mixed = await (await mixedRead).json();
+    assert.equal(mixed.id, order.id);
+    assert.equal(mixed.paymentStatus, 'declined');
+    assert.equal(mixed.paymentAttempt.id, attempt.id);
+    await page.clock.runFor(100);
+    await shown(page, 'Checking payment status…');
+    assert.equal(page.url(), openOrdersUrl);
+    assert.equal(projectedReads, 1);
+    assert.equal(await button(page, 'Retry payment').count(), 0);
+    assert.equal(await button(page, 'Restore saved checkout').count(), 0);
+    assert.equal(await button(page, 'Review reorder').count(), 0);
+    assert.equal(await page.getByText('Payment declined', { exact: true }).filter({ visible: true }).count(), 0);
+    assert.deepEqual(writes, initialWrites);
+
+    const coherentRead = readCancelledWithAttempt('declined');
+    await page.clock.fastForward(3100);
+    expiredOrder = await (await coherentRead).json();
+    assert.equal(projectedReads, 2);
+    await page.clock.resume();
   }
-  const automatedRead = page.waitForResponse(async response => {
-    if (response.url() !== orderUrl || response.request().method() !== 'GET' || !response.ok()) return false;
-    return (await response.json()).status === 'cancelled';
-  });
-  const openOrdersUrl = page.url();
-  await page.clock.fastForward(65_000);
-  const expiredOrder = await (await automatedRead).json();
   assert.equal(page.url(), openOrdersUrl, 'The order screen should reconcile in place');
   assert.equal(expiredOrder.id, order.id);
   assert.equal(expiredOrder.status, 'cancelled');

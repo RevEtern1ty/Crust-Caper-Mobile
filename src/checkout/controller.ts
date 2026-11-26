@@ -1,6 +1,6 @@
 import { ApiError, type Order, type OrderInput, type Quote, type ShopApi } from '../domain/types';
 import { paymentReturnOrderId } from './payment-return';
-import { isExpiredUnpaidHold } from './pickup-hold';
+import { hasInconsistentPayment, isExpiredUnpaidHold } from './pickup-hold';
 
 export const CHECKOUT_JOURNAL_KEY = 'crustcaper.checkout.v1';
 const maxRecentOrders = 10;
@@ -82,10 +82,10 @@ export function parseJournal(raw: string | null): CheckoutJournal {
 }
 
 export function canStartNewOrder(order: Order): boolean {
-  return order.status === 'cancelled'
+  return !hasInconsistentPayment(order) && (order.status === 'cancelled'
     || order.paymentStatus === 'paid'
     || order.paymentStatus === 'refund_pending'
-    || order.paymentStatus === 'refunded';
+    || order.paymentStatus === 'refunded');
 }
 
 export function hasSavedCheckout(raw: string | null): boolean {
@@ -155,7 +155,8 @@ export class CheckoutController {
             throw error;
           });
           const unresolved = order
-            ? order.paymentStatus === 'processing' || (order.status !== 'collected' && order.status !== 'cancelled')
+            ? hasInconsistentPayment(order) || order.paymentStatus === 'processing'
+              || (order.status !== 'collected' && order.status !== 'cancelled')
             : active?.phase === 'paying' && active.orderId === orderId;
           if (unresolved) {
             throw new CheckoutError('active_checkout');
@@ -212,7 +213,7 @@ export class CheckoutController {
 
       const order = await this.getTrackedOrder(active.orderId);
       if (!order) throw new ApiError('not_found');
-      if (order.recoveryReadOnly) return order;
+      if (order.recoveryReadOnly || hasInconsistentPayment(order)) return order;
       if (canStartNewOrder(order) || order.paymentStatus === 'processing') {
         if (active.phase === 'paying') {
           await this.finishPayment(active, order);
@@ -223,7 +224,8 @@ export class CheckoutController {
       if (active.phase === 'paying') {
         // Reconcile the saved attempt before interpreting a decline as permission to retry.
         const reconciled = await this.startPayment(active);
-        if (!retryDeclined || reconciled.paymentStatus !== 'declined' || reconciled.status === 'cancelled') {
+        if (!retryDeclined || reconciled.paymentStatus !== 'declined' || reconciled.status === 'cancelled'
+          || hasInconsistentPayment(reconciled)) {
           return reconciled;
         }
         return this.retryDeclinedPayment(reconciled.id);
@@ -278,7 +280,7 @@ export class CheckoutController {
       phase: 'paying', orderId: order.id, key: this.dependencies.newKey(), cartFingerprint: intent.cartFingerprint,
     } as const;
     await this.save(payment, orderIds);
-    if (order.status === 'cancelled' || order.paymentStatus !== 'unpaid') {
+    if (order.status === 'cancelled' || order.paymentStatus !== 'unpaid' || hasInconsistentPayment(order)) {
       await this.finishPayment(payment, order);
       return order;
     }
@@ -300,6 +302,7 @@ export class CheckoutController {
   }
 
   private async finishPayment(intent: Extract<Progress, { phase: 'paying' }>, order: Order) {
+    if (hasInconsistentPayment(order)) return;
     if (intent.cartFingerprint && order.status !== 'cancelled') {
       await this.dependencies.onOrderCreated(intent.cartFingerprint);
     }

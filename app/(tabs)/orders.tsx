@@ -9,7 +9,7 @@ import { ReorderPanel } from '../../src/checkout/reorder-panel';
 import { reorderOfferForCart } from '../../src/checkout/reorder-review';
 import { savedPaymentReturnOrderId } from '../../src/checkout/payment-return';
 import { PickupAlertPanel } from '../../src/checkout/pickup-alert';
-import { isAwaitingUnpaidHold, isExpiredUnpaidHold } from '../../src/checkout/pickup-hold';
+import { hasInconsistentPayment, isAwaitingUnpaidHold, isExpiredUnpaidHold } from '../../src/checkout/pickup-hold';
 import { shareReceipt } from '../../src/checkout/receipt-sharing';
 import { ApiError, type DemoKitchenStatus, type ReorderResult } from '../../src/domain/types';
 import { useShop } from '../../src/state/shop';
@@ -49,11 +49,12 @@ export default function OrdersScreen() {
   const active = journal?.active;
   const ongoingCreate = active?.phase === 'creating';
   const activeOrder = active && active.phase !== 'creating' && active.orderId === orderId;
+  const inconsistentPayment = !!order && hasInconsistentPayment(order);
   const canResume = checkoutAllowed && activeOrder && !!order && !order.recoveryReadOnly && isAwaitingUnpaidHold(order);
   const expiredHold = !!order && isExpiredUnpaidHold(order);
   const nextKitchen: DemoKitchenStatus | null = order?.status === 'accepted' ? 'preparing'
     : order?.status === 'preparing' ? 'ready' : order?.status === 'ready' ? 'collected' : null;
-  const repeat = preview?.orderId === orderId ? preview.result : null;
+  const repeat = !inconsistentPayment && preview?.orderId === orderId ? preview.result : null;
 
   async function run(label: Action, operation: () => Promise<void>) {
     if (running.current) return;
@@ -164,8 +165,10 @@ export default function OrdersScreen() {
               <Text variant="label" tone="mustard">{displayOrderId(order.id)}</Text>
               <Text variant="small" tone="cream">{money(order.total)}</Text>
             </View>
-            <Text variant="heading" tone="cream" accessibilityLiveRegion="polite">{kitchenLabel(order.status, locale)}</Text>
-            <Text tone="cream">{paymentLabel(order.paymentStatus, locale)}</Text>
+            <Text variant="heading" tone="cream" accessibilityLiveRegion="polite">{inconsistentPayment
+              ? t('Checking payment status…', 'Turimo kugenzura ubwishyu…')
+              : kitchenLabel(order.status, locale)}</Text>
+            {!inconsistentPayment && <Text tone="cream">{paymentLabel(order.paymentStatus, locale)}</Text>}
             <View style={styles.statusDivider} />
             <View style={styles.pickupTime}>
               <Icon name="time-outline" color={colors.mustard} size={20} />
@@ -195,7 +198,7 @@ export default function OrdersScreen() {
             </Card>
           )}
 
-          {order.recoveryReadOnly && order.status === 'awaiting_payment' && (
+          {order.recoveryReadOnly && order.status === 'awaiting_payment' && !inconsistentPayment && (
             <Card><Text>{t('You can view this order here. Contact the pickup team for help with payment.',
               'Ushobora kureba iyi komande hano. Saba ubufasha mu kwishyura aho ufatira komande.')}</Text></Card>
           )}
@@ -211,6 +214,7 @@ export default function OrdersScreen() {
           )}
 
           {checkoutAllowed && !order.recoveryReadOnly && activeOrder && active?.phase === 'paying' && !canResume && !expiredHold
+            && !inconsistentPayment
             && (order.paymentStatus !== 'processing' || (mode === 'connected' && order.status === 'cancelled')) && (
             <Button
               label={t('Restore saved checkout', 'Ongera ufungure ubwishyu bwabitswe')}
@@ -250,7 +254,7 @@ export default function OrdersScreen() {
             {mode === 'connected' && order.paymentStatus === 'paid' && order.receiptStatus === 'pending' && (
               <Text variant="small" tone="muted">{t('The receipt is pending.', 'Inyemezabwishyu iracyategerejwe.')}</Text>
             )}
-            {!order.recoveryReadOnly && (order.paymentStatus === 'paid' || order.status === 'cancelled') ? (
+            {!order.recoveryReadOnly && !inconsistentPayment && (order.paymentStatus === 'paid' || order.status === 'cancelled') ? (
               <Button label={t('Review reorder', 'Reba komande nshya isa n’iyi')} variant="secondary" busy={action === 'reorder'}
                 disabled={!!action || (expiredHold && busy)} onPress={() => {
                   void run('reorder', async () => {

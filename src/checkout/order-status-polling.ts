@@ -1,7 +1,7 @@
 import { ApiError, type Order } from '../domain/types';
-import { isAwaitingUnpaidHold } from './pickup-hold';
+import { hasInconsistentPayment, isAwaitingUnpaidHold, type HoldState } from './pickup-hold';
 
-type PolledOrder = Pick<Order, 'status' | 'paymentStatus'> & Partial<Pick<Order, 'reservationExpiresAt'>>;
+type PolledOrder = HoldState & Partial<Pick<Order, 'reservationExpiresAt'>>;
 export type OrderStatusResult = { order: PolledOrder } | { error: unknown };
 
 const unpaidHoldCheckIntervalMs = 60_000;
@@ -25,6 +25,8 @@ export function nextOrderStatusDelay(
     }
     return null;
   }
+
+  if (hasInconsistentPayment(result.order)) return mode === 'demo' && attempts >= 9 ? null : 3000;
 
   if (isAwaitingUnpaidHold(result.order)) {
     const remainingMs = Date.parse(result.order.reservationExpiresAt ?? '') - now;

@@ -5,6 +5,7 @@ import { Platform, StyleSheet, View } from 'react-native';
 
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../src/checkout/context';
 import { checkoutError, displayOrderId, paymentLabel } from '../src/checkout/labels';
+import { hasInconsistentPayment } from '../src/checkout/pickup-hold';
 import type { DemoPaymentResult } from '../src/domain/types';
 import { useShop } from '../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../src/ui/core';
@@ -23,6 +24,7 @@ export default function PaymentScreen() {
   const running = useRef(false);
   const t = (en: string, rw: string) => copy(locale, en, rw);
   const processing = !failed && order?.paymentStatus === 'processing' && order.paymentAttempt !== null && !order.recoveryReadOnly;
+  const checkingPayment = order ? hasInconsistentPayment(order) : loading;
   const onDevice = Platform.OS === 'android' || Platform.OS === 'ios';
   function goToOrders() {
     if (from === 'orders' && router.canGoBack()) router.back();
@@ -105,9 +107,9 @@ export default function PaymentScreen() {
         {(problem || failed) && <Text tone="red" accessibilityRole="alert">{problem ?? checkoutError(error, locale)}</Text>}
       </Card> : (
         <Card>
-          <Text variant="heading" accessibilityLiveRegion="polite">{order
-            ? paymentLabel(order.paymentStatus, locale)
-            : loading ? t('Checking payment status…', 'Turimo kugenzura ubwishyu…')
+          <Text variant="heading" accessibilityLiveRegion="polite">{checkingPayment
+            ? t('Checking payment status…', 'Turimo kugenzura ubwishyu…')
+            : order ? paymentLabel(order.paymentStatus, locale)
               : t('Check payment status', 'Genzura uko ubwishyu buhagaze')}</Text>
           {processing && order.status === 'awaiting_payment' && (
             settleLocalTestPayment ? (
