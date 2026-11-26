@@ -12,6 +12,7 @@ const { connect } = require('node:tls');
 const { chromium } = require('playwright-core');
 const { provisionStaffCredentials } = require('../tooling/storefront-load-kitchen.cjs');
 const { checkWebPerformance } = require('./storefront-web-perf.cjs');
+const { testReceipt } = require('./receipt-fixture.cjs');
 
 const storefront = 'crustcaper.test';
 const provider = 'checkout.flutterwave.com';
@@ -538,7 +539,7 @@ async function checkPhotoRendering(browser) {
   }
 }
 
-async function checkGuestCheckout(browser, ca) {
+async function checkGuestCheckout(browser, ca, t) {
   const context = await newContext(browser, { viewport: { width: 390, height: 844 } });
   try {
     const page = await context.newPage();
@@ -636,10 +637,15 @@ async function checkGuestCheckout(browser, ca) {
       .find(key => key.endsWith('.web.context') && sessionStorage.getItem(key) === sessionId), session.sessionId);
     assert.ok(storageKey, 'the owner link must leave its original browser session available');
     await page.goto(origin + '/orders');
-    if (catalogPhotos) await checkOrderPrivacy(browser, ca, order, session.sessionId, cookie);
-    else await checkSettledOrderRecovery(browser, page, context, ca, order, {
-      orderId: order.id, sessionId: session.sessionId, cookie, storageKey,
-    });
+    if (catalogPhotos) {
+      await checkOrderPrivacy(browser, ca, order, session.sessionId, cookie);
+      await t.test('manager attaches a correction and the order owner downloads both fiscal documents',
+        () => checkFiscalCorrection(browser, page, ca, order));
+    } else {
+      await checkSettledOrderRecovery(browser, page, context, ca, order, {
+        orderId: order.id, sessionId: session.sessionId, cookie, storageKey,
+      });
+    }
     assert.deepEqual(failures, []);
   } finally {
     await context.close();
@@ -896,6 +902,93 @@ async function signInManager(staff) {
   return credentials.username;
 }
 
+function recordFixtureRefund(orderId, username) {
+  const query = spawnSync('docker', ['exec', '-i', fixtureDatabase(), 'psql', '-XAtq', '-v', 'ON_ERROR_STOP=1',
+    '-U', 'storefront_fixture', '-d', 'storefront_fixture',
+    '-v', 'order_id=' + orderId, '-v', 'manager=' + username, '-f', '-',
+  ], { encoding: 'utf8', timeout: 10000, input: `
+    WITH fixture_refund AS (
+      INSERT INTO verified_refunds (provider_refund_id, attempt_id, provider_transaction_id, amount, currency,
+        refund_status, store_id, operator_id, operator_username, cleared_order_payment)
+      SELECT '6000001', a.id, p.provider_transaction_id, o.total, 'RWF', 'completed-momo', o.store_id, s.id, s.username, true
+      FROM orders o JOIN payment_attempts a ON a.order_id = o.id
+      JOIN payment_exceptions p ON p.attempt_id = a.id AND p.provider_transaction_id = a.provider_transaction_id
+      JOIN operator_accounts s ON s.store_id = o.store_id AND s.username = :'manager' AND s.role = 'manager'
+      WHERE o.id = :'order_id' AND o.status = 'cancelled' AND o.payment_status = 'refund_pending'
+        AND p.reason = 'restaurant_cancelled' AND a.status = 'paid' AND o.receipt_status = 'issued'
+      RETURNING provider_refund_id
+    )
+    UPDATE orders SET payment_status = 'refunded'
+    WHERE id = :'order_id' AND (SELECT count(*) FROM fixture_refund) = 1
+    RETURNING receipt_status;
+  ` });
+  assert.equal(query.status, 0, 'could not record the synthetic provider refund confirmation');
+  assert.equal(query.stdout.trim(), 'issued');
+}
+
+async function attachFiscalDocument(page, card, order, document, correction = false) {
+  const suffix = correction ? 'receipt-correction' : 'receipt';
+  const reference = correction ? 'FIXTURE-CORRECTION' : 'FIXTURE-ORIGINAL';
+  await card.getByLabel(correction ? 'EBM correction reference' : 'EBM receipt reference', { exact: true }).fill(reference);
+  await card.getByLabel(correction ? 'Refund amount printed on correction (RWF)' : 'Total printed on receipt (RWF)', { exact: true })
+    .fill(String(order.total));
+  await card.getByLabel(correction ? 'EBM correction PDF' : 'EBM receipt PDF', { exact: true })
+    .setInputFiles({ name: suffix + '.pdf', mimeType: 'application/pdf', buffer: document });
+  const [uploaded] = await Promise.all([
+    page.waitForResponse(response => response.request().method() === 'PUT'
+      && new URL(response.url()).pathname === `/api/v1/operator/orders/${order.id}/${suffix}`),
+    button(card, correction ? 'Attach correction' : 'Attach receipt').click(),
+  ]);
+  assert.equal(uploaded.status(), 200);
+  const payload = await uploaded.json();
+  assert.equal(payload.receiptStatus, correction ? 'corrected' : 'issued');
+  assert.equal(payload.receiptReference, 'FIXTURE-ORIGINAL');
+  if (correction) assert.equal(payload.correctionReference, reference);
+  return uploaded;
+}
+
+async function assertFiscalDownload(page, label, expected, namePrefix) {
+  const [download] = await Promise.all([page.waitForEvent('download'), button(page, label).click()]);
+  assert.ok(download.suggestedFilename().startsWith(namePrefix));
+  const stream = await download.createReadStream();
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  assert.deepEqual(Buffer.concat(chunks), expected);
+}
+
+async function checkFiscalCorrection(browser, customer, ca, order) {
+  const original = testReceipt('CrustCaper synthetic original');
+  const correction = testReceipt('CrustCaper synthetic correction');
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  try {
+    const staff = await context.newPage();
+    const manager = await signInManager(staff);
+    await button(staff, 'Fiscal receipts').click();
+    const card = staff.locator('#fiscal-receipts-list > li').filter({ hasText: '#' + order.id.slice(-8).toUpperCase() });
+    const attached = await attachFiscalDocument(staff, card, order, original);
+    const authorization = (await attached.request().allHeaders()).authorization;
+    assert.ok(typeof authorization === 'string' && authorization.startsWith('Bearer '), 'expected an operator session for cancellation');
+    const cancellation = await request(ca, '/api/v1/operator/orders/' + order.id + '/cancel', {
+      method: 'POST', headers: { Authorization: authorization },
+    });
+    assert.equal(cancellation.status, 200);
+    assert.equal(JSON.parse(cancellation.body).paymentStatus, 'refund_pending');
+    // Use confirmed synthetic provider data. The cancellation and both document uploads use the ordinary API.
+    recordFixtureRefund(order.id, manager);
+    await button(staff, 'Refresh fiscal receipts').click();
+    await attachFiscalDocument(staff, card, order, correction, true);
+    await shown(card, 'Corrected');
+    await capture(staff, 'fiscal-correction-manager');
+
+    await customer.goto(origin + '/order/' + order.id);
+    await assertFiscalDownload(customer, 'Download original receipt', original, 'receipt-');
+    await assertFiscalDownload(customer, 'Download corrected receipt', correction, 'receipt-correction-');
+    await capture(customer, 'fiscal-correction-customer');
+  } finally {
+    await context.close();
+  }
+}
+
 async function checkPrivacyStaff(browser, orderId, accepted) {
   const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
   try {
@@ -1069,7 +1162,7 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   await checkNoJavaScript(browser);
   await checkContactLayout(browser);
   await checkLegalLayout(browser);
-  await checkGuestCheckout(browser, ca);
+  await checkGuestCheckout(browser, ca, t);
   if (catalogPhotos) {
     await t.test('a named manager with MFA confirms an exact recipe approval without publishing it',
       () => checkRecipeApproval(browser, ca));

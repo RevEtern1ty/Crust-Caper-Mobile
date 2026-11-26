@@ -12,12 +12,12 @@ import { savedPaymentReturnOrderId } from './payment-return';
 import { PickupAlertPanel } from './pickup-alert';
 import { hasInconsistentPayment, isAwaitingUnpaidHold, isExpiredUnpaidHold } from './pickup-hold';
 import { shareReceipt } from './document-sharing';
-import { ApiError, type DemoKitchenStatus, type ReorderResult } from '../domain/types';
+import { ApiError, type DemoKitchenStatus, type ReceiptDocument, type ReorderResult } from '../domain/types';
 import { useShop } from '../state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../ui/core';
 import { copy, money, slotLabel } from '../ui/format';
 
-type Action = 'resume' | 'reorder' | 'kitchen' | 'receipt';
+type Action = 'resume' | 'reorder' | 'kitchen' | 'receipt' | 'receipt-correction';
 
 export default function OrdersScreen({ directOrderId }: { directOrderId?: string } = {}) {
   const { api, mode, demoApi, checkoutAllowed, webCheckout, locale, menu, cart, hydrated, replaceCart } = useShop();
@@ -45,6 +45,12 @@ export default function OrdersScreen({ directOrderId }: { directOrderId?: string
   const needsPhoneVerification = mode === 'connected' && (!!directOrderId || savedOrderId !== null)
     && statusError instanceof ApiError && (statusError.code === 'unauthenticated' || statusError.code === 'not_found');
   const visibleReceiptOrderId = order?.receiptUrl && order.receiptStatus !== 'pending' ? order.id : null;
+  const correctedReceipt = order?.receiptStatus === 'corrected';
+  const download = Platform.OS === 'web';
+  const originalReceiptLabel = correctedReceipt
+    ? (download ? t('Download original receipt', 'Kuramo inyemezabwishyu y’umwimerere')
+      : t('Share original receipt', 'Sangiza inyemezabwishyu y’umwimerere'))
+    : (download ? t('Download receipt', 'Kuramo inyemezabwishyu') : t('Share receipt', 'Sangiza inyemezabwishyu'));
 
   useEffect(() => {
     if (!directOrderId) return;
@@ -53,14 +59,15 @@ export default function OrdersScreen({ directOrderId }: { directOrderId?: string
   }, [directOrderId, needsPhoneVerification, order]);
 
   useLayoutEffect(() => {
+    const invalidateReceipt = () => { receiptRevision.current++; };
     const subscription = AppState.addEventListener('change', state => {
-      if (state !== 'active') receiptRevision.current++;
+      if (state !== 'active') invalidateReceipt();
     });
     return () => {
-      receiptRevision.current++;
+      invalidateReceipt();
       subscription.remove();
     };
-  }, [visibleReceiptOrderId]);
+  }, [visibleReceiptOrderId, correctedReceipt]);
 
   useEffect(() => {
     if (directOrderId || !journal || requestedOrderId === null) return;
@@ -121,15 +128,19 @@ export default function OrdersScreen({ directOrderId }: { directOrderId?: string
     });
   }
 
-  function openReceipt(id: string) {
+  function openReceipt(id: string, document: ReceiptDocument) {
     const started = receiptRevision.current;
     const stillFocused = guardNavigation();
     const shouldOpen = () => stillFocused() && receiptRevision.current === started && AppState.currentState === 'active';
-    void run('receipt', async () => {
+    const correction = document === 'correction';
+    const prefix = correction ? 'receipt-correction' : 'receipt';
+    const title = correction ? t('Corrected receipt', 'Inyemezabwishyu yakosowe')
+      : correctedReceipt ? t('Original receipt', 'Inyemezabwishyu y’umwimerere') : t('Receipt', 'Inyemezabwishyu');
+    void run(prefix, async () => {
       if (!api.getReceiptPdf) return;
       try {
-        const pdf = await api.getReceiptPdf(id);
-        if (shouldOpen()) await shareReceipt(pdf, `receipt-${id.slice(-8)}.pdf`, t('Receipt', 'Inyemezabwishyu'), shouldOpen);
+        const pdf = await api.getReceiptPdf(id, document);
+        if (shouldOpen()) await shareReceipt(pdf, `${prefix}-${id.slice(-8)}.pdf`, title, shouldOpen);
       } catch (error) {
         if (shouldOpen()) throw error;
       }
@@ -310,9 +321,14 @@ export default function OrdersScreen({ directOrderId }: { directOrderId?: string
             {mode === 'demo' && order.paymentStatus === 'paid' && (
               <Text variant="small" tone="muted">{t('Fiscal receipt unavailable in the demo.', 'Inyemezabwishyu yemewe ntiboneka mu igerageza.')}</Text>
             )}
-            {mode === 'connected' && api.getReceiptPdf && order.receiptUrl && order.receiptStatus !== 'pending' && (
-              <Button label={Platform.OS === 'web' ? t('Download receipt', 'Kuramo inyemezabwishyu') : t('Share receipt', 'Sangiza inyemezabwishyu')}
-                variant="secondary" busy={action === 'receipt'} disabled={!!action} onPress={() => openReceipt(order.id)} />
+            {mode === 'connected' && api.getReceiptPdf && visibleReceiptOrderId && (
+              <>
+                <Button label={originalReceiptLabel}
+                variant="secondary" busy={action === 'receipt'} disabled={!!action} onPress={() => openReceipt(order.id, 'original')} />
+                {correctedReceipt && <Button label={download
+                  ? t('Download corrected receipt', 'Kuramo inyemezabwishyu yakosowe') : t('Share corrected receipt', 'Sangiza inyemezabwishyu yakosowe')}
+                variant="secondary" busy={action === 'receipt-correction'} disabled={!!action} onPress={() => openReceipt(order.id, 'correction')} />}
+              </>
             )}
             {mode === 'connected' && order.paymentStatus === 'paid' && order.receiptStatus === 'pending' && (
               <Text variant="small" tone="muted">{t('The receipt is pending.', 'Inyemezabwishyu iracyategerejwe.')}</Text>

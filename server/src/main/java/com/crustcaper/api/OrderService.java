@@ -317,7 +317,16 @@ public class OrderService {
     byte[] receiptDocument(UUID guest, UUID id) {
         return jdbc.sql("""
             SELECT f.document FROM fiscal_receipts f JOIN orders ON orders.id = f.order_id
-            WHERE orders.id = ? AND orders.receipt_status = 'issued'
+            WHERE orders.id = ? AND orders.receipt_status IN ('issued', 'corrected')
+            """ + VISIBLE_TO_GUEST)
+            .params(id, guest, guest).query((rs, row) -> rs.getBytes("document"))
+            .optional().orElseThrow(ApiFailure::notFound);
+    }
+
+    byte[] receiptCorrectionDocument(UUID guest, UUID id) {
+        return jdbc.sql("""
+            SELECT f.document FROM fiscal_receipt_corrections f JOIN orders ON orders.id = f.order_id
+            WHERE orders.id = ? AND orders.receipt_status = 'corrected'
             """ + VISIBLE_TO_GUEST)
             .params(id, guest, guest).query((rs, row) -> rs.getBytes("document"))
             .optional().orElseThrow(ApiFailure::notFound);

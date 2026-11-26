@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { canStartNewOrder, hasSavedCheckout, parseJournal } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError } from '../domain/types';
-import type { ApiErrorCode, Locale, Order, PaymentAttempt, PendingCheckoutIntent, ShopApi, Storage } from '../domain/types';
+import type { ApiErrorCode, Locale, Order, PaymentAttempt, PendingCheckoutIntent, ReceiptDocument, ShopApi, Storage } from '../domain/types';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import {
   menuResponse, orderAccessChallenge, orderAccessGrant, orderDataExportResponse, orderErasureRequestResponse,
@@ -134,7 +134,8 @@ export function createLiveApi({
   const installationKey = journalKey + '.installation';
   const hosts = new Set(config.pspHosts);
   const orderPath = (id: string) => '/orders/' + encodeURIComponent(id);
-  const receiptPath = (id: string) => orderPath(id) + '/receipt';
+  const receiptPath = (id: string, document: ReceiptDocument = 'original') =>
+    orderPath(id) + (document === 'correction' ? '/receipt-correction' : '/receipt');
   let sessionPromise: Promise<Session> | null = null;
   let activation: Promise<boolean> | null = null;
   let recoveryQueue: Promise<void> = Promise.resolve();
@@ -673,9 +674,9 @@ export function createLiveApi({
         });
       }
     },
-    async getReceiptPdf(orderId) {
+    async getReceiptPdf(orderId, document) {
       if (!paymentReturnOrderId(orderId)) throw new ApiError('invalid_input');
-      const options = { path: receiptPath(orderId), schema: z.instanceof(Uint8Array), pdf: true };
+      const options = { path: receiptPath(orderId, document), schema: z.instanceof(Uint8Array), pdf: true };
       try {
         return await authorized(options);
       } catch (error) {

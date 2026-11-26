@@ -7,6 +7,7 @@ const { test } = require('node:test');
 const { setTimeout: delay } = require('node:timers/promises');
 const { chromium } = require('playwright-core');
 const { createPreviewServer } = require('../tooling/preview-server.cjs');
+const { testReceipt } = require('./receipt-fixture.cjs');
 
 const api = process.env.CRUSTCAPER_API_BASE_URL || 'http://127.0.0.1:18080/api/v1';
 const dist = process.env.CRUSTCAPER_CONNECTED_DIST || 'dist-connected';
@@ -681,26 +682,6 @@ test('pickup staff locate a paid order without the buyer screen and verify the e
   await result.getByText('Collected', { exact: true }).waitFor();
   assert.equal(await button(lookup, 'Open order in queue').isVisible(), false);
 });
-
-function testReceipt() {
-  const text = 'BT /F1 15 Tf 36 72 Td (CrustCaper synthetic test document) Tj ET';
-  const objects = [
-    '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 120] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
-    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-    `<< /Length ${text.length} >>\nstream\n${text}\nendstream`,
-  ];
-  let pdf = '%PDF-1.7\n';
-  const offsets = objects.map((value, index) => {
-    const offset = pdf.length;
-    pdf += `${index + 1} 0 obj\n${value}\nendobj\n`;
-    return String(offset).padStart(10, '0') + ' 00000 n \n';
-  });
-  const xref = pdf.length;
-  pdf += `xref\n0 6\n0000000000 65535 f \n${offsets.join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
-  return Buffer.from(pdf, 'ascii');
-}
 
 async function downloadedReceipt(page) {
   const download = page.waitForEvent('download');

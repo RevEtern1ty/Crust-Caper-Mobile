@@ -16,13 +16,28 @@ final class OperatorReceipts {
     private static final Pattern REFERENCE = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._/-]{0,79}");
     private static final Pattern WHOLE_RWF = Pattern.compile("[1-9][0-9]{0,18}");
     private static final String ORDER_FIELDS = """
-        SELECT o.id, o.status, o.receipt_status, o.receipt_url, o.total, f.reference
+        SELECT o.id, o.status, o.receipt_status, o.receipt_url, o.total, f.reference,
+            correction.reference AS correction_reference, refundable.refund_id
         FROM orders o LEFT JOIN fiscal_receipts f ON f.order_id = o.id
+        LEFT JOIN fiscal_receipt_corrections correction ON correction.order_id = o.id
+        LEFT JOIN LATERAL (
+            SELECT CASE WHEN count(*) = 1 THEN min(r.provider_refund_id) END AS refund_id
+            FROM verified_refunds r JOIN payment_attempts a ON a.id = r.attempt_id
+            WHERE o.status = 'cancelled' AND o.payment_status = 'refunded' AND f.order_id IS NOT NULL
+                AND a.order_id = o.id AND a.status = 'paid'
+                AND a.provider_transaction_id = r.provider_transaction_id
+                AND r.store_id = o.store_id AND r.amount = o.total AND r.cleared_order_payment
+        ) refundable ON true
         """;
 
-    record ReceiptOrder(UUID orderId, String status, String receiptStatus, long total, String currency, String receiptReference) {}
+    private static final String RECEIPT_QUEUE = """
+        (o.payment_status = 'paid' OR (o.payment_status = 'refunded' AND f.order_id IS NOT NULL))
+        """;
+
+    record ReceiptOrder(UUID orderId, String status, String receiptStatus, long total, String currency,
+                        String receiptReference, String correctionReference, boolean correctionEligible) {}
     record Metadata(String reference, long total) {}
-    private record UploadableOrder(ReceiptOrder view, String receiptUrl) {}
+    private record UploadableOrder(ReceiptOrder view, String receiptUrl, String refundId) {}
     private record Attached(String reference, long total, boolean matchesDocument) {}
 
     private final JdbcClient jdbc;
@@ -41,7 +56,7 @@ final class OperatorReceipts {
 
         OperatorOrderCode match = OperatorOrderCode.parse(orderCode);
         List<ReceiptOrder> matches = jdbc.sql(ORDER_FIELDS
-                + " WHERE o.store_id = ? AND o.payment_status = 'paid' AND " + match.predicate() + " LIMIT 2")
+                + " WHERE o.store_id = ? AND " + RECEIPT_QUEUE + " AND " + match.predicate() + " LIMIT 2")
             .params(actor.storeId(), match.parameter()).query(OperatorReceipts::view).list();
         if (matches.size() > 1) throw OperatorFailure.conflict("receipt_order_code_ambiguous");
         return matches;
@@ -52,8 +67,10 @@ final class OperatorReceipts {
             LEFT JOIN operator_order_events handoff ON handoff.order_id = o.id AND handoff.store_id = o.store_id
                 AND handoff.previous_status = 'ready' AND handoff.requested_status = 'collected' AND handoff.outcome = 'changed'
                 AND o.status = 'collected' AND o.receipt_status = 'pending'
-            WHERE o.store_id = ? AND o.payment_status = 'paid'
-            ORDER BY CASE WHEN handoff.occurred_at IS NOT NULL THEN 0 WHEN o.receipt_status = 'pending' THEN 1 ELSE 2 END,
+            WHERE o.store_id = ? AND
+            """ + RECEIPT_QUEUE + """
+            ORDER BY CASE WHEN handoff.occurred_at IS NOT NULL THEN 0 WHEN o.receipt_status = 'pending' THEN 1
+                WHEN refundable.refund_id IS NOT NULL AND o.receipt_status = 'issued' THEN 2 ELSE 3 END,
                 handoff.occurred_at ASC NULLS LAST, o.created_at DESC, o.id
             LIMIT 100
             """).param(storeId).query(OperatorReceipts::view).list();
@@ -76,6 +93,47 @@ final class OperatorReceipts {
             UploadableOrder order = uploadable(actor.storeId(), orderId, true);
             verifyTotal(order, metadata);
             return attachLocked(actor, order, metadata, document, usable);
+        }));
+    }
+
+    void preflightCorrection(String authorization, String id, String reference, String total) {
+        Principal actor = manager(authorization, false);
+        UploadableOrder order = uploadable(actor.storeId(), orderId(id), false);
+        verifyCorrection(order, metadata(reference, total));
+    }
+
+    ReceiptOrder attachCorrection(String authorization, String id, String reference, String total, byte[] document) {
+        UUID orderId = orderId(id);
+        Metadata metadata = metadata(reference, total);
+        boolean usable = ReceiptPdf.usable(document);
+        return Objects.requireNonNull(transactions.execute(tx -> {
+            Principal actor = manager(authorization, true);
+            UploadableOrder order = uploadable(actor.storeId(), orderId, true);
+            verifyCorrection(order, metadata);
+            Attached existing = jdbc.sql("""
+                SELECT reference, refund_total_rwf, document = ? AS matches_document
+                FROM fiscal_receipt_corrections WHERE order_id = ?
+                """).params(document, orderId)
+                .query((row, index) -> new Attached(row.getString("reference"), row.getLong("refund_total_rwf"),
+                    row.getBoolean("matches_document"))).optional().orElse(null);
+            if (existing != null) {
+                if (existing.reference().equals(metadata.reference()) && existing.total() == metadata.total()
+                    && existing.matchesDocument()) return order.view();
+                throw OperatorFailure.conflict("receipt_correction_already_attached");
+            }
+            if (!order.view().correctionEligible()) throw OperatorFailure.conflict("receipt_correction_not_available");
+            if (!usable) throw ReceiptPdf.invalidPdf();
+            int inserted = jdbc.sql("""
+                INSERT INTO fiscal_receipt_corrections (order_id, store_id, reference, refund_total_rwf,
+                    provider_refund_id, document, attached_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+                """).params(orderId, actor.storeId(), metadata.reference(), metadata.total(), order.refundId(),
+                    document, actor.id()).update();
+            if (inserted != 1) throw OperatorFailure.conflict("receipt_reference_in_use");
+
+            jdbc.sql("UPDATE orders SET receipt_status = 'corrected' WHERE id = ?").param(orderId).update();
+            return new ReceiptOrder(orderId, order.view().status(), "corrected", metadata.total(), "RWF",
+                order.view().receiptReference(), metadata.reference(), false);
         }));
     }
 
@@ -102,19 +160,30 @@ final class OperatorReceipts {
 
         jdbc.sql("UPDATE orders SET receipt_status = 'issued', receipt_url = ? WHERE id = ?")
             .params("/api/v1/orders/" + orderId + "/receipt", orderId).update();
-        return new ReceiptOrder(orderId, order.view().status(), "issued", metadata.total(), "RWF", metadata.reference());
+        return new ReceiptOrder(orderId, order.view().status(), "issued", metadata.total(), "RWF", metadata.reference(), null, false);
     }
 
     private UploadableOrder uploadable(String store, UUID id, boolean lock) {
         return jdbc.sql(ORDER_FIELDS + """
             WHERE o.store_id = ? AND o.id = ? AND (o.payment_status = 'paid' OR f.order_id IS NOT NULL)
             """ + (lock ? " FOR UPDATE OF o" : ""))
-            .params(store, id).query((rs, row) -> new UploadableOrder(view(rs, row), rs.getString("receipt_url")))
+            .params(store, id).query((rs, row) -> new UploadableOrder(view(rs, row), rs.getString("receipt_url"),
+                rs.getString("refund_id")))
             .optional().orElseThrow(OperatorFailure::notFound);
     }
 
     private static void verifyTotal(UploadableOrder order, Metadata metadata) {
         if (order.view().total() != metadata.total()) throw OperatorFailure.conflict("receipt_total_mismatch");
+    }
+
+    private static void verifyCorrection(UploadableOrder order, Metadata metadata) {
+        if (order.refundId() == null || !(order.view().correctionEligible() || order.view().correctionReference() != null)) {
+            throw OperatorFailure.conflict("receipt_correction_not_available");
+        }
+        verifyTotal(order, metadata);
+        if (metadata.reference().equalsIgnoreCase(order.view().receiptReference())) {
+            throw OperatorFailure.conflict("receipt_correction_reference_matches_original");
+        }
     }
 
     private Principal manager(String authorization, boolean lock) {
@@ -146,7 +215,9 @@ final class OperatorReceipts {
     }
 
     private static ReceiptOrder view(ResultSet row, int index) throws SQLException {
+        String status = row.getString("receipt_status");
         return new ReceiptOrder(row.getObject("id", UUID.class), row.getString("status"),
-            row.getString("receipt_status"), row.getLong("total"), "RWF", row.getString("reference"));
+            status, row.getLong("total"), "RWF", row.getString("reference"), row.getString("correction_reference"),
+            "issued".equals(status) && row.getString("refund_id") != null);
     }
 }

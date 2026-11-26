@@ -97,6 +97,11 @@ final class WebCommerceController {
         return receipts.downloadForGuest(guest, id);
     }
 
+    @GetMapping("/orders/{id}/receipt-correction")
+    ResponseEntity<byte[]> receiptCorrection(@RequestAttribute(GUEST_ATTRIBUTE) UUID guest, @PathVariable String id) {
+        return receipts.downloadCorrectionForGuest(guest, id);
+    }
+
     @PostMapping("/order-access/challenges")
     ResponseEntity<OrderAccessService.ChallengeReceipt> startChallenge(@RequestAttribute(GUEST_ATTRIBUTE) UUID guest,
         @RequestBody OrderAccessController.StartInput input) {

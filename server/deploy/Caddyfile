@@ -99,11 +99,11 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 	@storefrontPrivate path /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery /privacy /order-privacy /product/* /order/*
 	@receiptUpload {
 		method PUT
-		path_regexp ^/api/v1/operator/orders/[0-9a-fA-F-]{36}/receipt$
+		path_regexp ^/api/v1/operator/orders/[0-9a-fA-F-]{36}/receipt(?:-correction)?$
 	}
 	@otherRequests not {
 		method PUT
-		path_regexp ^/api/v1/operator/orders/[0-9a-fA-F-]{36}/receipt$
+		path_regexp ^/api/v1/operator/orders/[0-9a-fA-F-]{36}/receipt(?:-correction)?$
 	}
 	route {
 		respond @local 404

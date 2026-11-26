@@ -190,6 +190,26 @@ paths:
               schema: { type: string, format: binary }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
+  /orders/{id}/receipt-correction:
+    get:
+      operationId: downloadFiscalReceiptCorrection
+      description: Download the separately attached EBM correction for a verified full refund. The original remains available at the receipt endpoint.
+      security: [{ guestOrAccount: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: The attached correction PDF. Available to the order owner and an authorized recovery guest.
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string }
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
   /orders/{id}/data-export:
     get:
       operationId: exportOrderData
@@ -516,6 +536,17 @@ paths:
         - $ref: '#/components/parameters/WebSessionContext'
       responses:
         '200': { $ref: '#/paths/~1orders~1{id}~1receipt/get/responses/200' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+  /web/orders/{id}/receipt-correction:
+    get:
+      operationId: downloadWebFiscalReceiptCorrection
+      security: [{ webGuest: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/WebSessionContext'
+      responses:
+        '200': { $ref: '#/paths/~1orders~1{id}~1receipt-correction/get/responses/200' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
   /web/orders/{id}/data-export:
@@ -1180,7 +1211,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OperatorReceipt' }
         '400':
-          description: Invalid upload metadata or an unreadable new PDF. The pending order keeps its receipt state.
+          description: Invalid upload metadata or an unreadable new PDF. The order keeps its receipt state.
           content:
             application/problem+json:
               schema:
@@ -1195,6 +1226,44 @@ paths:
         '404': { $ref: '#/components/responses/OrderUnavailable' }
         '409':
           description: The receipt amount differs from the order, another receipt is attached, or the EBM reference is already in use.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ProblemDetails' }
+        '413': { description: The PDF exceeds 1 MiB. }
+        '415': { description: The request must contain a PDF. }
+  /operator/orders/{id}/receipt-correction:
+    put:
+      operationId: attachFiscalReceiptCorrection
+      description: An assigned manager attaches the correction issued by the EBM for an order with an original receipt and a confirmed full refund. An exact repeat returns the stored correction without replacing its author or content.
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - name: X-Receipt-Reference
+          in: header
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$' }
+        - name: X-Receipt-Total-RWF
+          in: header
+          required: true
+          description: The positive full refund amount shown in the correction, in whole RWF.
+          schema: { type: integer, minimum: 1 }
+      requestBody:
+        required: true
+        content:
+          application/pdf:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: The correction has been attached and the order receipt is marked corrected. The original is preserved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorReceipt' }
+        '400': { $ref: '#/paths/~1operator~1orders~1{id}~1receipt/put/responses/400' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '409':
+          description: The order has no eligible original and full refund, the amount differs, a conflicting correction is already attached, or the reference is in use.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/ProblemDetails' }
@@ -1774,6 +1843,8 @@ components:
         currency: { type: string, const: RWF }
         receiptStatus: { type: string, enum: [pending, issued, corrected] }
         receiptReference: { type: ['string', 'null'] }
+        correctionReference: { type: ['string', 'null'] }
+        correctionEligible: { type: boolean, description: An original exists and the full refund is verified. The manager can attach a correction. }
     VerifiedRefund:
       type: object
       required: [providerRefundId, refundStatus, amount, currency, recordedAt]

@@ -28,10 +28,25 @@ final class CustomerReceiptController {
         return downloadForGuest(sessions.authenticate(bearer), id);
     }
 
+    @GetMapping("/api/v1/orders/{id}/receipt-correction")
+    ResponseEntity<byte[]> downloadCorrection(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String bearer,
+            @PathVariable String id) {
+        return downloadCorrectionForGuest(sessions.authenticate(bearer), id);
+    }
+
     ResponseEntity<byte[]> downloadForGuest(UUID guest, String id) {
         UUID orderId = ApiFailure.uuid(id, ApiFailure.notFound());
-        byte[] pdf = orders.receiptDocument(guest, orderId);
-        String filename = "receipt-" + orderId.toString().substring(28) + ".pdf";
+        return pdf(orders.receiptDocument(guest, orderId), "receipt", orderId);
+    }
+
+    ResponseEntity<byte[]> downloadCorrectionForGuest(UUID guest, String id) {
+        UUID orderId = ApiFailure.uuid(id, ApiFailure.notFound());
+        return pdf(orders.receiptCorrectionDocument(guest, orderId), "receipt-correction", orderId);
+    }
+
+    private static ResponseEntity<byte[]> pdf(byte[] pdf, String kind, UUID orderId) {
+        String filename = kind + "-" + orderId.toString().substring(28) + ".pdf";
         return ResponseEntity.ok()
             .cacheControl(CacheControl.noStore().cachePrivate())
             .contentType(MediaType.APPLICATION_PDF)

@@ -855,6 +855,26 @@ test('the customer receipt uses an authenticated fixed GET without putting crede
   assert.doesNotMatch(JSON.stringify([...data.values()]), /%PDF|test receipt/);
 });
 
+test('native receipt corrections use the fixed sibling route and only the matching order recovery grant', async () => {
+  const { storage, data } = memory();
+  data.set(journalKey + '.guest', JSON.stringify(rotatable));
+  data.set(journalKey + '.recovery-guest', JSON.stringify({ guest: recoveryGuest, previous: rotatable.sessionId,
+    challengeId: recoveryChallengeId, grants: [recoveryOrderId] }));
+  const { fetcher, calls } = transport(call => call.token === 'Bearer ' + recoveryGuest.accessToken
+    ? new Response(receiptFixture, { headers: { 'Content-Type': PDF_MIME_TYPE } })
+    : new Response(null, { status: 404 }));
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  await assert.rejects(api.getReceiptPdf!(recoveryOrderId + '/receipt', 'correction'), { code: 'invalid_input' });
+  assert.deepEqual(await api.getReceiptPdf!(recoveryOrderId, 'correction'), receiptFixture);
+  await assert.rejects(api.getReceiptPdf!(pickupOrderId, 'correction'), { code: 'not_found' });
+  assert.deepEqual(calls.map(({ method, url, token }) => [method, url, token]), [
+    ['GET', config.apiBaseUrl + '/orders/' + recoveryOrderId + '/receipt-correction', 'Bearer ' + rotatable.accessToken],
+    ['GET', config.apiBaseUrl + '/orders/' + recoveryOrderId + '/receipt-correction', 'Bearer ' + recoveryGuest.accessToken],
+    ['GET', config.apiBaseUrl + '/orders/' + pickupOrderId + '/receipt-correction', 'Bearer ' + rotatable.accessToken],
+  ]);
+  assert.doesNotMatch(JSON.stringify([...data.values()]), /%PDF|test receipt/);
+});
+
 test('native order and receipt failures expose only a valid ID from the expected API response', async () => {
   const { data, storage } = memory();
   data.set(journalKey + '.guest', JSON.stringify(session));

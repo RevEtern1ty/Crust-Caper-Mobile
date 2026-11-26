@@ -106,6 +106,7 @@ const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const providerId = /^[1-9][0-9]{0,18}$/;
 const receiptReference = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$/;
 const maxReceiptBytes = 1024 * 1024;
+const receiptProgress = { pending: 0, issued: 1, corrected: 2 };
 const queuePollMs = 5000;
 const queueFreshMs = 12_000;
 const overdueMs = 60_000;
@@ -233,6 +234,9 @@ function messageFor(error, unavailable = 'The server could not complete this req
   if (error.code === 'payment_reference_unavailable') return 'The paid transaction could not be identified. Check Payment review before cancelling this order.';
   if (error.code === 'refund_already_recorded') return 'This payment already has a recorded refund. Refresh payment review.';
   if (error.code === 'receipt_already_issued') return 'A receipt is already attached to this order. Refresh fiscal receipts.';
+  if (error.code === 'receipt_correction_not_available') return 'A correction requires an original receipt and a verified full refund. Refresh fiscal receipts.';
+  if (error.code === 'receipt_correction_already_attached') return 'A correction is already attached to this order. Refresh fiscal receipts.';
+  if (error.code === 'receipt_correction_reference_matches_original') return 'The correction reference must differ from the original receipt reference.';
   if (error.code === 'receipt_reference_in_use') return 'This receipt reference is already attached to another order.';
   if (error.code === 'receipt_total_mismatch') return 'The total printed on the receipt must match the paid order.';
   if (error.code === 'invalid_receipt_pdf') return 'This PDF could not be opened. Choose the original PDF exported by the EBM.';
@@ -995,15 +999,36 @@ async function verifyRefund(entry, card, form) {
   }
 }
 
+function validReceiptReference(value) {
+  return typeof value === 'string' && receiptReference.test(value);
+}
+
 function checkedReceipt(entry) {
   if (!entry || typeof entry.orderId !== 'string' || !uuid.test(entry.orderId) || entry.currency !== 'RWF'
     || !Number.isSafeInteger(entry.total) || entry.total <= 0
-    || !['pending', 'issued', 'corrected'].includes(entry.receiptStatus)
-    || (entry.receiptReference != null && (typeof entry.receiptReference !== 'string'
-      || !receiptReference.test(entry.receiptReference)))) {
+    || typeof entry.receiptStatus !== 'string' || !Object.hasOwn(receiptProgress, entry.receiptStatus)
+    || (entry.receiptReference != null && !validReceiptReference(entry.receiptReference))
+    || (entry.correctionReference != null && !validReceiptReference(entry.correctionReference))
+    || (entry.correctionEligible !== undefined && typeof entry.correctionEligible !== 'boolean')) {
     throw new ApiError(502, 'invalid_response');
   }
-  return entry;
+  return { ...entry, correctionReference: entry.correctionReference ?? null, correctionEligible: entry.correctionEligible === true };
+}
+
+function canCorrectReceipt(entry) {
+  return entry.receiptStatus === 'issued' && entry.correctionEligible
+    && entry.receiptReference != null && entry.correctionReference == null;
+}
+
+function newerReceipt(entry, known) {
+  if (!known) return entry;
+  if (receiptProgress[known.receiptStatus] > receiptProgress[entry.receiptStatus]) return known;
+  return entry.receiptStatus === 'corrected' && known.receiptStatus === 'corrected'
+    && !entry.correctionReference && known.correctionReference ? known : entry;
+}
+
+function rememberReceiptAttachment(read, entry) {
+  if (read) read.attachments.set(entry.orderId, newerReceipt(entry, read.attachments.get(entry.orderId)));
 }
 
 function renderedReceipt(entry) {
@@ -1013,17 +1038,29 @@ function renderedReceipt(entry) {
   badge.dataset.status = entry.receiptStatus === 'pending' ? 'accepted' : 'ready';
   badge.textContent = entry.receiptStatus === 'pending' ? 'Awaiting receipt'
     : entry.receiptStatus === 'corrected' ? 'Corrected' : 'Attached';
-  card.querySelector('.receipt-total').textContent = `Paid total ${integerFormat.format(entry.total)} RWF`;
-  if (entry.receiptStatus === 'pending') {
+  const correction = canCorrectReceipt(entry);
+  const totalLabel = correction || entry.correctionReference ? 'Verified full refund' : 'Paid total';
+  card.querySelector('.receipt-total').textContent = `${totalLabel} ${integerFormat.format(entry.total)} RWF`;
+  if (entry.receiptStatus !== 'pending') {
+    const references = [];
+    if (entry.receiptReference) references.push(`EBM reference ${entry.receiptReference}`);
+    if (entry.correctionReference) references.push(`EBM correction reference ${entry.correctionReference}`);
+    showMessage(card.querySelector('.fiscal-result'), references.join(' · '));
+  }
+  if (entry.receiptStatus === 'pending' || correction) {
     const form = card.querySelector('.receipt-form');
+    if (correction) {
+      form.querySelector('.receipt-reference-label').textContent = 'EBM correction reference';
+      form.querySelector('.receipt-total-label').textContent = 'Refund amount printed on correction (RWF)';
+      form.querySelector('.receipt-document-label').textContent = 'EBM correction PDF';
+      form.querySelector('button').textContent = 'Attach correction';
+    }
     form.hidden = false;
     if (receiptUploads.has(entry.orderId)) setReceiptFormBusy(card, true);
     form.addEventListener('submit', (event) => {
       event.preventDefault();
       void attachReceipt(entry, card, form);
     });
-  } else if (entry.receiptReference) {
-    showMessage(card.querySelector('.fiscal-result'), `EBM reference ${entry.receiptReference}`);
   }
   return card;
 }
@@ -1031,7 +1068,9 @@ function renderedReceipt(entry) {
 function receiptCard(entry) {
   const previous = receiptCards.get(entry.orderId);
   if (previous && previous.entry.receiptStatus === entry.receiptStatus
-    && previous.entry.receiptReference === entry.receiptReference && previous.entry.total === entry.total) return previous.card;
+    && previous.entry.receiptReference === entry.receiptReference && previous.entry.total === entry.total
+    && previous.entry.correctionReference === entry.correctionReference
+    && previous.entry.correctionEligible === entry.correctionEligible) return previous.card;
   const card = renderedReceipt(entry);
   receiptCards.set(entry.orderId, { entry, card });
   return card;
@@ -1116,12 +1155,11 @@ async function findReceipt() {
       if (!matchesOrderCode(found.orderId, code)) {
         throw new ApiError(502, 'invalid_response');
       }
-      lookup.entry = found.receiptStatus === 'pending' ? lookup.attachments.get(found.orderId) ?? found : found;
-      if (lookup.entry.receiptStatus !== 'pending' && receipts.some((item) =>
-        item.orderId === found.orderId && item.receiptStatus === 'pending')) {
-        receiptRefresh?.attachments.set(found.orderId, lookup.entry);
-        receipts = receipts.map((item) => item.orderId === found.orderId && item.receiptStatus === 'pending'
-          ? lookup.entry : item);
+      const listed = receipts.find((item) => item.orderId === found.orderId);
+      lookup.entry = newerReceipt(newerReceipt(found, listed), lookup.attachments.get(found.orderId));
+      if (listed && newerReceipt(listed, lookup.entry) !== listed) {
+        rememberReceiptAttachment(receiptRefresh, lookup.entry);
+        receipts = receipts.map((item) => item === listed ? lookup.entry : item);
       }
       lastReceiptLookupId = found.orderId;
       lookup.state = 'found';
@@ -1157,16 +1195,24 @@ function setReceiptFormBusy(card, busy) {
 async function attachReceipt(entry, card, form) {
   const current = availableSession();
   if (current?.role !== 'manager' || receiptUploads.has(entry.orderId) || !card.isConnected) return;
+  const correction = canCorrectReceipt(entry);
   const reference = form.elements.namedItem('reference').value.trim();
   const total = form.elements.namedItem('total').value.trim();
   const file = form.elements.namedItem('document').files[0];
   const problem = form.querySelector('.manager-problem');
+  const totalMismatch = correction ? 'The refund amount printed on the correction must match the verified full refund.'
+    : 'The total printed on the receipt must match the paid order.';
   if (!receiptReference.test(reference)) {
-    showMessage(problem, 'Enter the receipt reference printed by the EBM.');
+    showMessage(problem, correction ? 'Enter the correction reference printed by the EBM.'
+      : 'Enter the receipt reference printed by the EBM.');
+    return;
+  }
+  if (correction && reference.toLowerCase() === entry.receiptReference.toLowerCase()) {
+    showMessage(problem, 'The correction reference must differ from the original receipt reference.');
     return;
   }
   if (!/^[1-9][0-9]{0,9}$/.test(total) || Number(total) !== entry.total) {
-    showMessage(problem, 'The total printed on the receipt must match the paid order.');
+    showMessage(problem, totalMismatch);
     return;
   }
   if (!file || (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf'))
@@ -1180,21 +1226,25 @@ async function attachReceipt(entry, card, form) {
   setReceiptFormBusy(card, true);
   showMessage(problem);
   try {
-    const data = checkedReceipt(await request(`/orders/${entry.orderId}/receipt`, {
+    const action = correction ? 'receipt-correction' : 'receipt';
+    const data = checkedReceipt(await request(`/orders/${entry.orderId}/${action}`, {
       method: 'PUT', token: current.accessToken, receipt: { file, reference, total }, timeoutMs: 25_000,
     }));
     if (session !== current) return;
-    if (data.orderId !== entry.orderId || data.total !== entry.total
-      || data.receiptStatus !== 'issued' || data.receiptReference !== reference) {
+    const confirmed = correction
+      ? data.receiptStatus === 'corrected' && data.receiptReference === entry.receiptReference && data.correctionReference === reference
+      : data.receiptReference === reference && (data.receiptStatus === 'issued'
+        || (data.receiptStatus === 'corrected' && data.correctionReference !== null));
+    if (data.orderId !== entry.orderId || data.total !== entry.total || !confirmed) {
       throw new ApiError(502, 'invalid_response');
     }
-    receiptRefresh?.attachments.set(data.orderId, data);
-    if (receiptLookup?.state === 'loading') receiptLookup.attachments.set(data.orderId, data);
-    if (receiptLookup?.entry?.orderId === data.orderId && receiptLookup.entry.receiptStatus === 'pending') {
-      receiptLookup.entry = data;
+    rememberReceiptAttachment(receiptRefresh, data);
+    if (receiptLookup?.state === 'loading') rememberReceiptAttachment(receiptLookup, data);
+    if (receiptLookup?.entry?.orderId === data.orderId) {
+      receiptLookup.entry = newerReceipt(receiptLookup.entry, data);
     }
     if (receipts.some(({ orderId }) => orderId === data.orderId)) {
-      receipts = receipts.map((item) => item.orderId === data.orderId && item.receiptStatus === 'pending' ? data : item);
+      receipts = receipts.map((item) => item.orderId === data.orderId ? newerReceipt(item, data) : item);
     } else {
       receipts.push(data);
     }
@@ -1211,7 +1261,7 @@ async function attachReceipt(entry, card, form) {
   } catch (error) {
     if (session !== current) return;
     if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
-    else showMessage(problem, messageFor(error));
+    else showMessage(problem, error instanceof ApiError && error.code === 'receipt_total_mismatch' ? totalMismatch : messageFor(error));
   } finally {
     if (session === current) {
       receiptUploads.delete(entry.orderId);
@@ -1508,10 +1558,8 @@ async function refreshReceipts() {
     const data = await request('/receipts', { token: current.accessToken });
     if (session !== current) return;
     if (!Array.isArray(data) || data.length > 100) throw new ApiError(502, 'invalid_response');
-    const next = data.map(checkedReceipt).map((entry) => {
-      // A list request already in flight can still return the pre-upload state for an attached receipt.
-      return entry.receiptStatus === 'pending' ? refresh.attachments.get(entry.orderId) ?? entry : entry;
-    });
+    // An in-flight list can still contain the state before an original or correction attachment.
+    const next = data.map(checkedReceipt).map((entry) => newerReceipt(entry, refresh.attachments.get(entry.orderId)));
     const returnedIds = new Set(next.map(({ orderId }) => orderId));
     for (const entry of receipts) {
       if (returnedIds.has(entry.orderId)) continue;

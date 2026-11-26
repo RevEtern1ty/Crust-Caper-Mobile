@@ -123,6 +123,18 @@ final class OperatorController {
             .body(receipts.attach(authorization, id, reference, total, document));
     }
 
+    @PutMapping("/orders/{id}/receipt-correction")
+    ResponseEntity<ReceiptOrder> attachReceiptCorrection(
+            @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
+            @PathVariable String id, HttpServletRequest request) {
+        String reference = request.getHeader("X-Receipt-Reference");
+        String total = request.getHeader("X-Receipt-Total-RWF");
+        receipts.preflightCorrection(authorization, id, reference, total);
+        byte[] document = ReceiptPdf.read(request);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+            .body(receipts.attachCorrection(authorization, id, reference, total, document));
+    }
+
     @PostMapping("/orders/{id}/status")
     ResponseEntity<OrderView> change(@RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String authorization,
                                      @PathVariable String id, @RequestBody StatusInput input) {

@@ -104,6 +104,7 @@ export type KitchenStatus =
   | 'cancelled'
 
 export type ReceiptStatus = 'pending' | 'issued' | 'corrected'
+export type ReceiptDocument = 'original' | 'correction'
 
 export type PaymentAttempt = {
   id: string
@@ -201,7 +202,7 @@ export interface ShopApi {
   recoverOrder?(key: string): Promise<Order | null>
   startPayment(orderId: string, key: string): Promise<PaymentAttempt>
   getOrder(orderId: string, options?: { readOnly?: boolean }): Promise<Order>
-  getReceiptPdf?(orderId: string): Promise<Uint8Array>
+  getReceiptPdf?(orderId: string, document?: ReceiptDocument): Promise<Uint8Array>
   getOrderDataExport?(orderId: string): Promise<OrderDataExport>
   getOrderErasureRequest?(orderId: string): Promise<OrderErasureRequestResponse>
   requestOrderErasure?(orderId: string): Promise<OrderErasureRequestResponse>

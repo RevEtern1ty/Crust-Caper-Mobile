@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { CheckoutController } from '../checkout/controller';
 import { ApiError } from '../domain/types';
+import { PDF_MIME_TYPE } from './receipt';
 import { createWebLiveApi } from './web-api';
 
 const config = {
@@ -171,6 +172,36 @@ test('web order and receipt failures expose only a valid ID from the expected AP
     assert.equal(transport.calls.length, 1);
   }
   assert.deepEqual([...saved.entries()], [context]);
+});
+
+test('web receipt corrections keep the fixed document route and matching order cookie context', async () => {
+  const entries: [string, string][] = [
+    [journalKey + '.context', first],
+    [journalKey + '.verified', JSON.stringify({ sessionId: second, orderIds: [orderId], owned: false })],
+  ];
+  const { storage, saved } = memory(entries);
+  const original = new TextEncoder().encode('%PDF-1.4\n% test original\n%%EOF\n');
+  const correction = new TextEncoder().encode('%PDF-1.4\n% test correction\n%%EOF\n');
+  const transport = fixture(first, ({ path }) => new Response(path.endsWith('/receipt-correction') ? correction : original,
+    { headers: { 'Content-Type': PDF_MIME_TYPE } }));
+  const api = createWebLiveApi({ config, storage, journalKey, browser, fetcher: transport.fetcher });
+  await assert.rejects(api.getReceiptPdf!(orderId + '/receipt', 'correction'), { code: 'invalid_input' });
+  assert.deepEqual(await api.getReceiptPdf!(orderId), original);
+  assert.deepEqual(await api.getReceiptPdf!(orderId, 'original'), original);
+  assert.deepEqual(await api.getReceiptPdf!(orderId, 'correction'), correction);
+  transport.setCookie(second);
+  assert.deepEqual(await api.getReceiptPdf!(orderId, 'correction'), correction);
+  await assert.rejects(api.getReceiptPdf!(unknownOrderId, 'correction'), { code: 'unauthenticated' });
+  const prefix = '/web/orders/';
+  assert.deepEqual(transport.calls.map(({ method, path, context }) => [method, path, context]), [
+    ['GET', prefix + orderId + '/receipt', first],
+    ['GET', prefix + orderId + '/receipt', first],
+    ['GET', prefix + orderId + '/receipt-correction', first],
+    ['GET', prefix + orderId + '/receipt-correction', first],
+    ['GET', prefix + orderId + '/receipt-correction', second],
+    ['GET', prefix + unknownOrderId + '/receipt-correction', first],
+  ]);
+  assert.deepEqual([...saved.entries()], entries);
 });
 
 test('pending journal and denied cookies block guest startup and checkout calls', async () => {

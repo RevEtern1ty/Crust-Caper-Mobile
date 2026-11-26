@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { canStartNewOrder, hasSavedCheckout, parseJournal } from '../checkout/controller';
 import { paymentReturnOrderId } from '../checkout/payment-return';
-import { ApiError, type Order, type PaymentAttempt, type PendingCheckoutIntent, type Storage } from '../domain/types';
+import { ApiError, type Order, type PaymentAttempt, type PendingCheckoutIntent, type ReceiptDocument, type Storage } from '../domain/types';
 import { apiResponseError, invalidResponse, rememberVerifiedOrder, safeHttps, type ConnectedConfig, type LiveShopApi } from './http-api';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import {
@@ -72,7 +72,8 @@ export function createWebLiveApi({
     if (!paymentReturnOrderId(id)) throw new ApiError('invalid_input');
     return '/orders/' + id;
   };
-  const receiptPath = (id: string) => orderPath(id) + '/receipt';
+  const receiptPath = (id: string, document: ReceiptDocument = 'original') =>
+    orderPath(id) + (document === 'correction' ? '/receipt-correction' : '/receipt');
   const work = new Set<Promise<unknown>>();
   let ending: Promise<void> | null = null;
   let challenge: { id: string; sessionId: string; separateContext: boolean } | null = null;
@@ -428,8 +429,8 @@ export function createWebLiveApi({
       // The prior order can seed a fresh cart using the sanitized payment projection above.
       return canContinueCheckout ? { ...order, recoveryReadOnly: undefined } : order;
     },
-    async getReceiptPdf(orderId) {
-      const result = await readOrder(orderId, { path: receiptPath(orderId), schema: z.instanceof(Uint8Array), pdf: true });
+    async getReceiptPdf(orderId, document) {
+      const result = await readOrder(orderId, { path: receiptPath(orderId, document), schema: z.instanceof(Uint8Array), pdf: true });
       return result.payload;
     },
     async getOrderDataExport(orderId) {

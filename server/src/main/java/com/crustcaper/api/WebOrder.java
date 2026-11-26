@@ -9,7 +9,8 @@ record WebOrder(@JsonUnwrapped Order order, @JsonInclude(JsonInclude.Include.NON
     static WebOrder from(Order order, boolean readOnly) {
         if (order.receiptUrl() != null) {
             String receiptSuffix = "/orders/" + order.id() + "/receipt";
-            String receiptUrl = order.receiptStatus().equals("issued") && order.receiptUrl().equals("/api/v1" + receiptSuffix)
+            boolean hasOriginal = order.receiptStatus().equals("issued") || order.receiptStatus().equals("corrected");
+            String receiptUrl = hasOriginal && order.receiptUrl().equals("/api/v1" + receiptSuffix)
                 ? "/api/v1/web" + receiptSuffix : null;
             order = new Order(order.id(), order.storeId(), order.slotId(), order.lines(), order.total(), order.tax(),
                 order.currency(), order.paymentStatus(), order.status(), order.pickupCode(), order.receiptStatus(),
