@@ -4,7 +4,7 @@ if (process.argv[2] === 'start') {
   const { cpSync } = require('node:fs');
   const { join } = require('node:path');
   const build = join(__dirname, '../.next');
-  const runtime = join(build, 'standalone');
+  const runtime = join(build, 'standalone/storefront');
 
   cpSync(join(build, 'static'), join(runtime, '.next/static'), { recursive: true });
   process.env.HOSTNAME = '0.0.0.0';
