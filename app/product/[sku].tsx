@@ -49,7 +49,7 @@ function Details({ product, editing }: { product: Product; editing?: CartLine })
         <Text variant="title" accessibilityRole="header">{product.name[locale]}</Text>
         <Text tone="muted">{product.description[locale]}</Text>
         <Text variant="label">{money(product.price)}</Text>
-        {!product.available && <Text tone="red">{copy(locale, 'Sold out', 'Byashize')}</Text>}
+        {!product.available && <Text tone="red">{copy(locale, 'Currently unavailable', 'Ntikiboneka ubu')}</Text>}
       </View>
       <Card>
         <Text variant="label">{copy(locale, 'Ingredients', 'Ibigize ifunguro')}</Text>

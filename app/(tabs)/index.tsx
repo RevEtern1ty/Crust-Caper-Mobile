@@ -20,10 +20,11 @@ function ProductTile({ product, featured = false, wide = false }: { product: Pro
   const router = useRouter();
   const photo = menuPhoto(product.sku, fixturePhotos, product.photoUrl);
   const label = product.name[locale];
+  const unavailable = copy(locale, 'Currently unavailable', 'Ntikiboneka ubu');
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={`${label}, ${money(product.price)}${product.available ? '' : copy(locale, ', sold out', ', byashize')}`}
+      accessibilityLabel={`${label}, ${money(product.price)}${product.available ? '' : `, ${unavailable}`}`}
       accessibilityHint={copy(locale, 'Opens item details.', 'Ifungura ibisobanuro by’ifunguro.')}
       onPress={() => router.push({ pathname: '/product/[sku]', params: { sku: product.sku } })}
       style={({ pressed }) => [styles.tile, featured && styles.featured, wide && styles.half, pressed && styles.pressed]}
@@ -36,7 +37,7 @@ function ProductTile({ product, featured = false, wide = false }: { product: Pro
         </View>
         <View style={styles.tileBottom}>
           <Text variant="label">{money(product.price)}</Text>
-          {!product.available && <Text variant="small" tone="red">{copy(locale, 'Sold out', 'Byashize')}</Text>}
+          {!product.available && <Text variant="small" tone="red">{unavailable}</Text>}
           <View style={styles.productAction}>
             <Text variant="small" style={styles.actionLabel}>{copy(locale, 'Details', 'Ibisobanuro')}</Text>
             <Icon name="chevron-forward" size={16} />

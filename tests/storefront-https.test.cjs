@@ -1143,7 +1143,7 @@ function publishProductSaleRules(catalog, product, rules) {
   return version;
 }
 
-async function checkProductSaleRules(ca) {
+async function checkProductSaleRules(browser, ca) {
   const api = '/api/v1/stores/kigali/menu';
   const webMenu = api + '?channel=web';
   const mobileMenu = api + '?channel=mobile';
@@ -1217,6 +1217,26 @@ async function checkProductSaleRules(ca) {
     assert.ok(details.body.includes(status));
     assert.ok(!details.body.includes('href="/product/double-smash?storefrontLocale=' + locale + '"'));
   }
+
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  try {
+    const page = await context.newPage();
+    for (const [locale, message, add] of [
+      ['en', 'Currently unavailable', /^Add to cart/], ['rw', 'Ntikiboneka ubu', /^Shyira mu gitebo/],
+    ]) {
+      await page.goto(origin + '/product/double-smash?storefrontLocale=' + locale);
+      await shown(page, message);
+      for (const width of [320, 390, 430]) {
+        await page.setViewportSize({ width, height: 844 });
+        await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+        assert.equal(await button(page, add).isDisabled(), true);
+        assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+        await capture(page, 'sale-hours-unavailable-' + locale + '-' + width);
+      }
+    }
+  } finally {
+    await context.close();
+  }
 }
 
 const scenario = webPerf ? 'HTTPS catalog captures cold mobile web performance'
@@ -1260,6 +1280,6 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
     await t.test('a named manager with MFA confirms an exact recipe approval without publishing it',
       () => checkRecipeApproval(browser, ca));
     await t.test('published sale rules update channel visibility and localized availability over HTTPS',
-      () => checkProductSaleRules(ca));
+      () => checkProductSaleRules(browser, ca));
   }
 });
