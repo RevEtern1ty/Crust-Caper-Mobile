@@ -35,13 +35,13 @@ async function restrictToOperatorAssets(page) {
   });
 }
 
-async function send(path, { method = 'GET', token, data, key, installationId } = {}) {
+async function send(path, { method = 'GET', token, data, key, installationId, baseUrl = api } = {}) {
   const headers = {};
   if (token) headers.Authorization = 'Bearer ' + token;
   if (data) headers['Content-Type'] = 'application/json';
   if (key) headers['Idempotency-Key'] = key;
   if (installationId) headers['X-Installation-Id'] = installationId;
-  return fetch(api + path, {
+  return fetch(baseUrl + path, {
     method, headers, body: data ? JSON.stringify(data) : undefined,
     redirect: 'error', signal: AbortSignal.timeout(10_000),
   });
@@ -1962,6 +1962,148 @@ test('manager finds and attaches a fiscal receipt beyond the rolling queue', { t
   assert.equal(persisted.status, 200);
   assert.ok(Buffer.from(await persisted.arrayBuffer()).equals(pdf));
   await capture(page, 'connected-fiscal-exact-lookup');
+});
+
+test('a saved order denied with a private 404 offers phone verification for its own number', { timeout: 45_000 }, async t => {
+  const isolatedFixture = process.env.CRUSTCAPER_SAVED_ORDER_FIXTURE_API;
+  const upstream = isolatedFixture || api;
+  for (const url of [api, upstream]) assert.match(url, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  if (isolatedFixture) assert.notEqual(upstream, api, 'Use a dedicated fixture endpoint for the one-off OTP rehearsal');
+  const fixture = (path, options) => send(path, { ...options, baseUrl: upstream });
+  const menu = await fixture('/stores/kigali/menu').then(response => response.json());
+  const product = menu.products.find(item => item.name.en === 'Double Smash' && item.available);
+  const slots = menu.slots.filter(item => item.available).slice(-2);
+  assert.ok(product && slots.length === 2);
+
+  async function createOrder(slot, buyer) {
+    const guestResponse = await fixture('/guest-sessions', { method: 'POST' });
+    assert.ok(guestResponse.ok);
+    const session = await guestResponse.json();
+    const token = session.accessToken;
+    const quote = await fixture('/quotes', { method: 'POST', token, data: { storeId: menu.store.id, slotId: slot.id,
+      lines: [{ sku: product.sku, modifierIds: [], quantity: 1, unitPrice: product.price }] } });
+    assert.ok(quote.ok);
+    const { quoteId } = await quote.json();
+    const placed = await fixture('/orders', { method: 'POST', token, key: randomUUID(), data: { quoteId, ...buyer } });
+    assert.ok(placed.ok);
+    const { id } = await placed.json();
+    return { id, session, number: id.slice(-8).toUpperCase() };
+  }
+
+  const earlier = await createOrder(slots[0], contact);
+  const latest = await createOrder(slots[1], { ...contact, phone: '+250700000001' });
+  const previousRead = await fixture('/orders/' + earlier.id, { token: latest.session.accessToken });
+  assert.equal(previousRead.status, 404);
+  assert.equal((await previousRead.json()).code, 'not_found');
+  assert.equal((await fixture('/orders/' + latest.id, { token: latest.session.accessToken })).status, 200);
+
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, serviceWorkers: 'block' });
+  page.setDefaultTimeout(6500);
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const apiUrl = new URL(api);
+  const journalKey = 'crustcaper.checkout.v1.local.' + apiUrl.hostname + '.' + apiUrl.port + '.kigali';
+  const orderIds = [latest.id, earlier.id];
+  await page.addInitScript(({ origin, journalKey, orderIds, session }) => {
+    if (location.origin !== origin) return;
+    sessionStorage.setItem(journalKey, JSON.stringify({ version: 1, active: null, orderIds }));
+    sessionStorage.setItem(journalKey + '.guest', JSON.stringify(session));
+  }, { origin, journalKey, orderIds, session: latest.session });
+  const writes = [];
+  await page.route('**/*', async route => {
+    const request = route.request();
+    const url = request.url();
+    if (new URL(url).origin === origin) return route.continue();
+    if (!url.startsWith(api + '/')) return route.abort();
+    const method = request.method();
+    if (method !== 'GET' && method !== 'OPTIONS') writes.push([method, new URL(url).pathname]);
+    if (upstream === api) return route.continue();
+    const response = await route.fetch({ url: upstream + url.slice(api.length), maxRedirects: 0 });
+    return route.fulfill({ response });
+  });
+
+  async function checkContext(actionLabel, notice, field, screenshot) {
+    const action = button(page, actionLabel);
+    await action.waitFor();
+    await shown(page, notice);
+    const texts = [action.getByText(actionLabel, { exact: true }), page.getByText(notice, { exact: true })];
+    const before = await Promise.all(texts.map(text =>
+      text.evaluate(element => {
+        const style = getComputedStyle(element);
+        const original = { fontSize: element.style.fontSize, lineHeight: element.style.lineHeight };
+        element.style.fontSize = (2 * parseFloat(style.fontSize)) + 'px';
+        element.style.lineHeight = (2 * parseFloat(style.lineHeight)) + 'px';
+        return original;
+      })));
+    for (const width of [390, 430, 320]) {
+      await page.setViewportSize({ width, height: 840 });
+      await action.scrollIntoViewIfNeeded();
+      const bounds = await action.boundingBox();
+      assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width + 1, 'Contextual recovery stays within the viewport');
+      for (const text of texts) {
+        assert.ok(await text.evaluate(element => element.scrollWidth <= element.clientWidth + 1),
+          'Enlarged recovery copy fits its container');
+      }
+    }
+    await capture(page, screenshot);
+    await Promise.all(texts.map((text, index) => text.evaluate((element, original) => {
+      element.style.fontSize = original.fontSize;
+      element.style.lineHeight = original.lineHeight;
+    }, before[index])));
+    await action.click();
+    await page.waitForURL(/\/order-recovery(?:\?|$)/);
+    assert.equal(await page.getByLabel(field, { exact: true }).inputValue(), earlier.number);
+  }
+
+  const orderUrl = api + '/orders/' + earlier.id;
+  const missing = page.waitForResponse(response => response.url() === orderUrl && response.status() === 404);
+  await page.goto(origin + '/orders');
+  await button(page, 'Find an order from another device').waitFor();
+  await page.getByRole('button', { name: '#' + earlier.number, exact: true }).click();
+  await missing;
+  await checkContext('Verify this order by phone', 'Verify your phone number to open this saved order.', 'Order number', 'saved-order-404-en');
+  await page.getByLabel(/(?:, back|Go back)$/i).click();
+  await page.waitForURL(origin + '/orders');
+  await button(page, 'Settings').click();
+  await button(page, 'Kinyarwanda').click();
+  await shown(page, 'Amagenamiterere');
+  await page.getByLabel(/(?:, back|Go back)$/i).click();
+  await page.waitForURL(origin + '/orders');
+  await checkContext('Emeza iyi komande ukoresheje telefoni', 'Emeza nimero ya telefoni kugira ngo ufungure iyi komande yabitswe.',
+    'Nimero ya komande', 'saved-order-404-rw');
+  assert.deepEqual(writes, []);
+
+  // The standard suite already verifies an SMS on the one synthetic phone under the shared cooldown.
+  // A dedicated database also exercises granting the selected historical order in this scenario.
+  if (isolatedFixture) {
+    await page.getByLabel('Nimero ya telefoni', { exact: true }).fill(contact.phone);
+    await button(page, 'Saba kode yo kwemeza').click();
+    const code = page.getByLabel('Kode yo kwemeza', { exact: true });
+    await code.fill('418263');
+    let verified;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const response = page.waitForResponse(item =>
+        /\/api\/v1\/order-access\/challenges\/[^/]+\/verify$/.test(item.url()) && item.request().method() === 'POST');
+      await button(page, 'Emeza kode ufungure komande').click();
+      verified = await response;
+      if (verified.ok()) break;
+      assert.equal(verified.status(), 404);
+      await delay(500);
+    }
+    assert.ok(verified?.ok(), 'The isolated fixture must confirm the received OTP');
+    assert.deepEqual(await verified.json(), { orderId: earlier.id });
+    await page.waitForURL(origin + '/orders');
+    assert.equal((await fixture('/orders/' + earlier.id, { token: latest.session.accessToken })).status, 200);
+    await shown(page, 'Gutegereza ubwishyu');
+    assert.ok(writes.every(([method, path]) => method === 'POST' && path.startsWith('/api/v1/order-access/challenges')));
+  }
 });
 
 test('connected checkout, receipt, pickup, recovery, payment return and restaurant cancellation', { timeout: 70_000 }, async t => {

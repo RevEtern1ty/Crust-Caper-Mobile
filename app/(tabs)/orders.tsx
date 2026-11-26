@@ -36,8 +36,9 @@ export default function OrdersScreen() {
   const { order, loading, failed, error: statusError, refresh, delayedPayment } = useOrderStatus(orderId);
   const t = (en: string, rw: string) => copy(locale, en, rw);
   const showDelayedPayment = !!order && delayedPayment && !failed;
-  const needsPhoneVerification = mode === 'connected' && !!orderId
-    && statusError instanceof ApiError && statusError.code === 'unauthenticated';
+  const savedOrderId = savedPaymentReturnOrderId(orderId ?? undefined, journal?.orderIds ?? []);
+  const needsPhoneVerification = mode === 'connected' && savedOrderId !== null
+    && statusError instanceof ApiError && (statusError.code === 'unauthenticated' || statusError.code === 'not_found');
 
   useEffect(() => {
     if (!journal || requestedOrderId === null) return;
@@ -167,7 +168,7 @@ export default function OrdersScreen() {
           : t('Find an order from another device', 'Shaka komande yakozwe ku kindi gikoresho')} variant="secondary"
           onPress={() => router.push({
             pathname: '/order-recovery',
-            params: { from: 'orders', ...(needsPhoneVerification && orderId ? { orderCode: orderId.slice(-8).toUpperCase() } : {}) },
+            params: { from: 'orders', ...(needsPhoneVerification ? { orderCode: displayOrderId(savedOrderId).slice(1) } : {}) },
           })} />
       )}
 
