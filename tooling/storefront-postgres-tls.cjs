@@ -1,6 +1,6 @@
 const { createPrivateKey, createPublicKey, randomBytes, X509Certificate } = require('node:crypto');
 const { mkdir, readFile, rm, writeFile } = require('node:fs/promises');
-const { join } = require('node:path');
+const { dirname, join } = require('node:path');
 
 const postgresTlsMount = '/fixture/postgres-tls';
 const postgresCaMount = '/run/crustcaper/postgres-ca.crt';
@@ -54,7 +54,7 @@ async function preparePostgresTls(directory, env, run) {
     await run('Export the PostgreSQL fixture CA', javaTool('keytool'), ['-exportcert', ...ca,
       '-rfc', '-file', caFile], safeOptions);
     const pem = await run('Export the PostgreSQL fixture private key', javaTool('java'), [
-      join(__dirname, 'StorefrontPostgresPrivateKey.java'), serverStore,
+      join(dirname(module.filename), 'StorefrontPostgresPrivateKey.java'), serverStore,
     ], safeOptions);
     const root = new X509Certificate(await readFile(caFile));
     const leaf = new X509Certificate(await readFile(certificate));
