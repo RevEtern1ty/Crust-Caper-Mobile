@@ -13,12 +13,13 @@ type Step = { kind: 'details' } | { kind: 'code'; challengeId: string }
   | { kind: 'save'; orderId: string; sessionRevision: number } | { kind: 'notPlaced' };
 type Field = 'orderCode' | 'phone' | 'code';
 
-export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPrivacyVerified, notice }: {
+export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPrivacyVerified, notice, suspended = false }: {
   from?: string;
   savedCode?: string;
   pendingOrder?: boolean;
   onPrivacyVerified?: (orderId: string, sessionRevision: number) => void;
   notice?: string;
+  suspended?: boolean;
 }) {
   const { api, checkoutAllowed, locale, mode } = useShop();
   const {
@@ -64,6 +65,13 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
     setWaiting(false);
     setInvalid(null);
   }, [guestSessionRevision]);
+
+  useEffect(() => {
+    if (!suspended) return;
+    setOrderCode('');
+    setPhone('');
+    setCode('');
+  }, [suspended]);
 
   function goToOrders() {
     if (!pendingOrder && from === 'orders' && router.canGoBack()) router.back();
@@ -134,7 +142,13 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
       if (!api.requestOrderAccess || !api.verifyOrderAccess) return;
       if (step.kind === 'details' && normalizedPhone) {
         const { challengeId } = await api.requestOrderAccess({ orderCode: reference, phone: normalizedPhone });
-        if (shouldNavigate() && displayedRevision.current === sessionRevision) setStep({ kind: 'code', challengeId });
+        if (shouldNavigate() && displayedRevision.current === sessionRevision) {
+          if (privacy) {
+            setOrderCode('');
+            setPhone('');
+          }
+          setStep({ kind: 'code', challengeId });
+        }
         return;
       }
 
@@ -181,6 +195,8 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
     setWaiting(false);
     setStep({ kind: 'details' });
   }
+
+  if (suspended) return null;
 
   if (step.kind === 'notPlaced') {
     return (

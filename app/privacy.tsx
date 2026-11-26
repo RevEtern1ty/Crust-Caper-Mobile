@@ -17,7 +17,9 @@ export default function PrivacyScreen() {
   const { guestSessionEndPending, guestSessionRevision } = useCheckout();
   const [verified, setVerified] = useState<VerifiedOrder | null>(null);
   const [expired, setExpired] = useState(false);
+  const [focused, setFocused] = useState(false);
   const [visible, setVisible] = useState(false);
+  const routeFocused = useRef(false);
   const visibility = useRef({ active: false, revision: 0 });
   const { getOrderDataExport, getOrderErasureRequest, requestOrderErasure } = api;
   const available = hydrated && checkoutAllowed && !guestSessionEndPending && mode === 'connected'
@@ -38,11 +40,15 @@ export default function PrivacyScreen() {
       setVisible(active);
     }
 
+    routeFocused.current = true;
+    setFocused(true);
     updateVisibility(AppState.currentState !== 'background' && AppState.currentState !== 'inactive');
     const subscription = AppState.addEventListener('change', state => updateVisibility(state === 'active'));
     return () => {
       subscription.remove();
       updateVisibility(false);
+      routeFocused.current = false;
+      setFocused(false);
     };
   }, []));
 
@@ -58,7 +64,7 @@ export default function PrivacyScreen() {
     setExpired(verifyAgain);
   }, []);
 
-  if (!visible || !hydrated) return null;
+  if (!focused || !hydrated) return null;
 
   if (!available || !getOrderDataExport || !getOrderErasureRequest || !requestOrderErasure) {
     return <Screen safeBottom>
@@ -71,15 +77,15 @@ export default function PrivacyScreen() {
   }
 
   if (verified?.sessionRevision === guestSessionRevision) {
-    return <VerifiedOrderPrivacy order={verified} locale={locale} captureAction={captureAction}
-      api={{ getOrderDataExport, getOrderErasureRequest, requestOrderErasure }} onClear={clearVerification} />;
+    return visible ? <VerifiedOrderPrivacy order={verified} locale={locale} captureAction={captureAction}
+      api={{ getOrderDataExport, getOrderErasureRequest, requestOrderErasure }} onClear={clearVerification} />
+      : null;
   }
 
-  const canVerify = captureAction(guestSessionRevision);
-  return <OrderAccessForm key={guestSessionRevision}
+  return <OrderAccessForm key={guestSessionRevision} suspended={!visible}
     notice={expired ? t('Verify this order again before continuing.', 'Ongera wemeze iyi komande mbere yo gukomeza.') : undefined}
     onPrivacyVerified={(orderId, sessionRevision) => {
-      if (canVerify() && sessionRevision === guestSessionRevision) {
+      if (routeFocused.current && access.current.available && sessionRevision === access.current.guestSessionRevision) {
         setVerified({ orderId, sessionRevision });
         setExpired(false);
       }
