@@ -47,7 +47,7 @@ function ProductTile({ product, featured = false, wide = false }: { product: Pro
 }
 
 export default function MenuScreen() {
-  const { locale, mode, menu, status, refreshing, refreshMenu, count, total } = useShop();
+  const { locale, mode, menu, status, refreshing, refreshMenu, pickupNow, count, total } = useShop();
   const { width } = useWindowDimensions();
   const compactCategories = width < 380;
   const wide = width >= 620;
@@ -56,7 +56,7 @@ export default function MenuScreen() {
   const products = menu?.products.filter(product => product.category === category) ?? [];
   const featured = products.find(product => product.sku === 'double-smash');
   const rest = products.filter(product => product !== featured);
-  const next = status === 'ready' ? nextPickupSlot(menu) : undefined;
+  const next = status === 'ready' ? nextPickupSlot(menu, pickupNow()) : undefined;
   let pickupAvailability = copy(locale, 'Pickup availability unconfirmed', 'Igihe cyo gufata komande ntikiramenyekana');
   if (status === 'ready' && menu) {
     if (!menu.store.open) pickupAvailability = copy(locale, 'Closed', 'Hafunze');

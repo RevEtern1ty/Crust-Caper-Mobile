@@ -25,7 +25,7 @@ function kinyarwandaDate(value: Date) {
   return `${rwMonths[Number(month) - 1]} ${day}`;
 }
 
-export function nextPickupSlot(menu: Menu | null, now = Date.now()) {
+export function nextPickupSlot(menu: Menu | null, now: number) {
   if (!menu?.store.open || menu.orderingUnavailable) return undefined;
 
   let next: PickupSlot | undefined;

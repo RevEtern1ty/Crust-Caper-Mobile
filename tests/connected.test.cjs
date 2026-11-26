@@ -978,6 +978,99 @@ test('the buyer can open the cart from product details and return to their selec
   await shown(page, 'Double Smash');
 });
 
+test('the menu and Pickup show the checkout window when the device clock is a day ahead', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const serverTime = '2026-11-25T10:00:00Z';
+  const deviceTime = new Date(Date.parse(serverTime) + 24 * 60 * 60 * 1000);
+  const menuPath = '/stores/kigali/menu?channel=mobile';
+  const menu = {
+    version: 'pickup-clock-fixture', updatedAt: serverTime,
+    store: {
+      id: 'kigali', open: true, name: { en: 'Fixture Kigali', rw: 'Fixture Kigali' },
+      area: { en: 'Fixture district', rw: 'Fixture district' }, hours: { en: '10:00–18:00', rw: '10:00–18:00' },
+    },
+    products: [{
+      sku: 'double-smash', category: 'burgers', available: true, price: 9200,
+      name: { en: 'Double Smash', rw: 'Double Smash' }, description: { en: 'Test burger', rw: 'Test burger' },
+      ingredients: [], allergens: [], modifiers: [],
+    }],
+    slots: [{ id: 'pickup-clock-window', startsAt: '2026-11-25T10:30:00Z', endsAt: '2026-11-25T10:40:00Z', available: true }],
+  };
+  const copies = [
+    { locale: 'en', slot: '25 Nov · 12:30–12:40', unavailable: 'No slots available', next: 'Next pickup time',
+      menu: /^Menu(?:,|$)/, add: /^Add to cart/, cart: /^View cart/, choose: 'Choose pickup time', pickup: 'Pickup time' },
+    { locale: 'rw', slot: 'Ugu. 25 · 12:30–12:40', unavailable: 'Nta mwanya uhari', next: 'Igihe gikurikira cyo kwakira',
+      menu: /^Ifunguro(?:,|$)/, add: /^Shyira mu gitebo/, cart: /^Reba igitebo/, choose: 'Hitamo igihe cyo kwakira', pickup: 'Igihe cyo gufata' },
+  ];
+
+  for (const copy of copies) {
+    const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
+    try {
+      page.setDefaultTimeout(6500);
+      await page.clock.setFixedTime(deviceTime);
+      const unexpectedRequests = [];
+      await page.route('**/*', route => {
+        const request = route.request();
+        if (new URL(request.url()).origin === origin) return route.continue();
+        if (request.method() === 'GET' && request.url() === api + menuPath) {
+          return route.fulfill({ json: menu, headers: {
+            'Access-Control-Allow-Origin': origin, 'Access-Control-Expose-Headers': 'X-Availability-Checked-At',
+            'X-Availability-Checked-At': serverTime,
+          } });
+        }
+        unexpectedRequests.push(request.method());
+        return route.abort('blockedbyclient');
+      });
+
+      if (copy.locale === 'rw') {
+        await page.goto(origin + '/settings');
+        await button(page, 'Kinyarwanda').click();
+        await shown(page, 'Amagenamiterere');
+      }
+      await page.goto(origin);
+      assert.equal(await page.evaluate(() => Date.now()), deviceTime.valueOf());
+      const banner = button(page, /Fixture Kigali/);
+      const availability = banner.getByText(/^Fixture district · /);
+      const available = banner.getByText('Fixture district · ' + copy.slot, { exact: true });
+      const unavailable = banner.getByText('Fixture district · ' + copy.unavailable, { exact: true });
+      const pickup = page.getByText(copy.next + ' · ' + copy.slot, { exact: true });
+      for (const width of [320, 390, 430]) {
+        await page.setViewportSize({ width, height: 800 });
+        await available.or(unavailable).waitFor();
+        assert.equal(await availability.textContent(), 'Fixture district · ' + copy.slot,
+          'The menu must use the same clock as Checkout');
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+        await capture(page, 'connected-pickup-clock-menu-' + copy.locale + '-' + width);
+        await banner.click();
+        await pickup.waitFor();
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+        await capture(page, 'connected-pickup-clock-pickup-' + copy.locale + '-' + width);
+        await page.getByRole('tab', { name: copy.menu }).click();
+      }
+
+      await button(page, /^Double Smash,/).click();
+      await button(page, copy.add).click();
+      await button(page, copy.cart).click();
+      await button(page, copy.choose).click();
+      const option = page.getByRole('radiogroup', { name: copy.pickup }).getByRole('radio', { name: copy.slot, exact: true });
+      await option.click();
+      assert.equal(await option.getAttribute('aria-checked'), 'true');
+      assert.deepEqual(unexpectedRequests, []);
+    } finally {
+      await page.close();
+    }
+  }
+});
+
 test('an open checkout clears an expired pickup window and waits for an explicit replacement', { timeout: 35_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const menuPath = '/stores/kigali/menu?channel=mobile';

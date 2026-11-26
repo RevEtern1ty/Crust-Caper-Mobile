@@ -8,11 +8,11 @@ import { copy, nextPickupSlot, slotLabel } from '../../src/ui/format';
 type LinkAction = 'directions' | 'support';
 
 export default function PickupScreen() {
-  const { locale, mode, menu, status, refreshing, refreshMenu } = useShop();
+  const { locale, mode, menu, status, refreshing, refreshMenu, pickupNow } = useShop();
   const router = useRouter();
   const [linkErrors, setLinkErrors] = useState({ directions: false, support: false });
   const store = menu?.store;
-  const next = status === 'ready' ? nextPickupSlot(menu) : undefined;
+  const next = status === 'ready' ? nextPickupSlot(menu, pickupNow()) : undefined;
   const directionsUrl = store?.directionsUrl;
   const supportUrl = store?.supportUrl;
 
