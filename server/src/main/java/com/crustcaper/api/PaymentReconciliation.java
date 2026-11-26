@@ -2,6 +2,7 @@ package com.crustcaper.api;
 
 import static com.crustcaper.api.OrderService.AUTOMATIC_RECONCILIATION_WINDOW_HOURS;
 
+import com.crustcaper.api.PaymentReconciliationMetrics.Result;
 import com.crustcaper.api.payment.PaymentGateway;
 import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
@@ -26,8 +27,8 @@ import org.springframework.transaction.TransactionException;
 class PaymentReconciliationConfiguration {
     @Bean
     PaymentReconciliation paymentReconciliation(JdbcClient jdbc, PaymentGateway gateway, OrderService orders,
-                                                MeterRegistry meters) {
-        return new PaymentReconciliation(jdbc, gateway, orders, meters);
+                                                MeterRegistry meters, PaymentReconciliationMetrics telemetry) {
+        return new PaymentReconciliation(jdbc, gateway, orders, meters, telemetry);
     }
 
     @Bean
@@ -46,21 +47,31 @@ final class PaymentReconciliation {
     private final PaymentGateway gateway;
     private final OrderService orders;
     private final MeterRegistry meters;
+    private final PaymentReconciliationMetrics telemetry;
 
-    PaymentReconciliation(JdbcClient jdbc, PaymentGateway gateway, OrderService orders, MeterRegistry meters) {
+    PaymentReconciliation(JdbcClient jdbc, PaymentGateway gateway, OrderService orders, MeterRegistry meters,
+                          PaymentReconciliationMetrics telemetry) {
         this.jdbc = jdbc;
         this.gateway = gateway;
         this.orders = orders;
         this.meters = meters;
+        this.telemetry = telemetry;
+        telemetry.enable();
     }
 
     @Scheduled(initialDelayString = "PT15S", fixedDelayString = "PT15S", scheduler = "paymentReconciliationScheduler")
     void poll() {
-        for (int remaining = MAX_ATTEMPTS_PER_RUN; remaining > 0; remaining--) {
-            Optional<UUID> attempt = claim();
-            if (attempt.isEmpty()) return;
-            verify(attempt.get());
+        try {
+            for (int remaining = MAX_ATTEMPTS_PER_RUN; remaining > 0; remaining--) {
+                Optional<UUID> attempt = claim();
+                if (attempt.isEmpty()) break;
+                verify(attempt.get());
+            }
+        } catch (RuntimeException failure) {
+            telemetry.abortSweep();
+            throw failure;
         }
+        telemetry.completeSweep();
     }
 
     private Optional<UUID> claim() {
@@ -89,19 +100,19 @@ final class PaymentReconciliation {
         try {
             var result = gateway.verifyByReference(reference);
             if (result.isEmpty() || result.get().result() != PaymentResult.PAID) {
-                count("pending");
+                count(Result.PENDING);
                 return;
             }
             var payment = result.get();
             if (!reference.equals(payment.reference())) {
-                count("rejected");
+                count(Result.REJECTED);
                 return;
             }
             settle(payment);
         } catch (PaymentGatewayException error) {
-            count("provider_error");
+            count(Result.PROVIDER_ERROR);
         } catch (ApiFailure error) {
-            count("rejected");
+            count(Result.REJECTED);
         }
     }
 
@@ -111,13 +122,14 @@ final class PaymentReconciliation {
         } catch (DataAccessException | TransactionException failure) {
             // Keep the committed claim and let the next due attempt use the remaining poll budget.
             LOG.warn("payment_reconciliation_settlement_failed");
-            count("settlement_error");
+            count(Result.SETTLEMENT_ERROR);
             return;
         }
-        count("verified");
+        count(Result.CONFIRMED);
     }
 
-    private void count(String result) {
-        meters.counter("crustcaper.payments.reconciliation", "result", result).increment();
+    private void count(Result result) {
+        meters.counter("crustcaper.payments.reconciliation", "result", result.meterTag).increment();
+        telemetry.record(result);
     }
 }

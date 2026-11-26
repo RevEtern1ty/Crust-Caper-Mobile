@@ -31,7 +31,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,commerceerrors
+        include: health,commerceerrors,paymentreconciliation
   endpoint:
     health:
       show-details: never

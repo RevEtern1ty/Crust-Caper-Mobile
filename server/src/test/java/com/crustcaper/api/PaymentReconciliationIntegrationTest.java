@@ -2,6 +2,9 @@ package com.crustcaper.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.crustcaper.api.ApiModels.CartLine;
 import com.crustcaper.api.ApiModels.OrderInput;
@@ -17,6 +20,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import org.json.JSONObject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -25,24 +29,32 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.ApplicationContext;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.json.JsonCompareMode;
+import org.springframework.test.web.servlet.MockMvc;
 
 @SpringBootTest(properties = {
     "spring.datasource.hikari.schema=payment_reconciliation_test",
     "spring.flyway.schemas=payment_reconciliation_test"
 })
 @ActiveProfiles("local")
+@AutoConfigureMockMvc
 class PaymentReconciliationIntegrationTest {
     private static final String SLOT = "reconciliation-slot";
+    private static final String TELEMETRY = "/actuator/paymentreconciliation";
 
     @Autowired ApplicationContext context;
     @Autowired JdbcClient jdbc;
     @Autowired GuestSessions sessions;
     @Autowired OrderService orders;
+    @Autowired MockMvc api;
     private final PaymentGateway gateway = mock(PaymentGateway.class);
     private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
+    private final PaymentReconciliationMetrics telemetry = new PaymentReconciliationMetrics();
     private final String store = "reconciliation-" + UUID.randomUUID();
     private UUID guest;
 
@@ -78,6 +90,12 @@ class PaymentReconciliationIntegrationTest {
         jdbc.sql("DELETE FROM stores WHERE id = ?").param(store).update();
         if (guest != null) jdbc.sql("DELETE FROM guest_sessions WHERE id = ?").param(guest).update();
         meters.close();
+    }
+
+    @Test
+    void exposesOnlyThePrivatePaymentReconciliationSnapshotWithLocalWorkerDisabled() throws Exception {
+        expectMetrics(processInstance(), false, 0, 0, 0, 0);
+        api.perform(get("/actuator/metrics/crustcaper.payments.reconciliation")).andExpect(status().isNotFound());
     }
 
     @Test
@@ -119,8 +137,7 @@ class PaymentReconciliationIntegrationTest {
         verify(gateway).verifyByReference(unresolved.reference());
         assertThat(orders.getOrder(guest, unresolved.orderId()).paymentStatus()).isEqualTo("processing");
 
-        jdbc.sql("UPDATE payment_attempts SET last_checked_at = now() - interval '31 seconds' WHERE id = ?")
-            .param(unresolved.attemptId()).update();
+        makeDue(unresolved);
         worker().poll();
         verify(gateway, times(2)).verifyByReference(unresolved.reference());
         verify(gateway, never()).verifyByReference(outsideWindow.reference());
@@ -128,6 +145,48 @@ class PaymentReconciliationIntegrationTest {
         assertThat(orders.getOrder(guest, outsideWindow.orderId()).paymentStatus()).isEqualTo("processing");
         assertThat(meters.get("crustcaper.payments.reconciliation").tag("result", "rejected").counter().count())
             .isEqualTo(1);
+        assertThat(telemetry.snapshot().rejected()).isEqualTo(1);
+    }
+
+    @Test
+    @DirtiesContext
+    void privateMetricsDistinguishIdleSweepsProviderFailuresPendingAndConfirmedPayments() throws Exception {
+        var payment = order("outage");
+        var failure = new PaymentGatewayException(PaymentGatewayException.Kind.UNAVAILABLE);
+        when(gateway.verifyByReference(payment.reference()))
+            .thenThrow(failure)
+            .thenThrow(failure)
+            .thenReturn(Optional.empty())
+            .thenReturn(Optional.of(payment.paid("123550001")));
+        var instance = processInstance();
+        // Run the production scheduled method with the live endpoint's counters.
+        var worker = new PaymentReconciliation(jdbc, gateway, orders, meters,
+            context.getBean(PaymentReconciliationMetrics.class));
+
+        worker.poll();
+        expectMetrics(instance, true, 1, 1, 0, 0);
+        worker.poll();
+        expectMetrics(instance, true, 2, 1, 0, 0);
+        verify(gateway).verifyByReference(payment.reference());
+
+        makeDue(payment);
+        worker.poll();
+        expectMetrics(instance, true, 3, 2, 0, 0);
+        assertThat(orders.getOrder(guest, payment.orderId()).paymentStatus()).isEqualTo("processing");
+
+        makeDue(payment);
+        worker.poll();
+        expectMetrics(instance, true, 4, 2, 1, 0);
+
+        makeDue(payment);
+        worker.poll();
+        expectMetrics(instance, true, 5, 2, 1, 1);
+        worker.poll();
+        expectMetrics(instance, true, 6, 2, 1, 1);
+        verify(gateway, times(4)).verifyByReference(payment.reference());
+        assertThat(orders.getOrder(guest, payment.orderId()).status()).isEqualTo("accepted");
+        assertThat(jdbc.sql("SELECT id FROM payment_attempts WHERE order_id = ? AND status = 'paid'")
+            .param(payment.orderId()).query(UUID.class).list()).containsExactly(payment.attemptId());
     }
 
     @Test
@@ -167,6 +226,8 @@ class PaymentReconciliationIntegrationTest {
         assertThat(meters.get("crustcaper.payments.reconciliation").tag("result", "settlement_error").counter().count())
             .isEqualTo(1);
         assertThat(meters.get("crustcaper.payments.reconciliation").tag("result", "verified").counter().count()).isEqualTo(1);
+        assertThat(telemetry.snapshot().settlementErrors()).isEqualTo(1);
+        assertThat(telemetry.snapshot().confirmed()).isEqualTo(1);
         assertThat(output.getAll().lines().filter(line -> line.contains("payment_reconciliation_settlement_failed")).toList())
             .hasSize(1);
         assertThat(output.getAll()).doesNotContain(recordedTransaction, healthyTransaction, conflicting.reference(),
@@ -199,7 +260,25 @@ class PaymentReconciliationIntegrationTest {
     }
 
     private PaymentReconciliation worker() {
-        return new PaymentReconciliation(jdbc, gateway, orders, meters);
+        return new PaymentReconciliation(jdbc, gateway, orders, meters, telemetry);
+    }
+
+    private void makeDue(Pending payment) {
+        jdbc.sql("UPDATE payment_attempts SET last_checked_at = now() - interval '31 seconds' WHERE id = ?")
+            .param(payment.attemptId()).update();
+    }
+
+    private UUID processInstance() throws Exception {
+        String body = api.perform(get(TELEMETRY)).andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        return UUID.fromString(new JSONObject(body).getString("instanceId"));
+    }
+
+    private void expectMetrics(UUID instance, boolean enabled, int sweeps, int providerErrors, int pending, int confirmed)
+            throws Exception {
+        api.perform(get(TELEMETRY)).andExpect(status().isOk()).andExpect(content().json("""
+            {"instanceId":"%s","enabled":%b,"sweeps":%d,"confirmed":%d,"pending":%d,
+             "providerErrors":%d,"rejected":0,"settlementErrors":0,"sweepErrors":0}
+            """.formatted(instance, enabled, sweeps, confirmed, pending, providerErrors), JsonCompareMode.STRICT));
     }
 
     private Pending order(String key) {
