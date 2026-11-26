@@ -6,6 +6,8 @@
 
 Запускайте скрипты из корня репозитория в Bash на выделенном узле с доступом к приватной БД. Для копирования используйте отдельную роль с доступом на чтение прикладных объектов. Для сетевого подключения задайте DNS-имя из сертификата, CA и `PGSSLMODE=verify-full`. Смените параметры в примере на параметры своего окружения. Передайте пароль через закрытый `PGPASSFILE` с режимом `0600` на Linux. Запускайте команды с проверенным набором переменных libpq для нужного окружения. [Файл паролей libpq](https://www.postgresql.org/docs/17/libpq-pgpass.html) · [Проверка TLS](https://www.postgresql.org/docs/17/libpq-ssl.html)
 
+Оба скрипта требуют `PGSSLMODE=verify-full` и абсолютный путь к читаемому файлу CA в `PGSSLROOTCERT` для TCP. Скрипты задают `PGGSSENCMODE=disable`, чтобы libpq проверял TLS-сертификат и имя сервера. Для локального Unix-сокета укажите абсолютный каталог сокета в `PGHOST` и оставьте `PGHOSTADDR` пустым. [Параметры подключения libpq](https://www.postgresql.org/docs/17/libpq-connect.html#LIBPQ-CONNECT-SSLMODE)
+
 ```sh
 (
   export PGHOST=db.internal PGPORT=5432 PGDATABASE=crustcaper PGUSER=crustcaper_backup
