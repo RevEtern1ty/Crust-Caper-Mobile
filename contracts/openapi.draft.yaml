@@ -2091,7 +2091,10 @@ components:
       properties:
         id: { type: string }
         status: { type: string, enum: [processing, paid, declined] }
-        checkoutUrl: { type: ['string', 'null'], format: uri }
+        checkoutUrl:
+          type: ['string', 'null']
+          format: uri
+          description: Hosted checkout URL for an active payment hold. Returns null when the hold or order has closed.
     Order:
       type: object
       required: [id, storeId, slotId, lines, total, tax, currency, paymentStatus, status, pickupCode,
