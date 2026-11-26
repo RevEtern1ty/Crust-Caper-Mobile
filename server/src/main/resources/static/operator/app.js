@@ -1,5 +1,6 @@
 import { mountAvailability } from './availability.js';
 import { createOrderSound } from './order-sound.js';
+import { mountReconciliation } from './reconciliation.js';
 
 const element = (id) => document.getElementById(id);
 const signIn = element('sign-in');
@@ -115,6 +116,7 @@ let pendingPaymentsNextCursor = null;
 let authVersion = 0;
 let cancellation = null;
 const availability = mountAvailability({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
+const reconciliation = mountReconciliation({ currentSession: availableSession, request, messageFor, showMessage, closeSession });
 let kitchenSoundState = 'off';
 const orderSound = createOrderSound((state) => {
   kitchenSoundState = state;
@@ -130,8 +132,8 @@ class ApiError extends Error {
   }
 }
 
-async function request(path, { method = 'GET', token, body, receipt, timeoutMs = 12_000 } = {}) {
-  const headers = { Accept: 'application/json, application/problem+json' };
+async function request(path, { method = 'GET', token, body, receipt, csv = false, timeoutMs = 12_000 } = {}) {
+  const headers = { Accept: csv ? 'text/csv, application/problem+json' : 'application/json, application/problem+json' };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (receipt) {
@@ -152,6 +154,11 @@ async function request(path, { method = 'GET', token, body, receipt, timeoutMs =
       redirect: 'error',
       signal: abort.signal,
     });
+    if (csv && response.ok) {
+      const type = response.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase();
+      if (response.status !== 200 || type !== 'text/csv') throw new ApiError(502, 'invalid_response');
+      return await response.blob();
+    }
     const data = response.status === 204 ? null : await response.json().catch(() => null);
     if (!response.ok) throw new ApiError(response.status, data?.code, response.headers.get('X-Request-ID'));
     return data;
@@ -809,6 +816,7 @@ function closeSession(message = '') {
   showMessage(fiscalReceiptsProblem);
   showMessage(fiscalReceiptsEmpty);
   availability.reset();
+  reconciliation.reset();
   workstation.hidden = true;
   signIn.hidden = false;
   loginForm.reset();
@@ -1289,6 +1297,7 @@ loginForm.addEventListener('submit', async (event) => {
     syncKitchenSignal();
     void refreshQueue();
     if (data.role === 'manager') {
+      reconciliation.show();
       void refreshPendingPayments();
       void refreshPaymentReview();
       void refreshReceipts();

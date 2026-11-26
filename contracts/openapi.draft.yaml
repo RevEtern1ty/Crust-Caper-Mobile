@@ -645,6 +645,48 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/OperatorForbidden' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/reconciliation:
+    get:
+      operationId: getOperatorDailyReconciliation
+      security: [{ operatorBearer: [] }]
+      description: Recorded platform activity and current follow-up counts for the manager's store on one Kigali calendar date.
+      parameters:
+        - $ref: '#/components/parameters/ReconciliationDate'
+      responses:
+        '200':
+          description: A snapshot of order, payment exception, verified refund and receipt records.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorDailyReconciliation' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/reconciliation/export:
+    get:
+      operationId: exportOperatorDailyReconciliation
+      security: [{ operatorBearer: [] }]
+      description: Export recorded activity for one Kigali date and the manager's assigned store. The columns contain event type, recording time, order and payment references, nominal RWF amount, exception reason and current review status.
+      parameters:
+        - $ref: '#/components/parameters/ReconciliationDate'
+      responses:
+        '200':
+          description: UTF-8 CSV attachment for the requested date.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+            Content-Disposition:
+              schema: { type: string }
+          content:
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/payment-attempts/pending:
     get:
       operationId: listOperatorPendingPaymentAttempts
@@ -780,6 +822,12 @@ components:
       in: header
       name: verif-hash
   parameters:
+    ReconciliationDate:
+      name: date
+      in: query
+      required: true
+      description: Gregorian calendar date in Africa/Kigali. The next midnight is excluded.
+      schema: { type: string, format: date }
     OrderId:
       name: id
       in: path
@@ -1021,6 +1069,33 @@ components:
           properties:
             status: { type: string, const: cancelled }
             paymentStatus: { type: string, enum: [refund_pending, refunded] }
+    ReconciliationBucket:
+      type: object
+      additionalProperties: false
+      required: [count, amountRwf]
+      properties:
+        count: { type: integer, minimum: 0, format: int64 }
+        amountRwf:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)$'
+          description: Exact nominal amount, in whole RWF.
+    OperatorDailyReconciliation:
+      type: object
+      required: [date, timeZone, currency, from, until, asOf, acceptedPayments, exceptionPayments, verifiedRefunds, attachedReceipts, unattachedReceipts, openExceptions, undatedAcceptedPayments]
+      properties:
+        date: { type: string, format: date }
+        timeZone: { type: string, const: Africa/Kigali }
+        currency: { type: string, const: RWF }
+        from: { $ref: '#/components/schemas/Timestamp' }
+        until: { $ref: '#/components/schemas/Timestamp' }
+        asOf: { $ref: '#/components/schemas/Timestamp' }
+        acceptedPayments: { $ref: '#/components/schemas/ReconciliationBucket', description: Orders accepted within the date, including orders later refunded. }
+        exceptionPayments: { $ref: '#/components/schemas/ReconciliationBucket', description: Distinct late, duplicate or superseded charges recorded within the date. }
+        verifiedRefunds: { $ref: '#/components/schemas/ReconciliationBucket', description: Refund verifications recorded within the date. }
+        attachedReceipts: { $ref: '#/components/schemas/ReconciliationBucket', description: Fiscal PDFs attached within the date. }
+        unattachedReceipts: { $ref: '#/components/schemas/ReconciliationBucket', description: Still-paid accepted orders for this date without an attached receipt at the time of the report. }
+        openExceptions: { $ref: '#/components/schemas/ReconciliationBucket', description: Payment exceptions recorded within the date without a verified refund for that exact charge. }
+        undatedAcceptedPayments: { $ref: '#/components/schemas/ReconciliationBucket', description: Earlier accepted orders for the store with unknown acceptance date. Excluded from dated totals. }
     OperatorPaymentReview:
       type: object
       additionalProperties: false

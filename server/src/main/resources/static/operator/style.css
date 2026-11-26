@@ -116,6 +116,17 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .payment-review-filters > .button { flex: 0 1 auto; }
 .payment-review-filters > .button[aria-pressed="true"] { background: var(--paper); border-color: var(--green); }
 .payment-review-more { margin-top: 1rem; }
+#reconciliation-jump { max-width: 100%; overflow-wrap: anywhere; }
+#reconciliation .queue-header > div { min-width: 0; overflow-wrap: anywhere; }
+.reconciliation-form { display: flex; flex-wrap: wrap; gap: .7rem; align-items: flex-end; margin-bottom: 1rem; }
+.reconciliation-form > div { width: min(17rem, 100%); display: grid; gap: .35rem; }
+.reconciliation-form .button, .reconciliation-result-header .button { max-width: 100%; overflow-wrap: anywhere; }
+.reconciliation-result-header { align-items: center; margin-bottom: 1rem; overflow-wrap: anywhere; }
+.reconciliation-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: .75rem; margin: .75rem 0 1.4rem; }
+.reconciliation-metrics dt { color: var(--muted); font-weight: 700; overflow-wrap: anywhere; }
+.reconciliation-metrics dd { display: grid; gap: .25rem; margin: .3rem 0 0; overflow-wrap: anywhere; }
+.reconciliation-metrics strong { font-size: 1.14rem; }
+.reconciliation-warning { border-left-color: #926524; background: var(--paper); overflow-wrap: anywhere; }
 .pending-payments-navigation { margin-block: .9rem; }
 .pending-payments-navigation > .button { flex: 0 1 auto; }
 .payment-identifiers { margin: 0; }

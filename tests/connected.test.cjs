@@ -1044,6 +1044,164 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   assert.deepEqual(errors, []);
 });
 
+test('manager can reconcile a Kigali date and download its CSV without leaking stale requests', { timeout: 40_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
+  page.setDefaultTimeout(6500);
+  await page.clock.setFixedTime(new Date('2026-06-15T22:30:00Z'));
+  const reads = [];
+  const exports = [];
+  const downloads = [];
+  page.on('download', download => downloads.push(download));
+  const csv = 'type,count,amountRwf\r\naccepted,2,9007199254740999\r\n';
+  const day = '2026-06-16';
+  const slowDate = '2026-06-14';
+  const fastDate = '2026-06-15';
+  const total = (count, amountRwf) => ({ count, amountRwf });
+  const report = date => ({
+    date, timeZone: 'Africa/Kigali', currency: 'RWF',
+    from: new Date(`${date}T00:00:00+02:00`).toISOString(),
+    until: new Date(Date.parse(`${date}T00:00:00+02:00`) + 86_400_000).toISOString(),
+    asOf: '2026-06-15T22:30:00Z',
+    acceptedPayments: total(2, date === slowDate ? '99' : date === fastDate ? '42' : '9007199254740999'),
+    exceptionPayments: total(1, '9200'),
+    verifiedRefunds: total(1, '9200'),
+    attachedReceipts: total(1, '4600'),
+    unattachedReceipts: total(1, '4600'),
+    openExceptions: total(1, '4600'),
+    undatedAcceptedPayments: date === fastDate ? total(0, '0') : total(1, '3200'),
+  });
+  let releaseSlow;
+  let releaseStaleExport;
+  const delayedRead = new Promise(resolve => { releaseSlow = resolve; });
+  const delayedExport = new Promise(resolve => { releaseStaleExport = resolve; });
+  t.after(() => { releaseSlow(); releaseStaleExport(); });
+  await restrictToOperatorAssets(page);
+  await page.route('**/api/v1/operator/**', async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    if (path.endsWith('/sessions')) {
+      const role = request.postDataJSON().username === 'fixture-manager' ? 'manager' : 'kitchen';
+      return route.fulfill({ json: { accessToken: `fixture-${role}`, role, storeId: 'kigali',
+        expiresAt: '2026-06-16T01:00:00Z' } });
+    }
+    if (path.endsWith('/sessions/current')) return route.fulfill({ status: 204, body: '' });
+    if (path.endsWith('/orders')) return route.fulfill({ json: { orders: [], serverTime: '2026-06-15T22:30:00Z' } });
+    if (path.endsWith('/receipts')) return route.fulfill({ json: [] });
+    if (path.endsWith('/availability')) return route.fulfill({ json: { version: 'reconciliation-fixture', open: true, products: [] } });
+    if (path.endsWith('/payment-attempts/pending')) return route.fulfill({ json: { attempts: [], hasMore: false } });
+    if (path.endsWith('/payment-exceptions')) return route.fulfill({ json: { exceptions: [], nextCursor: null } });
+    const date = url.searchParams.get('date');
+    assert.deepEqual([...url.searchParams], [['date', date]]);
+    assert.equal((await request.allHeaders()).authorization, 'Bearer fixture-manager');
+    assert.equal(request.method(), 'GET');
+    if (path.endsWith('/reconciliation')) {
+      reads.push(date);
+      if (date === slowDate) await delayedRead;
+      return route.fulfill({ json: report(date) });
+    }
+    if (path.endsWith('/reconciliation/export')) {
+      exports.push(date);
+      if (exports.length === 1) return route.fulfill({ json: { wrong: 'content type' } });
+      if (exports.length === 3) await delayedExport;
+      return route.fulfill({ contentType: 'text/csv;charset=UTF-8', body: csv });
+    }
+    return route.abort();
+  });
+
+  const signIn = async username => {
+    await page.getByLabel('Username', { exact: true }).fill(username);
+    await page.getByLabel('Password', { exact: true }).fill('fixture-only');
+    await button(page, 'Sign in').click();
+  };
+  const jump = button(page, 'Daily reconciliation');
+  const panel = page.getByRole('region', { name: 'Daily reconciliation' });
+  const date = panel.getByLabel('Activity date (Kigali)', { exact: true });
+  const view = button(panel, 'View reconciliation');
+  const download = button(panel, 'Download CSV');
+  const acceptedAmount = panel.locator('[data-reconciliation-total=acceptedPayments] strong');
+  await page.goto(new URL('/operator/index.html', api).href);
+  await signIn('fixture-kitchen');
+  await shown(page, 'Kitchen queue');
+  assert.equal(await jump.isVisible(), false);
+  assert.deepEqual(reads, []);
+  await button(page, 'Sign out').click();
+  await signIn('fixture-manager');
+  await jump.click();
+  assert.equal(await date.inputValue(), day);
+  await shown(page, '9,007,199,254,740,999 RWF');
+  await shown(page, /Undated accepted payments for this restaurant/);
+  assert.deepEqual(reads, [day]);
+
+  for (const width of [320, 390, 430]) {
+    await page.setViewportSize({ width, height: 800 });
+    const inspect = async size => {
+      await acceptedAmount.scrollIntoViewIfNeeded();
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+      assert.ok(await acceptedAmount.evaluate(element => {
+        const { left, right } = element.getBoundingClientRect();
+        return left >= 0 && right <= innerWidth && element.scrollWidth <= element.clientWidth;
+      }));
+      await capture(page, `operator-daily-reconciliation-${width}-${size}`);
+    };
+    await inspect('normal');
+    await withLargeText(page, () => inspect('large'), 'div, span, p, h1, h2, h3, button, label, dt, strong');
+  }
+
+  await download.click();
+  await shown(page, 'The CSV could not be downloaded. Try again.');
+  assert.equal(downloads.length, 0);
+  const incoming = page.waitForEvent('download');
+  await download.click();
+  const file = await incoming;
+  assert.equal(file.suggestedFilename(), `crustcaper-reconciliation-${day}.csv`);
+  const chunks = [];
+  for await (const chunk of await file.createReadStream()) chunks.push(chunk);
+  assert.equal(Buffer.concat(chunks).toString(), csv);
+
+  await date.fill(slowDate);
+  assert.equal(await download.isVisible(), false);
+  const started = page.waitForRequest(request => request.url() === api + `/operator/reconciliation?date=${slowDate}`);
+  await view.click();
+  await started;
+  await date.fill(fastDate);
+  await view.click();
+  await shown(page, '42 RWF');
+  const staleRead = page.waitForResponse(response => response.url() === api + `/operator/reconciliation?date=${slowDate}`);
+  releaseSlow();
+  await (await staleRead).finished();
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+  assert.equal(await acceptedAmount.textContent(), '42 RWF');
+  assert.equal(await panel.getByText(/Undated accepted payments/).filter({ visible: true }).count(), 0);
+  assert.deepEqual(reads, [day, slowDate, fastDate]);
+
+  await date.fill('');
+  await view.click();
+  await shown(page, 'Choose a valid activity date.');
+  assert.equal(await date.getAttribute('aria-invalid'), 'true');
+  assert.equal(await download.isVisible(), false);
+  assert.deepEqual(reads, [day, slowDate, fastDate]);
+  await date.fill(fastDate);
+  await view.click();
+  await shown(page, '42 RWF');
+  const exportUrl = api + `/operator/reconciliation/export?date=${fastDate}`;
+  const beganExport = page.waitForRequest(request => request.url() === exportUrl);
+  await download.click();
+  await beganExport;
+  await button(page, 'Sign out').click();
+  await shown(page, 'Staff sign in');
+  const staleExport = page.waitForResponse(response => response.url() === exportUrl);
+  releaseStaleExport();
+  await (await staleExport).finished();
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+  assert.equal(downloads.length, 1);
+  assert.equal(await panel.isVisible(), false);
+  assert.deepEqual(exports, [day, day, fastDate]);
+});
+
 test('payment review displays a verified refund only after the API confirms it', { timeout: 30_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const browser = await chromium.launch({ channel: 'chrome' });

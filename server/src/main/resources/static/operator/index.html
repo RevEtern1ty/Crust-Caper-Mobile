@@ -45,6 +45,7 @@
           <div class="toolbar">
             <button class="button button-secondary" id="payment-review-jump" type="button" hidden>Payment review</button>
             <button class="button button-secondary" id="fiscal-receipts-jump" type="button" hidden>Fiscal receipts</button>
+            <button class="button button-secondary" id="reconciliation-jump" type="button" hidden>Daily reconciliation</button>
             <button class="button button-secondary" id="availability-jump" type="button" hidden>Menu availability</button>
             <button class="button button-secondary" id="refresh-button" type="button">Refresh</button>
             <button class="button button-quiet" id="logout-button" type="button">Sign out</button>
@@ -125,6 +126,62 @@
           <p class="problem" id="fiscal-receipts-problem" role="alert" hidden></p>
           <p class="empty-state" id="fiscal-receipts-empty" role="status" hidden>No paid orders for fiscal receipts.</p>
           <ul class="order-list" id="fiscal-receipts-list" aria-label="Orders for fiscal receipts"></ul>
+        </section>
+
+        <section class="payment-review" id="reconciliation" aria-labelledby="reconciliation-title" hidden>
+          <div class="queue-header">
+            <div>
+              <h2 id="reconciliation-title" tabindex="-1">Daily reconciliation</h2>
+              <p class="payment-review-help">Compare activity recorded by CrustCaper with Flutterwave and EBM records for the same Kigali date.</p>
+            </div>
+          </div>
+          <form class="reconciliation-form" id="reconciliation-form" method="post" novalidate>
+            <div>
+              <label for="reconciliation-date">Activity date (Kigali)</label>
+              <input id="reconciliation-date" type="date" aria-describedby="reconciliation-problem" required>
+            </div>
+            <button class="button button-secondary" id="reconciliation-refresh" type="submit">View reconciliation</button>
+          </form>
+          <p class="problem" id="reconciliation-problem" role="alert" hidden></p>
+          <p class="queue-notice" id="reconciliation-status" role="status" hidden></p>
+          <div id="reconciliation-results" hidden>
+            <div class="queue-header reconciliation-result-header">
+              <p class="payment-review-help" id="reconciliation-as-of" aria-live="polite"></p>
+              <button class="button button-secondary" id="reconciliation-download" type="button" disabled>Download CSV</button>
+            </div>
+            <h3>Recorded activity</h3>
+            <dl class="reconciliation-metrics">
+              <div class="order-card">
+                <dt>Accepted payments</dt>
+                <dd data-reconciliation-total="acceptedPayments"></dd>
+              </div>
+              <div class="order-card">
+                <dt>Exception payments</dt>
+                <dd data-reconciliation-total="exceptionPayments"></dd>
+              </div>
+              <div class="order-card">
+                <dt>Verified refunds</dt>
+                <dd data-reconciliation-total="verifiedRefunds"></dd>
+              </div>
+              <div class="order-card">
+                <dt>Attached receipts</dt>
+                <dd data-reconciliation-total="attachedReceipts"></dd>
+              </div>
+            </dl>
+            <h3>Needs review</h3>
+            <p class="payment-review-help">Open exceptions and still-paid orders without a receipt for the selected date.</p>
+            <dl class="reconciliation-metrics">
+              <div class="order-card">
+                <dt>Missing receipts</dt>
+                <dd data-reconciliation-total="unattachedReceipts"></dd>
+              </div>
+              <div class="order-card">
+                <dt>Open payment exceptions</dt>
+                <dd data-reconciliation-total="openExceptions"></dd>
+              </div>
+            </dl>
+            <p class="queue-notice reconciliation-warning" id="reconciliation-undated" hidden></p>
+          </div>
         </section>
 
         <section class="payment-review" id="availability" aria-labelledby="availability-title" hidden>
