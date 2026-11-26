@@ -380,6 +380,97 @@ test('pickup is checked against the server after a lost reply or a concurrent ca
   assert.equal((await (await send(`/orders/${cancelled.id}`, { token: cancelled.token })).json()).paymentStatus, 'refund_pending');
 });
 
+test('pickup staff locate a paid order without the buyer screen and verify the existing code once', { timeout: 35_000 }, async t => {
+  assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
+  const kitchen = await operator('demo-kitchen');
+  const pickup = await operator('demo-pickup');
+  const order = await readyForPickup(kitchen);
+  t.after(async () => {
+    const stored = await send(`/orders/${order.id}`, { token: order.token }).then(response => response.json());
+    if (stored.status === 'ready') {
+      await send(`/operator/orders/${order.id}/status`, {
+        method: 'POST', token: pickup, data: { status: 'collected', pickupCode: order.pickupCode },
+      });
+    }
+    for (const token of [kitchen, pickup]) await send('/operator/sessions/current', { method: 'DELETE', token });
+  });
+
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.setDefaultTimeout(6500);
+  const origin = new URL(api).origin;
+  await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+  await page.goto(new URL('/operator/index.html', api).href);
+  await page.getByLabel('Username', { exact: true }).fill('demo-pickup');
+  await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+  await button(page, 'Sign in').click();
+  await shown(page, 'Pickup queue');
+
+  const lookup = page.getByRole('region', { name: 'Pickup order lookup', exact: true });
+  const reference = lookup.getByRole('searchbox', { name: 'Order number or ID', exact: true });
+  await reference.fill(order.number);
+  const lookupUrl = new URL(api + '/operator/orders/lookup');
+  const lookFor = code => page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return url.pathname === lookupUrl.pathname && url.searchParams.get('orderCode')?.toLowerCase() === code.toLowerCase();
+  });
+  const ready = lookFor(order.number.slice(1));
+  await button(lookup, 'Find pickup order').click();
+  const found = await ready;
+  assert.equal(found.status(), 200);
+  assert.equal(found.headers()['cache-control'], 'no-store');
+  const view = await found.json();
+  assert.deepEqual(Object.keys(view).sort(), ['orderId', 'pickupEndsAt', 'pickupStartsAt', 'status']);
+  assert.equal(view.orderId, order.id);
+  assert.equal(view.status, 'ready');
+  assert.ok(Date.parse(view.pickupStartsAt) < Date.parse(view.pickupEndsAt));
+  const result = lookup.locator('#pickup-lookup-result');
+  await result.getByText('Ready for pickup', { exact: true }).waitFor();
+  await result.getByRole('heading', { name: `Order ${order.number}`, exact: true }).waitFor();
+  assert.equal(await result.getByLabel('Pickup code').count(), 0);
+  assert.equal((await send(`/operator/orders/lookup?orderCode=${order.id}`, { token: kitchen })).status, 403);
+
+  const cardHeading = page.getByRole('list', { name: 'Orders', exact: true })
+    .getByRole('heading', { name: `Order ${order.number}`, exact: true });
+  const card = page.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem').filter({ has: cardHeading });
+  await button(lookup, 'Open order in queue').click();
+  assert.equal(await cardHeading.evaluate(heading => document.activeElement === heading), true);
+  const confirm = button(card, 'Confirm pickup');
+  const statusPath = api + `/operator/orders/${order.id}/status`;
+  const attempted = [];
+  page.on('response', response => {
+    if (response.url() === statusPath && response.request().method() === 'POST') attempted.push(response.status());
+  });
+  await confirm.click();
+  assert.deepEqual(attempted, []);
+  assert.equal((await send(`/orders/${order.id}`, { token: order.token }).then(response => response.json())).status, 'ready');
+
+  const code = card.getByLabel('Pickup code');
+  await code.fill(order.pickupCode === '000000' ? '999999' : '000000');
+  const denied = page.waitForResponse(response => response.url() === statusPath && response.request().method() === 'POST');
+  await confirm.click();
+  assert.equal((await denied).status(), 409);
+  await result.getByText('Ready for pickup', { exact: true }).waitFor();
+  await code.fill(order.pickupCode);
+  const handedOut = page.waitForResponse(response => response.url() === statusPath && response.request().method() === 'POST');
+  await confirm.click();
+  assert.equal((await handedOut).status(), 200);
+  await card.waitFor({ state: 'detached' });
+  await result.getByText('Collected', { exact: true }).waitFor();
+  assert.deepEqual(attempted, [409, 200]);
+
+  await reference.fill(order.id);
+  const terminal = lookFor(order.id);
+  await reference.press('Enter');
+  assert.equal((await (await terminal).json()).status, 'collected');
+  await result.getByText('Collected', { exact: true }).waitFor();
+  const stored = await send(`/orders/${order.id}`, { token: order.token }).then(response => response.json());
+  assert.equal(stored.status, 'collected');
+  assert.equal(stored.pickupCode, null);
+  await capture(page, 'operator-counter-order-lookup');
+});
+
 function testReceipt() {
   const text = 'BT /F1 15 Tf 36 72 Td (CrustCaper synthetic test document) Tj ET';
   const objects = [

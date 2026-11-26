@@ -840,6 +840,49 @@ paths:
                       status: { const: 409 }
                       code: { enum: [external_reference_mismatch, invalid_transition] }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /operator/orders/lookup:
+    get:
+      operationId: lookupOperatorPickupOrder
+      description: A pickup operator or manager can locate a paid direct order in the assigned store. The result is read-only and collection requires the existing pickup code.
+      security: [{ operatorBearer: [] }]
+      parameters:
+        - name: orderCode
+          in: query
+          required: true
+          description: Exact eight-hex order number or full hyphenated order ID. Matching is case-insensitive.
+          schema: { $ref: '#/components/schemas/OperatorOrderReference' }
+      responses:
+        '200':
+          description: Minimal pickup status and window for the located order.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [orderId, status, pickupStartsAt, pickupEndsAt]
+                properties:
+                  orderId: { type: string, format: uuid }
+                  status: { type: string, enum: [accepted, preparing, ready, collected] }
+                  pickupStartsAt: { type: string, format: date-time }
+                  pickupEndsAt: { type: string, format: date-time }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/OperatorForbidden' }
+        '404': { description: No eligible order was found in this store. }
+        '409':
+          description: More than one eligible order in this store shares the short order code. The full order ID resolves the ambiguity.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ProblemDetails'
+                  - properties:
+                      status: { const: 409 }
+                      code: { const: order_code_ambiguous }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /operator/orders/{id}/pickup-status:
     get:
       operationId: getOperatorPickupStatus
@@ -990,9 +1033,7 @@ paths:
         - name: orderCode
           in: query
           description: Exact case-insensitive match on the eight-hex order number or the full hyphenated order ID. Omit it for the rolling queue.
-          schema:
-            type: string
-            pattern: '^(?:[0-9A-Fa-f]{8}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$'
+          schema: { $ref: '#/components/schemas/OperatorOrderReference' }
       responses:
         '200':
           description: Up to 100 paid orders for the manager's store, starting with orders awaiting a receipt. An exact lookup returns one matching paid order or an empty list.
@@ -1690,6 +1731,9 @@ components:
           anyOf:
             - $ref: '#/components/schemas/Timestamp'
             - type: 'null'
+    OperatorOrderReference:
+      type: string
+      pattern: '^(?:[0-9A-Fa-f]{8}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$'
     OperatorOrder:
       allOf:
         - $ref: '#/components/schemas/OperatorOrderDetails'
