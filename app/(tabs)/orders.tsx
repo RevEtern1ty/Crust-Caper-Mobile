@@ -29,7 +29,7 @@ export default function OrdersScreen() {
   const [choice, setChoice] = useState<{ latest: string | null; id: string } | null>(null);
   const [action, setAction] = useState<Action | null>(null);
   const [preview, setPreview] = useState<{ orderId: string; result: ReorderResult } | null>(null);
-  const [problem, setProblem] = useState<string | null>(null);
+  const [problem, setProblem] = useState<{ error: unknown } | null>(null);
   const running = useRef(false);
   const linkedOrderId = savedPaymentReturnOrderId(requestedOrderId ?? undefined, journal?.orderIds ?? []);
   const orderId = linkedOrderId ?? (choice?.latest === latestId ? choice.id : latestId);
@@ -69,7 +69,7 @@ export default function OrdersScreen() {
     try {
       await operation();
     } catch (error) {
-      setProblem(checkoutError(error, locale));
+      setProblem({ error });
       await refresh();
     } finally {
       setAction(null);
@@ -315,9 +315,9 @@ export default function OrdersScreen() {
         </>
       )}
 
-      {(problem || failed) && <Text selectable accessibilityRole="alert" tone="red">{problem ?? (needsPhoneVerification
+      {(problem || failed) && <Text selectable accessibilityRole="alert" tone="red">{problem ? checkoutError(problem.error, locale) : needsPhoneVerification
         ? t('Verify your phone number to open this saved order.', 'Emeza nimero ya telefoni kugira ngo ufungure iyi komande yabitswe.')
-        : checkoutError(statusError, locale))}</Text>}
+        : checkoutError(statusError, locale)}</Text>}
       {orderId && !showDelayedPayment && <Button label={t('Refresh order status', 'Vugurura uko komande ihagaze')} onPress={() => { void refresh(); }} busy={loading} variant="secondary" />}
 
       {journal && journal.orderIds.length > 1 && (
