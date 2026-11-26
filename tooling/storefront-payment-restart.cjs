@@ -221,7 +221,8 @@ async function exercise({ signal, project, request, kitchen, containers, report 
   const current = await inspect(signal, project, 'api', api.id);
   ensure(current.status === 'running' && current.startedAt === restarted.startedAt, 'fixture_api_restarted_again');
   report.afterRestart = { orderStatus: paid.orderStatus, paymentStatus: paid.paymentStatus,
-    attempts: 1, paymentExceptions: 0, matchedProviderTransaction: true, provider: providerAfter, supportServiceRestarts: 0 };
+    attempts: 1, paymentExceptions: 0, matchedProviderTransaction: true, provider: providerAfter, supportServiceRestarts: 0,
+    acceptedMsAfterApiStart: paid.accepted - restartedAt };
 
   report.phase = 'kitchen_visibility';
   const queue = await waitFor(signal, 10000, 'fixture_kitchen_visibility_timeout', async () => {

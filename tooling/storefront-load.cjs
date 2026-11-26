@@ -46,6 +46,7 @@ function requireFixture(project) {
   const binding = JSON.parse(docker(['inspect', '--format', '{{json (index .NetworkSettings.Ports "443/tcp")}}', edge]));
   requireCondition(Array.isArray(binding) && binding.length === 1
     && binding[0].HostIp === '127.0.0.1' && binding[0].HostPort === '443', 'fixture_edge_not_loopback');
+  return edge;
 }
 
 function target(path, route) {
@@ -133,12 +134,21 @@ function transport(ca, agent, signal, metrics) {
     }
 
     const durationMs = performance.now() - start;
-    if (metric === 'order_create') {
+    if (metric === 'order_create' && metrics) {
       increment(metrics.order_create.statuses, response.status);
       if (response.status === 200) metrics.order_create.latencies.push(durationMs);
     }
     return { ...response, durationMs };
   };
+}
+
+async function openStorefrontFixture({ project, caFile, signal, metrics }) {
+  requireCondition(caFile, 'fixture_ca_required');
+  const edge = requireFixture(project);
+  const ca = await readFile(caFile).catch(() => { throw new LoadFailure('fixture_ca_unreadable'); });
+  requireCondition(ca.includes('-----BEGIN CERTIFICATE-----'), 'fixture_ca_invalid');
+  const agent = new Agent({ keepAlive: true, maxSockets: 64 });
+  return { request: transport(ca, agent, signal, metrics), edge, close: () => agent.destroy() };
 }
 
 function validMenu(response) {
@@ -302,7 +312,6 @@ async function main() {
   const controller = new AbortController();
   const interrupt = () => controller.abort();
   for (const event of ['SIGINT', 'SIGTERM']) process.on(event, interrupt);
-  const agent = new Agent({ keepAlive: true, maxSockets: 64 });
   const metrics = {
     menu: { latencies: [], statuses: {}, statusLatencies: { 200: [], 304: [] } },
     order_create: { latencies: [], statuses: {} },
@@ -314,12 +323,10 @@ async function main() {
     errors: [], passed: false,
   };
   let kitchen;
+  let fixture;
   try {
-    requireCondition(caFile, 'fixture_ca_required');
-    requireFixture(project);
-    const ca = await readFile(caFile).catch(() => { throw new LoadFailure('fixture_ca_unreadable'); });
-    requireCondition(ca.includes('-----BEGIN CERTIFICATE-----'), 'fixture_ca_invalid');
-    const request = transport(ca, agent, controller.signal, metrics);
+    fixture = await openStorefrontFixture({ project, caFile, signal: controller.signal, metrics });
+    const { request } = fixture;
     const warm = await request(menuPath);
     const slotIds = ['fixture-capacity', ...Array.from({ length: 8 }, (_, i) => `fixture-load-${i}`)];
     requireCondition(validMenu(warm)
@@ -384,7 +391,7 @@ async function main() {
     } catch {
       report.errors.push('kitchen_monitor_close_failed');
     }
-    agent.destroy();
+    fixture?.close();
     for (const event of ['SIGINT', 'SIGTERM']) process.off(event, interrupt);
   }
   report.passed = report.errors.length === 0;
@@ -392,7 +399,11 @@ async function main() {
   if (!report.passed) process.exitCode = 1;
 }
 
-main().catch(error => {
-  console.error(error instanceof LoadFailure ? error.message : 'storefront_load_failed');
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch(error => {
+    console.error(error instanceof LoadFailure ? error.message : 'storefront_load_failed');
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { openStorefrontFixture };
