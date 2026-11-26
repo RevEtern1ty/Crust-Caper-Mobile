@@ -13,6 +13,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import org.junit.jupiter.api.Test;
@@ -31,6 +32,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.util.AopTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.web.servlet.HandlerMapping;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -156,6 +158,24 @@ class ApiRequestDiagnosticsIntegrationTest {
         assertThatThrownBy(() -> diagnostics.doFilter(disconnected, new MockHttpServletResponse(), (request, response) -> {
             throw new IOException("private-disconnect-marker");
         })).isInstanceOf(IOException.class);
+        assertCounts(before, 2, 2);
+
+        var wrappedDisconnect = new MockHttpServletRequest("GET", "/api/v1/wrapped-disconnect-probe");
+        assertThatThrownBy(() -> diagnostics.doFilter(wrappedDisconnect, new MockHttpServletResponse(), (request, response) -> {
+            throw new ServletException(new IOException("private-wrapped-disconnect-marker"));
+        })).isInstanceOf(ServletException.class).hasRootCauseExactlyInstanceOf(IOException.class);
+        assertCounts(before, 2, 2);
+
+        var completed = new MockHttpServletRequest("GET", "/api/v1/committed-response-probe");
+        completed.setAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE, "/api/v1/committed-response-probe");
+        var delivered = new MockHttpServletResponse();
+        assertThatThrownBy(() -> diagnostics.doFilter(completed, delivered, (request, response) -> {
+            ((HttpServletResponse) response).setStatus(HttpServletResponse.SC_OK);
+            response.flushBuffer();
+            throw new IllegalStateException("private-after-commit-marker");
+        })).isInstanceOf(IllegalStateException.class);
+        assertThat(delivered.isCommitted()).isTrue();
+        assertThat(delivered.getStatus()).isEqualTo(HttpServletResponse.SC_OK);
         assertCounts(before, 2, 2);
     }
 
