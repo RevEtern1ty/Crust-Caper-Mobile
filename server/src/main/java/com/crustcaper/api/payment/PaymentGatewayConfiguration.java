@@ -4,36 +4,50 @@ import com.crustcaper.api.WebOrigin;
 import tools.jackson.databind.ObjectMapper;
 import java.net.URI;
 import java.time.Clock;
+import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
-import org.springframework.core.env.Profiles;
 
 @Configuration(proxyBeanMethods = false)
 class PaymentGatewayConfiguration {
+    private final Function<String, String> deploymentVariable;
+
+    PaymentGatewayConfiguration() {
+        this(System::getenv);
+    }
+
+    PaymentGatewayConfiguration(Function<String, String> deploymentVariable) {
+        this.deploymentVariable = deploymentVariable;
+    }
+
     @Bean
     @ConditionalOnProperty(name = "crustcaper.payment.provider", havingValue = "flutterwave")
     FlutterwavePaymentGateway flutterwaveGateway(ObjectMapper mapper, Environment environment) {
-        String secret = System.getenv("FLUTTERWAVE_SECRET_KEY");
-        boolean stage = environment.acceptsProfiles(Profiles.of("stage"));
-        if (stage && environment.acceptsProfiles(Profiles.of("prod", "production"))) {
-            throw new IllegalStateException("Flutterwave stage and production profiles cannot be active together");
+        List<String> active = List.of(environment.getActiveProfiles());
+        boolean stage = active.contains("stage");
+        boolean production = active.contains("prod") || active.contains("production");
+        if (stage == production || active.contains("local")) {
+            throw new IllegalStateException("Flutterwave requires an explicit stage or production profile without local");
         }
+        String secret = deploymentVariable.apply("FLUTTERWAVE_SECRET_KEY");
         String requiredPrefix = stage ? "FLWSECK_TEST-" : "FLWSECK-";
         if (secret != null && (!secret.startsWith(requiredPrefix) || secret.length() == requiredPrefix.length())) {
             throw new IllegalStateException("Flutterwave requires a test key on stage and a live key outside stage");
         }
         return new FlutterwavePaymentGateway(FlutterwavePaymentGateway.API_ORIGIN, configuredReturnUrl(),
-                configuredWebReturnUrl(environment), secret, mapper, Clock.systemUTC(), 4_000, 8_000);
+                configuredWebReturnUrl(environment), secret,
+                environment.getProperty("crustcaper.payment.flutterwave.options"), mapper, Clock.systemUTC(), 4_000, 8_000);
     }
 
     @Bean
     @ConditionalOnProperty(name = "crustcaper.payment.provider", havingValue = "flutterwave")
     FlutterwaveWebhookSignature flutterwaveWebhookSignature() {
-        return new FlutterwaveWebhookSignature(System.getenv("FLUTTERWAVE_WEBHOOK_SECRET"));
+        return new FlutterwaveWebhookSignature(deploymentVariable.apply("FLUTTERWAVE_WEBHOOK_SECRET"));
     }
 
     @Bean
@@ -58,8 +72,8 @@ class PaymentGatewayConfiguration {
         };
     }
 
-    private static URI configuredReturnUrl() {
-        String value = System.getenv("CRUST_PAYMENT_RETURN_URL");
+    private URI configuredReturnUrl() {
+        String value = deploymentVariable.apply("CRUST_PAYMENT_RETURN_URL");
         try {
             if (value != null) {
                 return URI.create(value);

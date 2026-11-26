@@ -51,6 +51,8 @@ crustcaper:
     android-fingerprints: ${CRUSTCAPER_APP_LINK_ANDROID_FINGERPRINTS:}
   payment:
     provider: ${CRUSTCAPER_PAYMENT_PROVIDER:flutterwave}
+    flutterwave:
+      options: ${CRUSTCAPER_FLUTTERWAVE_PAYMENT_OPTIONS:}
   push:
     provider: ${CRUSTCAPER_PUSH_PROVIDER:disabled}
     token-key: ${CRUSTCAPER_PUSH_TOKEN_KEY:}
