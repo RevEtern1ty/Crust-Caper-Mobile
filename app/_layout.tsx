@@ -18,7 +18,8 @@ function Routes() {
     if (!webCheckout || !hydrated || typeof window === 'undefined') return;
 
     const url = new URL(window.location.href);
-    if (url.pathname !== '/cart' && url.pathname !== '/orders' && !url.pathname.startsWith('/product/')) return;
+    if (url.pathname !== '/cart' && url.pathname !== '/orders' && url.pathname !== '/privacy'
+      && !url.pathname.startsWith('/product/')) return;
     const handoff = url.searchParams.getAll('storefrontLocale');
     if (handoff.length !== 1) return;
     const next = handoff[0];
@@ -53,6 +54,7 @@ function Routes() {
       <Stack.Screen name="payment-return" options={{ headerShown: false }} />
       <Stack.Screen name="web-payment-return" options={{ headerShown: false }} />
       <Stack.Screen name="order-recovery" options={{ title: copy(locale, 'Find an order', 'Shaka komande') }} />
+      <Stack.Screen name="privacy" options={{ title: copy(locale, 'Order privacy', 'Amakuru bwite ya komande') }} />
       <Stack.Screen name="settings" options={{ title: copy(locale, 'Settings', 'Amagenamiterere') }} />
     </Stack>
   );

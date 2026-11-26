@@ -1,3 +1,4 @@
+import { router } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
 import { Platform, Pressable, StyleSheet, type Text as NativeText, View } from 'react-native';
 import { useCheckout } from '../src/checkout/context';
@@ -75,6 +76,9 @@ export default function SettingsScreen() {
           ? <Button label={t('Retry opening saved orders', 'Ongera ugerageze gufungura komande zabitswe')} onPress={() => { void retryRestore(); }} variant="secondary" busy={busy} />
           : <Button label={t('End guest session', 'Soza igihe cy’umushyitsi')} onPress={() => setConfirmEnd(true)} variant="secondary" disabled={!journal || busy} />)}
       </Card>}
+      {mode === 'connected' && (
+        <Button label={t('Order privacy', 'Amakuru bwite ya komande')} variant="secondary" onPress={() => router.push('/privacy')} />
+      )}
       {mode === 'demo' && <Card>
         <Text variant="heading">{copy(locale, 'CrustCaper Demo', 'Igerageza rya CrustCaper')}</Text>
         <Text>{copy(locale, 'Orders and payments use test data. Follow their status under Orders.', 'Komande no kwishyura bikoresha amakuru y’igerageza. Kurikirana uko bimeze muri Komande.')}</Text>
