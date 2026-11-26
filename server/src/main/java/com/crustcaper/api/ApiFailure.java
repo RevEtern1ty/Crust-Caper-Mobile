@@ -28,6 +28,10 @@ public final class ApiFailure extends RuntimeException {
         return new ApiFailure(401, "unauthenticated");
     }
 
+    static ApiFailure forbidden() {
+        return new ApiFailure(403, "forbidden");
+    }
+
     static ApiFailure notFound() {
         return new ApiFailure(404, "not_found");
     }

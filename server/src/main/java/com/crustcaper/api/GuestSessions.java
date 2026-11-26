@@ -100,7 +100,7 @@ class GuestSessions {
     }
 
     private static RefreshProof refreshProof(String refresh, String rotationKey, ApiFailure invalidToken) {
-        if (refresh == null || !TOKEN.matcher(refresh).matches()) throw invalidToken;
+        if (!validToken(refresh)) throw invalidToken;
         String presentedHash = hash(refresh);
         if (rotationKey == null) return new RefreshProof(presentedHash, null, presentedHash);
         UUID key = ApiFailure.uuid(rotationKey, ApiFailure.invalid());
@@ -112,7 +112,7 @@ class GuestSessions {
     UUID authenticate(String authorization) {
         if (authorization == null || !authorization.startsWith("Bearer ")) throw ApiFailure.unauthenticated();
         String token = authorization.substring("Bearer ".length());
-        if (!TOKEN.matcher(token).matches()) throw ApiFailure.unauthenticated();
+        if (!validToken(token)) throw ApiFailure.unauthenticated();
         String secretHash = hash(token);
         return jdbc.sql("""
             SELECT g.id FROM guest_access_tokens a JOIN guest_sessions g ON g.id = a.guest_session_id
@@ -136,7 +136,11 @@ class GuestSessions {
         return new GuestSession(access, expiry, refresh, guest.refreshExpiresAt(), guest.id());
     }
 
-    private static String token() {
+    static boolean validToken(String token) {
+        return token != null && TOKEN.matcher(token).matches();
+    }
+
+    static String token() {
         byte[] entropy = new byte[32];
         RANDOM.nextBytes(entropy);
         return Base64.getUrlEncoder().withoutPadding().encodeToString(entropy);
@@ -153,7 +157,7 @@ class GuestSessions {
         }
     }
 
-    private static String hash(String token) {
+    static String hash(String token) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                 .digest(token.getBytes(StandardCharsets.US_ASCII)));

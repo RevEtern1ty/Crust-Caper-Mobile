@@ -45,7 +45,10 @@ final class OrderAccessController {
     ResponseEntity<OrderAccessService.ChallengeReceipt> start(
         @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String bearer,
         @RequestBody StartInput input) {
-        UUID guest = sessions.authenticate(bearer);
+        return startForGuest(sessions.authenticate(bearer), input);
+    }
+
+    ResponseEntity<OrderAccessService.ChallengeReceipt> startForGuest(UUID guest, StartInput input) {
         return ResponseEntity.accepted().cacheControl(CacheControl.noStore())
             .body(access.start(guest, input.orderCode(), input.phone()));
     }
@@ -54,7 +57,10 @@ final class OrderAccessController {
     CompletableFuture<ResponseEntity<OrderAccessService.VerifiedOrder>> verify(
         @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String bearer,
         @PathVariable String id, @RequestBody VerifyInput input) {
-        UUID guest = sessions.authenticate(bearer);
+        return verifyForGuest(sessions.authenticate(bearer), id, input);
+    }
+
+    CompletableFuture<ResponseEntity<OrderAccessService.VerifiedOrder>> verifyForGuest(UUID guest, String id, VerifyInput input) {
         long started = System.nanoTime();
         try {
             UUID challenge = ApiFailure.uuid(id, ApiFailure.notFound());

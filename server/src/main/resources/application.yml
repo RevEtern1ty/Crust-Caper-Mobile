@@ -41,6 +41,8 @@ management:
         readiness:
           include: readinessState,db
 crustcaper:
+  web:
+    origin: ${CRUSTCAPER_WEB_ORIGIN:}
   operator:
     mfa-key: ${CRUSTCAPER_OPERATOR_MFA_KEY:}
   app-links:

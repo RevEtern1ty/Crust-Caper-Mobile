@@ -13,7 +13,7 @@ import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 class LocalWebApiConfiguration implements WebMvcConfigurer {
     @Override
     public void addCorsMappings(CorsRegistry registry) {
-        registry.addMapping("/api/v1/**")
+        registry.addMapping("/api/v1/{section:(?!web$).+}/**")
             .allowedOriginPatterns("http://127.0.0.1:[*]", "http://localhost:[*]")
             .allowedMethods("GET", "POST")
             .allowedHeaders("Content-Type", "Authorization", "Idempotency-Key")

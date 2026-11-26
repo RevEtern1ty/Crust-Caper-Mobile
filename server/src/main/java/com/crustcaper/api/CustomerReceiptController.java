@@ -25,7 +25,10 @@ final class CustomerReceiptController {
     ResponseEntity<byte[]> download(
             @RequestHeader(value = HttpHeaders.AUTHORIZATION, required = false) String bearer,
             @PathVariable String id) {
-        UUID guest = sessions.authenticate(bearer);
+        return downloadForGuest(sessions.authenticate(bearer), id);
+    }
+
+    ResponseEntity<byte[]> downloadForGuest(UUID guest, String id) {
         UUID orderId = ApiFailure.uuid(id, ApiFailure.notFound());
         byte[] pdf = orders.receiptDocument(guest, orderId);
         String filename = "receipt-" + orderId.toString().substring(28) + ".pdf";
