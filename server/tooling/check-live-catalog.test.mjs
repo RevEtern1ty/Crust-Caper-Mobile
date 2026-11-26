@@ -29,7 +29,8 @@ async function mockFetch(requested, options, scenario) {
   }
   if (url.pathname.startsWith('/menu/')) {
     const locale = url.pathname.slice(-2);
-    return new Response('<html></html>', {
+    const html = `<html lang="${locale}"><body><main id="main">Menu</main></body></html>`;
+    return new Response(locale === 'rw' ? (scenario.rwHtml ?? html) : html, {
       status: locale === 'rw' ? (scenario.rwStatus ?? 200) : 200,
       headers: {
         'content-type': 'text/html; charset=utf-8', 'content-language': locale,
@@ -84,6 +85,9 @@ test('storefront gate reports broken SSR despite a successful API response', () 
   const stale = run({ rwVersion: 'old' }, '--storefront');
   assert.equal(stale.status, 1);
   assert.match(stale.stderr, /\/menu\/rw: rendered catalog does not match/);
+  const truncated = run({ rwHtml: '<html lang="rw"><body><main id="main">' }, '--storefront');
+  assert.equal(truncated.status, 1);
+  assert.match(truncated.stderr, /\/menu\/rw: missing or incomplete localized catalog HTML/);
 });
 
 test('storefront gate rejects missing, redirected, wrong-format and truncated images', () => {

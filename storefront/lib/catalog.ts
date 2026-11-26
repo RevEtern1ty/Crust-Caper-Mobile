@@ -7,6 +7,7 @@ export type CatalogSite = { publicOrigin: string; indexable: boolean };
 
 const storeIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const imagePath = /^\/assets\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.(?:avif|gif|jpe?g|png|webp)$/i;
+const catalogPhotoPath = /^\/catalog-photos\/[a-z0-9][a-z0-9._-]{0,119}\.(?:avif|jpe?g|png|webp)$/;
 const entityTag = /^(?:W\/)?"[\x21\x23-\x7e]{1,128}"$/;
 const availabilityHeader = 'X-Availability-Checked-At';
 const maxMenuBytes = 12 * 1024 * 1024;
@@ -96,8 +97,10 @@ function httpsLink(value: string | null | undefined): URL | null {
 
 function publicImage(value: string | null | undefined, publicOrigin: string): string | null {
   const url = httpsLink(value);
-  return url && url.origin === publicOrigin && imagePath.test(url.pathname) && !url.search && !url.hash
-    ? url.pathname : null;
+  if (!url || url.origin !== publicOrigin || url.search || url.hash) return null;
+  if (imagePath.test(url.pathname)) return url.pathname;
+  const sourcePath = /^https:\/\/[^/]+(\/.*)$/i.exec(value ?? '')?.[1];
+  return sourcePath === url.pathname && catalogPhotoPath.test(url.pathname) ? url.pathname : null;
 }
 
 function checkedAt(headers: Headers): string | null {

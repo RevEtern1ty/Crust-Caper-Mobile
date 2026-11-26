@@ -46,6 +46,8 @@ export const getServerSideProps: GetServerSideProps<Props> = async ({ params, re
     ({ sku, category, name, description, price, available, photoUrl }) => ({
       sku, category, name, description, price, available, photoUrl,
     }));
+  res.setHeader('X-CrustCaper-Catalog-Version', catalog.menu.version);
+  res.setHeader('X-CrustCaper-Store-Id', store.id);
   return { props: { view: 'menu', ...data, products: menu } };
 };
 

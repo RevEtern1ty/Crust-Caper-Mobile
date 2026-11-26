@@ -117,6 +117,7 @@ jobs:
           npm ci
           npm --prefix storefront ci
           npm --prefix storefront test
+          node --test server/tooling/check-live-catalog.test.mjs
           npm --prefix storefront audit --omit=dev --audit-level=high
       - name: Build the HTTPS checkout and isolated provider fixture
         run: |
@@ -126,7 +127,7 @@ jobs:
         run: |
           docker build -t "$CRUSTCAPER_FIXTURE_API_IMAGE" ./server
           docker build -f storefront/Dockerfile -t "$CRUSTCAPER_FIXTURE_CATALOG_IMAGE" .
-      - name: Verify the menu, guest session and hosted payment through HTTPS
+      - name: Verify the published menu photos, guest session and hosted payment through HTTPS
         env:
           CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: ${{ runner.temp }}/crustcaper-https-evidence
         run: |
@@ -137,7 +138,7 @@ jobs:
             docker image inspect --format 'api={{.Id}}' "$CRUSTCAPER_FIXTURE_API_IMAGE"
             docker image inspect --format 'catalog={{.Id}}' "$CRUSTCAPER_FIXTURE_CATALOG_IMAGE"
           } >"$CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR/candidate.txt"
-          npm run test:storefront
+          npm run test:storefront:catalog-photos
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

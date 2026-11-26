@@ -9,7 +9,6 @@ const photoMediaTypes = { avif: 'image/avif', gif: 'image/gif', jpg: 'image/jpeg
   png: 'image/png', webp: 'image/webp' };
 const pngSignature = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
 const pngTrailer = Buffer.from('0000000049454e44ae426082', 'hex');
-const maxPhotoBytes = 8 * 1024 * 1024;
 const timeoutMs = 8000;
 
 function menuUrl(baseUrl, storeId, channel) {
@@ -72,13 +71,23 @@ async function readPublicFile(url, label, accept) {
 async function checkStorefrontPage(origin, locale, storeId, expectedVersion) {
   const label = `Storefront /menu/${locale}`;
   const response = await readPublicFile(new URL(`/menu/${locale}`, origin), label, 'text/html');
-  await response.body?.cancel().catch(() => {});
-  if (response.status !== 200) throw new Error(`${label}: HTTP ${response.status}, expected 200.`);
-  if (mediaType(response) !== 'text/html') throw new Error(`${label}: expected HTML.`);
-  if (response.headers.get('content-language') !== locale) throw new Error(`${label}: incorrect Content-Language.`);
-  if (response.headers.get('x-crustcaper-store-id') !== storeId
+  let problem;
+  if (response.status !== 200) problem = `HTTP ${response.status}, expected 200`;
+  else if (mediaType(response) !== 'text/html') problem = 'expected HTML';
+  else if (response.headers.get('content-language') !== locale) problem = 'incorrect Content-Language';
+  else if (response.headers.get('x-crustcaper-store-id') !== storeId
       || response.headers.get('x-crustcaper-catalog-version') !== expectedVersion) {
-    throw new Error(`${label}: rendered catalog does not match the requested store and version.`);
+    problem = 'rendered catalog does not match the requested store and version';
+  }
+  if (problem) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`${label}: ${problem}.`);
+  }
+  const html = (await readPublicBody(response, label, 12)).toString('utf8');
+  const language = new RegExp(`<html\\b[^>]*\\slang="${locale}"(?=\\s|>)`, 'i');
+  if (!language.test(html) || !/<main\b[^>]*\sid="main"(?=\s|>)/i.test(html)
+      || !html.includes('</main>') || !html.trimEnd().endsWith('</html>')) {
+    throw new Error(`${label}: missing or incomplete localized catalog HTML.`);
   }
 }
 
@@ -146,14 +155,25 @@ async function checkPhoto(url, label) {
   const extension = url.pathname.slice(url.pathname.lastIndexOf('.') + 1).toLowerCase();
   const expectedType = photoMediaTypes[extension];
   const response = await readPublicFile(url, label, expectedType);
-  const length = response.headers.get('content-length');
-  const encoding = response.headers.get('content-encoding');
   let problem;
   if (response.status !== 200) problem = `HTTP ${response.status}, expected 200`;
   else if (mediaType(response) !== expectedType) problem = `expected ${expectedType} media type`;
-  else if (encoding && encoding.toLowerCase() !== 'identity') problem = 'expected an uncompressed HTTP response';
-  else if (length !== null && (!/^\d+$/.test(length) || Number(length) > maxPhotoBytes)) {
-    problem = 'file exceeds the 8 MiB limit or has an invalid Content-Length';
+  if (problem) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`${label}: ${problem}.`);
+  }
+  const bytes = await readPublicBody(response, label, 8);
+  if (!hasRasterSignature(bytes, expectedType)) throw new Error(`${label}: file is invalid or truncated.`);
+}
+
+async function readPublicBody(response, label, limitMiB) {
+  const limit = limitMiB * 1024 * 1024;
+  const length = response.headers.get('content-length');
+  const encoding = response.headers.get('content-encoding');
+  let problem;
+  if (encoding && encoding.toLowerCase() !== 'identity') problem = 'expected an uncompressed HTTP response';
+  else if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit)) {
+    problem = `file exceeds the ${limitMiB} MiB limit or has an invalid Content-Length`;
   }
   if (problem) {
     await response.body?.cancel().catch(() => {});
@@ -166,16 +186,17 @@ async function checkPhoto(url, label) {
   try {
     for await (const chunk of response.body ?? []) {
       size += chunk.byteLength;
-      if (size > maxPhotoBytes) break;
+      if (size > limit) break;
       chunks.push(chunk);
     }
   } catch {
     throw new Error(`${label}: response body was incomplete or timed out.`);
   }
-  if (size > maxPhotoBytes) throw new Error(`${label}: file exceeds the 8 MiB limit.`);
-  if ((length !== null && size !== Number(length)) || !hasRasterSignature(Buffer.concat(chunks, size), expectedType)) {
+  if (size > limit) throw new Error(`${label}: file exceeds the ${limitMiB} MiB limit.`);
+  if (length !== null && size !== Number(length)) {
     throw new Error(`${label}: file is invalid or truncated.`);
   }
+  return Buffer.concat(chunks, size);
 }
 
 async function checkStorefront(origin, menu, storeId, expectedVersion) {

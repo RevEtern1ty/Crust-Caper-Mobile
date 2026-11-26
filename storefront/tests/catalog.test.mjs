@@ -107,11 +107,17 @@ test('requests the actual public catalog with channel and locale and returns saf
   const menu = catalogPayload();
   menu.guestAccessToken = 'fixture-only-field';
   menu.products[0].internalReference = 'fixture-only-field';
+  menu.products.push({ ...menu.products[0], sku: 'published-photo',
+    photoUrl: publicOrigin + '/catalog-photos/double-smash-r39.jpg' });
   menu.products.push(...[
     'https://third-party.example.test/assets/meal.png',
     publicOrigin + '/api/v1/operator/private.png',
     publicOrigin + '/assets/meal.jpg?private=1',
     publicOrigin + '/assets/meal.svg',
+    publicOrigin + '/catalog-photos/hidden/meal.jpg',
+    publicOrigin + '/catalog-photos/hidden/../meal.jpg',
+    publicOrigin + '/catalog-photos/meal.svg',
+    publicOrigin + '/catalog-photos/meal.jpg?private=1',
   ].map((photoUrl, index) => ({ ...menu.products[0], sku: `unsupported-image-${index}`, photoUrl })));
   const requests = await apiFixture(t, (_, response) => sendJson(response, menu));
   const result = await loadCatalog('rw');
@@ -123,7 +129,8 @@ test('requests the actual public catalog with channel and locale and returns saf
   assert.equal(result.menu.products[0].price, 9200);
   assert.equal(result.menu.products[0].allergens[0].rw, 'Ingano');
   assert.equal(result.menu.products[0].photoUrl, '/assets/menu/double-smash.a1234.jpg');
-  assert.deepEqual(result.menu.products.slice(1).map(item => item.photoUrl), [null, null, null, null]);
+  assert.equal(result.menu.products[1].photoUrl, '/catalog-photos/double-smash-r39.jpg');
+  assert.ok(result.menu.products.slice(2).every(item => item.photoUrl === null));
   assert.equal(result.menu.store.supportUrl, 'https://support.example.test/contact');
   assert.equal(result.menu.store.directionsUrl, null);
   assert.equal(result.menu.availabilityCheckedAt, firstCheckedAt);

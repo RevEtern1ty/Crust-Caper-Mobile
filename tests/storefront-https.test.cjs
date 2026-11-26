@@ -191,11 +191,25 @@ async function checkPhotoRendering(browser) {
         assert.equal(response.status(), 200);
         assert.equal(page.url(), origin + path);
         assert.equal(await page.locator('html').getAttribute('lang'), locale);
+        if (path === '/menu/' + locale) {
+          assert.equal(response.headers()['x-crustcaper-store-id'], 'kigali');
+          assert.equal(response.headers()['x-crustcaper-catalog-version'], 'catalog-001');
+        }
         const photo = page.locator(selector);
         await photo.waitFor({ state: 'visible' });
         const decoded = await photo.evaluate(image => ({ url: image.currentSrc, width: image.naturalWidth }));
         assert.equal(decoded.url, url);
         assert.ok(decoded.width > 0, 'SSR approved image must decode with JavaScript disabled');
+        for (const width of [320, 430, 390]) {
+          await page.setViewportSize({ width, height: viewport.height });
+          await page.evaluate(size => { document.documentElement.style.fontSize = size; }, width === 390 ? '' : '200%');
+          const fits = await photo.evaluate(image => {
+            const bounds = image.getBoundingClientRect();
+            return bounds.width > 0 && bounds.left >= 0 && bounds.right <= window.innerWidth
+              && document.documentElement.scrollWidth <= window.innerWidth;
+          });
+          assert.ok(fits, 'Catalog content and approved photo must fit at ' + width + ' px');
+        }
       }
       await capture(page, 'catalog-photo-ssr-' + locale);
     }
@@ -305,7 +319,7 @@ async function checkGuestCheckout(browser, ca) {
 }
 
 const scenario = webPerf ? 'HTTPS catalog captures cold mobile web performance'
-  : catalogPhotos ? 'HTTPS storefront serves and renders only the approved catalog photo'
+  : catalogPhotos ? 'HTTPS storefront renders the approved photo and preserves a single verified guest payment'
     : 'HTTPS storefront renders public pages and preserves a single verified guest payment';
 
 test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
@@ -330,10 +344,7 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
     });
     return;
   }
-  if (catalogPhotos) {
-    await checkPhotoRendering(browser);
-    return;
-  }
+  if (catalogPhotos) await checkPhotoRendering(browser);
   await checkNoJavaScript(browser);
   await checkGuestCheckout(browser, ca);
 });
