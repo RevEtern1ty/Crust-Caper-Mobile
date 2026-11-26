@@ -384,15 +384,19 @@ test('pickup staff locate a paid order without the buyer screen and verify the e
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const kitchen = await operator('demo-kitchen');
   const pickup = await operator('demo-pickup');
+  const manager = await operator('demo-manager');
   const order = await readyForPickup(kitchen);
+  const fixtures = [order];
   t.after(async () => {
-    const stored = await send(`/orders/${order.id}`, { token: order.token }).then(response => response.json());
-    if (stored.status === 'ready') {
-      await send(`/operator/orders/${order.id}/status`, {
-        method: 'POST', token: pickup, data: { status: 'collected', pickupCode: order.pickupCode },
-      });
+    for (const item of fixtures) {
+      const stored = await send(`/orders/${item.id}`, { token: item.token }).then(response => response.json());
+      if (stored.status === 'ready') {
+        await send(`/operator/orders/${item.id}/status`, {
+          method: 'POST', token: pickup, data: { status: 'collected', pickupCode: item.pickupCode },
+        });
+      }
     }
-    for (const token of [kitchen, pickup]) await send('/operator/sessions/current', { method: 'DELETE', token });
+    for (const token of [kitchen, pickup, manager]) await send('/operator/sessions/current', { method: 'DELETE', token });
   });
 
   const browser = await chromium.launch({ channel: 'chrome' });
@@ -469,6 +473,23 @@ test('pickup staff locate a paid order without the buyer screen and verify the e
   assert.equal(stored.status, 'collected');
   assert.equal(stored.pickupCode, null);
   await capture(page, 'operator-counter-order-lookup');
+
+  const atOtherCounter = await readyForPickup(kitchen);
+  fixtures.push(atOtherCounter);
+  const readyAtOtherCounter = lookFor(atOtherCounter.number.slice(1));
+  await reference.fill(atOtherCounter.number);
+  await reference.press('Enter');
+  assert.equal((await (await readyAtOtherCounter).json()).status, 'ready');
+  await result.getByText('Ready for pickup', { exact: true }).waitFor();
+  await button(lookup, 'Open order in queue').waitFor();
+  const refreshed = lookFor(atOtherCounter.id);
+  assert.equal((await send(`/operator/orders/${atOtherCounter.id}/status`, {
+    method: 'POST', token: manager, data: { status: 'collected', pickupCode: atOtherCounter.pickupCode },
+  })).status, 200);
+  await button(page, 'Refresh').click();
+  assert.equal((await (await refreshed).json()).status, 'collected');
+  await result.getByText('Collected', { exact: true }).waitFor();
+  assert.equal(await button(lookup, 'Open order in queue').isVisible(), false);
 });
 
 function testReceipt() {
