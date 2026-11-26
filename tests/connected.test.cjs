@@ -55,14 +55,19 @@ async function operator(username) {
   return (await response.json()).accessToken;
 }
 
-async function readyForPickup(kitchen, { buyer = contact, guestToken, quantity = 1 } = {}) {
+async function readyForPickup(kitchen, { buyer = contact, guestToken, quantity = 1, modifierIds = [] } = {}) {
   const { products, slots, store } = await send('/stores/kigali/menu').then(response => response.json());
   const product = products.find(item => item.name.en === 'Double Smash' && item.available);
   const slot = slots.findLast(item => item.available);
   assert.ok(product && slot);
+  const unitPrice = product.price + modifierIds.reduce((price, id) => {
+    const modifier = product.modifiers.find(option => option.id === id);
+    assert.ok(modifier);
+    return price + modifier.price;
+  }, 0);
   const token = guestToken ?? (await send('/guest-sessions', { method: 'POST' }).then(response => response.json())).accessToken;
   const quote = await send('/quotes', { method: 'POST', token, data: {
-    storeId: store.id, slotId: slot.id, lines: [{ sku: product.sku, modifierIds: [], quantity, unitPrice: product.price }],
+    storeId: store.id, slotId: slot.id, lines: [{ sku: product.sku, modifierIds, quantity, unitPrice }],
   } });
   assert.equal(quote.status, 200);
   const { quoteId } = await quote.json();
@@ -81,6 +86,92 @@ async function readyForPickup(kitchen, { buyer = contact, guestToken, quantity =
   assert.match(pickupCode, /^[0-9]{6}$/);
   return { id, token, pickupCode, total, currency, number: '#' + id.slice(-8).toUpperCase() };
 }
+
+test('an earlier order retains its sold names after the public menu is renamed', { timeout: 35_000 }, async t => {
+  const menuPath = '/stores/kigali/menu?channel=mobile';
+  const menu = await send(menuPath).then(response => response.json());
+  const product = menu.products.find(item => item.sku === 'double-smash' && item.available);
+  const cheese = product?.modifiers.find(option => option.id === 'extra-cheese');
+  assert.ok(product && cheese);
+  const renamed = { en: 'Renamed burger in the current menu', rw: 'Burgeri nshya ku ifunguro' };
+  const currentMenu = {
+    ...menu,
+    version: menu.version + '-renamed',
+    products: menu.products.map(item => item !== product ? item : {
+      ...item, name: renamed, modifiers: item.modifiers.map(option => option !== cheese ? option : {
+        ...option, name: { en: 'New cheese name', rw: 'Izina rishya rya foromaje' },
+      }),
+    }),
+  };
+
+  const kitchen = await operator('demo-kitchen');
+  const pickup = await operator('demo-pickup');
+  const guest = await send('/guest-sessions', { method: 'POST' }).then(response => response.json());
+  const order = await readyForPickup(kitchen, { guestToken: guest.accessToken, modifierIds: [cheese.id] });
+  t.after(async () => {
+    await send(`/operator/orders/${order.id}/status`, { method: 'POST', token: pickup,
+      data: { status: 'collected', pickupCode: order.pickupCode } });
+    await send('/guest-sessions/revoke', { method: 'POST', data: { refreshToken: guest.refreshToken } });
+    for (const token of [kitchen, pickup]) await send('/operator/sessions/current', { method: 'DELETE', token });
+  });
+
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, serviceWorkers: 'block' });
+  page.setDefaultTimeout(6500);
+
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const { hostname, port } = new URL(api);
+  const journalKey = `crustcaper.checkout.v1.local.${hostname}.${port || '443'}.kigali`;
+  await page.addInitScript(({ origin, journalKey, orderId, guest }) => {
+    if (location.origin !== origin) return;
+    const journal = { version: 1, active: null, orderIds: [orderId] };
+    sessionStorage.setItem(journalKey, JSON.stringify(journal));
+    sessionStorage.setItem(journalKey + '.guest', JSON.stringify(guest));
+  }, { origin, journalKey, orderId: order.id, guest });
+  await page.route(api + menuPath, route => route.fulfill({ json: currentMenu, headers: { 'Access-Control-Allow-Origin': origin } }));
+
+  async function checkDetailsLayout(locale) {
+    const displayed = [page.getByText('1 × ' + product.name[locale], { exact: true }),
+      page.getByText(cheese.name[locale], { exact: true })];
+    for (const text of displayed) await text.evaluate(element => {
+      element.style.fontSize = Number.parseFloat(getComputedStyle(element).fontSize) * 2 + 'px';
+    });
+    for (const width of [320, 390, 430]) {
+      await page.setViewportSize({ width, height: 844 });
+      for (const text of displayed) {
+        assert.ok(await text.evaluate(element => element.scrollWidth <= element.clientWidth + 1),
+          `Sold item text wraps at ${width}px in ${locale}`);
+      }
+      await displayed[0].scrollIntoViewIfNeeded();
+      await capture(page, `sold-item-${locale}-${width}`);
+    }
+  }
+
+  await page.goto(origin);
+  await shown(page, renamed.en);
+  await page.goto(origin + '/orders');
+  await shown(page, 'Order details');
+  assert.equal(await page.getByText('1 × ' + product.name.en, { exact: true }).count(), 1,
+    'A placed order must keep its sold item name even when the current menu is renamed');
+  await shown(page, cheese.name.en);
+  assert.equal(await page.getByText('New cheese name', { exact: true }).count(), 0);
+  await checkDetailsLayout('en');
+
+  await page.goto(origin + '/settings');
+  await button(page, 'Kinyarwanda').click();
+  await page.locator('html[lang="rw"]').waitFor({ state: 'attached' });
+  await page.goto(origin + '/orders');
+  await shown(page, '1 × ' + product.name.rw);
+  await shown(page, cheese.name.rw);
+  await checkDetailsLayout('rw');
+});
 
 test('delivery intake and handoff recover lost replies alongside a paid direct order', { timeout: 35_000 }, async t => {
   const kitchen = await operator('demo-kitchen');
