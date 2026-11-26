@@ -9,6 +9,7 @@ import static org.mockito.Mockito.when;
 import static org.springframework.http.HttpMethod.DELETE;
 import static org.springframework.http.HttpMethod.GET;
 import static org.springframework.http.HttpMethod.POST;
+import static org.springframework.http.HttpMethod.PUT;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.request;
@@ -93,6 +94,7 @@ class WebCommerceIntegrationTest {
         guests.forEach(guest -> jdbc.sql("DELETE FROM order_access_challenges WHERE guest_session_id = ?")
             .param(guest).update());
         jdbc.sql("DELETE FROM fiscal_receipts WHERE store_id = ?").param(store).update();
+        jdbc.sql("DELETE FROM order_erasure_requests WHERE store_id = ?").param(store).update();
         jdbc.sql("DELETE FROM operator_accounts WHERE store_id = ?").param(store).update();
         jdbc.sql("""
             DELETE FROM payment_exceptions WHERE attempt_id IN (
@@ -249,6 +251,17 @@ class WebCommerceIntegrationTest {
         var verified = body(verifyChallenge(browser, challenge).andExpect(status().isOk())
             .andExpect(jsonPath("$.orderId").value(order.toString())));
         assertThat(verified.size()).isEqualTo(1);
+        api.perform(authorized(GET, path + "/data-export", browser)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.phone").value(PHONE)).andExpect(jsonPath("$.orderId").value(order.toString()))
+            .andExpect(jsonPath("$.paymentAttempt").doesNotExist());
+        api.perform(authorized(GET, path + "/data-export", stranger)).andExpect(status().isNotFound());
+        String erasure = path + "/erasure-request";
+        api.perform(web(PUT, erasure).cookie(browser.cookie()).header(SESSION_HEADER, browser.id().toString()))
+            .andExpect(status().isForbidden());
+        api.perform(web(PUT, erasure).cookie(browser.cookie()).header(SESSION_HEADER, browser.id().toString())
+            .header(HttpHeaders.ORIGIN, FOREIGN_ORIGIN).header(WEB_HEADER, "1")).andExpect(status().isForbidden());
+        api.perform(authorized(PUT, erasure, browser)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.request.status").value("pending"));
         api.perform(authorized(GET, path, browser)).andExpect(status().isOk())
             .andExpect(jsonPath("$.recoveryReadOnly").value(true))
             .andExpect(jsonPath("$.paymentAttempt.checkoutUrl").isEmpty());
@@ -325,6 +338,8 @@ class WebCommerceIntegrationTest {
             verifyChallenge(replacement, challenge).andExpect(status().isOk())
                 .andExpect(jsonPath("$.orderId").value(order.toString()));
         }
+        api.perform(authorized(GET, orderPath + "/data-export", replacement)).andExpect(status().isNotFound());
+        api.perform(authorized(PUT, orderPath + "/erasure-request", replacement)).andExpect(status().isNotFound());
         api.perform(authorized(GET, orderPath, replacement)).andExpect(status().isOk())
             .andExpect(jsonPath("$.id").value(order.toString())).andExpect(jsonPath("$.recoveryReadOnly").doesNotExist())
             .andExpect(jsonPath("$.paymentStatus").value("unpaid"));

@@ -8,12 +8,15 @@ import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 import com.crustcaper.api.recovery.PhoneVerificationGateway;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -57,6 +60,7 @@ class OrderAccessIntegrationTest {
 
     private final String store = "recovery-test-" + UUID.randomUUID();
     private final List<UUID> guests = new ArrayList<>();
+    private final List<UUID> operators = new ArrayList<>();
 
     private record ExistingOrder(UUID id, String quoteId) {
         String code() { return id.toString().substring(28).toUpperCase(Locale.ROOT); }
@@ -80,6 +84,11 @@ class OrderAccessIntegrationTest {
 
     @AfterEach
     void removeFixtureOnly() {
+        jdbc.sql("DELETE FROM order_erasure_requests WHERE store_id = ?").param(store).update();
+        for (UUID operator : operators) {
+            jdbc.sql("DELETE FROM operator_sessions WHERE operator_id = ?").param(operator).update();
+            jdbc.sql("DELETE FROM operator_accounts WHERE id = ?").param(operator).update();
+        }
         for (UUID guest : guests) {
             jdbc.sql("DELETE FROM order_access_challenges WHERE guest_session_id = ?").param(guest).update();
         }
@@ -145,6 +154,91 @@ class OrderAccessIntegrationTest {
             .param(target.id()).query(UUID.class).single()).isEqualTo(sessions.authenticate(owner));
         assertThat(jdbc.sql("SELECT count(*) FROM order_read_grants WHERE order_id = ?")
             .param(target.id()).query(Long.class).single()).isEqualTo(1);
+    }
+
+    @Test
+    void freshOrdinaryOtpAloneGrantsPrivacyAccessAndManagerReviewDoesNotChangeTheOrder() throws Exception {
+        String owner = guest();
+        String verifiedGuest = guest();
+        String otherGuest = guest();
+        ExistingOrder target = order(owner, "privacy-owner", PHONE);
+        String path = ORDERS + "/" + target.id();
+        String erasure = path + "/erasure-request";
+        String queue = "/api/v1/operator/erasure-requests";
+        String orderBefore = jdbc.sql("SELECT row_to_json(o)::text FROM orders o WHERE id = ?")
+            .param(target.id()).query(String.class).single();
+        api.perform(get(path + "/data-export").header(HttpHeaders.AUTHORIZATION, owner))
+            .andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("not_found"));
+        api.perform(put(erasure).header(HttpHeaders.AUTHORIZATION, otherGuest)).andExpect(status().isNotFound());
+
+        UUID challenge = challenge(verifiedGuest, target.code(), PHONE);
+        awaitState(challenge, "sent");
+        verifyChallenge(verifiedGuest, challenge, OTP).andExpect(status().isOk());
+        JsonNode data = body(api.perform(get(path + "/data-export").header(HttpHeaders.AUTHORIZATION, verifiedGuest))
+            .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store")));
+        assertThat(data.propertyNames()).containsExactlyInAnyOrder("orderId", "storeId", "phone", "email", "lines",
+            "total", "tax", "currency", "status", "paymentStatus", "receiptStatus", "createdAt",
+            "pickupStartsAt", "pickupEndsAt");
+        assertThat(data.path("phone").asString()).isEqualTo(PHONE);
+        assertThat(data.path("email").isNull()).isTrue();
+        assertThat(data.path("orderId").asString()).isEqualTo(target.id().toString());
+        assertThat(data.path("lines").path(0).path("sku").asString()).isEqualTo("double-smash");
+        assertThat(body(api.perform(get(erasure).header(HttpHeaders.AUTHORIZATION, verifiedGuest))
+            .andExpect(status().isOk())).path("request").isNull()).isTrue();
+        JsonNode submitted = body(api.perform(put(erasure).header(HttpHeaders.AUTHORIZATION, verifiedGuest))
+            .andExpect(status().isOk())).path("request");
+        assertThat(submitted.path("status").asString()).isEqualTo("pending");
+        assertThat(submitted.path("reviewedAt").isNull()).isTrue();
+        assertThat(body(api.perform(put(erasure).header(HttpHeaders.AUTHORIZATION, verifiedGuest))
+            .andExpect(status().isOk())).path("request")).isEqualTo(submitted);
+        UUID requestId = UUID.fromString(submitted.path("requestId").asString());
+        String review = queue + "/" + requestId + "/review";
+
+        String manager = operator(store, "manager");
+        String anotherManager = operator(store, "manager");
+        String kitchen = operator(store, "kitchen");
+        String otherStore = operator("kigali", "manager");
+        api.perform(get(queue).header(HttpHeaders.AUTHORIZATION, kitchen)).andExpect(status().isForbidden());
+        api.perform(get(queue).header(HttpHeaders.AUTHORIZATION, otherStore))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(0));
+        api.perform(post(review).header(HttpHeaders.AUTHORIZATION, otherStore)).andExpect(status().isNotFound());
+        JsonNode pending = body(api.perform(get(queue).header(HttpHeaders.AUTHORIZATION, manager))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(1))).path(0);
+        assertThat(pending.propertyNames()).containsExactlyInAnyOrder("requestId", "orderId", "submittedAt", "status", "reviewedAt");
+        assertThat(pending.path("orderId").asString()).isEqualTo(target.id().toString());
+        JsonNode reviewed = body(api.perform(post(review).header(HttpHeaders.AUTHORIZATION, manager))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.status").value("in_review")));
+        UUID reviewer = jdbc.sql("SELECT reviewed_by FROM order_erasure_requests WHERE id = ?")
+            .param(requestId).query(UUID.class).single();
+        assertThat(reviewer).isEqualTo(operators.getFirst());
+        assertThat(body(api.perform(post(review).header(HttpHeaders.AUTHORIZATION, anotherManager))
+            .andExpect(status().isOk()))).isEqualTo(reviewed);
+        assertThat(jdbc.sql("SELECT reviewed_by FROM order_erasure_requests WHERE id = ?")
+            .param(requestId).query(UUID.class).single()).isEqualTo(reviewer);
+        JsonNode repeated = body(api.perform(put(erasure).header(HttpHeaders.AUTHORIZATION, verifiedGuest))
+            .andExpect(status().isOk())).path("request");
+        assertThat(repeated.path("requestId")).isEqualTo(reviewed.path("requestId"));
+        assertThat(repeated.path("status")).isEqualTo(reviewed.path("status"));
+        assertThat(repeated.path("reviewedAt")).isEqualTo(reviewed.path("reviewedAt"));
+        api.perform(get(queue).header(HttpHeaders.AUTHORIZATION, manager))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(0));
+        api.perform(get(queue).queryParam("status", "in_review").header(HttpHeaders.AUTHORIZATION, manager))
+            .andExpect(status().isOk()).andExpect(jsonPath("$[0].requestId").value(requestId.toString()));
+
+        UUID guest = sessions.authenticate(verifiedGuest);
+        OffsetDateTime stale = jdbc.sql("""
+            UPDATE order_read_grants SET privacy_verified_at = clock_timestamp() - interval '11 minutes'
+            WHERE guest_session_id = ? AND order_id = ? RETURNING privacy_verified_at
+            """).params(guest, target.id()).query(OffsetDateTime.class).single();
+        verifyChallenge(verifiedGuest, challenge, OTP).andExpect(status().isOk());
+        assertThat(jdbc.sql("SELECT privacy_verified_at FROM order_read_grants WHERE guest_session_id = ? AND order_id = ?")
+            .params(guest, target.id()).query(OffsetDateTime.class).single()).isEqualTo(stale);
+        api.perform(get(path + "/data-export").header(HttpHeaders.AUTHORIZATION, verifiedGuest))
+            .andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("not_found"));
+        api.perform(get(erasure).header(HttpHeaders.AUTHORIZATION, verifiedGuest)).andExpect(status().isNotFound());
+        api.perform(put(erasure).header(HttpHeaders.AUTHORIZATION, verifiedGuest)).andExpect(status().isNotFound());
+        assertThat(jdbc.sql("SELECT row_to_json(o)::text FROM orders o WHERE id = ?")
+            .param(target.id()).query(String.class).single()).isEqualTo(orderBefore);
     }
 
     @Test
@@ -295,6 +389,20 @@ class OrderAccessIntegrationTest {
         String bearer = "Bearer " + result.path("accessToken").asString();
         guests.add(sessions.authenticate(bearer));
         return bearer;
+    }
+
+    private String operator(String location, String role) throws Exception {
+        UUID id = UUID.randomUUID();
+        String username = "privacy-" + id;
+        operators.add(id);
+        jdbc.sql("""
+            INSERT INTO operator_accounts (id, store_id, username, role, password_hash)
+            SELECT ?, ?, ?, ?, password_hash FROM operator_accounts WHERE username = 'demo-manager'
+            """).params(id, location, username, role).update();
+        JsonNode issued = body(api.perform(post("/api/v1/operator/sessions").contentType(MediaType.APPLICATION_JSON)
+            .content(json.writeValueAsString(Map.of("username", username, "password", "local-demo-passphrase"))))
+            .andExpect(status().isCreated()));
+        return "Bearer " + issued.path("accessToken").asString();
     }
 
     private ExistingOrder order(String bearer, String key, String phone) throws Exception {
