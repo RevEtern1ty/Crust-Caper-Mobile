@@ -178,16 +178,18 @@ function VerifiedOrderPrivacy({ order, locale, api, captureAction, onClear }: {
       <Text variant="heading" accessibilityRole="header">{t('Deletion request', 'Ubusabe bwo gusiba amakuru')}</Text>
       <Text>{t('Our team reviews requests to delete order data before taking action.', 'Itsinda ryacu risuzuma ubusabe bwo gusiba amakuru ya komande mbere yo kugira icyo rikora.')}</Text>
       {status.state === 'loading' && <Text accessibilityLiveRegion="polite">{t('Checking request status…', 'Turimo kugenzura uko ubusabe buhagaze…')}</Text>}
-      {status.state === 'unavailable' && <>
-        <Text tone="red" accessibilityRole="alert">{t('Request status is unavailable. Check again before submitting.', 'Uko ubusabe buhagaze ntibiboneka. Ongera ugenzure mbere yo kohereza ubusabe.')}</Text>
-        <Button variant="secondary" label={t('Check request status', 'Genzura uko ubusabe buhagaze')} disabled={busy !== null}
-          onPress={() => { void readStatus(captureAction(sessionRevision), () => onClear(true)); }} />
-      </>}
+      {status.state === 'unavailable' && <Text tone="red" accessibilityRole="alert">{t(
+        'Request status is unavailable. Check again before submitting.',
+        'Uko ubusabe buhagaze ntibiboneka. Ongera ugenzure mbere yo kohereza ubusabe.',
+      )}</Text>}
       {request && <>
         <Text variant="label" accessibilityLiveRegion="polite">{request.status === 'pending'
           ? t('Pending review', 'Butegereje gusuzumwa') : t('In review', 'Burimo gusuzumwa')}</Text>
         <Text tone="muted" variant="small">{t('Submitted', 'Bwoherejwe')} {kigaliTime(request.submittedAt, locale)}</Text>
       </>}
+      {(request || status.state === 'unavailable') && <Button variant="secondary"
+        label={t('Check request status', 'Genzura uko ubusabe buhagaze')} disabled={busy !== null}
+        onPress={() => { void readStatus(captureAction(sessionRevision), () => onClear(true)); }} />}
       {status.state === 'known' && !request && (confirmation ? <>
         <Text>{t('Submit a deletion request for this order?', 'Ushaka kohereza ubusabe bwo gusiba amakuru y’iyi komande?')}</Text>
         <Button label={t('Submit deletion request', 'Ohereza ubusabe bwo gusiba amakuru')} busy={busy === 'erasure'}
