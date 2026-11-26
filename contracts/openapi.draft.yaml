@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: CrustCaper Shared API
-  version: 0.11.0
+  version: 0.12.0
   description: Implemented Spring Boot commerce API. The web routes require an enabled storefront origin and otherwise return 404.
 servers:
   - url: /api/v1
@@ -135,6 +135,27 @@ paths:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
         '200': { $ref: '#/components/responses/Order' }
+        '400': { $ref: '#/components/responses/InvalidInput' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/OrderUnavailable' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /checkout-recovery:
+    post:
+      operationId: recoverPendingMobileCheckout
+      security: [{ guestOrAccount: [] }]
+      description: |
+        Resolves a mobile checkout when the original guest session can no longer repeat
+        the saved create request. Use the original mobile quote and idempotency key
+        with the phone entered at checkout. If an order exists, confirm the returned
+        challenge with the same bearer through /order-access/challenges/{id}/verify.
+        Verification permits checkout for that mobile order only. The original order,
+        guest, request key and payment attempts keep their identities. While an unused
+        quote can still produce an order, the result is waiting. Clear the saved create
+        intent only after not_placed or after the verified order has been saved locally.
+      requestBody:
+        $ref: '#/components/requestBodies/PendingCheckoutRecovery'
+      responses:
+        '200': { $ref: '#/components/responses/PendingCheckoutRecovery' }
         '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '404': { $ref: '#/components/responses/OrderUnavailable' }
@@ -453,40 +474,9 @@ paths:
         web verification route. Verified access permits checkout for that order only. Only
         not_placed allows the client to clear the saved attempt and start a new checkout.
       requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [quoteId, key, phone]
-              properties:
-                quoteId: { type: string, format: uuid }
-                key: { type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$', writeOnly: true }
-                phone: { type: string, pattern: '^\+[1-9][0-9]{7,14}$', writeOnly: true }
+        $ref: '#/components/requestBodies/PendingCheckoutRecovery'
       responses:
-        '200':
-          description: Current attempt resolution. An acknowledgement alone grants no order access.
-          headers:
-            Cache-Control:
-              schema: { type: string, const: no-store }
-          content:
-            application/json:
-              schema:
-                oneOf:
-                  - type: object
-                    required: [state, retryAt]
-                    properties:
-                      state: { type: string, const: waiting }
-                      retryAt: { $ref: '#/components/schemas/Timestamp' }
-                  - type: object
-                    required: [state]
-                    properties:
-                      state: { type: string, const: not_placed }
-                  - type: object
-                    required: [state, challengeId]
-                    properties:
-                      state: { type: string, const: verify }
-                      challengeId: { type: string, format: uuid }
+        '200': { $ref: '#/components/responses/PendingCheckoutRecovery' }
         '400': { $ref: '#/components/responses/InvalidInput' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/WebOriginRejected' }
@@ -1388,7 +1378,42 @@ components:
       required: true
       description: Reuse the key with the same payload to recover the original operation.
       schema: { type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$' }
+  requestBodies:
+    PendingCheckoutRecovery:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [quoteId, key, phone]
+            properties:
+              quoteId: { type: string, format: uuid }
+              key: { type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$', writeOnly: true }
+              phone: { type: string, pattern: '^\+[1-9][0-9]{7,14}$', writeOnly: true }
   responses:
+    PendingCheckoutRecovery:
+      description: Current attempt resolution. An acknowledgement alone grants no order access.
+      headers:
+        Cache-Control:
+          schema: { type: string, const: no-store }
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - type: object
+                required: [state, retryAt]
+                properties:
+                  state: { type: string, const: waiting }
+                  retryAt: { $ref: '#/components/schemas/Timestamp' }
+              - type: object
+                required: [state]
+                properties:
+                  state: { type: string, const: not_placed }
+              - type: object
+                required: [state, challengeId]
+                properties:
+                  state: { type: string, const: verify }
+                  challengeId: { type: string, format: uuid }
     WebSession:
       description: Browser session marker and expiry.
       headers:
