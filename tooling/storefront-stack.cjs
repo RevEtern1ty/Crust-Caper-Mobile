@@ -4,6 +4,8 @@ const { randomBytes, randomUUID } = require('node:crypto');
 const { access, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const { basename, dirname, join, resolve } = require('node:path');
+const { fixtureDatabaseUrl, preparePostgresTls, postgresJdbcTlsQuery, postgresTlsEntrypoint,
+  postgresTlsMount, postgresTlsRuntime } = require('./storefront-postgres-tls.cjs');
 
 const root = resolve(dirname(module.filename), '..');
 const deploy = join(root, 'server', 'deploy');
@@ -88,12 +90,12 @@ const mount = (source, target) => ({
   bind: { create_host_path: false },
 });
 
-async function prepareFixture(directory, testClasses, { load, paymentRestart, catalogPhotos, errorRehearsal, databaseRecovery }) {
+async function prepareFixture(directory, testClasses, env, { load, paymentRestart, catalogPhotos, errorRehearsal, databaseRecovery }) {
   const fixturePassword = randomBytes(24).toString('hex');
   const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
   const composeEnvironment = join(directory, 'compose.env');
-  const unusedDatabaseCa = join(directory, 'postgres-ca.crt');
+  const { tlsDirectory, caFile: databaseCa } = await preparePostgresTls(directory, env, run);
   const caddyfile = join(directory, 'Caddyfile');
   const overlay = join(directory, 'fixture.json');
   let recoveryOverlay;
@@ -101,7 +103,7 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, ca
   if (databaseRecovery) {
     recoveryOverlay = join(directory, 'recovery-cutover.json');
     await writeFile(recoveryOverlay, JSON.stringify({ services: { api: {
-      environment: { CRUSTCAPER_DB_URL: 'jdbc:postgresql://postgres:5432/' + recoveredDatabase },
+      environment: { CRUSTCAPER_DB_URL: fixtureDatabaseUrl(recoveredDatabase) },
       command: ['--recovery-api'],
     } } }));
     for (const name of ['backup-postgres.sh', 'restore-postgres.sh']) {
@@ -115,7 +117,7 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, ca
     'SPRING_PROFILES_ACTIVE=stage',
     `CRUSTCAPER_PAYMENT_PROVIDER=${paymentRestart ? 'flutterwave' : 'fixture'}`,
     'CRUSTCAPER_ORDER_ACCESS_PROVIDER=disabled',
-    `CRUSTCAPER_DB_URL=jdbc:postgresql://postgres:5432/${database}`,
+    `CRUSTCAPER_DB_URL=${fixtureDatabaseUrl(database)}`,
     `CRUSTCAPER_DB_USER=${database}`,
     `CRUSTCAPER_DB_PASSWORD=${fixturePassword}`,
     `CRUSTCAPER_OPERATOR_MFA_KEY=${fixtureMfaKey}`,
@@ -125,8 +127,6 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, ca
     ] : []),
     '',
   ].join('\n'), { mode: 0o600 });
-  // Bind the same CA mount as deployed Compose, using a private fixture network for PostgreSQL.
-  await writeFile(unusedDatabaseCa, 'Unused by the isolated browser fixture\n');
   await writeFile(composeEnvironment, '');
 
   const site = 'https://{$CRUSTCAPER_HTTPS_HOST} {';
@@ -181,14 +181,19 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, ca
       edge: { volumes: [mount(caddyfile, '/etc/caddy/Caddyfile')] },
       postgres: {
         image: postgresImage,
+        entrypoint: ['/bin/sh', '-ec', postgresTlsEntrypoint],
+        command: [],
+        tmpfs: [`${postgresTlsRuntime}:rw,noexec,nosuid,nodev,size=1m`],
         ...(errorRehearsal && { labels: errorRehearsalLabel }),
         ...(databaseRecovery && { labels: recoveryLabel }),
         environment: { POSTGRES_USER: database, POSTGRES_DB: database, POSTGRES_PASSWORD: fixturePassword },
         healthcheck: {
-          test: ['CMD', 'pg_isready', '-U', database, '-d', database],
+          test: ['CMD-SHELL', 'PGPASSWORD="$${POSTGRES_PASSWORD}" PGSSLMODE=verify-full '
+            + `PGSSLROOTCERT=${postgresTlsRuntime}/ca.crt psql -h postgres -XAtq --no-password -U ${database} -d ${database} -c 'SELECT 1'`],
           interval: '2s', timeout: '3s', retries: 15,
         },
         volumes: [
+          mount(tlsDirectory, postgresTlsMount),
           mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
           ...(load || paymentRestart || catalogPhotos
             ? [mount(join(root, 'server', 'tooling', 'operator-accounts.psql'), '/fixture/operator-accounts.psql')] : []),
@@ -197,7 +202,17 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart, ca
       },
     },
   }, null, 2), { mode: 0o600 });
-  return { apiEnvironment, composeEnvironment, unusedDatabaseCa, overlay, recoveryOverlay, fixtureMfaKey };
+  return { apiEnvironment, composeEnvironment, databaseCa, overlay, recoveryOverlay, fixtureMfaKey };
+}
+
+async function confirmPostgresTls(compose) {
+  const verified = await compose('Check the fixture API PostgreSQL TLS connections', [
+    'exec', '-T', 'postgres', 'psql', '-XAtq', '--no-password', '-U', database, '-d', database, '-c', postgresJdbcTlsQuery,
+  ], { capture: true });
+  if (verified !== 't') {
+    throw new Error('The fixture API did not establish verified PostgreSQL TLS connections');
+  }
+  console.log(`Verified PostgreSQL TLS for the isolated ${database} API`);
 }
 
 async function importCatalog(compose, { load, catalogPhotos, availability }) {
@@ -276,13 +291,13 @@ async function main() {
       await copyFile(join(root, 'assets', 'menu', `${fixturePhoto.sku}.jpg`), join(photos, fixturePhoto.file));
       await writeFile(join(photos, 'double-smash-r39.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
     }
-    const settings = await prepareFixture(directory, testClasses, { load, paymentRestart, catalogPhotos, errorRehearsal, databaseRecovery });
+    const settings = await prepareFixture(directory, testClasses, hostEnv, { load, paymentRestart, catalogPhotos, errorRehearsal, databaseRecovery });
     const env = {
       ...hostEnv,
       CRUSTCAPER_API_IMAGE: apiImage,
       CRUSTCAPER_CATALOG_IMAGE: catalogImage,
       CRUSTCAPER_API_ENV_FILE: dockerPath(settings.apiEnvironment),
-      CRUSTCAPER_POSTGRES_CA_FILE: dockerPath(settings.unusedDatabaseCa),
+      CRUSTCAPER_POSTGRES_CA_FILE: dockerPath(settings.databaseCa),
       CRUSTCAPER_HTTPS_HOST: fixtureHost,
       CRUSTCAPER_HTTPS_BIND_IP: '127.0.0.1',
       CRUSTCAPER_STOREFRONT_DIR: dockerPath(web),
@@ -303,6 +318,7 @@ async function main() {
       { cleanup: true, timeout: 45000 });
     await compose('Start the storefront HTTPS fixture', ['up', '-d', '--wait', '--wait-timeout', '90'],
       { timeout: 120000 });
+    await confirmPostgresTls(compose);
     await importCatalog(compose, { load, catalogPhotos, availability });
     await compose('Copy the storefront fixture TLS root', [
       'cp', 'edge:/data/caddy/pki/authorities/local/root.crt', dockerPath(browserCa),

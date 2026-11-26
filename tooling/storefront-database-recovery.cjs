@@ -6,6 +6,7 @@ const { setTimeout: delay } = require('node:timers/promises');
 const { promisify } = require('node:util');
 const { openStorefrontFixture } = require('./storefront-load.cjs');
 const { createRecoveryJourney } = require('./storefront-recovery-journey.cjs');
+const { fixtureDatabaseUrl, postgresJdbcTlsQuery, postgresTlsRuntime } = require('./storefront-postgres-tls.cjs');
 
 const execute = promisify(execFile);
 const source = 'storefront_fixture';
@@ -18,7 +19,8 @@ const postgresEnvironment = `
   set -euo pipefail
   [[ "$POSTGRES_DB" == storefront_fixture && "$POSTGRES_USER" == storefront_fixture && -n "$POSTGRES_PASSWORD" ]]
   unset PGSERVICE PGSERVICEFILE PGHOSTADDR PGOPTIONS
-  export PGHOST=127.0.0.1 PGPORT=5432 PGSSLMODE=disable PGUSER="$POSTGRES_USER" PGPASSWORD="$POSTGRES_PASSWORD"
+  export PGHOST=postgres PGPORT=5432 PGSSLMODE=verify-full PGSSLROOTCERT=${postgresTlsRuntime}/ca.crt
+  export PGUSER="$POSTGRES_USER" PGPASSWORD="$POSTGRES_PASSWORD"
   export PGDATABASE="$1"
   shift
   exec "$@"
@@ -64,7 +66,7 @@ async function apiDatabase(signal, container, database, flag) {
     && container.args.includes(application) && container.args.at(-1) === flag && container.restartPolicy === 'no',
   'database_recovery_api_signature');
   // Select a boolean marker. Other environment values can include credentials.
-  const expected = `CRUSTCAPER_DB_URL=jdbc:postgresql://postgres:5432/${database}`;
+  const expected = `CRUSTCAPER_DB_URL=${fixtureDatabaseUrl(database)}`;
   const format = `{{range .Config.Env}}{{if eq . "${expected}"}}true{{end}}{{end}}`;
   requireCondition(await docker(signal, ['inspect', '--type', 'container', '--format', format, container.id]) === 'true',
     'database_recovery_api_database');
@@ -167,7 +169,7 @@ function elapsed(startedAt) {
 async function runDatabaseRecovery({ project, caFile, evidence, stopSource, startRecovered, signal, fixtureMfaKey }) {
   const report = {
     recordedAt: new Date().toISOString(), scope: 'local_disposable_cluster_separate_recovery_database',
-    phase: 'preflight', provider: {}, errors: [], passed: false,
+    phase: 'preflight', provider: {}, postgresTls: {}, errors: [], passed: false,
   };
   const active = AbortSignal.any([signal, AbortSignal.timeout(175000)]);
   let fixture;
@@ -187,6 +189,8 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
     postgresContainer = database;
     const peers = { edge, postgres: database, provider, catalog };
     await apiDatabase(active, api, source, '--restart-api');
+    requireCondition(await sql(active, database, source, postgresJdbcTlsQuery) === 't', 'database_recovery_source_tls_unverified');
+    report.postgresTls.sourceApi = true;
     const initial = await databaseSnapshot(active, database, source);
     verifyOrders(initial, 0, 0, 0, 0, 0, 0);
     requireCondition(await sql(active, database, source,
@@ -252,6 +256,8 @@ async function runDatabaseRecovery({ project, caFile, evidence, stopSource, star
       'database_recovery_api_not_replaced');
     await apiDatabase(active, target, recovered, '--recovery-api');
     await waitReady(active, edge, fixture.request);
+    requireCondition(await sql(active, database, recovered, postgresJdbcTlsQuery) === 't', 'database_recovery_restored_tls_unverified');
+    report.postgresTls.restoredApi = true;
     report.recoveredApi = { readyAfterStartMs: elapsed(targetStartedAt), readyAfterRestoreStartedMs: elapsed(restoreStartedAt),
       readyAfterSourceStopStartedMs: elapsed(sourceStopStartedAt) };
     const reconcileStartedAt = performance.now();
