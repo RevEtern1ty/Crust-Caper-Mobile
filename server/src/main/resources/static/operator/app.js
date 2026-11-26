@@ -844,7 +844,11 @@ async function attachReceipt(entry, card, form) {
       throw new ApiError(502, 'invalid_response');
     }
     receiptRefresh?.attachments.set(data.orderId, data);
-    receipts = receipts.map((item) => item.orderId === data.orderId && item.receiptStatus === 'pending' ? data : item);
+    if (receipts.some(({ orderId }) => orderId === data.orderId)) {
+      receipts = receipts.map((item) => item.orderId === data.orderId && item.receiptStatus === 'pending' ? data : item);
+    } else {
+      receipts.push(data);
+    }
     const previous = receiptCards.get(data.orderId)?.card;
     const focused = document.activeElement;
     const focusResult = previous?.isConnected
@@ -1149,10 +1153,18 @@ async function refreshReceipts() {
     const data = await request('/receipts', { token: current.accessToken });
     if (session !== current) return;
     if (!Array.isArray(data) || data.length > 100) throw new ApiError(502, 'invalid_response');
-    receipts = data.map(checkedReceipt).map((entry) => {
+    const next = data.map(checkedReceipt).map((entry) => {
       // A list request already in flight can still return the pre-upload state for an attached receipt.
       return entry.receiptStatus === 'pending' ? refresh.attachments.get(entry.orderId) ?? entry : entry;
     });
+    const returnedIds = new Set(next.map(({ orderId }) => orderId));
+    for (const entry of receipts) {
+      if (returnedIds.has(entry.orderId)) continue;
+      // The bounded list can omit the order. Carry a concurrent confirmation or active form until the next read.
+      const confirmed = refresh.attachments.get(entry.orderId);
+      if (confirmed || receiptUploads.has(entry.orderId)) next.push(confirmed ?? entry);
+    }
+    receipts = next;
     renderReceipts();
   } catch (error) {
     if (session !== current) return;
