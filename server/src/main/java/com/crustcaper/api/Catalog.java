@@ -17,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 @Service
 class Catalog {
+    private static final int MENU_SLOT_LIMIT = 12;
     private static final String SLOT_QUERY = """
         SELECT id, starts_at, ends_at, capacity FROM pickup_slots WHERE store_id = ?
         """;
@@ -29,9 +30,24 @@ class Catalog {
             ) < upcoming.capacity ELSE false END AS available
         FROM (
             SELECT store_id, id, starts_at, ends_at, capacity FROM pickup_slots
-            WHERE store_id = ? AND starts_at > ? ORDER BY starts_at, id LIMIT 12
+            WHERE store_id = ? AND starts_at > ? ORDER BY starts_at, id LIMIT %d
         ) upcoming
         ORDER BY upcoming.starts_at, upcoming.id
+        """.formatted(MENU_SLOT_LIMIT);
+    private static final String NEXT_AVAILABLE_SLOT_QUERY = """
+        SELECT slot.id, slot.starts_at, slot.ends_at, true AS available
+        FROM pickup_slots slot
+        WHERE slot.store_id = :store AND slot.starts_at >= :lastStart
+          AND (slot.starts_at, slot.id) > (:lastStart, :lastId) AND slot.capacity > 0
+          AND (
+              SELECT count(*) FROM (
+                  SELECT 1 FROM orders
+                  WHERE store_id = slot.store_id AND slot_id = slot.id
+                    AND pickup_reservation_occupies_slot(status, reservation_expires_at, :checkedAt)
+                  LIMIT slot.capacity
+              ) occupied
+          ) < slot.capacity
+        ORDER BY slot.starts_at, slot.id LIMIT 1
         """;
     private static final String RESERVED_QUERY = """
         SELECT count(*) FROM orders WHERE store_id = ? AND slot_id = ?
@@ -55,11 +71,25 @@ class Catalog {
         StoreData store = store(storeId, false);
         List<Slot> slots = jdbc.sql(UPCOMING_SLOTS_QUERY)
             .params(store.store().open(), checkedAt, storeId, checkedAt)
-            .query((rs, row) -> new Slot(rs.getString("id"), readTime(rs, "starts_at"), readTime(rs, "ends_at"),
-                rs.getBoolean("available")))
+            .query(Catalog::menuSlotRow)
             .list();
+        if (store.store().open() && slots.size() == MENU_SLOT_LIMIT && slots.stream().noneMatch(Slot::available)) {
+            // Keep the normal window when it contains a choice. Otherwise seek forward in the same snapshot.
+            Slot last = slots.getLast();
+            Slot available = jdbc.sql(NEXT_AVAILABLE_SLOT_QUERY)
+                .param("store", storeId).param("lastStart", dbTime(last.startsAt())).param("lastId", last.id())
+                .param("checkedAt", checkedAt).query(Catalog::menuSlotRow).optional().orElse(null);
+            if (available != null) {
+                slots = new ArrayList<>(slots);
+                slots.set(MENU_SLOT_LIMIT - 1, available);
+            }
+        }
         return new Menu(store.version(), store.updatedAt(), checkedAt.toInstant(),
             store.store(), products(storeId, false), slots);
+    }
+
+    private static Slot menuSlotRow(ResultSet rs, int row) throws SQLException {
+        return new Slot(rs.getString("id"), readTime(rs, "starts_at"), readTime(rs, "ends_at"), rs.getBoolean("available"));
     }
 
     StoreData store(String id, boolean lock) {
