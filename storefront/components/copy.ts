@@ -2,7 +2,7 @@ import type { Locale } from '../lib/catalog';
 
 const labels = {
   en: {
-    menu: 'Menu', orders: 'Orders', cart: 'Cart', language: 'Language', main: 'Skip to content',
+    menu: 'Menu', orders: 'Orders', cart: 'Cart', customerNav: 'Order and cart', language: 'Language', main: 'Skip to content',
     store: 'Pickup location', directions: 'Directions', contact: 'Contact the restaurant',
     nearest: 'Next available pickup', closed: 'The restaurant is closed',
     noTimes: 'Pickup times are unavailable',
@@ -19,7 +19,7 @@ const labels = {
     categories: { burgers: 'Burgers', combos: 'Combos', sides: 'Sides', drinks: 'Drinks' },
   },
   rw: {
-    menu: 'Ifunguro', orders: 'Komande', cart: 'Agatebo', language: 'Ururimi',
+    menu: 'Ifunguro', orders: 'Komande', cart: 'Agatebo', customerNav: 'Komande n’agatebo', language: 'Ururimi',
     main: 'Jya ku bikubiye ku rupapuro',
     store: 'Aho ufatira komande', directions: 'Inzira', contact: 'Vugana na resitora',
     nearest: 'Igihe cya hafi cyo gufata komande',

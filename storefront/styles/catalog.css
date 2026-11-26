@@ -105,8 +105,7 @@ h3 { font-size: 1.3rem; line-height: 1.28; }
   .product-photo { aspect-ratio: 16 / 10; }
 }
 @media (max-width: 30rem) {
-  .language { order: 1; }
-  .site-nav { order: 2; flex: 0 0 100%; justify-content: flex-end; border-top: 1px solid #624960; padding-block-start: .3rem; }
+  .site-nav { flex: 0 0 100%; justify-content: flex-end; border-top: 1px solid #624960; padding-block-start: .3rem; }
   .hero-copy { padding-block: 1.6rem; }
   .cards { grid-template-columns: minmax(0, 1fr); }
 }

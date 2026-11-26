@@ -47,17 +47,17 @@ function Layout({ locale, sku, children }: PropsWithChildren<{ locale: Locale; s
             <img src={brandMark} alt="" width={36} height={36} />
             <span>CrustCaper</span>
           </a>
-          <nav className="site-nav">
-            <a href={'/orders?storefrontLocale=' + locale}>{t.orders}</a>
-            <a className="cart-link" href={'/cart?storefrontLocale=' + locale}>{t.cart}</a>
-          </nav>
           <nav className="language" aria-label={t.language}>
             <a aria-label="English" lang="en" href={menuPath('en', sku)} aria-current={locale === 'en' ? 'page' : undefined}>EN</a>
             <a aria-label="Kinyarwanda" lang="rw" href={menuPath('rw', sku)} aria-current={locale === 'rw' ? 'page' : undefined}>RW</a>
           </nav>
+          <nav className="site-nav" aria-label={t.customerNav}>
+            <a href={'/orders?storefrontLocale=' + locale}>{t.orders}</a>
+            <a className="cart-link" href={'/cart?storefrontLocale=' + locale}>{t.cart}</a>
+          </nav>
         </div>
       </header>
-      <main id="main" className="wrap content">{children}</main>
+      <main id="main" className="wrap content" tabIndex={-1}>{children}</main>
     </>
   );
 }
