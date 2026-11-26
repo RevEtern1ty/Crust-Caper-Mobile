@@ -173,9 +173,9 @@ async function prepareFixture(directory, testClasses, { load, paymentRestart }) 
   return { apiEnvironment, composeEnvironment, unusedDatabaseCa, overlay, fixtureMfaKey };
 }
 
-async function importCatalog(compose, { load, catalogPhotos }) {
+async function importCatalog(compose, { load, catalogPhotos, availability }) {
   const catalog = JSON.parse(await readFile(join(root, 'server', 'tooling', 'catalog.example.json'), 'utf8'));
-  catalog.store.open = true;
+  catalog.store.open = !availability;
   for (const product of catalog.products) product.available = true;
   if (catalogPhotos) {
     const product = catalog.products.find(({ sku }) => sku === fixturePhoto.sku);
@@ -209,12 +209,14 @@ async function main() {
   const load = mode === '--load' || mode === '--load-smoke';
   const webPerf = mode === '--web-perf';
   const catalogPhotos = mode === '--catalog-photos';
+  const availability = mode === '--availability';
   const kitchenRestart = mode === '--kitchen-restart';
   const paymentRestart = mode === '--payment-restart' || kitchenRestart;
-  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart)) {
-    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart]');
+  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart && !availability)) {
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart | --availability]');
   }
-  const script = paymentRestart ? 'tooling/storefront-payment-restart.cjs' : load ? 'tooling/storefront-load.cjs' : null;
+  const script = availability ? 'tooling/storefront-availability-rehearsal.cjs'
+    : paymentRestart ? 'tooling/storefront-payment-restart.cjs' : load ? 'tooling/storefront-load.cjs' : null;
   const scenarios = script
     ? [script, ...(mode === '--load-smoke' ? ['--smoke'] : [])]
     : ['--test', 'tests/storefront-https.test.cjs'];
@@ -270,14 +272,17 @@ async function main() {
       { cleanup: true, timeout: 45000 });
     await compose('Start the storefront HTTPS fixture', ['up', '-d', '--wait', '--wait-timeout', '90'],
       { timeout: 120000 });
-    await importCatalog(compose, { load, catalogPhotos });
+    await importCatalog(compose, { load, catalogPhotos, availability });
     await compose('Copy the storefront fixture TLS root', [
       'cp', 'edge:/data/caddy/pki/authorities/local/root.crt', dockerPath(browserCa),
     ]);
     if (evidence) await mkdir(evidence, { recursive: true });
+    const childEnv = availability ? Object.fromEntries(Object.entries(hostEnv).filter(([name]) =>
+      !/^(?:NODE_OPTIONS|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|NODE_USE_ENV_PROXY|(?:HTTP|HTTPS|ALL|NO)_PROXY)$/i.test(name)))
+      : hostEnv;
     await run('Verify the storefront against isolated HTTPS', process.execPath, scenarios, {
       env: {
-        ...hostEnv,
+        ...childEnv,
         CRUSTCAPER_HTTPS_TEST_CA: browserCa,
         CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT: project,
         ...(evidence && { CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: evidence }),
@@ -286,6 +291,7 @@ async function main() {
         ...(catalogPhotos && { CRUSTCAPER_HTTPS_TEST_CATALOG_PHOTOS: '1' }),
         ...(paymentRestart && { CRUSTCAPER_HTTPS_TEST_PAYMENT_RESTART: '1' }),
         ...(kitchenRestart && { CRUSTCAPER_HTTPS_TEST_KITCHEN_RESTART: '1' }),
+        ...(availability && { CRUSTCAPER_HTTPS_TEST_AVAILABILITY: '1', NODE_EXTRA_CA_CERTS: browserCa }),
       },
       timeout: { '--load': 300000, '--payment-restart': 160000, '--kitchen-restart': 190000 }[mode] ?? 180000,
     });
