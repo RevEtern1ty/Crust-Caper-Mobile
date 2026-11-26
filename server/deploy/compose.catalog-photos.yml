@@ -1,0 +1,11 @@
+services:
+  edge:
+    environment:
+      CRUSTCAPER_CATALOG_PHOTOS_ENABLED: "1"
+    volumes:
+      - type: bind
+        source: ${CRUSTCAPER_CATALOG_PHOTOS_DIR:?Set the absolute path to the approved catalog photos directory}
+        target: /srv/crustcaper-catalog-photos
+        read_only: true
+        bind:
+          create_host_path: false

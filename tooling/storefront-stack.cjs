@@ -1,7 +1,7 @@
 const { Buffer } = require('node:buffer');
 const { spawn } = require('node:child_process');
 const { randomBytes, randomUUID } = require('node:crypto');
-const { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } = require('node:fs/promises');
+const { access, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const { basename, dirname, join, resolve } = require('node:path');
 
@@ -11,6 +11,7 @@ const fixtureHost = 'crustcaper.test';
 const database = 'storefront_fixture';
 const testMain = 'com.crustcaper.api.payment.WebCheckoutFixture';
 const scratchPrefix = 'cc-storefront-';
+const fixturePhoto = { sku: 'double-smash', file: 'double-smash-r39.jpg' };
 const postgresImage = 'postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193';
 
 let active;
@@ -145,10 +146,15 @@ async function prepareFixture(directory, testClasses, load) {
   return { apiEnvironment, composeEnvironment, unusedDatabaseCa, overlay, fixtureMfaKey };
 }
 
-async function importCatalog(compose, load) {
+async function importCatalog(compose, { load, catalogPhotos }) {
   const catalog = JSON.parse(await readFile(join(root, 'server', 'tooling', 'catalog.example.json'), 'utf8'));
   catalog.store.open = true;
   for (const product of catalog.products) product.available = true;
+  if (catalogPhotos) {
+    const product = catalog.products.find(({ sku }) => sku === fixturePhoto.sku);
+    if (!product) throw new Error('Could not locate the product for the catalog photo fixture');
+    product.photoUrl = `https://${fixtureHost}/catalog-photos/${fixturePhoto.file}`;
+  }
   const pickupStarts = Date.now() + 3600000;
   const windows = load
     ? [
@@ -175,8 +181,9 @@ async function main() {
   const [mode] = modes;
   const load = mode === '--load' || mode === '--load-smoke';
   const webPerf = mode === '--web-perf';
-  if (modes.length > 1 || (mode !== undefined && !load && !webPerf)) {
-    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf]');
+  const catalogPhotos = mode === '--catalog-photos';
+  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos)) {
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos]');
   }
   const scenarios = load
     ? ['tooling/storefront-load.cjs', ...(mode === '--load-smoke' ? ['--smoke'] : [])]
@@ -200,6 +207,12 @@ async function main() {
   const browserCa = join(directory, 'browser-ca.crt');
   let stop;
   try {
+    const photos = join(directory, 'catalog-photos');
+    if (catalogPhotos) {
+      await mkdir(photos);
+      await copyFile(join(root, 'assets', 'menu', `${fixturePhoto.sku}.jpg`), join(photos, fixturePhoto.file));
+      await writeFile(join(photos, 'double-smash-r39.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
+    }
     const settings = await prepareFixture(directory, testClasses, load);
     const env = {
       ...hostEnv,
@@ -212,9 +225,12 @@ async function main() {
       CRUSTCAPER_STOREFRONT_DIR: dockerPath(web),
       CRUSTCAPER_STORE_ID: 'kigali',
       CRUSTCAPER_STOREFRONT_PROFILE: 'stage',
+      ...(catalogPhotos && { CRUSTCAPER_CATALOG_PHOTOS_DIR: dockerPath(photos) }),
     };
     const command = ['compose', '--project-name', project, '--env-file', dockerPath(settings.composeEnvironment)];
-    for (const file of ['compose.yml', 'compose.https.yml', 'compose.storefront.yml', 'compose.catalog.yml']) {
+    const files = ['compose.yml', 'compose.https.yml', 'compose.storefront.yml', 'compose.catalog.yml'];
+    if (catalogPhotos) files.push('compose.catalog-photos.yml');
+    for (const file of files) {
       command.push('-f', dockerPath(join(deploy, file)));
     }
     command.push('-f', dockerPath(settings.overlay));
@@ -224,7 +240,7 @@ async function main() {
       { cleanup: true, timeout: 45000 });
     await compose('Start the storefront HTTPS fixture', ['up', '-d', '--wait', '--wait-timeout', '90'],
       { timeout: 120000 });
-    await importCatalog(compose, load);
+    await importCatalog(compose, { load, catalogPhotos });
     await compose('Copy the storefront fixture TLS root', [
       'cp', 'edge:/data/caddy/pki/authorities/local/root.crt', dockerPath(browserCa),
     ]);
@@ -237,6 +253,7 @@ async function main() {
         ...(evidence && { CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: evidence }),
         ...(load && { CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY: settings.fixtureMfaKey }),
         ...(webPerf && { CRUSTCAPER_HTTPS_TEST_WEB_PERF: '1' }),
+        ...(catalogPhotos && { CRUSTCAPER_HTTPS_TEST_CATALOG_PHOTOS: '1' }),
       },
       timeout: mode === '--load' ? 300000 : 180000,
     });

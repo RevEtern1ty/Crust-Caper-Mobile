@@ -51,6 +51,11 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 		not path *.map
 		expression "{$CRUSTCAPER_CATALOG_ENABLED:0}" == "1"
 	}
+	@catalogPhotos {
+		method GET HEAD
+		path_regexp ^/catalog-photos/[a-z0-9][a-z0-9._-]{0,119}\.(?:avif|jpe?g|png|webp)$
+		expression "{$CRUSTCAPER_CATALOG_PHOTOS_ENABLED:0}" == "1"
+	}
 	@storefrontPages {
 		method GET HEAD
 		path / /cart /checkout /orders /pickup /payment /web-payment-return /settings /order-recovery /product/*
@@ -116,6 +121,16 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 					dial_timeout 2s
 					response_header_timeout 7s
 				}
+			}
+		}
+		handle @catalogPhotos {
+			route {
+				root * /srv/crustcaper-catalog-photos
+				uri strip_prefix /catalog-photos
+				@publishedPhoto file
+				header @publishedPhoto Cache-Control "public, max-age=3600"
+				file_server @publishedPhoto
+				respond 404
 			}
 		}
 		handle @storefrontPages {
