@@ -1,0 +1,1 @@
+org.springframework.boot.EnvironmentPostProcessor=com.crustcaper.api.config.PostgresTlsDeployment
