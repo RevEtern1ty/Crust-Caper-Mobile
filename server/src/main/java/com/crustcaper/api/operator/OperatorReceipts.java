@@ -38,8 +38,12 @@ final class OperatorReceipts {
     List<ReceiptOrder> pendingAndRecent(String authorization) {
         Principal actor = manager(authorization, false);
         return jdbc.sql(ORDER_FIELDS + """
+            LEFT JOIN operator_order_events handoff ON handoff.order_id = o.id AND handoff.store_id = o.store_id
+                AND handoff.previous_status = 'ready' AND handoff.requested_status = 'collected' AND handoff.outcome = 'changed'
+                AND o.status = 'collected' AND o.receipt_status = 'pending'
             WHERE o.store_id = ? AND o.payment_status = 'paid'
-            ORDER BY CASE WHEN o.receipt_status = 'pending' THEN 0 ELSE 1 END, o.created_at DESC, o.id
+            ORDER BY CASE WHEN handoff.occurred_at IS NOT NULL THEN 0 WHEN o.receipt_status = 'pending' THEN 1 ELSE 2 END,
+                handoff.occurred_at ASC NULLS LAST, o.created_at DESC, o.id
             LIMIT 100
             """).param(actor.storeId()).query(OperatorReceipts::view).list();
     }

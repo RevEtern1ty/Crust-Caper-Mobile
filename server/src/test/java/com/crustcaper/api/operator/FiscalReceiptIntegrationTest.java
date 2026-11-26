@@ -68,6 +68,7 @@ class FiscalReceiptIntegrationTest {
     void removeOnlyFixtures() {
         for (String fixture : stores) {
             jdbc.sql("DELETE FROM fiscal_receipts WHERE store_id = ?").param(fixture).update();
+            jdbc.sql("DELETE FROM operator_order_events WHERE store_id = ?").param(fixture).update();
             jdbc.sql("DELETE FROM operator_sessions WHERE operator_id IN (SELECT id FROM operator_accounts WHERE store_id = ?)")
                 .param(fixture).update();
             jdbc.sql("DELETE FROM operator_accounts WHERE store_id = ?").param(fixture).update();
@@ -129,6 +130,35 @@ class FiscalReceiptIntegrationTest {
         api.perform(get(path)).andExpect(status().isUnauthorized());
         api.perform(get(path).header(HttpHeaders.AUTHORIZATION, unrelated.bearer())).andExpect(status().isNotFound());
         api.perform(get(path).header(HttpHeaders.AUTHORIZATION, manager.bearer())).andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void handoffWithoutReceiptStaysAheadOfNewPendingOrdersAtTheQueueLimit() throws Exception {
+        Manager manager = staff(store, "manager");
+        Order laterHandoff = order(store, true);
+        Order earlierHandoff = order(store, true);
+        Order pending = order(store, true);
+        Order issued = order(store, true);
+        collect(manager, earlierHandoff);
+        collect(manager, laterHandoff);
+        jdbc.sql("""
+            UPDATE operator_order_events SET occurred_at = occurred_at - interval '2 hours'
+            WHERE order_id = ? AND store_id = ? AND requested_status = 'collected' AND outcome = 'changed'
+            """).params(earlierHandoff.id(), store).update();
+        upload(manager.bearer(), issued.id(), "EBM-ISSUED", "9200", PDF).andExpect(status().isOk());
+
+        api.perform(get(OPERATOR + "/receipts").header(HttpHeaders.AUTHORIZATION, manager.bearer()))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$[*].orderId").value(List.of(earlierHandoff.id().toString(),
+                laterHandoff.id().toString(), pending.id().toString(), issued.id().toString())));
+
+        jdbc.sql("UPDATE pickup_slots SET capacity = 104 WHERE store_id = ? AND id = 'receipt'").param(store).update();
+        for (int i = 0; i < 100; i++) order(store, true);
+        api.perform(get(OPERATOR + "/receipts").header(HttpHeaders.AUTHORIZATION, manager.bearer()))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(100))
+            .andExpect(jsonPath("$[0].orderId").value(earlierHandoff.id().toString()))
+            .andExpect(jsonPath("$[1].orderId").value(laterHandoff.id().toString()))
+            .andExpect(jsonPath("$[99].receiptStatus").value("pending"));
     }
 
     @Test
@@ -291,6 +321,17 @@ class FiscalReceiptIntegrationTest {
     private ResultActions upload(String bearer, UUID order, String reference, String total, byte[] pdf) throws Exception {
         return api.perform(put(operatorPath(order)).header(HttpHeaders.AUTHORIZATION, bearer)
             .header(REF, reference).header(TOTAL, total).contentType(MediaType.APPLICATION_PDF).content(pdf));
+    }
+
+    private void collect(Manager manager, Order order) throws Exception {
+        String pickupCode = jdbc.sql("SELECT pickup_code FROM orders WHERE id = ?")
+            .param(order.id()).query(String.class).single();
+        for (String status : List.of("preparing", "ready", "collected")) {
+            api.perform(post(OPERATOR + "/orders/" + order.id() + "/status").header(HttpHeaders.AUTHORIZATION, manager.bearer())
+                .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(
+                    new OperatorModels.StatusInput(status, status.equals("collected") ? pickupCode : null))))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.status").value(status));
+        }
     }
 
     private static String operatorPath(UUID order) { return OPERATOR + "/orders/" + order + "/receipt"; }
