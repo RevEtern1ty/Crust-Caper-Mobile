@@ -566,15 +566,15 @@ function checkedOrder(order, completed = false) {
 
 function appendLineComposition(details, line) {
   const fields = [
-    ['Ingredients', line.ingredients],
-    ['Allergens', line.allergens],
+    ['Base recipe ingredients', line.ingredients],
+    ['Base recipe allergens', line.allergens],
   ].filter(([, values]) => values?.length);
   if (!fields.length) return;
 
   const disclosure = document.createElement('details');
   disclosure.className = 'line-composition';
   const summary = document.createElement('summary');
-  summary.textContent = fields.length === 2 ? 'Ingredients and allergens' : fields[0][0];
+  summary.textContent = fields.length === 2 ? 'Base recipe ingredients and allergens' : fields[0][0];
   disclosure.append(summary);
   for (const [title, values] of fields) {
     const group = document.createElement('div');
