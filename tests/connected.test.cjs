@@ -1527,6 +1527,10 @@ test('manager can reconcile a Kigali date and download its CSV without leaking s
     if (path.endsWith('/sessions/current')) return route.fulfill({ status: 204, body: '' });
     if (path.endsWith('/orders')) return route.fulfill({ json: { orders: [], serverTime: '2026-06-15T22:30:00Z' } });
     if (path.endsWith('/receipts')) return route.fulfill({ json: [] });
+    if (path.endsWith('/operations/signals')) return route.fulfill({ json: {
+      observedAt: '2026-06-15T22:30:00Z', paymentWithoutKitchen: 0, fiscalReceiptsOverdue: 0,
+      fiscalReceiptOverdueAfterMinutes: 30,
+    } });
     if (path.endsWith('/availability')) return route.fulfill({ json: { version: 'reconciliation-fixture', open: true, products: [] } });
     if (path.endsWith('/payment-attempts/pending')) return route.fulfill({ json: { attempts: [], hasMore: false } });
     if (path.endsWith('/payment-exceptions')) return route.fulfill({ json: { exceptions: [], nextCursor: null } });
