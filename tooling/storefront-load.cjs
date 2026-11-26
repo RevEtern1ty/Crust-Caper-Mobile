@@ -74,11 +74,23 @@ function errorCode(error, fallback) {
 }
 
 function transport(ca, agent, signal, metrics) {
-  return async (path, { method = 'GET', body, headers = {}, route = 'api', metric } = {}) => {
+  return async (path, { method = 'GET', body, headers = {}, route = 'api', metric, binary = false } = {}) => {
     const host = target(path, route);
     const outgoing = Object.fromEntries(Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]));
     outgoing.host = host;
-    const payload = body === undefined ? undefined
+    const pdfUpload = Buffer.isBuffer(body);
+    if (pdfUpload) {
+      requireCondition(route === 'api' && method === 'PUT' && outgoing['content-type'] === 'application/pdf'
+        && body.length > 0 && body.length <= responseLimit
+        && /^\/api\/v1\/operator\/orders\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/receipt$/.test(path),
+      'invalid_binary_request');
+    }
+    if (binary) {
+      requireCondition(route === 'api' && method === 'GET' && body === undefined
+        && /^\/api\/v1\/web\/orders\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/receipt$/.test(path),
+      'invalid_binary_response');
+    }
+    const payload = pdfUpload ? body : body === undefined ? undefined
       : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
     if (payload) {
       outgoing['content-type'] ??= typeof body === 'string'
@@ -117,7 +129,8 @@ function transport(ca, agent, signal, metrics) {
                 return;
               }
             }
-            resolve({ status: incoming.statusCode, headers: incoming.headers, data });
+            resolve({ status: incoming.statusCode, headers: incoming.headers, data,
+              ...(binary && { body: Buffer.concat(chunks, bytes) }) });
           });
         });
         call.on('error', reject);

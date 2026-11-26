@@ -17,10 +17,7 @@ function ensure(condition, code) {
   if (!condition) throw Object.assign(new Error(code), { code });
 }
 
-async function prepareOrder(request, menu, slotId) {
-  const product = menu.products.find(item => item.available && Number.isSafeInteger(item.price) && item.price > 0);
-  ensure(menu.store?.open && product && menu.slots.some(slot => slot.id === slotId && slot.available), 'checkout_catalog');
-
+async function openFixtureWebGuest(request) {
   const session = await request(web + '/session', { method: 'POST', headers: originHeaders });
   const issued = session.headers?.['set-cookie'];
   const parts = Array.isArray(issued) && issued.length === 1 && typeof issued[0] === 'string'
@@ -32,7 +29,14 @@ async function prepareOrder(request, menu, slotId) {
     && guestCookie.test(cookie) && cookiePolicy.every(value => attributesLower.includes(value))
     && !attributesLower.some(value => value.startsWith('domain=')), 'checkout_session');
 
-  const headers = { ...originHeaders, Cookie: cookie, 'X-CrustCaper-Session': session.data.sessionId };
+  return { ...originHeaders, Cookie: cookie, 'X-CrustCaper-Session': session.data.sessionId };
+}
+
+async function prepareOrder(request, menu, slotId, guest) {
+  const product = menu.products.find(item => item.available && Number.isSafeInteger(item.price) && item.price > 0);
+  ensure(menu.store?.open && product && menu.slots.some(slot => slot.id === slotId && slot.available), 'checkout_catalog');
+
+  const headers = guest ?? await openFixtureWebGuest(request);
   const storeId = menu.store.id;
   const quoteResponse = await request(web + '/quotes', {
     method: 'POST', headers, body: { storeId, slotId, lines: [{
@@ -50,6 +54,7 @@ async function prepareOrder(request, menu, slotId) {
     headers,
     quote,
     place: metric => request(web + '/orders', { method: 'POST', headers: orderHeaders, body, metric }),
+    recover: () => request(web + '/orders/recovery', { headers: orderHeaders }),
   };
 }
 
@@ -65,9 +70,9 @@ function placedOrder(response, quote) {
   return order;
 }
 
-async function readPaidOrder(request, orderPath, headers, orderId, quote, attemptId) {
+async function readPaidOrder(request, orderPath, headers, orderId, quote, attemptId, { paymentWaitMs, signal }) {
   // The reconciler can claim a verification just before the hosted payment settles.
-  const deadline = performance.now() + 20_000;
+  const deadline = performance.now() + paymentWaitMs;
   do {
     const { status, data } = await request(orderPath, { headers });
     ensure(status === 200 && data?.id === orderId && matchesQuote(data, quote)
@@ -75,19 +80,20 @@ async function readPaidOrder(request, orderPath, headers, orderId, quote, attemp
     if (data.paymentStatus === 'paid') {
       ensure(data.status === 'accepted' && data.paymentAttempt.status === 'paid'
         && /^\d{6}$/.test(data.pickupCode), 'checkout_paid_state');
-      return;
+      return data;
     }
     ensure(data.status === 'awaiting_payment' && data.paymentStatus === 'processing'
       && data.paymentAttempt.status === 'processing', 'checkout_payment_state');
-    await delay(1000);
+    await delay(1000, undefined, { signal });
   } while (performance.now() < deadline);
   ensure(false, 'checkout_payment_timeout');
 }
 
-async function beginCheckout({ request, menu, slotId }) {
-  const { quote, headers, place } = await prepareOrder(request, menu, slotId);
+async function prepareHostedCheckout({ request, menu, slotId, guest, signal, paymentWaitMs = 20_000 }) {
+  const { quote, headers, place, recover } = await prepareOrder(request, menu, slotId, guest);
   const [first, replay] = await Promise.all([place('order_create'), place('order_replay')]);
-  const { id: orderId } = placedOrder(first, quote);
+  const placed = placedOrder(first, quote);
+  const { id: orderId } = placed;
   ensure(placedOrder(replay, quote).id === orderId, 'checkout_order_replay');
 
   const orderPath = web + '/orders/' + orderId;
@@ -101,15 +107,28 @@ async function beginCheckout({ request, menu, slotId }) {
   const hostedPath = '/v3/hosted/pay/' + attemptId;
   const links = results.map(({ data }) => data.checkoutUrl).filter(link => link != null);
   ensure(links.length > 0 && links.every(link => link === hostedOrigin + hostedPath), 'checkout_hosted_link');
-  const paid = await request(hostedPath, {
-    method: 'POST', route: 'hosted', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'result=pay',
-  });
-  const returnUrl = storefront + '/web-payment-return?orderId=' + orderId + '&status=successful&transaction_id=1';
-  ensure(paid.status === 303 && paid.headers?.location === returnUrl, 'checkout_hosted_return');
   return {
     order: { orderId, quoteId: quote.quoteId, attemptId, total: quote.total, slotId },
-    waitForPaid: () => readPaidOrder(request, orderPath, headers, orderId, quote, attemptId),
+    placed,
+    guest: headers,
+    readOrder: () => request(orderPath, { headers }),
+    recoverOrder: recover,
+    repeatPayment: startPayment,
+    async settleHosted() {
+      const paid = await request(hostedPath, {
+        method: 'POST', route: 'hosted', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'result=pay',
+      });
+      const returnUrl = storefront + '/web-payment-return?orderId=' + orderId + '&status=successful&transaction_id=1';
+      ensure(paid.status === 303 && paid.headers?.location === returnUrl, 'checkout_hosted_return');
+    },
+    waitForPaid: () => readPaidOrder(request, orderPath, headers, orderId, quote, attemptId, { paymentWaitMs, signal }),
   };
+}
+
+async function beginCheckout(options) {
+  const { order, settleHosted, waitForPaid } = await prepareHostedCheckout(options);
+  await settleHosted();
+  return { order, waitForPaid };
 }
 
 async function runCheckout({ request, index, menu }) {
@@ -184,4 +203,4 @@ async function runCapacityWave({ request, menu, project }) {
   return { offered: contenders, accepted: accepted.length, rejected: contenders - accepted.length };
 }
 
-module.exports = { beginCheckout, runCheckout, verifyPersisted, runCapacityWave };
+module.exports = { beginCheckout, prepareHostedCheckout, runCheckout, verifyPersisted, runCapacityWave };

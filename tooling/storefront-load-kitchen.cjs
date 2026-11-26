@@ -18,13 +18,13 @@ function fixturePostgres(project) {
   return container;
 }
 
-function provisionKitchenCredentials(project) {
-  const encodedKey = process.env.CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY ?? '';
+function provisionStaffCredentials(project, role, encodedKey = process.env.CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY ?? '') {
+  assert.ok(role === 'kitchen' || role === 'manager', 'Expected a synthetic kitchen or manager role');
   const key = Buffer.from(encodedKey, 'base64');
   assert.ok(key.length === 32 && key.toString('base64') === encodedKey, 'Missing isolated fixture MFA key');
   const container = fixturePostgres(project);
   const accountId = randomUUID();
-  const username = 'load-kitchen-' + accountId.slice(0, 8);
+  const username = 'load-' + role + '-' + accountId.slice(0, 8);
   const password = randomBytes(24).toString('base64url');
   const salt = randomBytes(16);
   const passwordHash = ['', 'pbkdf2-sha256', '600000', salt.toString('base64url'),
@@ -37,7 +37,7 @@ function provisionKitchenCredentials(project) {
         '-d', database, '-v', 'operator_database=' + database, '-f', '/fixture/operator-accounts.psql'],
       { input, timeout: 10000, stdio: ['pipe', 'ignore', 'ignore'] });
     } catch {
-      throw new Error('Could not provision the synthetic kitchen account');
+      throw new Error('Could not provision the synthetic operator account');
     }
   }
   const secret = randomBytes(20);
@@ -50,7 +50,7 @@ function provisionKitchenCredentials(project) {
   const encryptedSecret = Buffer.concat([
     version, nonce, cipher.update(secret), cipher.final(), cipher.getAuthTag(),
   ]).toString('base64');
-  apply({ operation: 'create', role: 'kitchen', passwordHash });
+  apply({ operation: 'create', role, passwordHash });
   apply({ operation: 'enroll-mfa', encryptedSecret });
 
   const counter = Buffer.alloc(8);
@@ -61,24 +61,38 @@ function provisionKitchenCredentials(project) {
   return { username, password, authenticatorCode };
 }
 
-async function openKitchenSession({ request, project }) {
-  const signedIn = await request('/api/v1/operator/sessions', { method: 'POST', body: provisionKitchenCredentials(project) });
-  assert.equal(signedIn.status, 201, 'Could not authenticate the synthetic kitchen');
-  assert.ok(signedIn.data?.storeId === 'kigali' && signedIn.data.role === 'kitchen'
-    && typeof signedIn.data.accessToken === 'string', 'Unexpected kitchen session metadata');
+function provisionKitchenCredentials(project) {
+  return provisionStaffCredentials(project, 'kitchen');
+}
 
-  const headers = { Authorization: 'Bearer ' + signedIn.data.accessToken };
+async function openStaffSession({ request, project, role, fixtureMfaKey }) {
+  const signedIn = await request('/api/v1/operator/sessions', { method: 'POST',
+    body: provisionStaffCredentials(project, role, fixtureMfaKey) });
+  assert.equal(signedIn.status, 201, 'Could not authenticate the synthetic operator');
+  assert.ok(signedIn.data?.storeId === 'kigali' && signedIn.data.role === role
+    && typeof signedIn.data.accessToken === 'string', 'Unexpected operator session metadata');
+
+  function requestAsStaff(path, options = {}) {
+    assert.ok(path.startsWith('/api/v1/operator/'), 'Expected a fixture operator route');
+    return request(path, { ...options, route: 'api',
+      headers: { ...options.headers, Authorization: 'Bearer ' + signedIn.data.accessToken } });
+  }
   return {
+    request: requestAsStaff,
     async readQueue() {
-      const response = await request('/api/v1/operator/orders', { headers });
+      const response = await requestAsStaff('/api/v1/operator/orders');
       if (response.status !== 200 || !Array.isArray(response.data?.orders)) throw new Error('Kitchen queue unavailable');
       return response.data.orders;
     },
     async close() {
-      const response = await request('/api/v1/operator/sessions/current', { method: 'DELETE', headers });
-      assert.equal(response.status, 204, 'Could not revoke the synthetic kitchen session');
+      const response = await requestAsStaff('/api/v1/operator/sessions/current', { method: 'DELETE' });
+      assert.equal(response.status, 204, 'Could not revoke the synthetic operator session');
     },
   };
+}
+
+function openKitchenSession(options) {
+  return openStaffSession({ ...options, role: 'kitchen' });
 }
 
 async function openKitchenMonitor(options) {
@@ -132,4 +146,4 @@ async function openKitchenMonitor(options) {
   };
 }
 
-module.exports = { openKitchenSession, openKitchenMonitor, provisionKitchenCredentials };
+module.exports = { openKitchenSession, openKitchenMonitor, openStaffSession, provisionKitchenCredentials };
