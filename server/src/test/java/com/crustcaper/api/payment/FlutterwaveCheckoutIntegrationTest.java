@@ -2,6 +2,9 @@ package com.crustcaper.api.payment;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.nullValue;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -16,7 +19,9 @@ import com.crustcaper.api.operator.OperatorMfaFixture;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
+import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -26,6 +31,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -72,6 +78,7 @@ class FlutterwaveCheckoutIntegrationTest {
     private static final String KEY = "Idempotency-Key";
     private static final String FIXTURE_KEY = "checkout-wire-fixture";
     private static final String WEBHOOK_SECRET = "webhook-wire-fixture-only";
+    private static final String RETRY_LINK = "https://checkout.flutterwave.com/v3/hosted/pay/retry-fixture";
     private static final ObjectMapper WIRE_JSON = JsonMapper.builder().build();
 
     private static final AtomicReference<JsonNode> OPEN_BODY = new AtomicReference<>();
@@ -79,6 +86,8 @@ class FlutterwaveCheckoutIntegrationTest {
     private static final AtomicInteger VERIFICATIONS = new AtomicInteger();
     private static final AtomicLong CHARGED = new AtomicLong();
     private static final AtomicLong TRANSACTION = new AtomicLong();
+    private static final AtomicBoolean TIMEOUT_NEXT_OPEN = new AtomicBoolean();
+    private static final AtomicBoolean RETURN_HOSTED_LINK = new AtomicBoolean();
     private static HttpServer provider;
 
     private final String store = STORE_PREFIX + UUID.randomUUID();
@@ -103,13 +112,31 @@ class FlutterwaveCheckoutIntegrationTest {
                 }
                 OPEN_BODY.set(WIRE_JSON.readTree(exchange.getRequestBody()));
                 OPENS.incrementAndGet();
-                // The provider has accepted the request but the hosted-link response never reaches the API.
+                if (RETURN_HOSTED_LINK.get()) {
+                    byte[] body = WIRE_JSON.writeValueAsBytes(WIRE_JSON.createObjectNode().put("status", "success").set(
+                        "data", WIRE_JSON.createObjectNode().put("link", RETRY_LINK)));
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, body.length);
+                    exchange.getResponseBody().write(body);
+                }
             }
         });
         provider.createContext("/v3/transactions/", FlutterwaveCheckoutIntegrationTest::verify);
         provider.start();
         return new FlutterwavePaymentGateway(URI.create("http://127.0.0.1:" + provider.getAddress().getPort()),
-            URI.create("https://localhost/payment-return"), FIXTURE_KEY, WIRE_JSON, Clock.systemUTC(), 1000, 1000);
+            URI.create("https://localhost/payment-return"), null, FIXTURE_KEY, "card, mobilemoneyrwanda", WIRE_JSON,
+            Clock.systemUTC(), 1000, 1000, uri -> {
+                if ("/v3/payments".equals(uri.getPath()) && TIMEOUT_NEXT_OPEN.getAndSet(false)) {
+                    var connection = mock(HttpURLConnection.class);
+                    doThrow(new SocketTimeoutException()).when(connection).connect();
+                    when(connection.getOutputStream()).thenAnswer(invocation -> {
+                        connection.connect();
+                        throw new AssertionError("Connection should have timed out");
+                    });
+                    return connection;
+                }
+                return (HttpURLConnection) uri.toURL().openConnection();
+            });
     }
 
     static FlutterwaveWebhookSignature fixtureSignature() {
@@ -123,6 +150,8 @@ class FlutterwaveCheckoutIntegrationTest {
         VERIFICATIONS.set(0);
         CHARGED.set(TOTAL - 1);
         TRANSACTION.set(ThreadLocalRandom.current().nextLong(1_000_000_000_000_000L, Long.MAX_VALUE));
+        TIMEOUT_NEXT_OPEN.set(false);
+        RETURN_HOSTED_LINK.set(false);
     }
 
     @AfterEach
@@ -179,20 +208,9 @@ class FlutterwaveCheckoutIntegrationTest {
     @Test
     void lostCheckoutLinkReplaysTheSameAttemptAndOnlyVerifiedFullPaymentReachesKitchen() throws Exception {
         String kitchen = seedStoreAndKitchen();
-        JsonNode session = json.readTree(api.perform(post(API + "/guest-sessions")).andExpect(status().isOk())
-            .andReturn().getResponse().getContentAsByteArray());
-        guestSession = UUID.fromString(session.path("sessionId").asString());
-        String guest = session.path("accessToken").asString();
-        var quoteInput = new QuoteInput(store, SLOT, List.of(new CartLine(SKU, List.of(), 1, TOTAL)));
-        String quote = json.readTree(api.perform(post(API + "/quotes").header(HttpHeaders.AUTHORIZATION, "Bearer " + guest)
-            .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(quoteInput)))
-            .andExpect(status().isOk()).andExpect(jsonPath("$.total").value(TOTAL))
-            .andReturn().getResponse().getContentAsByteArray()).path("quoteId").asString();
-        String order = json.readTree(api.perform(post(API + "/orders").header(HttpHeaders.AUTHORIZATION, "Bearer " + guest)
-            .header(KEY, "wire-order").contentType(MediaType.APPLICATION_JSON)
-            .content(json.writeValueAsBytes(new OrderInput(quote, "+250700000000", "payment-wire@example.test"))))
-            .andExpect(status().isOk()).andReturn().getResponse().getContentAsByteArray()).path("id").asString();
-
+        FixtureOrder input = createOrder();
+        String guest = input.guestToken();
+        String order = input.orderId();
         String orderPath = API + "/orders/" + order;
         String paymentPath = orderPath + "/payments";
         api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, "Bearer " + guest).header(KEY, "wire-payment"))
@@ -251,6 +269,74 @@ class FlutterwaveCheckoutIntegrationTest {
             .param(UUID.fromString(order)).query(Integer.class).single()).isEqualTo(1);
         assertThat(OPENS.get()).isEqualTo(1);
     }
+
+    @Test
+    void aConnectTimeoutAllowsOneNewPaymentForTheSameReservedOrder() throws Exception {
+        seedStoreAndKitchen();
+        FixtureOrder input = createOrder();
+        String authorization = "Bearer " + input.guestToken();
+        String orderPath = API + "/orders/" + input.orderId();
+        String paymentPath = orderPath + "/payments";
+        UUID orderId = UUID.fromString(input.orderId());
+        TIMEOUT_NEXT_OPEN.set(true);
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "timed-out-connect"))
+            .andExpect(status().isServiceUnavailable());
+        assertThat(OPENS.get()).isZero();
+        UUID declined = jdbc.sql("""
+            SELECT id FROM payment_attempts WHERE order_id = ? AND status = 'declined'
+                AND checkout_url IS NULL AND provider_transaction_id IS NULL
+            """).param(orderId).query(UUID.class).optional().orElse(null);
+        assertThat(declined).isNotNull();
+        assertThat(jdbc.sql("""
+            SELECT count(*) FROM orders WHERE id = ? AND status = 'awaiting_payment'
+                AND payment_status = 'declined' AND reservation_expires_at > now()
+            """).param(orderId).query(Long.class).single()).isEqualTo(1);
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, "timed-out-connect"))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(declined.toString()))
+            .andExpect(jsonPath("$.status").value("declined")).andExpect(jsonPath("$.checkoutUrl").value(nullValue()));
+        assertThat(OPENS.get()).isZero();
+
+        RETURN_HOSTED_LINK.set(true);
+        String retryKey = "explicit-payment-retry";
+        JsonNode retried = json.readTree(api.perform(post(paymentPath)
+            .header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, retryKey))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.checkoutUrl").value(RETRY_LINK))
+            .andReturn().getResponse().getContentAsByteArray());
+        String reference = retried.path("id").asString();
+        assertThat(reference).isNotEqualTo(declined.toString());
+        assertThat(OPEN_BODY.get().path("tx_ref").asString()).isEqualTo(reference);
+        api.perform(post(paymentPath).header(HttpHeaders.AUTHORIZATION, authorization).header(KEY, retryKey))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.id").value(reference));
+        CHARGED.set(TOTAL);
+        long transaction = TRANSACTION.get();
+        api.perform(post(API + "/webhooks/flutterwave").header("verif-hash", WEBHOOK_SECRET).contentType(MediaType.APPLICATION_JSON)
+            .content("{\"event\":\"charge.completed\",\"data\":{\"id\":" + transaction + "}}")).andExpect(status().isOk());
+        api.perform(get(orderPath).header(HttpHeaders.AUTHORIZATION, authorization))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.paymentStatus").value("paid"))
+            .andExpect(jsonPath("$.status").value("accepted"));
+        assertThat(jdbc.sql("SELECT status FROM payment_attempts WHERE order_id = ? ORDER BY sequence")
+            .param(orderId).query(String.class).list()).containsExactly("declined", "paid");
+        assertThat(OPENS.get()).isEqualTo(1);
+    }
+
+    private FixtureOrder createOrder() throws Exception {
+        JsonNode session = json.readTree(api.perform(post(API + "/guest-sessions")).andExpect(status().isOk())
+            .andReturn().getResponse().getContentAsByteArray());
+        guestSession = UUID.fromString(session.path("sessionId").asString());
+        String guest = session.path("accessToken").asString();
+        var quoteInput = new QuoteInput(store, SLOT, List.of(new CartLine(SKU, List.of(), 1, TOTAL)));
+        String quote = json.readTree(api.perform(post(API + "/quotes").header(HttpHeaders.AUTHORIZATION, "Bearer " + guest)
+            .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(quoteInput)))
+            .andExpect(status().isOk()).andExpect(jsonPath("$.total").value(TOTAL))
+            .andReturn().getResponse().getContentAsByteArray()).path("quoteId").asString();
+        String order = json.readTree(api.perform(post(API + "/orders").header(HttpHeaders.AUTHORIZATION, "Bearer " + guest)
+            .header(KEY, "wire-order").contentType(MediaType.APPLICATION_JSON)
+            .content(json.writeValueAsBytes(new OrderInput(quote, "+250700000000", "payment-wire@example.test"))))
+            .andExpect(status().isOk()).andReturn().getResponse().getContentAsByteArray()).path("id").asString();
+        return new FixtureOrder(guest, order);
+    }
+
+    private record FixtureOrder(String guestToken, String orderId) {}
 
     private OffsetDateTime verificationTime(UUID attemptId) {
         return jdbc.sql("SELECT verified_at FROM payment_attempts WHERE id = ?")

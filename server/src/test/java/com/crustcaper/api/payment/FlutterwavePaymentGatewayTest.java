@@ -9,6 +9,12 @@ import static com.crustcaper.api.payment.PaymentGatewayException.Kind.NOT_DISPAT
 import static com.crustcaper.api.payment.PaymentGatewayException.Kind.UNAVAILABLE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import com.crustcaper.api.payment.PaymentGateway.CheckoutChannel;
 import com.crustcaper.api.payment.PaymentGateway.PaymentRequest;
@@ -16,8 +22,13 @@ import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.ConnectException;
+import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -30,6 +41,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -273,6 +285,69 @@ class FlutterwavePaymentGatewayTest {
         assertThat(refused.getCause()).isNull();
         assertThat(assertThrows(PaymentGatewayException.class, () -> gateway.verify("12345")).kind())
                 .isEqualTo(UNAVAILABLE);
+    }
+
+    @Test
+    void treatsAHostedConnectionTimeoutBeforeTheOutputStreamAsNotDispatched() throws IOException {
+        var connection = mock(HttpURLConnection.class);
+        doThrow(new SocketTimeoutException("synthetic connection detail")).when(connection).connect();
+        // Model URLConnection's implicit connect as well as the explicit pre-dispatch phase.
+        when(connection.getOutputStream()).thenAnswer(invocation -> {
+            connection.connect();
+            throw new AssertionError("Connection should have timed out");
+        });
+        var transport = gatewayWithConnection(connection);
+
+        PaymentGatewayException failure = assertThrows(PaymentGatewayException.class,
+                () -> transport.open(paymentRequest(EMAIL, EXPIRY)));
+
+        assertThat(failure.kind()).isEqualTo(NOT_DISPATCHED);
+        assertThat(failure.getCause()).isNull();
+        assertThat(failure.getMessage()).doesNotContain("synthetic connection detail");
+        verify(connection).connect();
+        verify(connection, never()).getOutputStream();
+        verify(connection, never()).getResponseCode();
+        verify(connection).disconnect();
+    }
+
+    @ParameterizedTest
+    @EnumSource(DispatchPhase.class)
+    void classifiesAnyTimeoutAfterTheConnectionAsUncertain(DispatchPhase phase) throws IOException {
+        var connection = mock(HttpURLConnection.class);
+        var timeout = new SocketTimeoutException();
+        switch (phase) {
+            case OPEN_STREAM -> when(connection.getOutputStream()).thenThrow(timeout);
+            case WRITE_BODY -> {
+                var output = mock(OutputStream.class);
+                doThrow(timeout).when(output).write(any(byte[].class));
+                when(connection.getOutputStream()).thenReturn(output);
+            }
+            case READ_RESPONSE -> {
+                when(connection.getOutputStream()).thenReturn(new ByteArrayOutputStream());
+                when(connection.getResponseCode()).thenThrow(timeout);
+            }
+        }
+        var transport = gatewayWithConnection(connection);
+        assertThat(assertThrows(PaymentGatewayException.class,
+                () -> transport.open(paymentRequest(EMAIL, EXPIRY))).kind()).isEqualTo(UNAVAILABLE);
+        verify(connection).connect();
+        verify(connection).getOutputStream();
+        verify(connection).disconnect();
+    }
+
+    @Test
+    void anOutputStreamConnectionFailureAfterConnectingRemainsUncertain() throws IOException {
+        var connection = mock(HttpURLConnection.class);
+        when(connection.getOutputStream()).thenThrow(new ConnectException());
+        assertThat(assertThrows(PaymentGatewayException.class,
+                () -> gatewayWithConnection(connection).open(paymentRequest(EMAIL, EXPIRY))).kind()).isEqualTo(UNAVAILABLE);
+    }
+
+    private enum DispatchPhase { OPEN_STREAM, WRITE_BODY, READ_RESPONSE }
+
+    private FlutterwavePaymentGateway gatewayWithConnection(HttpURLConnection connection) {
+        return new FlutterwavePaymentGateway(fixtureOrigin(), URI.create(RETURN), null, KEY, "card", mapper,
+                Clock.fixed(NOW, ZoneOffset.UTC), 1_000, 1_000, uri -> connection);
     }
 
     @Test

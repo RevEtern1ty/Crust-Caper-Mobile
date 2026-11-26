@@ -18,6 +18,7 @@ import java.math.BigDecimal;
 import java.net.ConnectException;
 import java.net.HttpURLConnection;
 import java.net.NoRouteToHostException;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.UnknownHostException;
 import java.time.Clock;
@@ -54,6 +55,12 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
     private final Clock clock;
     private final int connectTimeoutMs;
     private final int readTimeoutMs;
+    private final ConnectionFactory connections;
+
+    @FunctionalInterface
+    interface ConnectionFactory {
+        HttpURLConnection open(URI uri) throws IOException;
+    }
 
     // The fixture overloads preserve both methods. The configured gateway uses the explicit allowlist.
     FlutterwavePaymentGateway(URI apiOrigin, URI returnUrl, String secretKey, ObjectMapper mapper,
@@ -69,6 +76,13 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
 
     FlutterwavePaymentGateway(URI apiOrigin, URI returnUrl, URI webReturnUrl, String secretKey, String paymentOptions,
                              ObjectMapper mapper, Clock clock, int connectTimeoutMs, int readTimeoutMs) {
+        this(apiOrigin, returnUrl, webReturnUrl, secretKey, paymentOptions, mapper, clock, connectTimeoutMs, readTimeoutMs,
+                uri -> (HttpURLConnection) uri.toURL().openConnection());
+    }
+
+    FlutterwavePaymentGateway(URI apiOrigin, URI returnUrl, URI webReturnUrl, String secretKey, String paymentOptions,
+                             ObjectMapper mapper, Clock clock, int connectTimeoutMs, int readTimeoutMs,
+                             ConnectionFactory connections) {
         if (!isHttpsUrl(returnUrl) || !PAYMENT_RETURN_PATH.equals(returnUrl.getRawPath()) || returnUrl.getRawQuery() != null) {
             throw new IllegalStateException("CRUST_PAYMENT_RETURN_URL must be an absolute HTTPS URL at "
                     + PAYMENT_RETURN_PATH + " without a query or fragment");
@@ -92,6 +106,7 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
         this.clock = clock;
         this.connectTimeoutMs = connectTimeoutMs;
         this.readTimeoutMs = readTimeoutMs;
+        this.connections = connections;
     }
 
     private static String parsePaymentOptions(String value) {
@@ -243,9 +258,8 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
 
     private Response request(String path, ObjectNode payload) {
         HttpURLConnection connection = null;
-        boolean bodyStarted = false;
         try {
-            connection = (HttpURLConnection) apiOrigin.resolve(path).toURL().openConnection();
+            connection = connections.open(apiOrigin.resolve(path));
             connection.setInstanceFollowRedirects(false);
             connection.setConnectTimeout(connectTimeoutMs);
             connection.setReadTimeout(readTimeoutMs);
@@ -258,8 +272,13 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
                 connection.setRequestProperty("Content-Type", "application/json");
                 // Stream the request once. A broken connection can conceal a successfully opened payment.
                 connection.setFixedLengthStreamingMode(requestBody.length);
+                // Only this phase can fail before the request's output stream has been requested.
+                try {
+                    connection.connect();
+                } catch (ConnectException | NoRouteToHostException | UnknownHostException | SocketTimeoutException ignored) {
+                    throw new PaymentGatewayException(NOT_DISPATCHED);
+                }
                 try (OutputStream output = connection.getOutputStream()) {
-                    bodyStarted = true;
                     output.write(requestBody);
                 }
             }
@@ -278,10 +297,6 @@ final class FlutterwavePaymentGateway implements PaymentGateway, RefundDirectory
             }
         } catch (IOException failure) {
             // Do not attach provider response bodies or HTTP exceptions containing a request URL.
-            if (HOSTED_PAYMENT_PATH.equals(path) && !bodyStarted && (failure instanceof ConnectException
-                    || failure instanceof NoRouteToHostException || failure instanceof UnknownHostException)) {
-                throw new PaymentGatewayException(NOT_DISPATCHED);
-            }
             throw new PaymentGatewayException(UNAVAILABLE);
         } finally {
             if (connection != null) {
