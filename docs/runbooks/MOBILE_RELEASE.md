@@ -99,6 +99,21 @@ ADB_SERVER_SOCKET=tcp:127.0.0.1:15042 python3 tooling/android-order-privacy.py "
 
 Сценарий создаёт синтетический оплаченный заказ через локальный API. В приложении он проверяет сохранение SMS-запроса и очистку поля кода после возврата из фона, отправку запроса на удаление и отображение статуса после проверки менеджером. При `--check-share` сценарий открывает и закрывает системный экран отправки без выбора получателя. Сохраните `evidence.json` с хешем установленного APK и `privacy-in-review.png` со статусом запроса. Для публичного пилота повторите проверку с SMS-провайдером на подписанных сборках.
 
+## Закрытые сборки для Play Internal и TestFlight
+
+Профиль `stage` предназначен для прямой установки APK и iOS-сборки с внутренним профилем подписи. `stage-store` наследует окружение EAS `preview` и настройки приложения `stage`, выпускает AAB для Play Internal и IPA для TestFlight. У обеих stage-сборок идентификатор `com.crustcaper.mobile.stage`. Для публичной раскатки используйте профиль `production` с его окружением и идентификаторами. Все профили EAS используют версию Node.js из `.nvmrc`. [Профили Expo Build](https://docs.expo.dev/build/eas-json/) · [Внутренняя раздача](https://docs.expo.dev/build/internal-distribution/)
+
+1. Владелец связывает исходники с проектом Expo, задаёт публичные параметры API, точки, PSP и App Links в окружении EAS `preview`, регистрирует приложение stage в Play Console и App Store Connect, настраивает подпись. Перед раздачей сверьте ассоциации stage-домена с сертификатом, которым Play подписывает приложение, и идентификатором Apple App ID. [Настройка подключённой среды](CONNECTED_RELEASE.md#подпись-и-приёмка)
+2. Номера сборок `versionCode` и `buildNumber` для `stage-store` увеличивает EAS. Если сборки с идентификатором stage уже загружались, задайте в EAS последние номера для каждого магазина через `eas build:version:set --profile stage-store` до создания следующей сборки. [Управление версиями](https://docs.expo.dev/build-reference/app-versions/)
+3. После настройки учётных записей соберите артефакты. Загрузку выполните отдельно после сверки SHA, идентификатора и номера сборки.
+
+   ```bash
+   eas build --profile stage-store --platform android
+   eas build --profile stage-store --platform ios
+   ```
+
+4. Загрузите AAB в раздел Internal testing приложения stage в Play Console, а IPA в запись stage в App Store Connect. Добавьте тестеров в соответствующие группы и выполните подключённую приёмку на установленных из магазинов сборках. [Google Play](https://docs.expo.dev/submit/android/) · [TestFlight](https://docs.expo.dev/submit/testflight/)
+
 ## Подключённая приёмка
 
 1. Зафиксировать SHA, изолированную среду, OpenAPI, данные тестовой точки, устройства, ОС и сеть. В Android-пилоте взять бюджетный и современный телефоны, в iOS — iPhone 11 и доступную актуальную модель.

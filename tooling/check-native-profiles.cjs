@@ -1,8 +1,42 @@
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
-const { mkdtempSync, rmdirSync, unlinkSync, writeFileSync } = require('node:fs');
+const { mkdtempSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
+
+const { cli, build } = require('../eas.json');
+const stageStore = build['stage-store'];
+assert.ok(stageStore, 'A store-distributed stage profile is required for Play Internal and TestFlight');
+assert.equal(stageStore.extends, 'stage');
+assert.equal(cli.appVersionSource, 'remote');
+const nodeVersion = readFileSync(require.resolve('../.nvmrc'), 'utf8').trim();
+const resolvedStageStore = { ...build.stage, ...stageStore };
+const distributionProfiles = [
+  { name: 'stage', config: build.stage, environment: 'preview', appProfile: 'stage', distribution: 'internal', androidBuildType: 'apk' },
+  { name: 'stage-store', config: resolvedStageStore, environment: 'preview', appProfile: 'stage',
+    distribution: 'store', androidBuildType: 'app-bundle' },
+  { name: 'production', config: build.production, environment: 'production', appProfile: 'production',
+    distribution: 'store', androidBuildType: 'app-bundle' },
+];
+for (const { name, config, environment, appProfile, distribution, androidBuildType } of distributionProfiles) {
+  assert.equal(config.android.buildType, androidBuildType, name);
+  for (const platform of ['android', 'ios']) {
+    const platformConfig = { ...config, ...config[platform] };
+    const env = { ...config.env, ...config[platform]?.env };
+    const label = `${name} ${platform}`;
+    assert.equal(platformConfig.node, nodeVersion, label);
+    assert.equal(platformConfig.environment, environment, label);
+    assert.equal(platformConfig.distribution, distribution, label);
+    assert.equal(env.CRUSTCAPER_BUILD_PROFILE, appProfile, label);
+    assert.notEqual(platformConfig.withoutCredentials, true, label);
+    assert.notEqual(platformConfig.developmentClient, true, label);
+    if (distribution === 'store') {
+      assert.equal(platformConfig.autoIncrement, true, label);
+      assert.notEqual(platformConfig.simulator, true, label);
+    }
+  }
+}
+console.log('EAS build distributions, stage isolation, remote versions and Node runtime match the mobile release configuration');
 
 const expoCli = require.resolve('expo/bin/cli');
 const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('CRUSTCAPER_')));
@@ -80,7 +114,7 @@ function inspectPushWithFixture(profile, clients, json = true, keys = [fixtureAp
   }
 }
 
-for (const profile of ['stage', 'production']) {
+for (const profile of [resolvedStageStore.env.CRUSTCAPER_BUILD_PROFILE, build.production.env.CRUSTCAPER_BUILD_PROFILE]) {
   const result = inspect(profile);
   assert.equal(result.status, 0, result.stderr);
   const config = JSON.parse(result.stdout);

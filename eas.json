@@ -6,12 +6,20 @@
     "stage": {
       "distribution": "internal",
       "environment": "preview",
+      "node": "24.22.0",
       "env": { "CRUSTCAPER_BUILD_PROFILE": "stage" },
       "android": { "buildType": "apk" }
+    },
+    "stage-store": {
+      "extends": "stage",
+      "distribution": "store",
+      "autoIncrement": true,
+      "android": { "buildType": "app-bundle" }
     },
     "production": {
       "distribution": "store",
       "environment": "production",
+      "node": "24.22.0",
       "autoIncrement": true,
       "env": { "CRUSTCAPER_BUILD_PROFILE": "production" },
       "android": { "buildType": "app-bundle" }
