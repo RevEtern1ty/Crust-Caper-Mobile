@@ -4,6 +4,10 @@ const labels = {
   en: {
     menu: 'Menu', orders: 'Orders', cart: 'Cart', customerNav: 'Order and cart', language: 'Language', main: 'Skip to content',
     store: 'Pickup location', directions: 'Directions', contact: 'Contact the restaurant', privacy: 'Order privacy',
+    contactSupport: 'Contact support',
+    supportUnavailable: 'The restaurant has not published a support link yet.',
+    contactUnavailable: 'Contact information is temporarily unavailable.',
+    contactDescription: 'Find the CrustCaper pickup location, hours and customer support.',
     nearest: 'Next available pickup', closed: 'The restaurant is closed',
     noTimes: 'Pickup times are unavailable',
     soldOut: 'Currently unavailable', emptyMenu: 'No items are available in the menu right now.',
@@ -22,6 +26,10 @@ const labels = {
     menu: 'Ifunguro', orders: 'Komande', cart: 'Agatebo', customerNav: 'Komande n’agatebo', language: 'Ururimi',
     main: 'Jya ku bikubiye ku rupapuro',
     store: 'Aho ufatira komande', directions: 'Inzira', contact: 'Vugana na resitora', privacy: 'Amakuru bwite ya komande',
+    contactSupport: 'Saba ubufasha',
+    supportUnavailable: 'Resitora ntirashyiraho uburyo bwo kuyivugisha.',
+    contactUnavailable: 'Amakuru yo kuvugana na resitora ntaboneka ubu.',
+    contactDescription: 'Reba aho ufatira komande za CrustCaper, amasaha n’uburyo bwo gusaba ubufasha.',
     nearest: 'Igihe cya hafi cyo gufata komande',
     closed: 'Resitora irafunze', noTimes: 'Igihe cyo gufata komande ntikiboneka',
     soldOut: 'Ntikiboneka ubu',
@@ -45,6 +53,10 @@ export function text(locale: Locale) {
 
 export function menuPath(locale: Locale, sku?: string) {
   return '/menu/' + locale + (sku ? '/' + encodeURIComponent(sku) : '');
+}
+
+export function contactPath(locale: Locale) {
+  return locale === 'rw' ? '/contact?storefrontLocale=rw' : '/contact';
 }
 
 export function price(amount: number, locale: Locale) {

@@ -1,31 +1,32 @@
 import Head from 'next/head';
 import type { PropsWithChildren } from 'react';
 import type { CatalogMenu, CatalogSite, Locale } from '../lib/catalog';
-import { menuPath, pickupStatus, price, text } from './copy';
+import { contactPath, menuPath, pickupStatus, price, text } from './copy';
 import { brandMark, photoFor } from './photos';
 
 type Product = CatalogMenu['products'][number];
 type Store = CatalogMenu['store'];
 export type MenuItem = Pick<Product, 'sku' | 'category' | 'name' | 'description' | 'price' | 'available' | 'photoUrl'>;
 
-function Seo({ locale, site, title, description, sku, photo }: {
+function Seo({ locale, site, title, description, sku, photo, localizedPath = language => menuPath(language, sku) }: {
   locale: Locale;
   site: CatalogSite;
   title: string;
   description: string;
   sku?: string;
   photo?: string;
+  localizedPath?: (language: Locale) => string;
 }) {
-  const canonical = site.publicOrigin + menuPath(locale, sku);
+  const canonical = site.publicOrigin + localizedPath(locale);
   return (
     <Head>
       <title>{title}</title>
       <meta name="description" content={description} />
       {!site.indexable && <meta name="robots" content="noindex, nofollow" />}
       <link rel="canonical" href={canonical} />
-      <link rel="alternate" hrefLang="en" href={site.publicOrigin + menuPath('en', sku)} />
-      <link rel="alternate" hrefLang="rw" href={site.publicOrigin + menuPath('rw', sku)} />
-      <link rel="alternate" hrefLang="x-default" href={site.publicOrigin + menuPath('en', sku)} />
+      <link rel="alternate" hrefLang="en" href={site.publicOrigin + localizedPath('en')} />
+      <link rel="alternate" hrefLang="rw" href={site.publicOrigin + localizedPath('rw')} />
+      <link rel="alternate" hrefLang="x-default" href={site.publicOrigin + localizedPath('en')} />
       <meta property="og:type" content="website" />
       <meta property="og:site_name" content="CrustCaper" />
       <meta property="og:title" content={title} />
@@ -36,7 +37,8 @@ function Seo({ locale, site, title, description, sku, photo }: {
   );
 }
 
-function Layout({ locale, sku, children }: PropsWithChildren<{ locale: Locale; sku?: string }>) {
+export function Layout({ locale, sku, children, localizedPath = language => menuPath(language, sku) }:
+  PropsWithChildren<{ locale: Locale; sku?: string; localizedPath?: (language: Locale) => string }>) {
   const t = text(locale);
   return (
     <>
@@ -48,8 +50,8 @@ function Layout({ locale, sku, children }: PropsWithChildren<{ locale: Locale; s
             <span>CrustCaper</span>
           </a>
           <nav className="language" aria-label={t.language}>
-            <a aria-label="English" lang="en" href={menuPath('en', sku)} aria-current={locale === 'en' ? 'page' : undefined}>EN</a>
-            <a aria-label="Kinyarwanda" lang="rw" href={menuPath('rw', sku)} aria-current={locale === 'rw' ? 'page' : undefined}>RW</a>
+            <a aria-label="English" lang="en" href={localizedPath('en')} aria-current={locale === 'en' ? 'page' : undefined}>EN</a>
+            <a aria-label="Kinyarwanda" lang="rw" href={localizedPath('rw')} aria-current={locale === 'rw' ? 'page' : undefined}>RW</a>
           </nav>
           <nav className="site-nav" aria-label={t.customerNav}>
             <a href={'/orders?storefrontLocale=' + locale}>{t.orders}</a>
@@ -62,22 +64,66 @@ function Layout({ locale, sku, children }: PropsWithChildren<{ locale: Locale; s
   );
 }
 
-function StoreDetails({ locale, store }: { locale: Locale; store: Store }) {
-  const t = text(locale);
+function StoreAddress({ locale, store }: { locale: Locale; store: Store }) {
   return (
-    <footer className="store-info">
-      <h2>{t.store}</h2>
+    <>
       <address>
         <strong>{store.name[locale]}</strong>
         {store.area[locale] && <div>{store.area[locale]}</div>}
       </address>
       {store.hours[locale] && <p>{store.hours[locale]}</p>}
+    </>
+  );
+}
+
+function StoreDetails({ locale, store }: { locale: Locale; store: Store }) {
+  const t = text(locale);
+  return (
+    <footer className="store-info">
+      <h2>{t.store}</h2>
+      <StoreAddress locale={locale} store={store} />
       <div className="store-links">
         {store.directionsUrl && <a href={store.directionsUrl} rel="noreferrer">{t.directions}</a>}
-        {store.supportUrl && <a href={store.supportUrl} rel="noreferrer">{t.contact}</a>}
+        <a href={contactPath(locale)}>{t.contact}</a>
         <a href={'/privacy?storefrontLocale=' + locale}>{t.privacy}</a>
       </div>
     </footer>
+  );
+}
+
+export function ContactPage({ locale, site, store }: {
+  locale: Locale;
+  site: CatalogSite | null;
+  store: Store | null;
+}) {
+  const t = text(locale);
+  const title = t.contact + ' | CrustCaper';
+  return (
+    <Layout locale={locale} localizedPath={contactPath}>
+      {site && store ? (
+        <Seo locale={locale} site={site} title={title} description={t.contactDescription} localizedPath={contactPath} />
+      ) : (
+        <Head><title>{title}</title><meta name="robots" content="noindex, nofollow" /></Head>
+      )}
+      <a className="back-link" href={menuPath(locale)}>‹ {t.back}</a>
+      <h1 className="contact-title">{t.contact}</h1>
+      {store ? (
+        <section className="store-info">
+          <h2>{t.store}</h2>
+          <StoreAddress locale={locale} store={store} />
+          <div className="store-links">
+            {store.directionsUrl && <a href={store.directionsUrl} rel="noreferrer">{t.directions}</a>}
+            {store.supportUrl && <a href={store.supportUrl} rel="noreferrer">{t.contactSupport}</a>}
+          </div>
+          {!store.supportUrl && <p>{t.supportUnavailable}</p>}
+        </section>
+      ) : (
+        <div className="problem">
+          <p>{t.contactUnavailable}</p>
+          <a className="secondary-action" href={contactPath(locale)}>{t.reload}</a>
+        </div>
+      )}
+    </Layout>
   );
 }
 

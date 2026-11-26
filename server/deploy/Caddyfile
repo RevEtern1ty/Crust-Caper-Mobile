@@ -48,7 +48,7 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 	}
 	@catalogDocuments {
 		method GET HEAD
-		path /menu/* /robots.txt /sitemap.xml /_next/static/*
+		path /menu/* /contact /robots.txt /sitemap.xml /_next/static/*
 		not path *.map
 		expression "{$CRUSTCAPER_CATALOG_ENABLED:0}" == "1"
 	}

@@ -102,6 +102,8 @@ async function checkPublicCatalog(ca) {
   assert.match(kinyarwanda.body, /Ingano/);
   assert.ok(kinyarwanda.body.includes('/privacy?storefrontLocale=rw'));
   assert.ok(english.body.includes('/privacy?storefrontLocale=en'));
+  assert.ok(kinyarwanda.body.includes('href="/contact?storefrontLocale=rw"'));
+  assert.ok(english.body.includes('href="/contact"'));
   const privacy = await request(ca, '/privacy');
   assert.equal(privacy.status, 200);
   assert.match(privacy.headers['cache-control'], /no-store/);
@@ -113,6 +115,34 @@ async function checkPublicCatalog(ca) {
   assert.equal((await request(ca, '/api/catalog-health')).status, 404);
   assert.equal((await request(ca, '/api/v1/local/orders')).status, 404);
   assert.equal((await request(ca, '/actuator/paymentreconciliation')).status, 404);
+}
+
+async function checkPublicContact(ca) {
+  const [english, kinyarwanda, head, post] = await Promise.all([
+    request(ca, '/contact'),
+    request(ca, '/contact?storefrontLocale=rw', { headers: { Cookie: 'demo=synthetic' } }),
+    request(ca, '/contact', { method: 'HEAD' }),
+    request(ca, '/contact', { method: 'POST' }),
+  ]);
+  for (const [contact, locale] of [[english, 'en'], [kinyarwanda, 'rw']]) {
+    assert.equal(contact.status, 200);
+    assert.equal(contact.headers['content-language'], locale);
+    assert.equal(contact.headers['set-cookie'], undefined);
+    assert.equal(contact.headers['cache-control'], 'no-store');
+    assert.match(contact.headers['x-robots-tag'], /noindex/);
+    assert.match(contact.body, new RegExp('<html[^>]*lang="' + locale + '"'));
+    assert.doesNotMatch(contact.body, /<script\b|demo=synthetic/);
+  }
+  assert.match(english.body, /Contact the restaurant/);
+  assert.match(english.body, /Example pickup address/);
+  assert.match(english.body, /Example hours/);
+  assert.match(english.body, /The restaurant has not published a support link yet/);
+  assert.match(kinyarwanda.body, /Vugana na resitora/);
+  assert.match(kinyarwanda.body, /Amasaha y’icyitegererezo/);
+  assert.match(kinyarwanda.body, /Resitora ntirashyiraho uburyo bwo kuyivugisha/);
+  assert.equal(head.status, 200);
+  assert.equal(head.body, '');
+  assert.equal(post.status, 404);
 }
 
 async function runPublishedCheck(caPath, checker, args, logName) {
@@ -217,6 +247,37 @@ async function checkNoJavaScript(browser) {
     await page.locator('a[href="/product/double-smash?storefrontLocale=rw"]').waitFor();
     assert.equal((await context.cookies(origin)).length, 0, 'browsing the catalog must not start a session');
     await capture(page, 'catalog-rw');
+  } finally {
+    await context.close();
+  }
+}
+
+async function checkContactLayout(browser) {
+  const context = await newContext(browser, { javaScriptEnabled: false }, false);
+  try {
+    const page = await context.newPage();
+    await page.goto(origin + '/menu/en');
+    await page.getByRole('link', { name: 'Contact the restaurant' }).click();
+    await page.getByRole('heading', { name: 'Contact the restaurant' }).waitFor();
+    await page.keyboard.press('Tab');
+    assert.equal(await page.evaluate(() => document.activeElement.getAttribute('href')), '#main');
+    await page.keyboard.press('Enter');
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'main');
+    for (const locale of ['en', 'rw']) {
+      if (locale === 'rw') await page.getByRole('link', { name: 'Kinyarwanda' }).click();
+      assert.equal(new URL(page.url()).pathname, '/contact');
+      assert.equal(await page.locator('html').getAttribute('lang'), locale);
+      for (const width of [320, 390, 430]) {
+        await page.setViewportSize({ width, height: 844 });
+        await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+        assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+          `Contact layout for ${locale} at ${width}px and 200% text size`);
+        await capture(page, 'contact-' + locale + '-' + width);
+      }
+    }
+    await page.getByRole('link', { name: 'Subira ku ifunguro' }).click();
+    assert.equal(new URL(page.url()).pathname, '/menu/rw');
+    assert.equal((await context.cookies(origin)).length, 0);
   } finally {
     await context.close();
   }
@@ -664,6 +725,7 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   const ca = readFileSync(caPath);
   if (!webPerf) {
     await checkPublicCatalog(ca);
+    await checkPublicContact(ca);
     await checkCheckoutPreflight(caPath);
     await checkNativeReturnPreflight(caPath);
   }
@@ -686,5 +748,6 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   }
   if (catalogPhotos) await checkPhotoRendering(browser);
   await checkNoJavaScript(browser);
+  await checkContactLayout(browser);
   await checkGuestCheckout(browser, ca);
 });
