@@ -25,3 +25,9 @@ services:
     init: true
     restart: unless-stopped
     stop_grace_period: 30s
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, --noproxy, "*", --output, /dev/null, http://127.0.0.1:8080/actuator/health/readiness]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
