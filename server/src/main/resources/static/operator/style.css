@@ -156,7 +156,7 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .payment-identifiers dd { margin: .12rem 0 0; font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
 .receipt-search { display: grid; gap: .4rem; max-width: 23rem; margin-bottom: 1rem; }
 .receipt-search .button { justify-self: start; max-width: 100%; overflow-wrap: anywhere; }
-.receipt-search .button[aria-disabled="true"] { opacity: .55; cursor: default; }
+.receipt-search .button[aria-disabled="true"], #fiscal-receipts-refresh[aria-disabled="true"] { opacity: .55; cursor: default; }
 .manager-form { display: grid; gap: .8rem; margin-top: .9rem; }
 .manager-form label { display: grid; gap: .35rem; min-width: 0; }
 .manager-form input[type="file"] { max-width: 100%; }

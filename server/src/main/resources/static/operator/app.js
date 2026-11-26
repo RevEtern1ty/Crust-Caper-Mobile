@@ -818,11 +818,20 @@ function renderReceipts() {
     : orderCode ? 'No matching order in this list.' : 'No paid orders for fiscal receipts.');
 }
 
+function syncReceiptSearchControls() {
+  const finding = receiptLookup?.state === 'loading';
+  for (const control of [fiscalReceiptsFind, fiscalReceiptsRefresh]) {
+    if (finding) control.setAttribute('aria-disabled', 'true');
+    else control.removeAttribute('aria-disabled');
+  }
+  fiscalReceiptsRefresh.disabled = !receiptLookup && receiptRefresh !== null;
+}
+
 function clearReceiptLookup() {
   const lookup = receiptLookup;
   receiptLookup = null;
   lookup?.controller.abort();
-  fiscalReceiptsFind.removeAttribute('aria-disabled');
+  syncReceiptSearchControls();
   fiscalReceiptsFilter.removeAttribute('aria-invalid');
   showMessage(fiscalReceiptsLookupProblem);
 }
@@ -842,7 +851,7 @@ async function findReceipt() {
   const entry = receiptLookup?.code === code ? receiptLookup.entry : null;
   const lookup = { code, entry, state: 'loading', controller: new AbortController(), attachments: new Map() };
   receiptLookup = lookup;
-  fiscalReceiptsFind.setAttribute('aria-disabled', 'true');
+  syncReceiptSearchControls();
   fiscalReceiptsFilter.removeAttribute('aria-invalid');
   showMessage(fiscalReceiptsLookupProblem);
   renderReceipts();
@@ -858,6 +867,12 @@ async function findReceipt() {
         throw new ApiError(502, 'invalid_response');
       }
       lookup.entry = found.receiptStatus === 'pending' ? lookup.attachments.get(found.orderId) ?? found : found;
+      if (lookup.entry.receiptStatus !== 'pending' && receipts.some((item) =>
+        item.orderId === found.orderId && item.receiptStatus === 'pending')) {
+        receiptRefresh?.attachments.set(found.orderId, lookup.entry);
+        receipts = receipts.map((item) => item.orderId === found.orderId && item.receiptStatus === 'pending'
+          ? lookup.entry : item);
+      }
       lastReceiptLookupId = found.orderId;
       lookup.state = 'found';
     } else {
@@ -879,7 +894,7 @@ async function findReceipt() {
   } finally {
     if (session === current && receiptLookup === lookup) {
       lookup.attachments.clear();
-      fiscalReceiptsFind.removeAttribute('aria-disabled');
+      syncReceiptSearchControls();
       renderReceipts();
     }
   }
@@ -1014,7 +1029,6 @@ function closeSession(message = '') {
   fiscalReceiptsJump.hidden = true;
   fiscalReceiptsFilter.value = '';
   fiscalReceiptsList.replaceChildren();
-  fiscalReceiptsRefresh.disabled = false;
   showMessage(fiscalReceiptsProblem);
   showMessage(fiscalReceiptsEmpty);
   availability.reset();
@@ -1228,11 +1242,11 @@ async function refreshPendingPayments(after = pendingPaymentsCursor) {
 
 async function refreshReceipts() {
   const current = availableSession();
-  if (current?.role !== 'manager' || fiscalReceiptsRefresh.disabled) return;
+  if (current?.role !== 'manager' || receiptRefresh) return;
 
   const refresh = { attachments: new Map() };
   receiptRefresh = refresh;
-  fiscalReceiptsRefresh.disabled = true;
+  syncReceiptSearchControls();
   showMessage(fiscalReceiptsProblem);
   if (!receiptLookup) showMessage(fiscalReceiptsEmpty, receipts.length ? '' : 'Loading fiscal receipts…');
   try {
@@ -1264,7 +1278,7 @@ async function refreshReceipts() {
   } finally {
     if (session === current) {
       receiptRefresh = null;
-      fiscalReceiptsRefresh.disabled = false;
+      syncReceiptSearchControls();
     }
   }
 }
@@ -1590,7 +1604,7 @@ pendingPaymentsNext.addEventListener('click', () => {
   void refreshPendingPayments(pendingPaymentsNextCursor);
 });
 fiscalReceiptsJump.addEventListener('click', () => { element('fiscal-receipts-title').focus(); });
-fiscalReceiptsRefresh.addEventListener('click', () => { void refreshReceipts(); });
+fiscalReceiptsRefresh.addEventListener('click', () => { void (receiptLookup ? findReceipt() : refreshReceipts()); });
 fiscalReceiptsFilter.addEventListener('input', () => {
   clearReceiptLookup();
   renderReceipts();
