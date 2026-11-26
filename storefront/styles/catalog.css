@@ -94,6 +94,11 @@ h3 { font-size: 1.3rem; line-height: 1.28; }
 .store-links { display: flex; flex-wrap: wrap; gap: .6rem 1rem; }
 .store-links a { display: inline-flex; align-items: center; min-height: 44px; color: var(--green); font-weight: 750; overflow-wrap: anywhere; }
 .contact-title { font-size: clamp(1.5rem, calc(1rem + 4vw), 4rem); }
+
+.legal-document { display: grid; gap: 1.25rem; max-width: 45rem; }
+.legal-document h1 { font-size: clamp(1.5rem, calc(1rem + 4vw), 4rem); }
+.legal-document section { display: grid; gap: .7rem; }
+
 .problem { display: grid; justify-items: start; gap: 1.15rem; max-width: 42rem; padding-block: 2rem; }
 .problem h1 { font-size: clamp(2rem, 6vw, 4rem); }
 

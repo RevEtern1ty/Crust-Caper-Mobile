@@ -107,6 +107,10 @@ export default ({ config }: ConfigContext): ExpoConfig => {
   }
 
   const production = profile === 'production';
+  const configuredLegalOrigin = production ? required(process.env.CRUSTCAPER_LEGAL_ORIGIN, 'CRUSTCAPER_LEGAL_ORIGIN')
+    : local ? undefined : process.env.CRUSTCAPER_LEGAL_ORIGIN?.trim();
+  const legalOrigin = configuredLegalOrigin ? httpsOrigin(configuredLegalOrigin, 'CRUSTCAPER_LEGAL_ORIGIN') : null;
+  if (legalOrigin && legalOrigin.pathname !== '/') throw new Error('Use only the public legal site origin.');
   const androidPackage = production ? required(process.env.CRUSTCAPER_ANDROID_PACKAGE, 'CRUSTCAPER_ANDROID_PACKAGE')
     : `com.crustcaper.mobile.${profile}`;
   const iosBundleId = production ? required(process.env.CRUSTCAPER_IOS_BUNDLE_ID, 'CRUSTCAPER_IOS_BUNDLE_ID')
@@ -161,6 +165,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       ...(pushProjectId ? { eas: { ...config.extra?.eas, projectId: pushProjectId } } : {}),
       restaurant: {
         profile, apiBaseUrl: api.origin + '/api/v1', storeId, pspHosts, pushProjectId,
+        ...(legalOrigin ? { legalOrigin: legalOrigin.origin } : {}),
         ...(webCheckout ? { webCheckout: true } : {}),
       },
     },

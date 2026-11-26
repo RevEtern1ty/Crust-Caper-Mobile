@@ -21,6 +21,8 @@ const recoveryHost = 'postgres-recovery';
 const testMain = 'com.crustcaper.api.payment.WebCheckoutFixture';
 const scratchPrefix = 'cc-storefront-';
 const fixturePhoto = { sku: 'double-smash', file: 'double-smash-r39.jpg' };
+const legalFixtureVersion = '2026-05-01';
+const archivedPrivacyVersion = '2026-04-01';
 const errorRehearsalLabel = { 'crustcaper.fixture.error-rehearsal': '1' };
 const recoveryLabel = { 'crustcaper.fixture.database-recovery': '1' };
 const postgresImage = 'postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193';
@@ -312,6 +314,18 @@ async function main() {
   let stop;
   try {
     const photos = join(directory, 'catalog-photos');
+    const legalFile = join(directory, 'legal-fixture.json');
+    const edition = (en, rw) => Object.fromEntries(Object.entries({ en, rw }).map(([locale, title]) => [
+      locale, { title, sections: [{ paragraphs: ['Synthetic fixture text <example> for ' + title + '.'] }] },
+    ]));
+    await writeFile(legalFile, JSON.stringify({
+      current: { privacy: legalFixtureVersion, terms: legalFixtureVersion },
+      privacy: {
+        [legalFixtureVersion]: edition('Fixture privacy policy', 'Politiki y’amakuru bwite y’igerageza'),
+        [archivedPrivacyVersion]: edition('Archived fixture privacy policy', 'Politiki y’amakuru bwite yabitswe'),
+      },
+      terms: { [legalFixtureVersion]: edition('Fixture ordering terms', 'Amabwiriza yo gutumiza y’igerageza') },
+    }));
     if (catalogPhotos) {
       await mkdir(photos);
       await copyFile(join(root, 'assets', 'menu', `${fixturePhoto.sku}.jpg`), join(photos, fixturePhoto.file));
@@ -329,10 +343,11 @@ async function main() {
       CRUSTCAPER_STOREFRONT_DIR: dockerPath(web),
       CRUSTCAPER_STORE_ID: 'kigali',
       CRUSTCAPER_STOREFRONT_PROFILE: 'stage',
+      CRUSTCAPER_LEGAL_PUBLICATION_FILE: dockerPath(legalFile),
       ...(catalogPhotos && { CRUSTCAPER_CATALOG_PHOTOS_DIR: dockerPath(photos) }),
     };
     const command = ['compose', '--project-name', project, '--env-file', dockerPath(settings.composeEnvironment)];
-    const files = ['compose.yml', 'compose.https.yml', 'compose.storefront.yml', 'compose.catalog.yml'];
+    const files = ['compose.yml', 'compose.https.yml', 'compose.storefront.yml', 'compose.catalog.yml', 'compose.legal.yml'];
     if (catalogPhotos) files.push('compose.catalog-photos.yml');
     for (const file of files) {
       command.push('-f', dockerPath(join(deploy, file)));

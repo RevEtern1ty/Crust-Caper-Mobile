@@ -35,6 +35,13 @@ test('production passes its own native identities and supports a separate output
   assert.equal(env.CRUSTCAPER_BUILD_PROFILE, 'production');
   assert.equal(env.CRUSTCAPER_ANDROID_PACKAGE, 'com.crustcaper.mobile');
   assert.equal(env.CRUSTCAPER_IOS_BUNDLE_ID, 'com.crustcaper.ios');
+  assert.equal(env.CRUSTCAPER_LEGAL_ORIGIN, origin);
+});
+
+test('stage enables legal links only when the public documents have been configured', () => {
+  const inherited = { CRUSTCAPER_LEGAL_ORIGIN: 'https://old.example.test' };
+  assert.equal(storefrontEnvironment(parseStorefrontArguments(stage), inherited).CRUSTCAPER_LEGAL_ORIGIN, undefined);
+  assert.equal(storefrontEnvironment(parseStorefrontArguments([...stage, '--legal']), inherited).CRUSTCAPER_LEGAL_ORIGIN, origin);
 });
 
 test('host-bound export rejects noncanonical URLs and reserved fixture output', () => {

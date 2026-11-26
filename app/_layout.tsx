@@ -21,7 +21,7 @@ function Routes() {
 
     const url = new URL(window.location.href);
     if (url.pathname !== '/cart' && url.pathname !== '/orders' && url.pathname !== '/privacy'
-      && !url.pathname.startsWith('/product/')) return;
+      && url.pathname !== '/order-privacy' && !url.pathname.startsWith('/product/')) return;
     const handoff = url.searchParams.getAll('storefrontLocale');
     if (handoff.length !== 1) return;
     const next = handoff[0];
@@ -56,7 +56,7 @@ function Routes() {
       <Stack.Screen name="payment-return" options={{ headerShown: false }} />
       <Stack.Screen name="web-payment-return" options={{ headerShown: false }} />
       <Stack.Screen name="order-recovery" options={{ title: copy(locale, 'Find an order', 'Shaka komande') }} />
-      <Stack.Screen name="privacy" options={{
+      {(['privacy', 'order-privacy'] as const).map(name => <Stack.Screen key={name} name={name} options={{
         title: privacyTitle,
         // Let the browser shrink the title row even before the navigator observes the new width.
         header: Platform.OS === 'web' ? ({ back, options }) => (
@@ -69,7 +69,7 @@ function Routes() {
             headerTitleContainerStyle={styles.privacyHeaderTitle}
           />
         ) : undefined,
-      }} />
+      }} />)}
       <Stack.Screen name="settings" options={{ title: copy(locale, 'Settings', 'Amagenamiterere') }} />
     </Stack>
   );

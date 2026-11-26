@@ -25,6 +25,7 @@ if (!settings || !['demo', 'local', 'stage', 'production'].includes(settings.pro
   throw new Error('CrustCaper runtime profile is missing.');
 }
 const connected = settings.profile !== 'demo' ? settings : null;
+export const legalOrigin = connected?.legalOrigin;
 const httpsWeb = !!connected && connected.profile !== 'local' && Platform.OS === 'web';
 const webCheckout = !!connected && httpsWeb && connected.webCheckout === true && webCheckoutAvailable(connected);
 const pushProjectId = connected && connected.profile !== 'local' && (Platform.OS === 'android' || Platform.OS === 'ios')

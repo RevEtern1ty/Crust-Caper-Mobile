@@ -4,6 +4,7 @@ process.exitCode = buildStorefront({
   origin: 'https://crustcaper.test',
   profile: 'stage',
   storeId: 'kigali',
+  legal: true,
   pspHosts: 'checkout.flutterwave.com',
   outputDir: 'dist-storefront-test',
 });

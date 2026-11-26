@@ -1,6 +1,7 @@
 import Head from 'next/head';
 import type { PropsWithChildren } from 'react';
 import type { CatalogMenu, CatalogSite, Locale } from '../lib/catalog';
+import { legalPath } from '../lib/legal-path';
 import { contactPath, menuPath, pickupStatus, price, text } from './copy';
 import { brandMark, photoFor } from './photos';
 
@@ -76,7 +77,7 @@ function StoreAddress({ locale, store }: { locale: Locale; store: Store }) {
   );
 }
 
-function StoreDetails({ locale, store }: { locale: Locale; store: Store }) {
+function StoreDetails({ locale, store, legalAvailable }: { locale: Locale; store: Store; legalAvailable: boolean }) {
   const t = text(locale);
   return (
     <footer className="store-info">
@@ -85,16 +86,21 @@ function StoreDetails({ locale, store }: { locale: Locale; store: Store }) {
       <div className="store-links">
         {store.directionsUrl && <a href={store.directionsUrl} rel="noreferrer">{t.directions}</a>}
         <a href={contactPath(locale)}>{t.contact}</a>
-        <a href={'/privacy?storefrontLocale=' + locale}>{t.privacy}</a>
+        <a href={'/order-privacy?storefrontLocale=' + locale}>{t.privacy}</a>
+        {legalAvailable && <>
+          <a href={legalPath('privacy', locale)}>{t.privacyPolicy}</a>
+          <a href={legalPath('terms', locale)}>{t.terms}</a>
+        </>}
       </div>
     </footer>
   );
 }
 
-export function ContactPage({ locale, site, store }: {
+export function ContactPage({ locale, site, store, legalAvailable }: {
   locale: Locale;
   site: CatalogSite | null;
   store: Store | null;
+  legalAvailable: boolean;
 }) {
   const t = text(locale);
   const title = t.contact + ' | CrustCaper';
@@ -114,6 +120,7 @@ export function ContactPage({ locale, site, store }: {
           <div className="store-links">
             {store.directionsUrl && <a href={store.directionsUrl} rel="noreferrer">{t.directions}</a>}
             {store.supportUrl && <a href={store.supportUrl} rel="noreferrer">{t.contactSupport}</a>}
+            {legalAvailable && <a href={legalPath('terms', locale)}>{t.terms}</a>}
           </div>
           {!store.supportUrl && <p>{t.supportUnavailable}</p>}
         </section>
@@ -147,12 +154,13 @@ function ItemCard({ locale, product, illustrative }: { locale: Locale; product: 
   );
 }
 
-export function MenuPage({ locale, site, store, startsAt, products }: {
+export function MenuPage({ locale, site, store, startsAt, products, legalAvailable }: {
   locale: Locale;
   site: CatalogSite;
   store: Store;
   startsAt: string | null;
   products: MenuItem[];
+  legalAvailable: boolean;
 }) {
   const t = text(locale);
   const pickup = pickupStatus(store.open, startsAt, locale);
@@ -192,7 +200,7 @@ export function MenuPage({ locale, site, store, startsAt, products }: {
         </section>
       ))}
       {categories.length === 0 && <p className="empty-menu">{t.emptyMenu}</p>}
-      <StoreDetails locale={locale} store={store} />
+      <StoreDetails locale={locale} store={store} legalAvailable={legalAvailable} />
     </Layout>
   );
 }
@@ -227,12 +235,13 @@ function ProductFacts({ locale, product }: { locale: Locale; product: Product })
   );
 }
 
-export function ProductPage({ locale, site, store, startsAt, product }: {
+export function ProductPage({ locale, site, store, startsAt, product, legalAvailable }: {
   locale: Locale;
   site: CatalogSite;
   store: Store;
   startsAt: string | null;
   product: Product;
+  legalAvailable: boolean;
 }) {
   const t = text(locale);
   const pickup = pickupStatus(store.open, startsAt, locale);
@@ -259,7 +268,7 @@ export function ProductPage({ locale, site, store, startsAt, product }: {
           </div>
         </div>
       </article>
-      <StoreDetails locale={locale} store={store} />
+      <StoreDetails locale={locale} store={store} legalAvailable={legalAvailable} />
     </Layout>
   );
 }

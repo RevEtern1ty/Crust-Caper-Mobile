@@ -5,7 +5,7 @@ const { parseArgs } = require('node:util');
 
 const projectRoot = resolve(dirname(module.filename), '..');
 const outputName = /^dist-storefront(?:-[a-z0-9]+(?:[._-][a-z0-9]+)*)?$/;
-const usage = 'npm run build:storefront -- --origin https://stage.example.test --profile stage --store-id kigali --psp-hosts checkout.flutterwave.com [--output-dir dist-storefront-stage]\n'
+const usage = 'npm run build:storefront -- --origin https://stage.example.test --profile stage --store-id kigali --psp-hosts checkout.flutterwave.com [--legal] [--output-dir dist-storefront-stage]\n'
   + 'Production requires --android-package and --ios-bundle-id. The default output directory is dist-storefront.';
 
 function parseStorefrontArguments(args) {
@@ -18,10 +18,11 @@ function parseStorefrontArguments(args) {
     'output-dir': { type: 'string', default: 'dist-storefront' },
     'android-package': { type: 'string' },
     'ios-bundle-id': { type: 'string' },
+    legal: { type: 'boolean' },
   } });
   if (values.help) return null;
   const { origin, profile, 'store-id': storeId, 'psp-hosts': pspHosts, 'output-dir': outputDir,
-    'android-package': androidPackage, 'ios-bundle-id': iosBundleId } = values;
+    'android-package': androidPackage, 'ios-bundle-id': iosBundleId, legal } = values;
   const url = URL.parse(origin ?? '');
   if (url?.protocol !== 'https:' || url.port || (origin !== url.origin && origin !== url.origin + '/')) {
     throw new Error('Set --origin to a canonical HTTPS origin on its standard port.');
@@ -35,10 +36,10 @@ function parseStorefrontArguments(args) {
     throw new Error('The stage profile uses the staging application identifiers.');
   }
   if (outputDir === 'dist-storefront-test') throw new Error('Use npm run build:storefront-test for the fixture output.');
-  return { origin: url.origin, profile, storeId, pspHosts, outputDir, androidPackage, iosBundleId };
+  return { origin: url.origin, profile, storeId, pspHosts, outputDir, androidPackage, iosBundleId, legal };
 }
 
-function storefrontEnvironment({ origin, profile, storeId, pspHosts, androidPackage, iosBundleId }, inherited = process.env) {
+function storefrontEnvironment({ origin, profile, storeId, pspHosts, androidPackage, iosBundleId, legal }, inherited = process.env) {
   const env = Object.fromEntries(Object.entries(inherited).filter(([key]) => !/^(?:CRUSTCAPER_|EXPO_|EAS_)/i.test(key)));
   return {
     ...env,
@@ -49,6 +50,7 @@ function storefrontEnvironment({ origin, profile, storeId, pspHosts, androidPack
     CRUSTCAPER_WEB_CHECKOUT: 'true',
     CRUSTCAPER_API_BASE_URL: `${origin}/api/v1`,
     CRUSTCAPER_APP_LINK_ORIGIN: origin,
+    ...((profile === 'production' || legal) && { CRUSTCAPER_LEGAL_ORIGIN: origin }),
     CRUSTCAPER_PSP_HOSTS: pspHosts,
     CRUSTCAPER_STORE_ID: storeId,
     ...(androidPackage && { CRUSTCAPER_ANDROID_PACKAGE: androidPackage }),

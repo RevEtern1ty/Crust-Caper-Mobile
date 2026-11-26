@@ -100,11 +100,13 @@ async function checkPublicCatalog(ca) {
   assert.equal(kinyarwanda.status, 200);
   assert.match(kinyarwanda.body, /<html[^>]*lang="rw"/);
   assert.match(kinyarwanda.body, /Ingano/);
-  assert.ok(kinyarwanda.body.includes('/privacy?storefrontLocale=rw'));
-  assert.ok(english.body.includes('/privacy?storefrontLocale=en'));
   assert.ok(kinyarwanda.body.includes('href="/contact?storefrontLocale=rw"'));
   assert.ok(english.body.includes('href="/contact"'));
-  const privacy = await request(ca, '/privacy');
+  assert.ok(kinyarwanda.body.includes('/order-privacy?storefrontLocale=rw'));
+  assert.ok(english.body.includes('/order-privacy?storefrontLocale=en'));
+  assert.ok(kinyarwanda.body.includes('href="/privacy?lang=rw"'));
+  assert.ok(english.body.includes('href="/terms"'));
+  const privacy = await request(ca, '/order-privacy');
   assert.equal(privacy.status, 200);
   assert.match(privacy.headers['cache-control'], /no-store/);
   assert.match(privacy.headers['x-robots-tag'], /noindex/);
@@ -137,12 +139,41 @@ async function checkPublicContact(ca) {
   assert.match(english.body, /Example pickup address/);
   assert.match(english.body, /Example hours/);
   assert.match(english.body, /The restaurant has not published a support link yet/);
+  assert.ok(english.body.includes('href="/terms"'));
   assert.match(kinyarwanda.body, /Vugana na resitora/);
   assert.match(kinyarwanda.body, /Amasaha y’icyitegererezo/);
   assert.match(kinyarwanda.body, /Resitora ntirashyiraho uburyo bwo kuyivugisha/);
+  assert.ok(kinyarwanda.body.includes('href="/terms?lang=rw"'));
   assert.equal(head.status, 200);
   assert.equal(head.body, '');
   assert.equal(post.status, 404);
+}
+
+async function checkPublicLegal(ca) {
+  for (const [path, title, locale, version] of [
+    ['/privacy', 'Fixture privacy policy', 'en', '2026-05-01'],
+    ['/privacy?lang=rw', 'Politiki y’amakuru bwite y’igerageza', 'rw', '2026-05-01'],
+    ['/privacy/2026-04-01', 'Archived fixture privacy policy', 'en', '2026-04-01'],
+    ['/terms?lang=rw', 'Amabwiriza yo gutumiza y’igerageza', 'rw', '2026-05-01'],
+  ]) {
+    const response = await request(ca, path, { headers: { Cookie: guestCookie + '=ignored' } });
+    assert.equal(response.status, 200, path);
+    assert.equal(response.headers['content-language'], locale);
+    assert.match(response.headers['cache-control'], /no-store/);
+    assert.match(response.headers['x-robots-tag'], /noindex/);
+    assert.match(response.headers['content-security-policy'], /frame-ancestors 'none'/);
+    assert.ok(!response.headers['set-cookie']);
+    assert.ok(response.body.includes('>' + title + '</h1>'));
+    assert.ok(response.body.includes('<time dateTime="' + version + '">' + version + '</time>'));
+    assert.ok(response.body.includes('&lt;example&gt;'));
+    assert.doesNotMatch(response.body, /<script\b|<example>/i);
+  }
+  const head = await request(ca, '/privacy', { method: 'HEAD' });
+  assert.equal(head.status, 200);
+  assert.equal(head.body, '');
+  assert.equal((await request(ca, '/terms', { method: 'POST' })).status, 404);
+  assert.equal((await request(ca, '/privacy/1900-01-01')).status, 404);
+  assert.equal((await request(ca, '/legal/privacy')).status, 404);
 }
 
 async function runPublishedCheck(caPath, checker, args, logName) {
@@ -283,6 +314,33 @@ async function checkContactLayout(browser) {
   }
 }
 
+async function checkLegalLayout(browser) {
+  const context = await newContext(browser, { viewport: { width: 320, height: 760 } }, false);
+  try {
+    const page = await context.newPage();
+    for (const width of [320, 390, 430]) {
+      await page.setViewportSize({ width, height: 760 });
+      for (const locale of ['en', 'rw']) {
+        await page.goto(origin + '/privacy' + (locale === 'rw' ? '?lang=rw' : ''));
+        await page.addStyleTag({ content: 'html { font-size: 200% !important; }' });
+        await page.getByRole('heading', { level: 1 }).waitFor();
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), width);
+        await capture(page, `legal-publication-${locale}-${width}`);
+      }
+    }
+    await page.getByRole('link', { name: 'English', exact: true }).click();
+    await page.waitForURL(origin + '/privacy');
+    await page.getByRole('link', { name: 'Manage your order data', exact: true }).click();
+    await page.waitForURL(origin + '/order-privacy');
+    await shown(page, 'Verify a single order to download its data or request deletion.');
+    await page.goto(origin + '/settings');
+    await button(page, 'Privacy policy').waitFor();
+    await button(page, 'Ordering terms').waitFor();
+  } finally {
+    await context.close();
+  }
+}
+
 async function checkPhotoTransport(ca) {
   const source = readFileSync(resolve(dirname(module.filename), '..', 'assets', 'menu', 'double-smash.jpg'));
   const [get, head, absent, nonRaster] = await Promise.all([
@@ -383,6 +441,14 @@ async function checkGuestCheckout(browser, ca) {
     await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { disabled: false }).nth(2).click();
     await page.getByLabel('Phone number', { exact: true }).fill('+250700000000');
     await page.getByLabel('Email address', { exact: true }).fill('storefront-checkout@example.test');
+    const [termsPage] = await Promise.all([
+      context.waitForEvent('page'),
+      button(page, 'Ordering terms').click(),
+    ]);
+    await termsPage.waitForURL(origin + '/terms');
+    await termsPage.getByRole('heading', { name: 'Fixture ordering terms' }).waitFor();
+    await termsPage.close();
+    assert.equal(await page.getByLabel('Phone number', { exact: true }).inputValue(), '+250700000000');
 
     const sessionPath = '/api/v1/web/session';
     const [sessionResponse] = await Promise.all([
@@ -556,13 +622,13 @@ async function checkOrderPrivacy(browser, ca, order, sessionId, cookie) {
 
 async function checkVerifiedOrderPrivacy(browser, page, ca, order, orderPath, statusPath) {
   await page.goto(origin + '/menu/rw');
-  await page.locator('a[href="/privacy?storefrontLocale=rw"]').click();
-  await page.waitForURL(origin + '/privacy');
+  await page.locator('a[href="/order-privacy?storefrontLocale=rw"]').click();
+  await page.waitForURL(origin + '/order-privacy');
   await page.locator('html[lang="rw"]').waitFor({ state: 'attached' });
   await page.getByLabel('Nimero ya komande', { exact: true }).waitFor();
   await checkPrivacyLayout(page, 'rw');
-  await page.goto(origin + '/privacy?storefrontLocale=en');
-  await page.waitForURL(origin + '/privacy');
+  await page.goto(origin + '/order-privacy?storefrontLocale=en');
+  await page.waitForURL(origin + '/order-privacy');
   await page.locator('html[lang="en"]').waitFor({ state: 'attached' });
   await page.getByLabel('Order number', { exact: true }).waitFor();
   await checkPrivacyLayout(page, 'en');
@@ -726,6 +792,7 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   if (!webPerf) {
     await checkPublicCatalog(ca);
     await checkPublicContact(ca);
+    await checkPublicLegal(ca);
     await checkCheckoutPreflight(caPath);
     await checkNativeReturnPreflight(caPath);
   }
@@ -749,5 +816,6 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   if (catalogPhotos) await checkPhotoRendering(browser);
   await checkNoJavaScript(browser);
   await checkContactLayout(browser);
+  await checkLegalLayout(browser);
   await checkGuestCheckout(browser, ca);
 });

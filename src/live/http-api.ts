@@ -40,6 +40,7 @@ export type ConnectedConfig = {
   apiBaseUrl: string;
   storeId: string;
   pspHosts: string[];
+  legalOrigin?: string;
   pushProjectId?: string;
   webCheckout?: boolean;
 };

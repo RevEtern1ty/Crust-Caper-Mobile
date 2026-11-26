@@ -2,10 +2,11 @@ import type { GetServerSideProps, PageConfig } from 'next';
 import { CatalogProblem, MenuPage, ProductPage, type MenuItem } from '../../components/CatalogPages';
 import { menuPath } from '../../components/copy';
 import { isCatalogSku, isLocale, loadCatalog, type CatalogMenu, type CatalogSite, type Locale } from '../../lib/catalog';
+import { legalPublication } from '../../lib/legal';
 
 export const config: PageConfig = { unstable_runtimeJS: false };
 
-type PageData = { locale: Locale; site: CatalogSite; store: CatalogMenu['store']; startsAt: string | null };
+type PageData = { locale: Locale; site: CatalogSite; store: CatalogMenu['store']; startsAt: string | null; legalAvailable: boolean };
 type Props =
   | ({ view: 'menu'; products: MenuItem[] } & PageData)
   | ({ view: 'product'; product: CatalogMenu['products'][number] } & PageData)
@@ -37,6 +38,7 @@ export const getServerSideProps: GetServerSideProps<Props> = async ({ params, re
   const data: PageData = {
     locale, site: catalog.site, store,
     startsAt: slots.find(slot => slot.available)?.startsAt ?? null,
+    legalAvailable: (await legalPublication()).status === 'published',
   };
   if (sku !== undefined) {
     const product = products.find(item => item.sku === sku);

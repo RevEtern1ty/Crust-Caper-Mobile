@@ -45,6 +45,7 @@ const fixture = {
   CRUSTCAPER_STORE_ID: 'ci-test-store',
   CRUSTCAPER_PSP_HOSTS: 'checkout.crustcaper.invalid',
   CRUSTCAPER_APP_LINK_ORIGIN: 'https://stage.crustcaper.invalid',
+  CRUSTCAPER_LEGAL_ORIGIN: 'https://public.crustcaper.invalid',
   CRUSTCAPER_ANDROID_PACKAGE: 'org.crustcaper.civerification',
   CRUSTCAPER_IOS_BUNDLE_ID: 'org.crustcaper.civerification',
 };
@@ -130,6 +131,7 @@ for (const profile of [resolvedStageStore.env.CRUSTCAPER_BUILD_PROFILE, build.pr
     apiBaseUrl: fixture.CRUSTCAPER_API_BASE_URL,
     storeId: fixture.CRUSTCAPER_STORE_ID,
     pspHosts: [fixture.CRUSTCAPER_PSP_HOSTS],
+    legalOrigin: fixture.CRUSTCAPER_LEGAL_ORIGIN,
   });
   const manifest = native.android.manifest.manifest;
   const permissions = manifest['uses-permission'] ?? [];
@@ -196,6 +198,9 @@ const rejectedProductionConfigs = [
   [{ CRUSTCAPER_PSP_HOSTS: '*.crustcaper.invalid' }, 'Supply exact PSP host names'],
   [{ CRUSTCAPER_APP_LINK_ORIGIN: undefined }, 'Set CRUSTCAPER_APP_LINK_ORIGIN'],
   [{ CRUSTCAPER_APP_LINK_ORIGIN: 'https://stage.crustcaper.invalid/a' }, 'Use only the app-link origin'],
+  [{ CRUSTCAPER_LEGAL_ORIGIN: undefined }, 'Set CRUSTCAPER_LEGAL_ORIGIN'],
+  [{ CRUSTCAPER_LEGAL_ORIGIN: 'http://public.crustcaper.invalid' }, 'must use a domain over HTTPS'],
+  [{ CRUSTCAPER_LEGAL_ORIGIN: 'https://public.crustcaper.invalid/privacy' }, 'Use only the public legal site origin'],
   [{ CRUSTCAPER_ANDROID_PACKAGE: undefined }, 'Set CRUSTCAPER_ANDROID_PACKAGE'],
   [{ CRUSTCAPER_ANDROID_PACKAGE: 'com.crustcaper.mobile.stage' }, 'Use a distinct, valid native application identifier'],
   [{ CRUSTCAPER_IOS_BUNDLE_ID: undefined }, 'Set CRUSTCAPER_IOS_BUNDLE_ID'],

@@ -3,9 +3,10 @@ import { useEffect, useRef, useState } from 'react';
 import { Platform, Pressable, StyleSheet, type Text as NativeText, View } from 'react-native';
 import { useCheckout } from '../src/checkout/context';
 import { CheckoutError } from '../src/checkout/controller';
-import { useShop } from '../src/state/shop';
+import { legalOrigin, useShop } from '../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../src/ui/core';
 import { copy } from '../src/ui/format';
+import { LegalDocumentLink } from '../src/ui/legal-document-link';
 
 const languages = [{ id: 'en', name: 'English' }, { id: 'rw', name: 'Kinyarwanda' }] as const;
 
@@ -77,8 +78,13 @@ export default function SettingsScreen() {
           : <Button label={t('End guest session', 'Soza igihe cy’umushyitsi')} onPress={() => setConfirmEnd(true)} variant="secondary" disabled={!journal || busy} />)}
       </Card>}
       {mode === 'connected' && (
-        <Button label={t('Order privacy', 'Amakuru bwite ya komande')} variant="secondary" onPress={() => router.push('/privacy')} />
+        <Button label={t('Order privacy', 'Amakuru bwite ya komande')} variant="secondary"
+          onPress={() => router.push('/order-privacy')} />
       )}
+      {legalOrigin && <Card>
+        <LegalDocumentLink kind="privacy" variant="secondary" />
+        <LegalDocumentLink kind="terms" variant="secondary" />
+      </Card>}
       {mode === 'demo' && <Card>
         <Text variant="heading">{copy(locale, 'CrustCaper Demo', 'Igerageza rya CrustCaper')}</Text>
         <Text>{copy(locale, 'Orders and payments use test data. Follow their status under Orders.', 'Komande no kwishyura bikoresha amakuru y’igerageza. Kurikirana uko bimeze muri Komande.')}</Text>

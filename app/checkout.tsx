@@ -12,6 +12,7 @@ import { ApiError, type PickupSlot, type Quote } from '../src/domain/types';
 import { useShop } from '../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../src/ui/core';
 import { copy, money, slotLabel } from '../src/ui/format';
+import { LegalDocumentLink } from '../src/ui/legal-document-link';
 
 const demoPhoneLabel = '+250 700 000 000';
 const pickupWindowKey = ({ id, startsAt, endsAt }: PickupSlot) => JSON.stringify([id, startsAt, endsAt]);
@@ -323,6 +324,7 @@ export default function CheckoutScreen() {
       )}>
         <Text variant="title" accessibilityRole="header">{t('Resume checkout', 'Komeza kwishyura')}</Text>
         {contactCard}
+        <LegalDocumentLink kind="terms" />
       </Screen>
     );
   }
@@ -473,6 +475,7 @@ export default function CheckoutScreen() {
             ? t('Confirm the shown items, total and time to open demo payment.', 'Emeza ibyo ubonye, igiteranyo n’igihe kugira ngo wishyure mu igerageza.')
             : t('Confirm the items, total and pickup time to continue to payment.', 'Emeza ibiribwa, igiteranyo n’igihe cyo gufata komande kugira ngo wishyure.')
           : t('We’ll confirm the items, price and time before payment.', 'Tuzemeza ibiribwa, igiciro n’igihe mbere yo kwishyura.')}</Text>}
+        <LegalDocumentLink kind="terms" />
       </Card>
     </Screen>
   );

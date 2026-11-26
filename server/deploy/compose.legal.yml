@@ -1,0 +1,15 @@
+services:
+  edge:
+    environment:
+      CRUSTCAPER_LEGAL_ENABLED: "1"
+
+  catalog:
+    environment:
+      CRUSTCAPER_LEGAL_PUBLICATION_FILE: /srv/crustcaper-legal/publication.json
+    volumes:
+      - type: bind
+        source: ${CRUSTCAPER_LEGAL_PUBLICATION_FILE:?Set the absolute path to the approved legal publication JSON}
+        target: /srv/crustcaper-legal/publication.json
+        read_only: true
+        bind:
+          create_host_path: false
