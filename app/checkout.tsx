@@ -6,9 +6,9 @@ import { reviewCheckoutCart } from '../src/checkout/cart-review';
 import { useCheckout, useRouteActionGuard } from '../src/checkout/context';
 import { normalizePhone } from '../src/checkout/contact';
 import type { CheckoutContact } from '../src/checkout/controller';
-import { checkoutError, changeLabel, itemName, itemOptions } from '../src/checkout/labels';
+import { checkoutError, changeLabel, itemName, itemOptions, orderItemLabels } from '../src/checkout/labels';
 import { DEMO_PHONE } from '../src/domain/demo-api';
-import { ApiError, type PickupSlot, type Quote } from '../src/domain/types';
+import { ApiError, type CartLine, type OrderLine, type PickupSlot, type Quote } from '../src/domain/types';
 import { useShop } from '../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../src/ui/core';
 import { copy, money, slotLabel } from '../src/ui/format';
@@ -54,7 +54,8 @@ export default function CheckoutScreen() {
   const quote = quoteExpiresAt > now ? matchingReview : null;
   const quotedCart = quote ? reviewCheckoutCart(cart, quote) : null;
   const requiresCartEdit = quotedCart?.requiresCartEdit ?? false;
-  const reviewedLines = quotedCart?.available ?? cart.map((current) => ({ current, previous: current }));
+  const reviewedLines: { current: OrderLine; previous: CartLine | undefined }[] =
+    quotedCart?.available ?? cart.map((current) => ({ current, previous: current }));
   const unfinished = journal?.active && journal.active.phase !== 'tracking';
   const demo = mode === 'demo';
   const restoringContact = !demo && journal?.active?.phase === 'creating' && resume === 'contact';
@@ -439,21 +440,31 @@ export default function CheckoutScreen() {
             {line.modifierIds.length > 0 && <Text variant="small" tone="muted">{itemOptions(line, locale, menu)}</Text>}
           </View>
         ))}
-        {reviewedLines.map(({ current: line, previous }) => (
-          <View key={`${line.sku}:${line.modifierIds.join(',')}`} style={styles.row}>
-            <View style={styles.shrink}>
-              <Text>{line.quantity} × {itemName(line.sku, locale, menu)}</Text>
-              {line.modifierIds.length > 0 && <Text variant="small" tone="muted">{itemOptions(line, locale, menu)}</Text>}
-              {previous && previous.unitPrice !== line.unitPrice && <Text variant="small" tone="red">
-                {t('Price per item', 'Igiciro kuri kimwe')} · {money(previous.unitPrice)} → {money(line.unitPrice)}
-              </Text>}
-              {previous && previous.quantity !== line.quantity && <Text variant="small" tone="red">
-                {t('Quantity', 'Umubare')} · {previous.quantity} → {line.quantity}
-              </Text>}
+        {reviewedLines.map(({ current: line, previous }) => {
+          const { name, options } = orderItemLabels(line, locale, menu);
+          const { soldItem } = line;
+          return (
+            <View key={`${line.sku}:${line.modifierIds.join(',')}`} style={styles.row}>
+              <View style={styles.shrink}>
+                <Text>{line.quantity} × {name}</Text>
+                {!!options && <Text variant="small" tone="muted">{options}</Text>}
+                {!!soldItem?.ingredients.length && <Text variant="small" tone="muted">
+                  {t('Base recipe ingredients', 'Ibigize ifunguro ry’ibanze')} · {soldItem.ingredients.map(item => item[locale]).join(', ')}
+                </Text>}
+                {!!soldItem?.allergens.length && <Text variant="small" tone="muted">
+                  {t('Base recipe allergens', 'Ibitera ubwivumbure mu ifunguro ry’ibanze')} · {soldItem.allergens.map(item => item[locale]).join(', ')}
+                </Text>}
+                {previous && previous.unitPrice !== line.unitPrice && <Text variant="small" tone="red">
+                  {t('Price per item', 'Igiciro kuri kimwe')} · {money(previous.unitPrice)} → {money(line.unitPrice)}
+                </Text>}
+                {previous && previous.quantity !== line.quantity && <Text variant="small" tone="red">
+                  {t('Quantity', 'Umubare')} · {previous.quantity} → {line.quantity}
+                </Text>}
+              </View>
+              <Text style={styles.amount}>{money(line.quantity * line.unitPrice)}</Text>
             </View>
-            <Text style={styles.amount}>{money(line.quantity * line.unitPrice)}</Text>
-          </View>
-        ))}
+          );
+        })}
         {quote && (
           <>
             <View style={styles.row}>

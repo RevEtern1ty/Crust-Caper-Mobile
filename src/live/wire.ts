@@ -73,6 +73,7 @@ export const quoteResponse = priceChanges.extend({
   quoteId: identifier,
   storeId: identifier,
   slotId: identifier,
+  lines: z.array(orderLine),
   subtotal: amount,
   tax: amount,
   total: amount,

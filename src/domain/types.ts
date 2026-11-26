@@ -76,7 +76,7 @@ export type Quote = {
   id: string
   storeId: string
   slotId: string
-  lines: CartLine[]
+  lines: OrderLine[]
   subtotal: number
   tax: number
   total: number

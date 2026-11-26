@@ -20,6 +20,12 @@ const refreshToken = 'refresh_' + 'b'.repeat(40);
 const refreshExpiresAt = '2027-01-26T10:00:00Z';
 const session = { accessToken, expiresAt, refreshToken, refreshExpiresAt };
 const cartLine = { sku: 'double-smash', quantity: 1, unitPrice: 9200, modifierIds: [] };
+const purchasedItem = {
+  catalogVersion: 'sale-1', name: { en: 'Original burger', rw: 'Burgeri ya mbere' },
+  ingredients: [{ en: 'Bun', rw: 'Umugati' }],
+  allergens: [{ en: 'Wheat', rw: 'Ingano' }],
+  modifiers: [{ id: 'extra-cheese', name: { en: 'Extra cheese', rw: 'Foromaje y’inyongera' }, price: 500 }],
+};
 const pickupOrderId = 'ab83bbb6-fd3c-4fad-99c7-4538319add23';
 const installationId = '67295c19-0610-4210-94df-79d8161bb727';
 const pushConfig = { ...config, pushProjectId: '13015b68-c43c-481a-be41-1ff695c1a37b' };
@@ -77,12 +83,7 @@ function transport(handler: (call: Call) => Response | Promise<Response>) {
 
 test('connected order reads retain validated purchased items without putting them into repeat offers', async () => {
   const { storage } = memory();
-  const soldItem = {
-    catalogVersion: 'sale-1', name: { en: 'Original burger', rw: 'Burgeri ya mbere' },
-    ingredients: [{ en: 'Bun', rw: 'Umugati' }],
-    allergens: [{ en: 'Wheat', rw: 'Ingano' }],
-    modifiers: [{ id: 'extra-cheese', name: { en: 'Extra cheese', rw: 'Foromaje y’inyongera' }, price: 500 }],
-  };
+  const soldItem = purchasedItem;
   const selectedLine = { ...cartLine, modifierIds: ['extra-cheese'] };
   let orderLine: object = { ...selectedLine, soldItem };
   const { fetcher } = transport(call => {
@@ -104,6 +105,30 @@ test('connected order reads retain validated purchased items without putting the
   await assert.rejects(api.getOrder(order.id), { code: 'invalid_response' });
   orderLine = { ...selectedLine, soldItem: { ...soldItem, allergens: [{ en: 'Wheat' }] } };
   await assert.rejects(api.getOrder(order.id), { code: 'invalid_response' });
+});
+
+test('checkout quotes retain the quoted recipe and selected options while accepting legacy responses', async () => {
+  const { storage } = memory();
+  const selectedLine = { ...cartLine, modifierIds: ['extra-cheese'] };
+  const input = { storeId: 'kigali', slotId: 'lunch', lines: [selectedLine] };
+  let responseLine: object = { ...selectedLine, soldItem: purchasedItem };
+  const { fetcher } = transport(call => {
+    if (call.url.endsWith('/guest-sessions')) return Response.json(session, { status: 201 });
+    assert.equal(call.url, config.apiBaseUrl + '/quotes');
+    assert.equal(call.method, 'POST');
+    assert.deepEqual(call.body, input);
+    return Response.json({
+      quoteId: 'quote-1', storeId: input.storeId, slotId: input.slotId, lines: [responseLine],
+      subtotal: 9200, tax: 0, total: 9200, currency: 'RWF', changes: [],
+      expiresAt: '2026-11-25T10:10:00Z', pickupStartsAt: order.pickupStartsAt, pickupEndsAt: order.pickupEndsAt,
+    });
+  });
+  const api = createLiveApi({ config, storage, journalKey, fetcher, now });
+  assert.deepEqual((await api.createQuote(input)).lines, [{ ...selectedLine, soldItem: purchasedItem }]);
+  responseLine = { ...responseLine, soldItem: { ...purchasedItem, modifiers: [] } };
+  await assert.rejects(api.createQuote(input), { code: 'invalid_response' });
+  responseLine = selectedLine;
+  assert.deepEqual((await api.createQuote(input)).lines, [selectedLine]);
 });
 
 test('pickup alert reads, opt-in and opt-out are bearer scoped and reuse a private installation after restart', async () => {
