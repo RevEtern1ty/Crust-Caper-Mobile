@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { checkAvailability, watchAvailability } from './storefront-availability.mjs';
 
 const origin = 'https://storefront.fixture.test';
@@ -252,4 +253,27 @@ test('watcher starting with an outage emits an incident followed by recovery', {
   assert.deepEqual(await watchSamples([false, false, true, true]), [
     ['incident', 2, null, 'http_status'], ['recovered', 4, false, 'ok'],
   ]);
+});
+
+test('watch cancels a stalled notification sink', { timeout: 2000 }, async () => {
+  const controller = new AbortController();
+  const enteredSink = Promise.withResolvers();
+  const flushed = Promise.withResolvers();
+  const watcher = watchAvailability({
+    signal: controller.signal,
+    probe: () => ({ ok: true, orderingOpen: true, checks: [] }),
+    emit() {
+      enteredSink.resolve();
+      return flushed.promise;
+    },
+  });
+  await enteredSink.promise;
+  controller.abort();
+  try {
+    const stopped = await Promise.race([watcher.then(() => true), delay(200, false, { ref: false })]);
+    assert.equal(stopped, true, 'watcher must terminate before the stalled sink flushes');
+  } finally {
+    flushed.resolve();
+    await watcher;
+  }
 });

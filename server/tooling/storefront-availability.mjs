@@ -202,7 +202,8 @@ export async function watchAvailability({ probe, emit, intervalMs = 10000, signa
       }
       if (event && !stop.aborted) {
         announced = true;
-        await emit({ event, at: new Date().toISOString(), orderingOpen: result.orderingOpen, checks: result.checks });
+        const notification = { event, at: new Date().toISOString(), orderingOpen: result.orderingOpen, checks: result.checks };
+        await withSignal(stop, () => emit(notification));
       }
       if (!stop.aborted) await delay(intervalMs, undefined, { signal: stop });
     }
@@ -229,7 +230,11 @@ async function main(args) {
   }
 
   const controller = new AbortController();
-  const stop = () => controller.abort();
+  const stop = () => {
+    controller.abort();
+    // Node can keep an unread stdout pipe alive after an aborted monitor. Give the sink a brief grace period.
+    if (mode === '--watch' && process.stdout.writableLength > 0) setTimeout(() => process.exit(0), 1000).unref();
+  };
   const probe = signal => checkAvailability({ apiBaseUrl, storeId, signal });
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
