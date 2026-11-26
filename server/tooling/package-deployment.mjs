@@ -79,8 +79,12 @@ async function inspectArchive(archive, revision, exportId) {
     const descriptors = named.filter(item => item.annotations['io.containerd.image.name'] === `docker.io/${tag}`);
     const entries = classic.filter(item => item.RepoTags[0] === tag);
     const descriptor = descriptors[0];
+    // Docker can omit platform on the descriptor after saving a loaded single-platform image.
+    // Its content-addressed config still has to confirm linux/amd64 below.
+    const declaredPlatform = descriptor?.platform;
     requireMatch(descriptors.length === 1 && entries.length === 1 && digestPattern.test(descriptor.digest)
-      && descriptor.platform?.os === 'linux' && descriptor.platform?.architecture === 'amd64',
+      && (declaredPlatform === undefined
+        || (declaredPlatform?.os === 'linux' && declaredPlatform?.architecture === 'amd64')),
     `${role} does not have exactly one linux/amd64 archive manifest`);
     const manifestBytes = await tarEntry(archive, blobPath(descriptor.digest));
     const manifest = JSON.parse(manifestBytes);
