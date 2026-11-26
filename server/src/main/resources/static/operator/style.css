@@ -87,6 +87,9 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .quantity { color: var(--green); font-weight: 810; }
 .name { font-weight: 720; overflow-wrap: anywhere; }
 .modifiers { display: block; margin-top: .13rem; color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
+.line-composition { margin-top: .32rem; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
+.line-composition > summary { width: fit-content; cursor: pointer; font-weight: 650; }
+.line-composition > div { margin-top: .22rem; }
 .order-actions:not(:empty) { margin-top: .95rem; }
 .order-actions { display: grid; gap: .6rem; }
 .order-actions > .button { width: 100%; }

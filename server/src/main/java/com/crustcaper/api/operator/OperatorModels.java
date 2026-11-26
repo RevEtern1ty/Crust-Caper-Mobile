@@ -1,5 +1,6 @@
 package com.crustcaper.api.operator;
 
+import com.crustcaper.api.ApiModels.SoldItem;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import java.time.Instant;
@@ -29,7 +30,8 @@ final class OperatorModels {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    record OrderLine(String sku, List<String> modifierIds, int quantity) { }
+    record OrderLine(String sku, List<String> modifierIds, int quantity,
+                     @JsonInclude(JsonInclude.Include.NON_NULL) SoldItem soldItem) { }
 
     record OrderView(UUID id, String status, String paymentStatus, List<OrderLine> lines, long total, String currency,
                      Instant pickupStartsAt, Instant pickupEndsAt,

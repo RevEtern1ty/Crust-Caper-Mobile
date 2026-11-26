@@ -506,6 +506,41 @@ function rememberPickupLookupOutcome(orderId, status) {
   renderPickupLookup();
 }
 
+function localizedText(value) {
+  return typeof value?.en === 'string' && value.en.trim().length > 0
+    && typeof value.rw === 'string' && value.rw.trim().length > 0;
+}
+
+function checkedLine(line) {
+  if (!line || typeof line.sku !== 'string' || !Number.isInteger(line.quantity) || line.quantity <= 0
+    || !Array.isArray(line.modifierIds) || !line.modifierIds.every((id) => typeof id === 'string')) {
+    throw new ApiError(502, 'invalid_response');
+  }
+
+  const { sku, modifierIds, quantity, soldItem } = line;
+  if (soldItem == null) return { sku, modifierIds, quantity };
+
+  if (typeof soldItem.catalogVersion !== 'string' || !soldItem.catalogVersion.trim() || !localizedText(soldItem.name)
+    || !Array.isArray(soldItem.ingredients) || !soldItem.ingredients.every(localizedText)
+    || !Array.isArray(soldItem.allergens) || !soldItem.allergens.every(localizedText)
+    || !Array.isArray(soldItem.modifiers) || soldItem.modifiers.length !== modifierIds.length
+    || !soldItem.modifiers.every((option) => typeof option?.id === 'string' && localizedText(option.name)
+      && Number.isSafeInteger(option.price) && option.price >= 0)) {
+    throw new ApiError(502, 'invalid_response');
+  }
+  const optionsById = new Map(soldItem.modifiers.map(({ id, name }) => [id, name.en]));
+  if (optionsById.size !== modifierIds.length || !modifierIds.every((id) => optionsById.has(id))) {
+    throw new ApiError(502, 'invalid_response');
+  }
+
+  return {
+    sku, modifierIds, quantity, name: soldItem.name.en,
+    modifiers: modifierIds.map((id) => optionsById.get(id)),
+    ingredients: soldItem.ingredients.map(({ en }) => en),
+    allergens: soldItem.allergens.map(({ en }) => en),
+  };
+}
+
 function checkedOrder(order, completed = false) {
   if (!order || typeof order.id !== 'string' || !order.id || order.paymentStatus !== 'paid'
     || (!Object.hasOwn(statuses, order.status) && !(completed && order.status === 'collected'))
@@ -513,9 +548,7 @@ function checkedOrder(order, completed = false) {
     || ((order.total !== undefined || order.currency !== undefined)
       && (!Number.isSafeInteger(order.total) || order.total <= 0 || order.currency !== 'RWF'))
     || (order.acceptedAt != null && (typeof order.acceptedAt !== 'string' || !Number.isFinite(Date.parse(order.acceptedAt))))
-    || !Array.isArray(order.lines) || !order.lines.every((line) => line && typeof line.sku === 'string'
-      && Number.isInteger(line.quantity) && line.quantity > 0 && Array.isArray(line.modifierIds)
-      && line.modifierIds.every((modifier) => typeof modifier === 'string'))) {
+    || !Array.isArray(order.lines)) {
     throw new ApiError(502, 'invalid_response');
   }
   return {
@@ -527,8 +560,30 @@ function checkedOrder(order, completed = false) {
     acceptedAt: order.acceptedAt ?? null,
     pickupStartsAt: order.pickupStartsAt,
     pickupEndsAt: order.pickupEndsAt,
-    lines: order.lines.map(({ sku, modifierIds, quantity }) => ({ sku, modifierIds, quantity })),
+    lines: order.lines.map(checkedLine),
   };
+}
+
+function appendLineComposition(details, line) {
+  const fields = [
+    ['Ingredients', line.ingredients],
+    ['Allergens', line.allergens],
+  ].filter(([, values]) => values?.length);
+  if (!fields.length) return;
+
+  const disclosure = document.createElement('details');
+  disclosure.className = 'line-composition';
+  const summary = document.createElement('summary');
+  summary.textContent = fields.length === 2 ? 'Ingredients and allergens' : fields[0][0];
+  disclosure.append(summary);
+  for (const [title, values] of fields) {
+    const group = document.createElement('div');
+    const heading = document.createElement('strong');
+    heading.textContent = title;
+    group.append(heading, document.createTextNode(` ${values.join(' · ')}`));
+    disclosure.append(group);
+  }
+  details.append(disclosure);
 }
 
 function renderedLine(line) {
@@ -549,6 +604,7 @@ function renderedLine(line) {
     modifiers.textContent = options.join(' · ');
     details.append(modifiers);
   }
+  appendLineComposition(details, line);
   row.append(quantity, details);
   return row;
 }
