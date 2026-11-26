@@ -58,13 +58,27 @@ fail() {
 
 wifi_state() {
   local status first_line
-  status=$(device_text 8s shell cmd wifi status) || return 1
+  if [[ "$android_api" == 28 ]]; then
+    # Android 9 exposes its runtime Wi-Fi state in the service dump.
+    status=$(device_text 8s shell dumpsys wifi) || return 1
+  else
+    status=$(device_text 8s shell cmd wifi status) || return 1
+  fi
   first_line=${status%%$'\n'*}
   case "$first_line" in
-    'Wifi is enabled') printf 'enabled\n' ;;
-    'Wifi is disabled') printf 'disabled\n' ;;
+    'Wifi is enabled'|'Wi-Fi is enabled') printf 'enabled\n' ;;
+    'Wifi is disabled'|'Wi-Fi is disabled') printf 'disabled\n' ;;
     *) return 1 ;;
   esac
+}
+
+set_wifi_state() {
+  local state=$1
+  if [[ "$android_api" == 28 ]]; then
+    device 8s shell svc wifi "${state%d}"
+  else
+    device 8s shell cmd wifi set-wifi-enabled "$state"
+  fi
 }
 
 capture_failure() {
@@ -89,7 +103,7 @@ finish() {
   set +e
   if (( status != 0 )) && { $radios_owned || $install_owned; }; then capture_failure; fi
 
-  local cleanup_failed=false
+  local cleanup_failed=false attempt
   if [[ -n "$remote_dir" ]]; then
     device 8s shell rm -f "$remote_dir/window.xml" || cleanup_failed=true
     device 8s shell rmdir "$remote_dir" || cleanup_failed=true
@@ -111,8 +125,14 @@ finish() {
       device 8s shell cmd connectivity airplane-mode disable || cleanup_failed=true
     fi
     if [[ $(wifi_state) != "$original_wifi" ]]; then
-      device 8s shell cmd wifi set-wifi-enabled "$original_wifi" || cleanup_failed=true
+      set_wifi_state "$original_wifi" || cleanup_failed=true
     fi
+    for ((attempt = 0; attempt < 10; attempt++)); do
+      if [[ $(wifi_state) == "$original_wifi" ]]; then break; fi
+      sleep 1
+    done
+    [[ $(wifi_state) == "$original_wifi" && $(device_text 8s shell cmd connectivity airplane-mode) == "$original_airplane" ]] \
+      || cleanup_failed=true
   fi
   if [[ -n "$scratch_dir" ]]; then
     rm -f -- "$scratch_dir/base.apk" "$scratch_dir/window.xml" || cleanup_failed=true
@@ -189,9 +209,9 @@ original_airplane=$(device_text 8s shell cmd connectivity airplane-mode)
 original_wifi=$(wifi_state) || fail 'Unable to read emulator Wi-Fi state.'
 radios_owned=true
 if [[ "$original_airplane" == disabled ]]; then device 8s shell cmd connectivity airplane-mode enable; fi
-if [[ $(wifi_state) != disabled ]]; then device 8s shell cmd wifi set-wifi-enabled disabled; fi
+if [[ $(wifi_state) != disabled ]]; then set_wifi_state disabled; fi
 for ((attempt = 0; attempt < 10; attempt++)); do
-  if network_is_offline; then break; fi
+  if [[ $(wifi_state) == disabled ]] && network_is_offline; then break; fi
   sleep 1
 done
 network_is_offline || fail 'The emulator still has an active default network.'

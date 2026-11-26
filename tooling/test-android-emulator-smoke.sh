@@ -72,18 +72,21 @@ case "$1" in
     shift
     case "$*" in
       'getprop ro.kernel.qemu'|'getprop sys.boot_completed') printf '1\n' ;;
-      'getprop ro.build.version.sdk') printf '35\n' ;;
+      'getprop ro.build.version.sdk') printf '%s\n' "$SMOKE_MOCK_API" ;;
       'am get-current-user') printf '0\n' ;;
       'pm list packages '*) if [[ -f installed ]]; then printf 'package:%s\n' "$package"; fi ;;
       'pm path '*) printf 'package:/data/app/~~fixture/%s-fixture/base.apk\n' "$package" ;;
       'cmd connectivity airplane-mode') cat airplane ;;
       'cmd connectivity airplane-mode enable') printf 'enabled\n' >airplane ;;
       'cmd connectivity airplane-mode disable') printf 'disabled\n' >airplane ;;
-      'cmd wifi status') printf 'Wifi is %s\n' "$(cat wifi)" ;;
-      'cmd wifi set-wifi-enabled '*) printf '%s\n' "$4" >wifi ;;
+      'cmd wifi status') [[ $SMOKE_MOCK_API != 28 ]]; printf 'Wifi is %s\n' "$(cat wifi)" ;;
+      'cmd wifi set-wifi-enabled '*) [[ $SMOKE_MOCK_API != 28 ]]; printf '%s\n' "$4" >wifi ;;
+      'dumpsys wifi') [[ $SMOKE_MOCK_API == 28 ]]; printf 'Wi-Fi is %s\nWifiController:\n' "$(cat wifi)" ;;
+      'svc wifi enable'|'svc wifi disable') [[ $SMOKE_MOCK_API == 28 ]]; printf '%sd\n' "$3" >wifi ;;
       'dumpsys connectivity')
         [[ $(cat airplane) == enabled && $(cat wifi) == disabled ]]
-        printf 'Active default network: none\n' ;;
+        if [[ $SMOKE_MOCK_SCENARIO == online ]]; then printf 'Active default network: 100\n'
+        else printf 'Active default network: none\n'; fi ;;
       'cmd package resolve-activity '*) printf '%s/.MainActivity\n' "$package" ;;
       'mktemp -d '*) printf '/data/local/tmp/crustcaper-smoke.Fixture1\n' ;;
       'input keyevent KEYCODE_WAKEUP'|'wm dismiss-keyguard'|'uiautomator dump '*|'rm -f '*|'rmdir '*) ;;
@@ -112,8 +115,9 @@ with ZipFile(sys.argv[1], "w") as archive:
 PY
 
 run_case() {
-  local scenario=$1 profile=$2 evidence="$fixture/$1-$2" exit_status=0
-  export SMOKE_MOCK_SCENARIO=$scenario SMOKE_MOCK_PROFILE=$profile
+  local scenario=$1 profile=$2 android_api=${3:-35} exit_status=0
+  local evidence="$fixture/$scenario-$profile-$android_api"
+  export SMOKE_MOCK_SCENARIO=$scenario SMOKE_MOCK_PROFILE=$profile SMOKE_MOCK_API=$android_api
   : >"$fixture/commands"
   : >"$fixture/samples"
   printf 'disabled\n' >"$fixture/airplane"
@@ -126,6 +130,7 @@ run_case() {
   if [[ $scenario == good ]]; then
     if (( exit_status != 0 )); then cat "$fixture/current.log" >&2; return 1; fi
     grep -Fxq 'Result: passed' "$evidence/evidence.txt"
+    grep -Fxq "Android API: $android_api" "$evidence/evidence.txt"
     [[ -s "$evidence/first-launch.xml" && -s "$evidence/second-launch.png" ]]
     [[ $(wc -l <"$fixture/samples") -eq 20 ]]
     [[ $(cat "$fixture/starts") == 2 ]]
@@ -133,8 +138,19 @@ run_case() {
     if (( exit_status == 0 )); then cat "$fixture/current.log" >&2; return 1; fi
     [[ -s "$evidence/failure.txt" && ! -e "$evidence/evidence.txt" ]]
   fi
+  if [[ $android_api == 28 ]]; then
+    grep -Fxq 'shell dumpsys wifi' "$fixture/commands"
+    grep -Fxq 'shell svc wifi disable' "$fixture/commands"
+    grep -Fxq 'shell svc wifi enable' "$fixture/commands"
+    ! grep -Fq 'shell cmd wifi' "$fixture/commands"
+  fi
+  if [[ $scenario == online ]]; then
+    grep -Fxq 'Phase: Isolate emulator networking' "$evidence/failure.txt"
+    [[ $(cat "$fixture/starts") == 0 ]]
+    ! grep -Fq 'install ' "$fixture/commands"
+  fi
   [[ $(cat "$fixture/airplane") == disabled && $(cat "$fixture/wifi") == enabled && ! -e "$fixture/installed" ]]
-  printf 'Mock Android smoke: %s %s\n' "$scenario" "$profile"
+  printf 'Mock Android smoke: %s %s API %s\n' "$scenario" "$profile" "$android_api"
 }
 
 run_case good demo
@@ -145,4 +161,6 @@ run_case wrong-bytes demo
 run_case lost-install-reply demo
 run_case wrong-ui stage
 run_case restart demo
+run_case good demo 28
+run_case online demo 28
 printf 'Mock checks only. No emulator or APK was exercised.\n'
