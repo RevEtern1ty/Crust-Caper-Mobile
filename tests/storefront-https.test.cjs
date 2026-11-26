@@ -115,12 +115,11 @@ async function checkPublicCatalog(ca) {
   assert.equal((await request(ca, '/actuator/paymentreconciliation')).status, 404);
 }
 
-async function checkCheckoutPreflight(caPath) {
+async function runPublishedCheck(caPath, checker, args, logName) {
   const testDirectory = dirname(module.filename);
   const result = spawnSync(process.execPath, [
     '--require', resolve(testDirectory, 'storefront-loopback.cjs'),
-    resolve(testDirectory, '../server/tooling/check-live-catalog.mjs'),
-    origin + '/api/v1', 'kigali', 'catalog-001', '--checkout',
+    resolve(testDirectory, '../server/tooling', checker), ...args,
   ], {
     env: { ...(process.platform === 'win32' && { SystemRoot: process.env.SystemRoot }), NODE_EXTRA_CA_CERTS: caPath },
     encoding: 'utf8', timeout: 25000, maxBuffer: 32 * 1024, windowsHide: true,
@@ -128,10 +127,29 @@ async function checkCheckoutPreflight(caPath) {
   assert.ifError(result.error);
   if (evidence) {
     await mkdir(evidence, { recursive: true });
-    await writeFile(resolve(evidence, 'storefront-checkout-preflight.log'), result.stdout + result.stderr);
+    await writeFile(resolve(evidence, logName), result.stdout + result.stderr);
   }
+  return result;
+}
+
+async function checkCheckoutPreflight(caPath) {
+  const result = await runPublishedCheck(caPath, 'check-live-catalog.mjs',
+    [origin + '/api/v1', 'kigali', 'catalog-001', '--checkout'], 'storefront-checkout-preflight.log');
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Checkout EN and RW handoffs and Expo entry verified\./);
+}
+
+async function checkNativeReturnPreflight(caPath) {
+  const { androidPackage, androidFingerprint, iosAppId } = JSON.parse(process.env.CRUSTCAPER_HTTPS_TEST_APP_LINKS);
+  const check = (fingerprint, logName) => runPublishedCheck(caPath, 'check-app-links.mjs',
+    [origin, origin + '/payment-return', androidPackage, fingerprint, iosAppId], logName);
+  const result = await check(androidFingerprint, 'storefront-native-return-preflight.log');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Verified Android and Apple associations and \/payment-return over HTTPS\./);
+  const wrongFingerprint = 'B7:'.repeat(31) + 'B7';
+  const mismatch = await check(wrongFingerprint, 'storefront-native-return-mismatch.log');
+  assert.equal(mismatch.status, 1);
+  assert.match(mismatch.stderr, /Android association does not match the expected package and signing certificate\./);
 }
 
 function fixtureDatabase() {
@@ -623,6 +641,7 @@ test(scenario, { timeout: webPerf ? 155000 : 90000 }, async t => {
   if (!webPerf) {
     await checkPublicCatalog(ca);
     await checkCheckoutPreflight(caPath);
+    await checkNativeReturnPreflight(caPath);
   }
   if (catalogPhotos) await checkPhotoTransport(ca);
   const pins = await Promise.all([fixturePin(ca, storefront), fixturePin(ca, provider)]);

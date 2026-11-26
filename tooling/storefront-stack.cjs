@@ -10,6 +10,11 @@ const { fixtureDatabaseUrl, preparePostgresTls, postgresCaMount, postgresJdbcTls
 const root = resolve(dirname(module.filename), '..');
 const deploy = join(root, 'server', 'deploy');
 const fixtureHost = 'crustcaper.test';
+const fixtureAppLinks = Object.freeze({
+  androidPackage: 'com.crustcaper.mobile.stage',
+  androidFingerprint: '9A:'.repeat(31) + '9A',
+  iosAppId: 'ABCDE12345.com.crustcaper.mobile.stage',
+});
 const database = 'storefront_fixture';
 const recoveredDatabase = 'storefront_recovered';
 const recoveryHost = 'postgres-recovery';
@@ -152,6 +157,9 @@ async function prepareFixture(directory, testClasses, env, { load, paymentRestar
     `CRUSTCAPER_DB_USER=${database}`,
     `CRUSTCAPER_DB_PASSWORD=${fixturePassword}`,
     `CRUSTCAPER_OPERATOR_MFA_KEY=${fixtureMfaKey}`,
+    `CRUSTCAPER_APP_LINK_ANDROID_PACKAGE=${fixtureAppLinks.androidPackage}`,
+    `CRUSTCAPER_APP_LINK_ANDROID_FINGERPRINTS=${fixtureAppLinks.androidFingerprint}`,
+    `CRUSTCAPER_APP_LINK_IOS_APP_ID=${fixtureAppLinks.iosAppId}`,
     ...(paymentRestart ? [
       'FLUTTERWAVE_WEBHOOK_SECRET=fixture-restart-webhook-v1',
       `CRUST_PAYMENT_RETURN_URL=https://${fixtureHost}/payment-return`,
@@ -370,6 +378,7 @@ async function main() {
         ...childEnv,
         CRUSTCAPER_HTTPS_TEST_CA: browserCa,
         CRUSTCAPER_HTTPS_TEST_DOCKER_PROJECT: project,
+        CRUSTCAPER_HTTPS_TEST_APP_LINKS: JSON.stringify(fixtureAppLinks),
         ...(evidence && { CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: evidence }),
         ...((load || paymentRestart || catalogPhotos) && { CRUSTCAPER_HTTPS_TEST_MFA_FIXTURE_KEY: settings.fixtureMfaKey }),
         ...(webPerf && { CRUSTCAPER_HTTPS_TEST_WEB_PERF: '1' }),
