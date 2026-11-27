@@ -37,6 +37,8 @@ bash tooling/android-emulator-smoke.sh android/app/build/outputs/apk/release/app
 
 Для проверки именно iOS 16.0 запустите **Mobile CI** с набором `ios-minimum`. На Apple Silicon задание выбирает Xcode 26.6, проверяет наличие среды iOS 16.0 (`20A360`) и при необходимости запрашивает её через `xcodebuild`. Затем оно запускает Release профиля `local` на созданном iPhone 14 и сверяет загрузку меню с записью API. В артефакте `mobile-ios-simulator-smoke-<SHA>` сохраните сведения о среде, снимок и `connected.txt`. Если runner не сможет получить или загрузить iOS 16.0, артефакт покажет этап отказа. [Установка сред симулятора через Xcode](https://developer.apple.com/documentation/xcode/downloading-and-installing-additional-xcode-components)
 
+Набор `ios-minimum-checkout` дополнительно проходит оформление через интерфейс установленной Release-сборки с XCTest. Он проверяет восстановление того же заказа после перезапуска и подтверждение тестовой оплаты. PostgreSQL сверяет один принятый заказ и одну подтверждённую попытку оплаты. В артефакте сохраняются снимки, результаты XCTest и `checkout-persistence.txt`.
+
 ### Заказ в локальном Android APK
 
 Соберите APK профиля `local` из чистой копии проверяемого SHA. Вариант для Linux использует образ `reactnativecommunity/react-native-android@sha256:71884cd2953769cdaedced1922970d3168d9028f74f78246c5f0cbc6d60598df`. В нём установлены JDK 17, Android API 36, Build Tools 36.0.0, CMake 3.30.5 и NDK 27.1.12297006. Подключите Node.js 24.22.0 согласно `.nvmrc` для установки зависимостей и сборки JS. [Dockerfile v20.1](https://github.com/react-native-community/docker-android/blob/v20.1/Dockerfile) · [Node.js 24.22.0](https://nodejs.org/dist/v24.22.0/)

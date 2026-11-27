@@ -13,6 +13,7 @@ fi
 mkdir -p -- "$1"
 evidence_dir=$(cd -- "$1" && pwd -P)
 simulator_evidence="$evidence_dir/simulator"
+checkout_smoke=${CRUSTCAPER_IOS_ORDER_SMOKE:-0}
 if [[ -e "$evidence_dir/connected.txt" || -e "$evidence_dir/connected-failure.txt" ]] \
   || ! mkdir -- "$simulator_evidence"; then
   printf 'Use a fresh connected iOS evidence directory.\n' >&2
@@ -90,6 +91,24 @@ await_menu_request() {
   return 1
 }
 
+checkout_counts() {
+  env -i PATH="$PATH" PGPASSWORD="$db_password" PGCONNECT_TIMEOUT=3 \
+    PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=5000' \
+    "$pg_bin/psql" -XAtqw -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$pg_port" -U crustcaper -d crustcaper_dev -F '|' <<'SQL'
+WITH paid AS (
+    SELECT id FROM public.orders
+    WHERE store_id = 'kigali' AND checkout_channel = 'mobile'
+      AND status = 'accepted' AND payment_status = 'paid' AND accepted_at IS NOT NULL
+)
+SELECT (SELECT count(*) FROM public.orders),
+       (SELECT count(*) FROM paid),
+       (SELECT count(*) FROM public.payment_attempts),
+       (SELECT count(*) FROM public.payment_attempts attempt JOIN paid ON paid.id = attempt.order_id
+        WHERE attempt.status = 'paid' AND attempt.verified_at IS NOT NULL
+          AND attempt.provider_transaction_id = 'local-' || attempt.id::text);
+SQL
+}
+
 if [[ -e ios || -L ios ]]; then
   printf 'Run the connected smoke in a fresh checkout without a generated ios project.\n' >&2
   exit 2
@@ -153,7 +172,7 @@ env -i PATH="$PATH" CRUSTCAPER_PORT="$api_port" \
   --server.tomcat.accesslog.prefix=menu-access --server.tomcat.accesslog.suffix=.log \
   '--server.tomcat.accesslog.pattern=%m %U %q %s' > "$scratch_dir/api.log" 2>&1 &
 api_pid=$!
-unset db_password
+if [[ "$checkout_smoke" != 1 ]]; then unset db_password; fi
 ready=false
 for ((attempt = 0; attempt < 45; attempt++)); do
   kill -0 "$api_pid" 2>/dev/null || break
@@ -174,6 +193,16 @@ printf '\n%s\n' "$phase"
 curl --noproxy '*' --fail --silent --show-error --max-time 5 "$origin/api/v1/stores/kigali/menu?channel=web" >/dev/null
 await_menu_request 'GET /api/v1/stores/kigali/menu ?channel=web 200'
 
+if [[ "$checkout_smoke" == 1 ]]; then
+  phase='Verify the checkout fixture starts without orders or attempts'
+  printf '\n%s\n' "$phase"
+  before_checkout=$(checkout_counts)
+  if [[ "$before_checkout" != '0|0|0|0' ]]; then
+    printf 'Unexpected initial checkout counts: %s\n' "$before_checkout" >&2
+    exit 1
+  fi
+fi
+
 phase='Run the local Release on the iPhone simulator'
 printf '\n%s\n' "$phase"
 CRUSTCAPER_API_BASE_URL="$origin/api/v1" CRUSTCAPER_STORE_ID=kigali \
@@ -183,5 +212,15 @@ phase='Verify the simulator fetched the menu from the local API'
 printf '\n%s\n' "$phase"
 menu_request='GET /api/v1/stores/kigali/menu ?channel=mobile 200'
 await_menu_request "$menu_request"
+if [[ "$checkout_smoke" == 1 ]]; then
+  phase='Verify one accepted order and one verified payment attempt'
+  printf '\n%s\n' "$phase"
+  after_checkout=$(checkout_counts)
+  unset db_password
+  printf 'Columns: orders | accepted paid mobile orders in Kigali | payment attempts | matching verified attempts\nBefore: %s\nAfter: %s\nPayment provider: local\n' \
+    "$before_checkout" "$after_checkout" | tee "$evidence_dir/checkout-persistence.txt"
+  test "$after_checkout" = '1|1|1|1'
+  printf 'Result: passed\n' >> "$evidence_dir/checkout-persistence.txt"
+fi
 printf 'Source SHA: %s\nAPI JAR SHA-256: %s\nDatabase: %s\nAPI readiness: UP at %s\nMobile request: %s\nScope: iOS Release simulator boot and HTTP menu retrieval from the Spring Boot/PostgreSQL fixture.\n' \
   "$source_sha" "$jar_sha" "$pg_version" "$origin" "$menu_request" | tee "$evidence_dir/connected.txt"

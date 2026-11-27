@@ -11,6 +11,7 @@ evidence_dir=$1
 profile=${2:-demo}
 export CRUSTCAPER_BUILD_PROFILE="$profile"
 simulator_hint=''
+checkout_smoke=${CRUSTCAPER_IOS_ORDER_SMOKE:-0}
 if [[ "$profile" == local ]]; then
   export CRUSTCAPER_API_BASE_URL=${CRUSTCAPER_API_BASE_URL:-http://127.0.0.1:18080/api/v1}
   if [[ ! "$CRUSTCAPER_API_BASE_URL" =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})/api/v1$ ]] || (( BASH_REMATCH[1] > 65535 )); then
@@ -24,6 +25,10 @@ if [[ "$profile" == local ]]; then
   fi
   export CRUSTCAPER_STORE_ID=${CRUSTCAPER_STORE_ID:-kigali}
   export CRUSTCAPER_WEB_CHECKOUT=false EXPO_NO_DOTENV=1 EXPO_NO_TELEMETRY=1
+fi
+if [[ "$checkout_smoke" == 1 && ( "$profile" != local || -z "$simulator_hint" ) ]]; then
+  printf 'The iOS checkout smoke requires local Release and the exact simulator UUID.\n' >&2
+  exit 2
 fi
 mkdir -p "$evidence_dir"
 
@@ -160,6 +165,10 @@ selected_device=$(xcrun simctl list devices available --json | node -e '
   process.exitCode = 1;
 ' "$simulator_hint")
 IFS=$'\t' read -r simulator device runtime state <<< "$selected_device"
+if [[ "$checkout_smoke" == 1 && "$runtime" != 16-0 ]]; then
+  printf 'The iOS checkout smoke requires the verified iOS 16.0 simulator.\n' >&2
+  exit 1
+fi
 printf 'Using %s on iOS %s (%s), state %s.\n' "$device" "$runtime" "$simulator" "$state"
 start_phase 'Boot the iPhone simulator'
 if [[ "$state" == Shutdown ]]; then
@@ -206,4 +215,12 @@ if [[ "$profile" == local ]]; then
     "$source_sha" "$source_state" "$CRUSTCAPER_API_BASE_URL" "$CRUSTCAPER_STORE_ID" "$simulator" \
     "$arbitrary_http" "$local_networking" "$executable_sha" "$bundle_sha" "$xcode_version" \
     | tee -a "$evidence_dir/evidence.txt"
+fi
+if [[ "$checkout_smoke" == 1 ]]; then
+  start_phase 'Verify checkout through the installed iOS Release'
+  bash tooling/ios-order-ui-ci.sh "$simulator" "$evidence_dir/checkout"
+  installed_app=$(xcrun simctl get_app_container "$simulator" "$bundle_id" app)
+  cmp -s "$app/$executable" "$installed_app/$executable"
+  cmp -s "$app/main.jsbundle" "$installed_app/main.jsbundle"
+  printf 'Installed executable and embedded JS still match after checkout.\n' >> "$evidence_dir/evidence.txt"
 fi
