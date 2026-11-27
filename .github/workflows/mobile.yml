@@ -13,6 +13,7 @@ on:
           - pilot
           - ios-minimum
           - ios-minimum-checkout
+          - ios-runner-probe
           - android-minimum-connected
         default: native
       android_apk_run:
@@ -26,6 +27,7 @@ permissions:
 jobs:
   verification:
     name: Verify mobile source and bundles
+    if: inputs.suite != 'ios-runner-probe'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -100,7 +102,7 @@ jobs:
 
   android-demo:
     name: ${{ matrix.profile == 'local' && 'Build and verify Android 9 connected checkout' || format('Compile Android {0} APK', matrix.artifact) }}
-    if: inputs.suite != 'pilot' && inputs.suite != 'ios-minimum' && inputs.suite != 'ios-minimum-checkout' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    if: inputs.suite != 'pilot' && inputs.suite != 'ios-minimum' && inputs.suite != 'ios-minimum-checkout' && inputs.suite != 'ios-runner-probe' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     strategy:
@@ -315,7 +317,7 @@ jobs:
 
   ios-simulator:
     name: ${{ inputs.suite == 'ios-minimum-checkout' && 'Verify customer checkout on iOS 16.0' || inputs.suite == 'ios-minimum' && 'Verify connected Release on iOS 16.0' || inputs.suite == 'pilot' && 'Build iOS Release and load menu from the local API' || 'Build and launch iOS demo on simulator' }}
-    if: inputs.suite != 'android-minimum-connected' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    if: inputs.suite != 'android-minimum-connected' && inputs.suite != 'ios-runner-probe' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     runs-on: macos-26
     timeout-minutes: ${{ inputs.suite == 'ios-minimum-checkout' && 75 || inputs.suite == 'ios-minimum' && 60 || 45 }}
     env:
@@ -406,8 +408,74 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  ios-runner-probe:
+    name: XCTest startup on iOS ${{ matrix.runtime }} with Xcode ${{ matrix.xcode }}
+    if: github.event_name == 'workflow_dispatch' && inputs.suite == 'ios-runner-probe'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 29
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-26, xcode: '26.6', runtime: '16.0' }
+          - { runner: macos-26, xcode: '26.6', runtime: '26.5' }
+          - { runner: macos-15, xcode: '26.2', runtime: '16.0' }
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ matrix.xcode }}.app/Contents/Developer
+      PROBE_RUNTIME: ${{ matrix.runtime }}
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Prepare the isolated probe simulator
+        id: probe_simulator
+        timeout-minutes: 13
+        shell: bash
+        run: |
+          evidence="$RUNNER_TEMP/crustcaper-ios-probe"
+          mkdir -p "$evidence"
+          if [[ "$PROBE_RUNTIME" == 16.0 ]]; then
+            bash tooling/prepare-ios-minimum-ci.sh "$evidence"
+          else
+            runtime=com.apple.CoreSimulator.SimRuntime.iOS-26-5
+            xcodebuild -version | tee "$evidence/control-runtime.txt"
+            simulator=$(xcrun simctl create "CrustCaper XCTest control" com.apple.CoreSimulator.SimDeviceType.iPhone-17 "$runtime")
+            [[ "$simulator" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]
+            printf 'simulator=%s\n' "$simulator" >> "$GITHUB_OUTPUT"
+            xcrun simctl boot "$simulator"
+            xcrun simctl bootstatus "$simulator" -b
+            printf 'Simulator UUID: %s\nRuntime: %s\n' "$simulator" "$runtime" >> "$evidence/control-runtime.txt"
+          fi
+      - name: Check XCTest can launch iOS Settings
+        timeout-minutes: 11
+        shell: bash
+        env:
+          SIMULATOR_UDID: ${{ steps.probe_simulator.outputs.simulator }}
+        run: bash tooling/ios-order-ui-ci.sh "$SIMULATOR_UDID" "$RUNNER_TEMP/crustcaper-ios-probe/result" probe
+      - name: Delete the simulator allocated to this probe
+        if: ${{ always() && steps.probe_simulator.outputs.simulator != '' }}
+        timeout-minutes: 2
+        env:
+          SIMULATOR_UDID: ${{ steps.probe_simulator.outputs.simulator }}
+        run: |
+          xcrun simctl shutdown "$SIMULATOR_UDID" || true
+          xcrun simctl delete "$SIMULATOR_UDID"
+      - name: Retain XCTest startup evidence
+        if: ${{ !cancelled() && steps.probe_simulator.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-ios-runner-probe-${{ matrix.xcode }}-${{ matrix.runtime }}-${{ github.sha }}
+          path: ${{ runner.temp }}/crustcaper-ios-probe/
+          if-no-files-found: error
+          retention-days: 14
+
   dependency-audit:
     name: Audit npm lockfile
+    if: inputs.suite != 'ios-runner-probe'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

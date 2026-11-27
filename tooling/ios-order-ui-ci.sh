@@ -2,8 +2,9 @@
 set -euo pipefail
 umask 077
 
-if [[ $# -ne 2 || ! ${1:-} =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ || -z ${2:-} ]]; then
-  printf 'Usage: %s SIMULATOR_UDID EVIDENCE_DIR\n' "$0" >&2
+if [[ $# -lt 2 || $# -gt 3 || ! ${1:-} =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ || -z ${2:-} ]] ||
+   [[ $# -eq 3 && ${3:-} != probe ]]; then
+  printf 'Usage: %s SIMULATOR_UDID EVIDENCE_DIR [probe]\n' "$0" >&2
   exit 2
 fi
 if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
@@ -12,6 +13,7 @@ if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
 fi
 
 simulator=$1
+mode=${3:-checkout}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 mkdir -p -- "$2"
 evidence=$(cd "$2" && pwd -P)
@@ -38,15 +40,20 @@ cleanup() {
       status=1
     fi
   fi
-  printf 'simulator=%s\nphase=%s\nexit_code=%s\nscratch_cleanup=%s\n' \
-    "$simulator" "$phase" "$status" "$removal" > "$receipt"
+  printf 'simulator=%s\nphase=%s\nexit_code=%s\nscratch_cleanup=%s\nmode=%s\n' \
+    "$simulator" "$phase" "$status" "$removal" "$mode" > "$receipt"
   exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-xcrun simctl get_app_container "$simulator" com.crustcaper.mobile.local app >/dev/null
+if [[ $mode == probe ]]; then
+  test_source=ios-order-runner-probe.swift
+else
+  xcrun simctl get_app_container "$simulator" com.crustcaper.mobile.local app >/dev/null
+  test_source=ios-order-checkout.swift
+fi
 scheme=CrustCaperOrderUITests
 project="$scratch/$scheme.xcodeproj"
 derived_data="$scratch/DerivedData"
@@ -54,7 +61,7 @@ destination="platform=iOS Simulator,id=$simulator,arch=arm64"
 xcode_options=(-project "$project" -scheme "$scheme" -configuration Release -sdk iphonesimulator
   -destination "$destination" -derivedDataPath "$derived_data" -parallel-testing-enabled NO
   ARCHS=arm64 ONLY_ACTIVE_ARCH=YES)
-cp "$script_dir/ios-order-checkout.swift" "$scratch/ios-order-checkout.swift"
+cp "$script_dir/$test_source" "$scratch/ios-order-checkout.swift"
 
 phase=build
 {
@@ -88,7 +95,7 @@ const { failedTests, passedTests, result, skippedTests, totalTestCount } =
   JSON.parse(readFileSync(process.argv[2], 'utf8'));
 if (result !== 'Passed' || !Number.isInteger(totalTestCount) || totalTestCount < 1 ||
     passedTests !== totalTestCount || failedTests !== 0 || skippedTests !== 0) {
-  throw new Error('Xcode did not report a completed passing checkout test.');
+  throw new Error('Xcode did not report a completed passing UI test.');
 }
 NODE
 
