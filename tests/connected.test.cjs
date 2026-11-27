@@ -1831,9 +1831,16 @@ test('a selected item option survives a menu refresh until the buyer explicitly 
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolve);
   });
-  t.after(() => new Promise(resolve => server.close(resolve)));
-  const browser = await chromium.launch({ channel: 'chrome' });
-  t.after(() => browser.close());
+  let browser;
+  t.after(async () => {
+    // A live browser request must not hold the preview server open during teardown.
+    const previewClosed = new Promise(resolve => {
+      server.close(resolve);
+      server.closeAllConnections();
+    });
+    await Promise.all([previewClosed, browser?.close()]);
+  }, { timeout: 10_000 });
+  browser = await chromium.launch({ channel: 'chrome' });
   const page = await browser.newPage({ viewport: { width: 320, height: 800 }, isMobile: true, hasTouch: true });
   page.setDefaultTimeout(6500);
 
