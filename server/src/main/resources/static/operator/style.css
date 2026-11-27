@@ -64,6 +64,8 @@ button:focus-visible, input:focus-visible { outline: .19rem solid var(--green); 
 .problem { font-weight: 680; color: var(--red); overflow-wrap: anywhere; }
 #queue-problem { margin-bottom: 1rem; }
 .queue-notice { margin-bottom: 1rem; border-left: .24rem solid var(--green); border-radius: .4rem; padding: .75rem 1rem; background: var(--mint); }
+#pickup-receipt-action { margin-bottom: 1rem; }
+#pickup-receipt-open { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .queue-stale { margin-bottom: 1rem; border-left: .24rem solid var(--red); border-radius: .4rem; padding: .75rem 1rem; background: var(--paper); color: var(--red); font-weight: 750; }
 .kitchen-signal { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .8rem 1rem; padding: .8rem 1rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: .85rem; background: var(--white); }
 .kitchen-signal[data-waiting="true"] { border-left: .28rem solid var(--mustard); }

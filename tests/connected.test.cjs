@@ -2777,6 +2777,111 @@ test('manager finds and attaches a fiscal receipt beyond the rolling queue', { t
   await capture(page, 'connected-fiscal-exact-lookup');
 });
 
+test('pickup cashier attaches the original receipt for their own confirmed handoff', { timeout: 35_000 }, async t => {
+  const kitchen = await operator('demo-kitchen');
+  const manager = await operator('demo-manager');
+  const order = await readyForPickup(kitchen);
+  const other = await readyForPickup(kitchen);
+  const handoff = (item) => `/operator/orders/${item.id}/status`;
+  const collect = (item) => ({ status: 'collected', pickupCode: item.pickupCode });
+  t.after(async () => {
+    await send(handoff(order), { method: 'POST', token: manager, data: collect(order) });
+    for (const token of [kitchen, manager]) await send('/operator/sessions/current', { method: 'DELETE', token });
+  });
+  assert.equal((await send(handoff(other), { method: 'POST', token: manager, data: collect(other) })).status, 200);
+
+  const browser = await chromium.launch({ channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.setDefaultTimeout(7000);
+  const receiptsPath = new URL(api + '/operator/receipts').pathname;
+  const searches = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (request.method() === 'GET' && url.pathname === receiptsPath) searches.push(url.searchParams.get('orderCode'));
+  });
+  async function signIn() {
+    await page.getByLabel('Username', { exact: true }).fill('demo-pickup');
+    await page.getByLabel('Password', { exact: true }).fill('local-demo-passphrase');
+    await button(page, 'Sign in').click();
+    await page.getByRole('heading', { name: 'Pickup queue' }).waitFor();
+    await button(page, 'Fiscal receipts').waitFor();
+    for (const report of ['Payment review', 'Daily reconciliation', 'Operations signals', 'Refresh fiscal receipts']) {
+      assert.equal(await button(page, report).count(), 0);
+    }
+  }
+
+  await page.goto(new URL('/operator/index.html', api).href);
+  await signIn();
+  assert.deepEqual(searches, [], 'Signing in as pickup must not load an unfiltered receipt list');
+  const list = page.getByRole('list', { name: 'Orders for fiscal receipts' });
+  const card = list.getByRole('listitem').filter({ has: page.getByRole('heading', { name: `Order ${order.number}`, exact: true }) });
+  const ready = page.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem')
+    .filter({ has: page.getByRole('heading', { name: `Order ${order.number}`, exact: true }) });
+  let pickupWrites = 0;
+  await page.route(api + handoff(order), async route => {
+    const response = await route.fetch();
+    assert.equal(response.status(), 200);
+    pickupWrites++;
+    await route.abort();
+  });
+  await ready.getByLabel('Pickup code', { exact: true }).fill(order.pickupCode);
+  await button(ready, 'Confirm pickup').click();
+  await shown(page, `Pickup for order ${order.number} was confirmed by this account.`);
+  assert.equal(pickupWrites, 1);
+
+  async function lookup(code, action) {
+    const result = page.waitForResponse(response => {
+      const url = new URL(response.url());
+      return url.pathname === receiptsPath && url.searchParams.get('orderCode') === code;
+    });
+    await action();
+    const receipt = await result;
+    assert.equal(receipt.status(), 200);
+    return receipt.json();
+  }
+
+  assert.deepEqual((await lookup(order.id, () => button(page, `Attach receipt for order ${order.number}`).click()))
+    .map(({ orderId }) => orderId), [order.id]);
+  await shown(card, 'Awaiting receipt');
+  await capture(page, 'pickup-receipt-after-confirmed-handoff');
+
+  await page.reload();
+  await signIn();
+  await button(page, 'Fiscal receipts').click();
+  const search = page.getByLabel('Receipt order number or ID');
+  const find = () => button(page, 'Find order').click();
+  await search.fill(other.id);
+  assert.deepEqual(await lookup(other.id, find), []);
+  await shown(page, 'No eligible pickup order matches that number.');
+  assert.equal(await list.getByRole('listitem').count(), 0);
+  await search.fill(order.number);
+  assert.deepEqual((await lookup(order.number.slice(1).toLowerCase(), find)).map(({ orderId }) => orderId), [order.id]);
+  await shown(card, 'Awaiting receipt');
+  assert.equal(await button(card, 'Attach correction').count(), 0);
+  assert.deepEqual(searches, [order.id, other.id, order.number.slice(1).toLowerCase()]);
+
+  const pdf = testReceipt();
+  const reference = `PICKUP-${order.number.slice(1)}`;
+  await card.getByLabel('EBM receipt reference').fill(reference);
+  await card.getByLabel('Total printed on receipt (RWF)').fill(String(order.total));
+  await card.getByLabel('EBM receipt PDF').setInputFiles({
+    name: 'synthetic-pickup-receipt.pdf', mimeType: 'application/pdf', buffer: pdf,
+  });
+  const attached = page.waitForResponse(response => response.request().method() === 'PUT'
+    && response.url() === api + `/operator/orders/${order.id}/receipt`);
+  await button(card, 'Attach receipt').click();
+  assert.equal((await attached).status(), 200);
+  await shown(card, 'Attached');
+  await shown(card, `EBM reference ${reference}`);
+  const buyer = await send(`/orders/${order.id}`, { token: order.token });
+  assert.equal((await buyer.json()).receiptStatus, 'issued');
+  const downloaded = await send(`/orders/${order.id}/receipt`, { token: order.token });
+  assert.equal(downloaded.status, 200);
+  assert.ok(Buffer.from(await downloaded.arrayBuffer()).equals(pdf));
+  await capture(page, 'pickup-receipt-attached');
+});
+
 test('a saved order denied with a private 404 offers phone verification for its own number', { timeout: 45_000 }, async t => {
   const isolatedFixture = process.env.CRUSTCAPER_SAVED_ORDER_FIXTURE_API;
   const upstream = isolatedFixture || api;

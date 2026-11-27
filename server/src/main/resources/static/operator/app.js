@@ -23,6 +23,8 @@ const kitchenNewOrders = element('kitchen-new-orders');
 const kitchenSoundToggle = element('kitchen-sound-toggle');
 const kitchenSoundStatus = element('kitchen-sound-status');
 const queueNotice = element('queue-notice');
+const pickupReceiptAction = element('pickup-receipt-action');
+const pickupReceiptOpen = element('pickup-receipt-open');
 const pickupUncertainNotice = element('pickup-uncertain-notice');
 const pickupLookupSection = element('pickup-lookup');
 const pickupLookupForm = element('pickup-lookup-form');
@@ -71,6 +73,8 @@ const fiscalReceiptsJump = element('fiscal-receipts-jump');
 const fiscalReceiptsRefresh = element('fiscal-receipts-refresh');
 const fiscalReceiptsSearch = element('fiscal-receipts-search');
 const fiscalReceiptsFilter = element('fiscal-receipts-filter');
+const fiscalReceiptsFilterLabel = element('fiscal-receipts-filter-label');
+const fiscalReceiptsSearchHelp = element('fiscal-receipts-search-help');
 const fiscalReceiptsFind = element('fiscal-receipts-find');
 const fiscalReceiptsLookupProblem = element('fiscal-receipts-lookup-problem');
 const fiscalReceiptsProblem = element('fiscal-receipts-problem');
@@ -126,6 +130,7 @@ let receiptRefresh = null;
 let receiptLookup = null;
 let lastReceiptLookupId = null;
 let pickupLookup = null;
+let pickupReceiptId = null;
 let timer;
 let kitchenTimer;
 let refreshVersion = 0;
@@ -1003,13 +1008,14 @@ function validReceiptReference(value) {
   return typeof value === 'string' && receiptReference.test(value);
 }
 
-function checkedReceipt(entry) {
+function checkedReceipt(entry, pickupOnly = false) {
   if (!entry || typeof entry.orderId !== 'string' || !uuid.test(entry.orderId) || entry.currency !== 'RWF'
     || !Number.isSafeInteger(entry.total) || entry.total <= 0
     || typeof entry.receiptStatus !== 'string' || !Object.hasOwn(receiptProgress, entry.receiptStatus)
     || (entry.receiptReference != null && !validReceiptReference(entry.receiptReference))
     || (entry.correctionReference != null && !validReceiptReference(entry.correctionReference))
-    || (entry.correctionEligible !== undefined && typeof entry.correctionEligible !== 'boolean')) {
+    || (entry.correctionEligible !== undefined && typeof entry.correctionEligible !== 'boolean')
+    || (pickupOnly && (entry.receiptStatus === 'corrected' || entry.correctionReference != null || entry.correctionEligible))) {
     throw new ApiError(502, 'invalid_response');
   }
   return { ...entry, correctionReference: entry.correctionReference ?? null, correctionEligible: entry.correctionEligible === true };
@@ -1038,7 +1044,7 @@ function renderedReceipt(entry) {
   badge.dataset.status = entry.receiptStatus === 'pending' ? 'accepted' : 'ready';
   badge.textContent = entry.receiptStatus === 'pending' ? 'Awaiting receipt'
     : entry.receiptStatus === 'corrected' ? 'Corrected' : 'Attached';
-  const correction = canCorrectReceipt(entry);
+  const correction = session?.role === 'manager' && canCorrectReceipt(entry);
   const totalLabel = correction || entry.correctionReference ? 'Verified full refund' : 'Paid total';
   card.querySelector('.receipt-total').textContent = `${totalLabel} ${integerFormat.format(entry.total)} RWF`;
   if (entry.receiptStatus !== 'pending') {
@@ -1077,8 +1083,9 @@ function receiptCard(entry) {
 }
 
 function renderReceipts() {
+  const pickupOnly = session?.role === 'pickup';
   const orderCode = fiscalReceiptsFilter.value.trim().replace(/^#/, '').toLowerCase();
-  const visible = receiptLookup ? [receiptLookup.entry].filter(Boolean) : receipts.filter((entry) =>
+  const visible = receiptLookup ? [receiptLookup.entry].filter(Boolean) : pickupOnly ? [] : receipts.filter((entry) =>
     entry.orderId === orderCode || entry.orderId.slice(-8).includes(orderCode));
   const listedIds = new Set(receipts.map(({ orderId }) => orderId));
   // Retain one out-of-list draft for another lookup, and keep any upload alive through refiltering.
@@ -1101,10 +1108,11 @@ function renderReceipts() {
   }
   if (receiptLookup) {
     if (receiptLookup.state === 'loading') showMessage(fiscalReceiptsEmpty, 'Finding order…');
-    else showMessage(fiscalReceiptsEmpty, receiptLookup.state === 'missing' ? 'No paid order matches that number.' : '');
+    else showMessage(fiscalReceiptsEmpty, receiptLookup.state === 'missing'
+      ? pickupOnly ? 'No eligible pickup order matches that number.' : 'No paid order matches that number.' : '');
     return;
   }
-  showMessage(fiscalReceiptsEmpty, visible.length ? ''
+  showMessage(fiscalReceiptsEmpty, pickupOnly || visible.length ? ''
     : orderCode ? 'No matching order in this list.' : 'No paid orders for fiscal receipts.');
 }
 
@@ -1128,7 +1136,8 @@ function clearReceiptLookup() {
 
 async function findReceipt() {
   const current = availableSession();
-  if (current?.role !== 'manager' || receiptLookup?.state === 'loading') return;
+  if (!staffPickup(current) || receiptLookup?.state === 'loading') return;
+  const pickupOnly = current.role === 'pickup';
   const code = exactOrderCode(fiscalReceiptsFilter.value);
   if (!code) {
     fiscalReceiptsFilter.setAttribute('aria-invalid', 'true');
@@ -1151,7 +1160,7 @@ async function findReceipt() {
     if (session !== current || receiptLookup !== lookup) return;
     if (!Array.isArray(data) || data.length > 1) throw new ApiError(502, 'invalid_response');
     if (data.length === 1) {
-      const found = checkedReceipt(data[0]);
+      const found = checkedReceipt(data[0], pickupOnly);
       if (!matchesOrderCode(found.orderId, code)) {
         throw new ApiError(502, 'invalid_response');
       }
@@ -1194,8 +1203,10 @@ function setReceiptFormBusy(card, busy) {
 
 async function attachReceipt(entry, card, form) {
   const current = availableSession();
-  if (current?.role !== 'manager' || receiptUploads.has(entry.orderId) || !card.isConnected) return;
-  const correction = canCorrectReceipt(entry);
+  if (!staffPickup(current) || receiptUploads.has(entry.orderId) || !card.isConnected) return;
+  const pickupOnly = current.role === 'pickup';
+  if (pickupOnly && (receiptLookup?.entry?.orderId !== entry.orderId || entry.receiptStatus !== 'pending')) return;
+  const correction = !pickupOnly && canCorrectReceipt(entry);
   const reference = form.elements.namedItem('reference').value.trim();
   const total = form.elements.namedItem('total').value.trim();
   const file = form.elements.namedItem('document').files[0];
@@ -1229,7 +1240,7 @@ async function attachReceipt(entry, card, form) {
     const action = correction ? 'receipt-correction' : 'receipt';
     const data = checkedReceipt(await request(`/orders/${entry.orderId}/${action}`, {
       method: 'PUT', token: current.accessToken, receipt: { file, reference, total }, timeoutMs: 25_000,
-    }));
+    }), pickupOnly);
     if (session !== current) return;
     const confirmed = correction
       ? data.receiptStatus === 'corrected' && data.receiptReference === entry.receiptReference && data.correctionReference === reference
@@ -1243,10 +1254,12 @@ async function attachReceipt(entry, card, form) {
     if (receiptLookup?.entry?.orderId === data.orderId) {
       receiptLookup.entry = newerReceipt(receiptLookup.entry, data);
     }
-    if (receipts.some(({ orderId }) => orderId === data.orderId)) {
-      receipts = receipts.map((item) => item.orderId === data.orderId ? newerReceipt(item, data) : item);
-    } else {
-      receipts.push(data);
+    if (!pickupOnly) {
+      if (receipts.some(({ orderId }) => orderId === data.orderId)) {
+        receipts = receipts.map((item) => item.orderId === data.orderId ? newerReceipt(item, data) : item);
+      } else {
+        receipts.push(data);
+      }
     }
     const previous = receiptCards.get(data.orderId)?.card;
     const focused = document.activeElement;
@@ -1285,6 +1298,7 @@ function closeSession(message = '') {
   pickupLookupSection.hidden = true;
   closeCancellation('', false);
   showMessage(queueNotice);
+  showPickupReceiptAction();
   showMessage(pickupUncertainNotice);
   refreshing = false;
   refreshButton.disabled = false;
@@ -1559,7 +1573,8 @@ async function refreshReceipts() {
     if (session !== current) return;
     if (!Array.isArray(data) || data.length > 100) throw new ApiError(502, 'invalid_response');
     // An in-flight list can still contain the state before an original or correction attachment.
-    const next = data.map(checkedReceipt).map((entry) => newerReceipt(entry, refresh.attachments.get(entry.orderId)));
+    const next = data.map((entry) => checkedReceipt(entry))
+      .map((entry) => newerReceipt(entry, refresh.attachments.get(entry.orderId)));
     const returnedIds = new Set(next.map(({ orderId }) => orderId));
     for (const entry of receipts) {
       if (returnedIds.has(entry.orderId)) continue;
@@ -1604,6 +1619,7 @@ function setPickupCheck(id, state) {
 
 function showPickupOutcome(id, status, confirmedByCurrentOperator) {
   const number = orderNumber(id);
+  showPickupReceiptAction(status === 'collected' && confirmedByCurrentOperator && session?.role === 'pickup' ? id : null);
   if (status === 'collected' || status === 'cancelled') {
     // A queue read started before the terminal outcome can still contain the ready card.
     refreshVersion++;
@@ -1623,6 +1639,12 @@ function showPickupOutcome(id, status, confirmedByCurrentOperator) {
       ? `Order ${number} is still ready for pickup. Check the code before confirming again.`
       : `Order ${number} is no longer ready for pickup. Review the queue.`);
   }
+}
+
+function showPickupReceiptAction(id = null) {
+  pickupReceiptId = id;
+  pickupReceiptAction.hidden = !id;
+  changeText(pickupReceiptOpen, id ? `Attach receipt for order ${orderNumber(id)}` : '');
 }
 
 async function checkPickup(id, current) {
@@ -1842,8 +1864,16 @@ loginForm.addEventListener('submit', async (event) => {
     pickupLookupSection.hidden = !staffPickup(session);
     paymentReview.hidden = data.role !== 'manager';
     paymentReviewJump.hidden = paymentReview.hidden;
-    fiscalReceipts.hidden = paymentReview.hidden;
+    const pickupOnly = data.role === 'pickup';
+    fiscalReceipts.hidden = !staffPickup(session);
     fiscalReceiptsJump.hidden = fiscalReceipts.hidden;
+    fiscalReceiptsRefresh.hidden = pickupOnly;
+    element('fiscal-receipts-manager-help').hidden = pickupOnly;
+    element('fiscal-receipts-pickup-help').hidden = !pickupOnly;
+    fiscalReceiptsFilterLabel.textContent = pickupOnly ? 'Receipt order number or ID' : 'Filter by order number';
+    fiscalReceiptsSearchHelp.textContent = pickupOnly
+      ? 'Enter the eight-character order number or full order ID.'
+      : 'Enter the eight-character order number or full order ID to find a paid order outside this list.';
     delivery.show(session);
     workstationTitle.focus();
     timer = setInterval(() => { void refreshQueue(); }, queuePollMs);
@@ -1918,6 +1948,13 @@ fiscalReceiptsFilter.addEventListener('input', () => {
 });
 fiscalReceiptsSearch.addEventListener('submit', (event) => {
   event.preventDefault();
+  void findReceipt();
+});
+pickupReceiptOpen.addEventListener('click', () => {
+  if (availableSession()?.role !== 'pickup' || !pickupReceiptId) return;
+  clearReceiptLookup();
+  fiscalReceiptsFilter.value = pickupReceiptId;
+  fiscalReceiptsFilter.focus();
   void findReceipt();
 });
 pickupLookupCode.addEventListener('input', clearPickupLookup);

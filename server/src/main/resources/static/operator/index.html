@@ -73,6 +73,9 @@
           </div>
         </section>
         <p class="queue-notice" id="queue-notice" role="status" tabindex="-1" hidden></p>
+        <div id="pickup-receipt-action" hidden>
+          <button class="button button-secondary" id="pickup-receipt-open" type="button"></button>
+        </div>
         <p class="queue-notice" id="pickup-uncertain-notice" role="status" hidden></p>
         <p class="queue-notice" id="external-queue-notice" role="status" tabindex="-1" hidden></p>
         <p class="queue-notice" id="external-pending-notice" role="status" hidden></p>
@@ -212,13 +215,14 @@
           <div class="queue-header">
             <div>
               <h2 id="fiscal-receipts-title" tabindex="-1">Fiscal receipts</h2>
-              <p class="payment-review-help">Attach the original PDF issued by the restaurant’s EBM. After a verified full refund, attach the correction separately. The customer can download the attached PDFs from the order.</p>
+              <p class="payment-review-help" id="fiscal-receipts-manager-help">Attach the original PDF issued by the restaurant’s EBM. After a verified full refund, attach the correction separately. The customer can download the attached PDFs from the order.</p>
+              <p class="payment-review-help" id="fiscal-receipts-pickup-help" hidden>Find an order you handed out and attach its original EBM receipt PDF. The customer can download it from their order.</p>
             </div>
             <button class="button button-secondary" id="fiscal-receipts-refresh" type="button">Refresh fiscal receipts</button>
           </div>
           <form class="receipt-search" id="fiscal-receipts-search">
-            <label for="fiscal-receipts-filter">Filter by order number</label>
-            <input id="fiscal-receipts-filter" type="search" maxlength="36" autocomplete="off" spellcheck="false" placeholder="#1A2B3C4D" aria-describedby="fiscal-receipts-search-help">
+            <label for="fiscal-receipts-filter" id="fiscal-receipts-filter-label">Filter by order number</label>
+            <input id="fiscal-receipts-filter" type="search" maxlength="36" autocomplete="off" spellcheck="false" placeholder="#1A2B3C4D" aria-describedby="fiscal-receipts-search-help fiscal-receipts-lookup-problem">
             <p class="payment-review-help" id="fiscal-receipts-search-help">Enter the eight-character order number or full order ID to find a paid order outside this list.</p>
             <button class="button button-secondary" id="fiscal-receipts-find" type="submit">Find order</button>
           </form>
