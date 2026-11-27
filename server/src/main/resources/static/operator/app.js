@@ -1706,7 +1706,7 @@ async function submitTransition(order, action, button, problem, input) {
   } catch (error) {
     if (session !== current || (kitchenAction && queueEpoch !== epoch)) return;
     if (error instanceof ApiError && error.status === 401) closeSession('Your staff session expired. Sign in again.');
-    else if (!kitchenAction && (!(error instanceof ApiError) || error.status >= 500
+    else if (!kitchenAction && (!(error instanceof ApiError) || error.status === 408 || error.status >= 500
       || ([404, 409].includes(error.status) && error.code !== 'pickup_code_mismatch'))) {
       input.value = '';
       await checkPickup(order.id, current);

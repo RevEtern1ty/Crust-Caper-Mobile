@@ -511,6 +511,80 @@ test('a delayed delivery preparation response preserves the newer queue through 
   }
 });
 
+test('a pickup HTTP 408 checks the original handoff without resubmitting', { timeout: 25_000 }, async t => {
+  const server = createPreviewServer(resolve(dirname(module.filename), '../server/src/main/resources/static'));
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  let browser;
+  t.after(async () => {
+    await Promise.all([browser?.close(), new Promise(resolve => {
+      server.close(resolve);
+      server.closeAllConnections();
+    })]);
+  }, { timeout: 10_000 });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  browser = await chromium.launch({ channel: 'chrome' });
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.setDefaultTimeout(6500);
+  const id = '2bba37e8-58db-4563-a4e2-fb197fe59890';
+  const number = '#7FE59890';
+  const now = Date.now();
+  const order = {
+    id, status: 'ready', paymentStatus: 'paid', total: 9200, currency: 'RWF',
+    lines: [{ sku: 'double-smash', quantity: 1, modifierIds: [] }],
+    acceptedAt: new Date(now - 600_000).toISOString(),
+    pickupStartsAt: new Date(now).toISOString(), pickupEndsAt: new Date(now + 900_000).toISOString(),
+  };
+  const operatorApi = origin + '/api/v1/operator';
+  const statusUrl = `${operatorApi}/orders/${id}/pickup-status`;
+  let storedStatus = order.status;
+  const posted = [];
+  await page.route(operatorApi + '/**', async route => {
+    const request = route.request();
+    const path = request.url().slice(operatorApi.length);
+    if (path === '/sessions' && request.method() === 'POST') {
+      return route.fulfill({ status: 201, json: { accessToken: 'fixture-token', role: 'pickup', storeId: 'kigali',
+        expiresAt: new Date(now + 120_000).toISOString() } });
+    }
+    if (path === '/orders' && request.method() === 'GET') {
+      return route.fulfill({ json: { orders: storedStatus === 'ready' ? [order] : [],
+        externalOrders: [], serverTime: new Date().toISOString() } });
+    }
+    if (path === `/orders/${id}/status` && request.method() === 'POST') {
+      posted.push(request.postDataJSON());
+      // The pickup was recorded before the timeout reply reached the operator.
+      storedStatus = 'collected';
+      return route.fulfill({ status: 408, json: { code: 'request_timeout' } });
+    }
+    if (request.url() === statusUrl && request.method() === 'GET') {
+      return route.fulfill({ headers: { 'Cache-Control': 'no-store' },
+        json: { id, status: storedStatus, confirmedByCurrentOperator: storedStatus === 'collected' } });
+    }
+    return route.abort();
+  });
+  await page.goto(origin + '/operator/index.html');
+  await page.getByLabel('Username', { exact: true }).fill('fixture-pickup');
+  await page.getByLabel('Password', { exact: true }).fill('fixture-only');
+  await button(page, 'Sign in').click();
+
+  const card = page.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem')
+    .filter({ has: page.getByRole('heading', { name: 'Order ' + number, exact: true }) });
+  await card.getByLabel('Pickup code').fill('123456');
+  const result = Promise.race([
+    page.waitForResponse(response => response.url() === statusUrl && response.request().method() === 'GET' && response.ok())
+      .then(response => response.json()),
+    shown(page, 'The server could not complete this request. Try again.').then(() => null),
+  ]);
+  await button(card, 'Confirm pickup').click();
+  assert.deepEqual(await result, { id, status: 'collected', confirmedByCurrentOperator: true },
+    'HTTP 408 must recheck the original pickup before asking for another handoff');
+  await shown(page, `Pickup for order ${number} was confirmed by this account.`);
+  await card.waitFor({ state: 'detached' });
+  assert.deepEqual(posted, [{ status: 'collected', pickupCode: '123456' }]);
+});
+
 test('pickup is checked against the server after a lost reply or a concurrent cancellation', { timeout: 35_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const kitchen = await operator('demo-kitchen');
