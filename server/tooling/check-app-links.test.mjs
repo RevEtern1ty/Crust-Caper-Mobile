@@ -8,6 +8,7 @@ const origin = 'https://stage.example.test';
 const androidPackage = 'com.crustcaper.mobile.stage';
 const fingerprint = '9A:'.repeat(31) + '9A';
 const iosAppId = 'ABCDE12345.' + androidPackage;
+const checkArgs = [origin, origin + '/payment-return', androidPackage, fingerprint, iosAppId];
 const callback = {
   orderId: 'c0de0000-1111-4222-8333-444444444444',
   tx_ref: 'cc-app-link-fixture-reference',
@@ -17,7 +18,9 @@ const callback = {
 
 async function fixtureFetch(requested, options) {
   const url = new URL(requested);
-  if (url.origin !== origin || options.redirect !== 'manual') throw new Error('Unexpected fixture request');
+  if (url.origin !== origin || options.redirect !== 'manual' || options.credentials !== 'omit') {
+    throw new Error('Unexpected fixture request');
+  }
   if (url.pathname === '/.well-known/assetlinks.json') {
     return Response.json([{
       relation: ['delegate_permission/common.handle_all_urls'],
@@ -35,6 +38,7 @@ async function fixtureFetch(requested, options) {
   const expectedQuery = url.searchParams.size === Object.keys(callback).length
     && Object.entries(callback).every(([key, value]) => sent[key] === value);
   console.log('Callback query is complete:', expectedQuery);
+  if (scenario.returnForbidden) return new Response(null, { status: 403 });
   const headers = {
     'Content-Type': 'text/html; charset=UTF-8',
     'Cache-Control': scenario.cacheControl ?? 'no-store',
@@ -49,13 +53,13 @@ async function fixtureFetch(requested, options) {
   });
 }
 
-function run(scenario = {}) {
+function run(scenario = {}, args = checkArgs) {
   const data = { origin, androidPackage, fingerprint, iosAppId, callback, scenario };
   const fixture = Object.entries(data).map(([name, value]) => 'const ' + name + '=' + JSON.stringify(value) + ';').join('')
     + 'globalThis.fetch = (' + fixtureFetch.toString() + ');';
   const result = spawnSync(process.execPath, [
     '--import', 'data:text/javascript,' + encodeURIComponent(fixture),
-    check, origin, origin + '/payment-return', androidPackage, fingerprint, iosAppId,
+    check, ...args,
   ], { encoding: 'utf8', timeout: 5000 });
   assert.ifError(result.error);
   return result;
@@ -66,6 +70,45 @@ test('verifies both association documents and the complete synthetic callback qu
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Callback query is complete: true/);
   assert.match(result.stdout, /Verified Android and Apple associations and \/payment-return over HTTPS/);
+});
+
+test('verifies associations from outside a closed pilot without requesting its return page', () => {
+  const scenario = { returnForbidden: true };
+  const full = run(scenario);
+  assert.equal(full.status, 1);
+  assert.match(full.stdout, /Callback query is complete: true/);
+  assert.match(full.stderr, /\/payment-return returned HTTP 403/);
+
+  const outside = run(scenario, ['--associations-only', ...checkArgs]);
+  assert.equal(outside.status, 0, outside.stderr);
+  assert.equal(outside.stdout.trim(), 'Verified Android and Apple associations over HTTPS.');
+});
+
+test('association-only verification still checks the signing identity and canonical return path', () => {
+  const scenario = { returnForbidden: true, wrongFingerprint: true };
+  const wrongFingerprint = run(scenario, ['--associations-only', ...checkArgs]);
+  assert.equal(wrongFingerprint.status, 1);
+  assert.match(wrongFingerprint.stderr, /Android association does not match/);
+  assert.equal(wrongFingerprint.stdout, '');
+
+  const [base, , ...identity] = checkArgs;
+  const wrongPath = run(scenario, ['--associations-only', base, base + '/other-return', ...identity]);
+  assert.equal(wrongPath.status, 1);
+  assert.match(wrongPath.stderr, /deployed payment return URL must use/);
+  assert.equal(wrongPath.stdout, '');
+});
+
+test('rejects unknown, repeated and misplaced options', () => {
+  for (const args of [
+    ['--unexpected', ...checkArgs],
+    ['--associations-only', '--associations-only', ...checkArgs],
+    [...checkArgs, '--associations-only'],
+  ]) {
+    const result = run({}, args);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Usage: node server\/tooling\/check-app-links\.mjs/);
+    assert.equal(result.stdout, '');
+  }
 });
 
 test('rejects a payment return without the expected cache and referrer policies', () => {

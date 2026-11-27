@@ -91,11 +91,13 @@ function verifyPaymentReturn({ headers, content }) {
   }
 }
 
-async function checkAppLinks(args) {
+async function checkAppLinks(rawArgs) {
+  const associationsOnly = rawArgs[0] === '--associations-only';
+  const args = associationsOnly ? rawArgs.slice(1) : rawArgs;
   const [base, deployedReturn, androidPackage, fingerprint, iosAppId] = args;
   if (args.length !== 5 || !packagePattern.test(androidPackage) || !fingerprintPattern.test(fingerprint)
       || !/^[A-Z0-9]{10}\./.test(iosAppId) || !packagePattern.test(iosAppId.slice(11))) {
-    throw new Error('Usage: node server/tooling/check-app-links.mjs <https-origin> <payment-return-url> <android-package> <cert-sha256> <ios-app-id>');
+    throw new Error('Usage: node server/tooling/check-app-links.mjs [--associations-only] <https-origin> <payment-return-url> <android-package> <cert-sha256> <ios-app-id>');
   }
   const origin = URL.parse(base);
   if (origin?.protocol !== 'https:' || origin.pathname !== '/' || origin.username || origin.password || origin.search
@@ -112,7 +114,7 @@ async function checkAppLinks(args) {
   const [assetLinks, appleAssociation, returnPage] = await Promise.all([
     readPublished(origin, '/.well-known/assetlinks.json', 'application/json'),
     readPublished(origin, '/.well-known/apple-app-site-association', 'application/json'),
-    readPublished(origin, paymentReturn, 'text/html', callbackProbe),
+    associationsOnly ? undefined : readPublished(origin, paymentReturn, 'text/html', callbackProbe),
   ]);
   if (!matchesAndroid(assetLinks.content, androidPackage, fingerprint.toUpperCase())) {
     throw new Error('Android association does not match the expected package and signing certificate.');
@@ -120,8 +122,12 @@ async function checkAppLinks(args) {
   if (!matchesApple(appleAssociation.content, iosAppId)) {
     throw new Error(`Apple association does not map the expected application ID to ${paymentReturn}.`);
   }
-  verifyPaymentReturn(returnPage);
-  console.log(`Verified Android and Apple associations and ${paymentReturn} over HTTPS.`);
+  if (associationsOnly) {
+    console.log('Verified Android and Apple associations over HTTPS.');
+  } else {
+    verifyPaymentReturn(returnPage);
+    console.log(`Verified Android and Apple associations and ${paymentReturn} over HTTPS.`);
+  }
 }
 
 try {
