@@ -12,6 +12,7 @@ profile=${2:-demo}
 export CRUSTCAPER_BUILD_PROFILE="$profile"
 simulator_hint=''
 checkout_smoke=${CRUSTCAPER_IOS_ORDER_SMOKE:-0}
+checkout_runtime=${CRUSTCAPER_IOS_ORDER_RUNTIME:-16-0}
 if [[ "$profile" == local ]]; then
   export CRUSTCAPER_API_BASE_URL=${CRUSTCAPER_API_BASE_URL:-http://127.0.0.1:18080/api/v1}
   if [[ ! "$CRUSTCAPER_API_BASE_URL" =~ ^http://127\.0\.0\.1:([1-9][0-9]{0,4})/api/v1$ ]] || (( BASH_REMATCH[1] > 65535 )); then
@@ -28,6 +29,10 @@ if [[ "$profile" == local ]]; then
 fi
 if [[ "$checkout_smoke" == 1 && ( "$profile" != local || -z "$simulator_hint" ) ]]; then
   printf 'The iOS checkout smoke requires local Release and the exact simulator UUID.\n' >&2
+  exit 2
+fi
+if [[ "$checkout_smoke" == 1 && "$checkout_runtime" != 16-0 && "$checkout_runtime" != 26-5 ]]; then
+  printf 'The iOS checkout smoke requires the iOS 16.0 or 26.5 test runtime.\n' >&2
   exit 2
 fi
 mkdir -p "$evidence_dir"
@@ -165,8 +170,8 @@ selected_device=$(xcrun simctl list devices available --json | node -e '
   process.exitCode = 1;
 ' "$simulator_hint")
 IFS=$'\t' read -r simulator device runtime state <<< "$selected_device"
-if [[ "$checkout_smoke" == 1 && "$runtime" != 16-0 ]]; then
-  printf 'The iOS checkout smoke requires the verified iOS 16.0 simulator.\n' >&2
+if [[ "$checkout_smoke" == 1 && "$runtime" != "$checkout_runtime" ]]; then
+  printf 'The iOS checkout smoke requires the verified iOS %s simulator.\n' "$checkout_runtime" >&2
   exit 1
 fi
 printf 'Using %s on iOS %s (%s), state %s.\n' "$device" "$runtime" "$simulator" "$state"
