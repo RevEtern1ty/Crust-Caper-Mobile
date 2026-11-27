@@ -19,7 +19,7 @@ final class CrustCaperCheckoutTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Pickup order"].waitForExistence(timeout: 12))
         try choosePickupSlot(in: app)
 
-        try enter("+250700000000", in: "Phone number", app: app)
+        try enterPhoneNumber(in: app)
         try enter("ios-checkout@example.test", in: "Email address", app: app)
         // The iOS phone keypad has no Return key. The checkout scroll view dismisses keyboards on a drag.
         if app.keyboards.firstMatch.exists {
@@ -60,6 +60,34 @@ final class CrustCaperCheckoutTests: XCTestCase {
         proof.name = "checkout-reference"
         proof.lifetime = .keepAlways
         add(proof)
+    }
+
+    @MainActor
+    private func enterPhoneNumber(in app: XCUIApplication) throws {
+        let fields = app.textFields.matching(NSPredicate(format: "label == %@", "Phone number"))
+        let field = try actionable(fields, named: "Phone number", in: app, scrolls: 5)
+        field.tap()
+        let keypad = app.keyboards.firstMatch
+        XCTAssertTrue(keypad.waitForExistence(timeout: 8), "The phone keypad must open")
+
+        func expectValue(_ value: String) {
+            let expected = NSPredicate(format: "value == %@", value)
+            let input = XCTNSPredicateExpectation(predicate: expected, object: field)
+            XCTAssertEqual(XCTWaiter().wait(for: [input], timeout: 3), .completed,
+                           "The phone field must retain all \(value.count) entered characters")
+        }
+
+        // Bulk typeText on the phone pad lost part of this number on the hosted simulator.
+        var entered = "+"
+        field.typeText(entered)
+        expectValue(entered)
+        for digit in "250700000000" {
+            let key = keypad.keys[String(digit)]
+            XCTAssertTrue(key.exists, "The phone keypad must expose its numeric keys")
+            key.tap()
+            entered.append(digit)
+            expectValue(entered)
+        }
     }
 
     @MainActor
