@@ -20,8 +20,8 @@ final class CrustCaperCheckoutTests: XCTestCase {
         try choosePickupSlot(in: app)
 
         try enterPhoneNumber(in: app)
-        try enter("ios-checkout@example.test", in: "Email address", app: app)
-        // The iOS phone keypad has no Return key. The checkout scroll view dismisses keyboards on a drag.
+        try enter("ios@example.test", in: "Email address", app: app)
+        // The checkout scroll view dismisses the keyboard on a drag.
         if app.keyboards.firstMatch.exists {
             scrollDown(in: app)
         }
@@ -70,23 +70,16 @@ final class CrustCaperCheckoutTests: XCTestCase {
         let keypad = app.keyboards.firstMatch
         XCTAssertTrue(keypad.waitForExistence(timeout: 8), "The phone keypad must open")
 
-        func expectValue(_ value: String) {
-            let expected = NSPredicate(format: "value == %@", value)
-            let input = XCTNSPredicateExpectation(predicate: expected, object: field)
-            XCTAssertEqual(XCTWaiter().wait(for: [input], timeout: 3), .completed,
-                           "The phone field must retain all \(value.count) entered characters")
-        }
-
         // Bulk typeText on the phone pad lost part of this number on the hosted simulator.
         var entered = "+"
         field.typeText(entered)
-        expectValue(entered)
+        expectInput(entered, in: field, named: "Phone number")
         for digit in "250700000000" {
             let key = keypad.keys[String(digit)]
             XCTAssertTrue(key.exists, "The phone keypad must expose its numeric keys")
             key.tap()
             entered.append(digit)
-            expectValue(entered)
+            expectInput(entered, in: field, named: "Phone number")
         }
     }
 
@@ -116,8 +109,21 @@ final class CrustCaperCheckoutTests: XCTestCase {
         let fields = app.textFields.matching(NSPredicate(format: "label == %@", label))
         let field = try actionable(fields, named: label, in: app, scrolls: 5)
         field.tap()
-        field.typeText(text)
-        XCTAssertEqual(field.value as? String, text, "The checkout field must contain the test value")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 8), "The keyboard must open for \(label)")
+        var entered = ""
+        for character in text {
+            field.typeText(String(character))
+            entered.append(character)
+            expectInput(entered, in: field, named: label)
+        }
+    }
+
+    @MainActor
+    private func expectInput(_ value: String, in field: XCUIElement, named label: String) {
+        let expected = NSPredicate(format: "value == %@", value)
+        let input = XCTNSPredicateExpectation(predicate: expected, object: field)
+        XCTAssertEqual(XCTWaiter().wait(for: [input], timeout: 3), .completed,
+                       "\(label) must retain all \(value.count) entered characters")
     }
 
     @MainActor
