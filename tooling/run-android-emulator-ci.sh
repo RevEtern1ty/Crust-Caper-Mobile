@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 4 || ( $2 != demo && $2 != stage ) ]]; then
-  printf 'Usage: %s APK {demo|stage} EVIDENCE_DIR {28|35}\n' "$0" >&2
+if [[ $# != 4 || ( $2 != demo && $2 != stage && $2 != local ) ]]; then
+  printf 'Usage: %s APK {demo|stage} EVIDENCE_DIR {28|35}\n       %s APK local EVIDENCE_DIR 28\n' "$0" "$0" >&2
   exit 2
 fi
 apk=$1
 profile=$2
 evidence_dir=$3
 api=$4
+if [[ "$profile" == local && "$api" != 28 ]]; then
+  printf 'The connected Android smoke requires API 28.\n' >&2
+  exit 2
+fi
 case "$api" in
   28) image='system-images;android-28;google_apis;x86_64' ;;
   35) image='system-images;android-35;default;x86_64' ;;
@@ -32,11 +36,31 @@ cleanup() {
     timeout --kill-after=2s 8s adb emu kill >/dev/null 2>&1 || true
     kill "$emulator_pid" 2>/dev/null || true
     wait "$emulator_pid" 2>/dev/null || true
+    if [[ "$profile" == local ]]; then
+      local attempt devices emulator_stopped=false
+      for ((attempt = 1; attempt <= 5; attempt++)); do
+        if devices=$(timeout --kill-after=1s 2s adb devices) &&
+          ! grep -Eq "^${ANDROID_SERIAL}[[:space:]]" <<< "$devices"; then
+          emulator_stopped=true
+          break
+        fi
+        if (( attempt < 5 )); then sleep 1; fi
+      done
+      printf 'emulator_stopped=%s\n' "$emulator_stopped" >> "$receipt"
+      if [[ "$emulator_stopped" != true ]]; then
+        printf 'Could not confirm the connected smoke emulator stopped.\n' >&2
+        if (( result == 0 )); then result=1; fi
+      fi
+    fi
   fi
   printf 'smoke_exit_status=%s\n' "$result" >> "$receipt"
   exit "$result"
 }
 trap cleanup EXIT
+if [[ "$profile" == local ]]; then
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+fi
 candidate="$(git rev-parse HEAD)"
 printf 'source_sha=%s\nprofile=%s\nsystem_image=%s\n' "$candidate" "$profile" "$image" > "$receipt"
 test -s "$apk"
@@ -81,4 +105,10 @@ printf 'runtime_api=%s\n' "$observed_api" >> "$receipt"
 test "$observed_api" = "$api"
 timeout --kill-after=2s 12s adb shell input keyevent KEYCODE_WAKEUP
 timeout --kill-after=2s 12s adb shell wm dismiss-keyguard
-timeout --kill-after=55s 7m bash tooling/android-emulator-smoke.sh "$apk" "$profile" "$evidence_dir"
+if [[ "$profile" == local ]]; then
+  printf 'checkout_transport=emulator-host-alias\n' >> "$receipt"
+  timeout --signal=INT --kill-after=55s 7m python3 tooling/android-connected-checkout.py \
+    "$apk" "$evidence_dir/checkout" --check-payment-return --check-session-end
+else
+  timeout --kill-after=55s 7m bash tooling/android-emulator-smoke.sh "$apk" "$profile" "$evidence_dir"
+fi

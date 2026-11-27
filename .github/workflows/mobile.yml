@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: Native builds, pilot checks or the iOS minimum runtime
+        description: Native builds, pilot checks or connected minimum runtime checks
         type: choice
         options:
           - native
           - pilot
           - ios-minimum
+          - android-minimum-connected
         default: native
       android_apk_run:
         description: Successful Mobile CI run ID with a demo APK for pilot checks
@@ -97,23 +98,22 @@ jobs:
           retention-days: 14
 
   android-demo:
-    name: Compile Android ${{ matrix.artifact }} APK
+    name: ${{ matrix.profile == 'local' && 'Build and verify Android 9 connected checkout' || format('Compile Android {0} APK', matrix.artifact) }}
     if: inputs.suite != 'pilot' && inputs.suite != 'ios-minimum' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - profile: demo
-            artifact: demo
-          - profile: stage
-            artifact: connected-ci
+        include: >-
+          ${{ fromJSON(inputs.suite == 'android-minimum-connected'
+              && '[{"profile":"local","artifact":"local-api28"}]'
+              || '[{"profile":"demo","artifact":"demo"},{"profile":"stage","artifact":"connected-ci"}]') }}
     env:
       EXPO_NO_TELEMETRY: 1
       CRUSTCAPER_BUILD_PROFILE: ${{ matrix.profile }}
-      CRUSTCAPER_API_BASE_URL: https://api-stage.crustcaper.invalid/api/v1
-      CRUSTCAPER_STORE_ID: ci-test-store
+      CRUSTCAPER_API_BASE_URL: ${{ matrix.profile == 'local' && 'http://10.0.2.2:18080/api/v1' || 'https://api-stage.crustcaper.invalid/api/v1' }}
+      CRUSTCAPER_STORE_ID: ${{ matrix.profile == 'local' && 'kigali' || 'ci-test-store' }}
       CRUSTCAPER_PSP_HOSTS: checkout.crustcaper.invalid
       CRUSTCAPER_APP_LINK_ORIGIN: https://stage.crustcaper.invalid
     steps:
@@ -201,7 +201,7 @@ jobs:
             profile,
             apiBaseUrl: process.env.CRUSTCAPER_API_BASE_URL,
             storeId: process.env.CRUSTCAPER_STORE_ID,
-            pspHosts: [process.env.CRUSTCAPER_PSP_HOSTS],
+            pspHosts: profile === 'local' ? [] : [process.env.CRUSTCAPER_PSP_HOSTS],
           };
           assert.deepEqual(config.extra.restaurant, expected);
           NODE
@@ -216,12 +216,26 @@ jobs:
           python3 tooling/check-android-page-size.py android/app/build/outputs/apk/release/app-release.apk \
             --zipalign "$ANDROID_HOME/build-tools/36.0.0/zipalign"
       - name: Smoke-test the same APK offline in a headless Android emulator
+        if: matrix.profile != 'local'
         id: android_smoke
         timeout-minutes: 20
         shell: bash
         run: |
           bash tooling/run-android-emulator-ci.sh android/app/build/outputs/apk/release/app-release.apk \
             "$CRUSTCAPER_BUILD_PROFILE" "$RUNNER_TEMP/crustcaper-android-smoke" 35
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        if: matrix.profile == 'local'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Verify a connected pickup order on Android 9
+        if: matrix.profile == 'local'
+        id: android_connected
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          bash tooling/android-connected-ci.sh android/app/build/outputs/apk/release/app-release.apk \
+            "$RUNNER_TEMP/crustcaper-android-smoke"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mobile-android-${{ matrix.artifact }}-${{ github.sha }}
@@ -229,7 +243,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Retain Android emulator evidence
-        if: ${{ !cancelled() && steps.android_smoke.outcome != 'skipped' }}
+        if: ${{ !cancelled() && (steps.android_smoke.outcome == 'success' || steps.android_smoke.outcome == 'failure' || steps.android_connected.outcome == 'success' || steps.android_connected.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mobile-android-${{ matrix.artifact }}-emulator-smoke-${{ github.sha }}
@@ -300,7 +314,7 @@ jobs:
 
   ios-simulator:
     name: ${{ inputs.suite == 'ios-minimum' && 'Verify connected Release on iOS 16.0' || inputs.suite == 'pilot' && 'Build iOS Release and load menu from the local API' || 'Build and launch iOS demo on simulator' }}
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    if: inputs.suite != 'android-minimum-connected' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
     runs-on: macos-26
     timeout-minutes: ${{ inputs.suite == 'ios-minimum' && 60 || 45 }}
     env:
