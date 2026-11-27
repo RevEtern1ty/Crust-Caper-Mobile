@@ -1,0 +1,37 @@
+services:
+  edge:
+    environment:
+      CRUSTCAPER_PILOT_ALLOWED_NETWORKS: ${CRUSTCAPER_PILOT_ALLOWED_NETWORKS:?Set the approved pilot CIDRs}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        reject_networks() {
+          printf '%s\n' 'CRUSTCAPER_PILOT_ALLOWED_NETWORKS requires explicit IPv4 or IPv6 CIDRs with nonzero prefixes' >&2
+          exit 1
+        }
+        validated_networks() {
+          # Split only spaces and tabs, then expand validated tokens on one Caddyfile line.
+          IFS=$$(printf ' \t')
+          set -f
+          set -- $$CRUSTCAPER_PILOT_ALLOWED_NETWORKS
+          [ "$$#" -gt 0 ] || reject_networks
+          for network; do
+            case "$$network" in
+              */*) ;;
+              *) reject_networks ;;
+            esac
+            case "$${network%/*}" in
+              ''|*[!0-9A-Fa-f:.]*) reject_networks ;;
+            esac
+            case "$${network##*/}" in
+              ''|0*|*[!0-9]*) reject_networks ;;
+            esac
+          done
+          printf '%s' "$$*"
+        }
+        CRUSTCAPER_PILOT_ALLOWED_NETWORKS=$$(validated_networks)
+        export CRUSTCAPER_PILOT_ALLOWED_NETWORKS
+        exec "$$@"
+      - crustcaper-pilot
+    command: [caddy, run, --config, /etc/caddy/Caddyfile, --adapter, caddyfile]

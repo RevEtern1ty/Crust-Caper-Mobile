@@ -94,6 +94,18 @@ stage_compose exec -T edge wget -qO- http://api:8080/actuator/health/readiness
 
 Run the [connected release checks](../docs/runbooks/CONNECTED_RELEASE.md) against the deployed HTTPS hostname. The proxy exposes customer API and Flutterwave webhook, `/operator/index.html`, `/payment-return` and the two signing association URLs. Internal health probes stay inside the Docker network. The receipt upload route accepts up to 1 MiB and other requests are capped at 64 KiB. Before allowing pilot traffic, configure log and availability monitoring, an approved request-rate policy and rehearse [database backup and recovery](docs/DATABASE_RECOVERY.md). Prepare a verified previous image reference. Roll back the container by restoring that reference and rerunning `up` only after confirming the previous image supports the current Flyway schema.
 
+### Direct Caddy ingress for a closed pilot
+
+Set `CRUSTCAPER_PILOT_ALLOWED_NETWORKS` in `compose.env` to a single line of space-separated literal IPv4 or IPv6 CIDRs. Use the stable egress addresses of the venue and the VPN or networks used by designated testers. For a single IPv4 address use `/32`, and for a single IPv6 address use `/128`. The pilot overlay requires an explicit list and startup rejects invalid or zero-length prefixes. This setup uses the address of the connection directly to Caddy. If a proxy terminates client connections, enforce the equivalent access policy at that public ingress. [Caddy source-address matcher](https://caddyserver.com/docs/caddyfile/matchers#remote_ip)
+
+Add `-f server/deploy/compose.pilot.yml` after the HTTPS overlay and before `compose.portable.yml` in the selected Compose function. Use the same overlays for configuration validation, `run --rm --no-deps edge caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile` and subsequent updates. The regular HTTPS deployment has public guest routes when this overlay is omitted.
+
+Keep ports 80 and 443 reachable for Caddy certificate issuance and renewal. Outside the invited networks, Caddy permits `POST /api/v1/webhooks/flutterwave` with the API's existing signature check, and `GET` or `HEAD` on the two exact `/.well-known` app association URLs. All other customer and staff requests require an allowed source network, including both payment return URLs. A shared VPN or NAT admits the approved network. Staff authentication and order authorization still apply.
+
+Before opening orders, check denial on the storefront, API and staff console from an independent network. From the allowed networks, check both storefront languages, checkout, staff login and the HTTPS return on each enrolled device. Verify provider delivery and public signing association files separately. Run the authenticated operational checks from an allowed connection. [Pilot acceptance](../docs/runbooks/CONNECTED_RELEASE.md#конфигурация-стенда)
+
+To change the allowed networks, update `compose.env`, validate the configuration and use the same Compose project to run `up -d --no-deps --force-recreate --wait edge`. Retain the certificate volume and repeat the access checks. Before removing the overlay, pause order intake. Verify the new external access policy before reopening.
+
 ### Browser storefront
 
 Build the storefront from the repository root with Node 24 using the same HTTPS origin configured on the API. Replace the example hostname and store ID with the approved values for the environment. The command uses one public origin for the API and the return route and excludes the builder's local Expo environment settings. The stage pilot build uses `--legal` so checkout links to the approved ordering terms.

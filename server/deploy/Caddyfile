@@ -51,6 +51,11 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 
 	@local path /api/v1/local /api/v1/local/*
 	@management path /actuator /actuator/*
+	@pilotDenied {
+		not remote_ip {$CRUSTCAPER_PILOT_ALLOWED_NETWORKS:0.0.0.0/0 ::/0}
+		expression `!(method('POST') && path('/api/v1/webhooks/flutterwave') ||
+			method('GET', 'HEAD') && path('/.well-known/apple-app-site-association', '/.well-known/assetlinks.json'))`
+	}
 	@operatorHome path /operator /operator/
 	@publicRoutes path /api/v1 /api/v1/* /operator/* /payment-return /.well-known/apple-app-site-association /.well-known/assetlinks.json
 	@catalogEnglish {
@@ -110,6 +115,8 @@ https://{$CRUSTCAPER_HTTPS_HOST} {
 	route {
 		respond @local 404
 		respond @management 404
+		header @pilotDenied Cache-Control "no-store"
+		respond @pilotDenied 403
 		redir @operatorHome /operator/index.html 308
 		redir @catalogEnglish /menu/en 308
 		redir @catalogKinyarwanda /menu/rw 308
