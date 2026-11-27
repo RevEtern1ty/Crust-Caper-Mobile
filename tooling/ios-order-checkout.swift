@@ -1,3 +1,4 @@
+import CoreGraphics
 import XCTest
 
 final class CrustCaperCheckoutTests: XCTestCase {
@@ -127,7 +128,8 @@ final class CrustCaperCheckoutTests: XCTestCase {
         try tap(orderData, named: "Share verified order data", in: app, scrolls: 3)
         try waitForShareSheet(in: shareRoots, phase: "order-data-first-share")
         captureSystemScreen("order-data-first-share")
-        try closeShareSheet(in: shareRoots, phase: "order-data-cancel")
+        dismissOrderDataPopover(in: shareRoots, restoring: orderData.firstMatch)
+        captureSystemScreen("order-data-cancelled")
         try tap(orderData, named: "Reopen verified order data after cancelling", in: app, scrolls: 3)
         try saveToLocalFiles(from: shareRoots, pickerRoots: fileRoots, phase: "order-data")
         _ = try actionable(orderData, named: "Order data action restored after Files", in: app, scrolls: 3)
@@ -136,6 +138,39 @@ final class CrustCaperCheckoutTests: XCTestCase {
             Saved the export through On My iPhone.
             Expected filename: crustcaper-order-data.json
             """)
+    }
+
+    @MainActor
+    private func dismissOrderDataPopover(in roots: [XCUIApplication], restoring action: XCUIElement) {
+        let app = roots[0]
+        let backdrop = app.otherElements["PopoverDismissRegion"]
+        let activityList = app.otherElements["ActivityListView"]
+        let title = activityList.otherElements.matching(NSPredicate(
+            format: "identifier == %@ AND label == %@", "LP.CaptionBar.TopCaption", "crustcaper-order-data"
+        )).firstMatch
+        guard title.waitForExistence(timeout: 5), backdrop.exists else {
+            captureSystemDiagnostics("order-data-cancel", in: roots)
+            XCTFail("The JSON share popover must expose its system dismissal region")
+            return
+        }
+
+        // Tap the exposed system backdrop above the popover, whose frame overlaps the dismissal region.
+        let backdropFrame = backdrop.frame
+        let exposedHeight = activityList.frame.minY - backdropFrame.minY
+        guard backdropFrame.width > 0, exposedHeight > 0, exposedHeight <= backdropFrame.height else {
+            captureSystemDiagnostics("order-data-cancel", in: roots)
+            XCTFail("The JSON share popover must leave a tappable area above it")
+            return
+        }
+        backdrop.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: exposedHeight / backdropFrame.height / 2)).tap()
+
+        let dismissed = waitForSystemState(timeout: 10) {
+            !activityList.exists && action.isEnabled && action.isHittable
+        }
+        if !dismissed {
+            captureSystemDiagnostics("order-data-cancel", in: roots)
+            XCTFail("The JSON share popover must close and restore Share order data before reopening")
+        }
     }
 
     @MainActor
