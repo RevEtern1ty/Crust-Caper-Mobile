@@ -3,6 +3,7 @@ import { canStartNewOrder, hasSavedCheckout, parseJournal } from '../checkout/co
 import { paymentReturnOrderId } from '../checkout/payment-return';
 import { ApiError } from '../domain/types';
 import type { ApiErrorCode, Locale, Order, PaymentAttempt, PendingCheckoutIntent, ReceiptDocument, ShopApi, Storage } from '../domain/types';
+import type { CommerceJsonRequest } from './commerce-contract';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import { menuAvailability } from './menu-availability';
 import {
@@ -134,7 +135,7 @@ export function createLiveApi({
   const endKey = journalKey + '.end-guest';
   const installationKey = journalKey + '.installation';
   const hosts = new Set(config.pspHosts);
-  const orderPath = (id: string) => '/orders/' + encodeURIComponent(id);
+  const orderPath = (id: string) => `/orders/${encodeURIComponent(id)}` as const;
   const receiptPath = (id: string, document: ReceiptDocument = 'original') =>
     orderPath(id) + (document === 'correction' ? '/receipt-correction' : '/receipt');
   let sessionPromise: Promise<Session> | null = null;
@@ -585,11 +586,11 @@ export function createLiveApi({
     async getMenu() {
       let availability: ReturnType<typeof menuAvailability> = {};
       const menu = await request({
-        path: '/stores/' + encodeURIComponent(config.storeId) + '/menu?channel=mobile', schema: menuResponse,
+        path: `/stores/${encodeURIComponent(config.storeId)}/menu?channel=mobile`, method: 'GET', schema: menuResponse,
         onHeaders: (headers) => {
           availability = menuAvailability(headers);
         },
-      });
+      } satisfies CommerceJsonRequest<'/stores/{id}/menu', 'get'>);
       if (menu.store.id !== config.storeId) invalidResponse();
       return {
         ...menu,
@@ -603,13 +604,17 @@ export function createLiveApi({
       };
     },
     async createQuote(input) {
-      const quote = await authorized({ path: '/quotes', method: 'POST', schema: quoteResponse, body: input });
+      const quote = await authorized({
+        path: '/quotes', method: 'POST', schema: quoteResponse, body: input,
+      } satisfies CommerceJsonRequest<'/quotes', 'post'>);
       if (quote.storeId !== config.storeId || quote.slotId !== input.slotId) invalidResponse();
       const { quoteId, ...fields } = quote;
       return { ...fields, id: quoteId };
     },
     async createOrder(input, key) {
-      return checkedOrder(await authorized({ path: '/orders', method: 'POST', schema: orderResponse, key, body: input }));
+      return checkedOrder(await authorized({
+        path: '/orders', method: 'POST', schema: orderResponse, key, body: input,
+      } satisfies CommerceJsonRequest<'/orders', 'post'>));
     },
     async recoverOrder(key) {
       try {
@@ -658,7 +663,9 @@ export function createLiveApi({
       });
     },
     async startPayment(orderId, key) {
-      const attempt = await authorized({ path: orderPath(orderId) + '/payments', method: 'POST', schema: paymentResponse, key });
+      const attempt = await authorized({
+        path: `${orderPath(orderId)}/payments`, method: 'POST', schema: paymentResponse, key,
+      } satisfies CommerceJsonRequest<'/orders/{id}/payments', 'post'>);
       return checkedPayment(attempt);
     },
     async getOrder(orderId) {

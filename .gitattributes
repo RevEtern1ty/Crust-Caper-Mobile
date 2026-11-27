@@ -2,3 +2,4 @@
 /server/gradlew text eol=lf
 /server/gradlew.bat text eol=crlf
 *.sh text eol=lf
+/contracts/openapi.generated.d.ts text eol=lf

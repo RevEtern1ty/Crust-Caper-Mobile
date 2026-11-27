@@ -5,6 +5,7 @@ import { ApiError, type Order, type PaymentAttempt, type PendingCheckoutIntent, 
 import { apiResponseError, invalidResponse, rememberVerifiedOrder, safeHttps, type ConnectedConfig, type LiveShopApi } from './http-api';
 import { PDF_MIME_TYPE, readReceiptPdf } from './receipt';
 import { menuAvailability } from './menu-availability';
+import { WEB_API_PREFIX, type CommerceJsonRequest } from './commerce-contract';
 import {
   menuResponse, orderAccessChallenge, orderAccessGrant, orderDataExportResponse, orderErasureRequestResponse, paymentResponse,
   pendingCheckoutRecovery, quoteResponse, reorderResponse, webOrderResponse, webSessionResponse,
@@ -71,7 +72,7 @@ export function createWebLiveApi({
   const hosts = new Set(config.pspHosts);
   const orderPath = (id: string) => {
     if (!paymentReturnOrderId(id)) throw new ApiError('invalid_input');
-    return '/orders/' + id;
+    return `/orders/${id}` as const;
   };
   const receiptPath = (id: string, document: ReceiptDocument = 'original') =>
     orderPath(id) + (document === 'correction' ? '/receipt-correction' : '/receipt');
@@ -245,7 +246,7 @@ export function createWebLiveApi({
   }
 
   function privateCall<T>(options: Request<T>, sessionId: string) {
-    return request({ ...options, path: '/web' + options.path }, true, sessionId);
+    return request({ ...options, path: WEB_API_PREFIX + options.path }, true, sessionId);
   }
 
   async function primaryCall<T>(options: Request<T>) {
@@ -358,12 +359,13 @@ export function createWebLiveApi({
     async getMenu() {
       let availability: ReturnType<typeof menuAvailability> = {};
       const menu = await request({
-        path: '/stores/' + encodeURIComponent(config.storeId) + '/menu?channel=web',
+        path: `/stores/${encodeURIComponent(config.storeId)}/menu?channel=web`,
+        method: 'GET',
         schema: menuResponse,
         onHeaders(headers) {
           availability = menuAvailability(headers);
         },
-      });
+      } satisfies CommerceJsonRequest<'/stores/{id}/menu', 'get'>);
       if (menu.store.id !== config.storeId) invalidResponse();
       return {
         ...menu,
@@ -381,7 +383,7 @@ export function createWebLiveApi({
         const sessionId = await forQuote();
         const quote = await privateCall({
           path: '/quotes', method: 'POST', schema: quoteResponse, body: input,
-        }, sessionId);
+        } satisfies CommerceJsonRequest<'/web/quotes', 'post'>, sessionId);
         if (quote.storeId !== config.storeId || quote.slotId !== input.slotId) invalidResponse();
         const { quoteId, ...fields } = quote;
         // Keep the quote bound even if a new cookie appeared before the journal saved the intent.
@@ -392,7 +394,7 @@ export function createWebLiveApi({
     createOrder(input, key) {
       return withWork(async () => checkedOrder(await privateCall({
         path: '/orders', method: 'POST', schema: webOrderResponse, key, body: input,
-      }, await contextForQuote(input.quoteId))));
+      } satisfies CommerceJsonRequest<'/web/orders', 'post'>, await contextForQuote(input.quoteId))));
     },
     recoverOrder(key) {
       return withWork(async () => {
@@ -409,8 +411,8 @@ export function createWebLiveApi({
     },
     startPayment(orderId, key) {
       return withWork(async () => checkedPayment(await checkoutOrderCall(orderId, {
-        path: orderPath(orderId) + '/payments', method: 'POST', schema: paymentResponse, key,
-      })));
+        path: `${orderPath(orderId)}/payments`, method: 'POST', schema: paymentResponse, key,
+      } satisfies CommerceJsonRequest<'/web/orders/{id}/payments', 'post'>)));
     },
     async getOrder(orderId, { readOnly = false } = {}) {
       const { payload, alternateContext } = await readOrder(orderId, { path: orderPath(orderId), schema: webOrderResponse });
