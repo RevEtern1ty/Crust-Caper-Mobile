@@ -34,8 +34,10 @@ export default function OrdersScreen({ directOrderId }: { directOrderId?: string
   const [directPhoneVerification, setDirectPhoneVerification] = useState(false);
   const running = useRef(false);
   const receiptRevision = useRef(0);
+  const selectionRevision = useRef(0);
   const linkedOrderId = savedPaymentReturnOrderId(requestedOrderId ?? undefined, journal?.orderIds ?? []);
-  const orderId = directOrderId ?? linkedOrderId ?? (choice?.latest === latestId ? choice.id : latestId);
+  const historyOrderId = choice?.latest === latestId ? choice.id : latestId;
+  const orderId = directOrderId ?? linkedOrderId ?? historyOrderId;
   const { order, loading, failed, error: statusError, refresh, delayedPayment } = useOrderStatus(orderId, {
     readOnly: !!directOrderId, watchPendingReceipt: true,
   });
@@ -72,13 +74,14 @@ export default function OrdersScreen({ directOrderId }: { directOrderId?: string
   useEffect(() => {
     if (directOrderId || !journal || requestedOrderId === null) return;
     if (linkedOrderId) {
+      if (linkedOrderId !== historyOrderId) selectionRevision.current++;
       setChoice({ latest: latestId, id: linkedOrderId });
       setPreview(null);
       setProblem(null);
       if (Platform.OS !== 'web') void refresh();
     }
     setRequestedOrderId(null);
-  }, [directOrderId, journal, latestId, linkedOrderId, refresh, requestedOrderId, setRequestedOrderId]);
+  }, [directOrderId, historyOrderId, journal, latestId, linkedOrderId, refresh, requestedOrderId, setRequestedOrderId]);
 
   const active = directOrderId ? null : journal?.active;
   const ongoingCreate = active?.phase === 'creating';
@@ -111,14 +114,18 @@ export default function OrdersScreen({ directOrderId }: { directOrderId?: string
   function resume(retryDeclined = false) {
     if (!checkoutAllowed) return;
     const shouldNavigate = guardNavigation();
+    // Resuming can publish a new latest order. Only a later selection invalidates this action's UI.
+    const selected = selectionRevision.current;
     void run('resume', async () => {
       try {
         const resumed = await resumeCheckout(retryDeclined);
+        if (selectionRevision.current !== selected) return;
         if (!resumed.recoveryReadOnly && resumed.paymentStatus === 'processing'
           && (mode === 'demo' || resumed.status === 'awaiting_payment') && shouldNavigate()) {
           router.push({ pathname: '/payment', params: { from: 'orders' } });
         } else await refresh();
       } catch (error) {
+        if (selectionRevision.current !== selected) return;
         if (error instanceof CheckoutError && error.code === 'contact_required') {
           if (shouldNavigate()) router.push({ pathname: '/checkout', params: { resume: 'contact' } });
           return;
@@ -402,7 +409,10 @@ export default function OrdersScreen({ directOrderId }: { directOrderId?: string
                 aria-pressed={Platform.OS === 'web' ? id === orderId : undefined}
                 accessibilityState={Platform.OS === 'web' ? undefined : { selected: id === orderId }}
                 onPress={() => {
-                  if (id !== orderId) receiptRevision.current++;
+                  if (id !== orderId) {
+                    receiptRevision.current++;
+                    selectionRevision.current++;
+                  }
                   setChoice({ latest: latestId, id });
                   setPreview(null);
                   setProblem(null);

@@ -1022,6 +1022,118 @@ test('a delayed payment keeps its polling window through Orders and Settings', {
   assert.deepEqual(unexpectedWrites, []);
 });
 
+test('a delayed payment resume respects a later order selection', { timeout: 35_000 }, async t => {
+  const server = createPreviewServer(dist);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  let browser;
+  let delayed;
+  t.after(async () => {
+    delayed?.release.resolve();
+    await Promise.all([browser?.close(), new Promise(resolve => {
+      server.close(resolve);
+      server.closeAllConnections();
+    })]);
+  }, { timeout: 10_000 });
+  browser = await chromium.launch({ channel: 'chrome' });
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, serviceWorkers: 'block' });
+  page.setDefaultTimeout(6500);
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  const { hostname, port } = new URL(api);
+  const journalKey = `crustcaper.checkout.v1.local.${hostname}.${port || '443'}.kigali`;
+  const pending = '2bba37e8-58db-4563-a4e2-fb197fe59890';
+  const collected = '164064f3-2cad-475e-aa6b-67a8403ef030';
+  const orderRef = id => '#' + id.slice(-8).toUpperCase();
+  const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+  const guest = { accessToken: 'fixture_payment_resume_access_token_01', refreshToken: 'fixture_payment_resume_refresh_token_01',
+    expiresAt, refreshExpiresAt: expiresAt };
+  await page.addInitScript(({ origin, journalKey, guest, pending, collected }) => {
+    if (location.origin !== origin) return;
+    sessionStorage.setItem(journalKey, JSON.stringify({ version: 1, active: {
+      phase: 'tracking', orderId: pending, key: 'fixture-payment-resume',
+    }, orderIds: [pending, collected] }));
+    sessionStorage.setItem(journalKey + '.guest', JSON.stringify(guest));
+  }, { origin, journalKey, guest, pending, collected });
+
+  const cors = { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Headers': 'Authorization',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS' };
+  const label = { en: 'Fixture store', rw: 'Fixture store' };
+  const writes = [];
+  await page.route('**/*', async route => {
+    const request = route.request();
+    const url = request.url();
+    if (new URL(url).origin === origin) return route.continue();
+    if (!url.startsWith(api + '/')) return route.abort();
+    if (request.method() === 'OPTIONS') return route.fulfill({ status: 204, headers: cors });
+    if (request.method() !== 'GET') {
+      writes.push(request.method());
+      return route.abort();
+    }
+    if (new URL(url).pathname.endsWith('/stores/kigali/menu')) {
+      return route.fulfill({ headers: cors, json: { version: 'fixture', updatedAt: new Date().toISOString(),
+        store: { id: 'kigali', name: label, area: label, hours: label, open: true }, products: [], slots: [] } });
+    }
+    const id = url.slice((api + '/orders/').length);
+    if (id !== pending && id !== collected) return route.abort();
+    if (id === pending && delayed && !delayed.requested) {
+      const held = delayed;
+      held.requested = true;
+      held.entered.resolve();
+      await held.release.promise;
+      if (held.fail) return route.fulfill({ status: 503, headers: cors, json: { code: 'service_unavailable' } });
+    }
+    const total = id === pending ? 9200 : 9400;
+    const orderTime = Date.now() - (id === pending ? 0 : 3_600_000);
+    const when = offset => new Date(orderTime + offset).toISOString();
+    return route.fulfill({ headers: cors, json: {
+      id, storeId: 'kigali', slotId: 'fixture-slot',
+      lines: [{ sku: 'double-smash', modifierIds: [], quantity: 1, unitPrice: total }],
+      total, tax: 1400, currency: 'RWF', status: id === pending ? 'awaiting_payment' : 'collected',
+      paymentStatus: id === pending ? 'processing' : 'paid', pickupCode: null, receiptStatus: 'pending', receiptUrl: null,
+      paymentAttempt: id === pending
+        ? { id: '0212f7a2-3aed-4a7f-bc17-f650d8800d91', status: 'processing', checkoutUrl: null } : null,
+      createdAt: when(-30_000), reservationExpiresAt: when(600_000),
+      pickupStartsAt: when(900_000), pickupEndsAt: when(1_200_000),
+    } });
+  });
+
+  await page.goto(origin + '/orders');
+  const open = button(page, 'Open payment');
+  for (const fail of [false, true]) {
+    await button(page, orderRef(pending)).click();
+    await open.waitFor();
+    delayed = { entered: Promise.withResolvers(), release: Promise.withResolvers(), requested: false, fail };
+    await open.click();
+    await Promise.race([
+      delayed.entered.promise,
+      delay(5000, undefined, { ref: false, signal: t.signal })
+        .then(() => assert.fail('The pending payment resume did not reach the order API')),
+    ]);
+    await button(page, orderRef(collected)).click();
+    await shown(page, 'Picked up');
+    const reorder = page.getByRole('button', { name: 'Review reorder', exact: true, disabled: false });
+    assert.equal(await reorder.count(), 0, 'The outstanding payment still owns the action guard');
+    const result = Promise.race([
+      page.waitForURL(url => url.pathname === '/payment').then(() => 'payment'),
+      reorder.waitFor().then(() => 'orders'),
+    ]);
+    delayed.release.resolve();
+    assert.equal(await result, 'orders', 'A stale resume result must leave the explicitly selected order open');
+    assert.equal(new URL(page.url()).pathname, '/orders');
+    await shown(page, 'Picked up');
+    assert.equal(await page.getByRole('alert').count(), 0, 'An old payment error must not appear on another order');
+  }
+
+  await button(page, orderRef(pending)).click();
+  await open.click();
+  await page.waitForURL(url => url.pathname === '/payment');
+  await shown(page, orderRef(pending));
+  await button(page, 'Confirm local test payment').waitFor();
+  assert.deepEqual(writes, []);
+});
+
 test('open Orders reconciles a declined checkout after its pickup hold expires', { timeout: 50_000 }, async t => {
   assert.match(api, /^http:\/\/(?:127\.0\.0\.1|localhost):\d+\/api\/v1$/);
   const fixturePath = process.env.CRUSTCAPER_EXPIRE_ORDER_FIXTURE;
