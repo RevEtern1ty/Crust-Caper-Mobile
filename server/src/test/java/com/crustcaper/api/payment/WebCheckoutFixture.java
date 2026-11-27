@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -143,9 +144,13 @@ public final class WebCheckoutFixture {
     }
 
     private record Charge(String returnUrl, long amount, long transactionId, AtomicBoolean paid) {}
+    private record Refund(Charge charge, AtomicBoolean disbursed) {}
 
     static final class Provider implements AutoCloseable {
         private static final String HOSTED_PATH = "/v3/hosted/pay/";
+        private static final String REFUNDS_PATH = "/v3/refunds";
+        private static final String REFUND_REFERENCE_PREFIX = "FIXTURE-REFUND-";
+        private static final String REFUND_FILTER = "currency=RWF&flw_ref=" + REFUND_REFERENCE_PREFIX;
         private static final String STATE_PATH = "/fixture/state";
         private static final Pattern UUID_PATH = Pattern.compile("[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}");
         private static final Pattern RETURN_URL = Pattern.compile(Pattern.quote(WEB_ORIGIN)
@@ -157,6 +162,7 @@ public final class WebCheckoutFixture {
         private final ExecutorService workers;
         private final boolean holdFirstPaidVerification;
         private final Map<String, Charge> charges = new ConcurrentHashMap<>();
+        private final Map<String, Refund> refunds = new ConcurrentHashMap<>();
         private final AtomicLong sequences = new AtomicLong(7000);
         private final AtomicLong openCalls = new AtomicLong();
         private final AtomicLong verifyCalls = new AtomicLong();
@@ -171,6 +177,7 @@ public final class WebCheckoutFixture {
                 Thread.ofPlatform().name("fixture-provider-", 0).factory()) : null;
             server.createContext("/v3/payments", this::open);
             server.createContext("/v3/transactions/verify_by_reference", this::verify);
+            server.createContext(REFUNDS_PATH, this::refund);
             server.createContext(HOSTED_PATH, this::hosted);
             if (workers != null) {
                 server.setExecutor(workers);
@@ -260,6 +267,31 @@ public final class WebCheckoutFixture {
             }
         }
 
+        private void refund(HttpExchange exchange) throws IOException {
+            try (exchange) {
+                URI uri = exchange.getRequestURI();
+                String path = uri.getRawPath();
+                String query = uri.getRawQuery();
+                boolean listing = REFUNDS_PATH.equals(path);
+                String id = "";
+                if (listing && query != null && query.startsWith(REFUND_FILTER)) {
+                    id = query.substring(REFUND_FILTER.length());
+                } else if (path.startsWith(REFUNDS_PATH + "/") && query == null) {
+                    id = path.substring(REFUNDS_PATH.length() + 1);
+                }
+                Refund refund = refunds.get(id);
+                if (!"GET".equals(exchange.getRequestMethod()) || !authorized(exchange) || refund == null) {
+                    reply(exchange, 404, "{}", "application/json");
+                    return;
+                }
+                var entry = Map.of("id", id, "transaction_id", refund.charge().transactionId(),
+                    "amount_refunded", refund.charge().amount(), "flw_ref", REFUND_REFERENCE_PREFIX + id,
+                    "status", refund.disbursed().get() ? "completed-momo" : "completed");
+                Object response = listing ? Map.of("status", "success", "data", List.of(entry)) : entry;
+                reply(exchange, 200, mapper.writeValueAsString(response), "application/json");
+            }
+        }
+
         private void hosted(HttpExchange exchange) throws IOException {
             try (exchange) {
                 String reference = exchange.getRequestURI().getPath().substring(HOSTED_PATH.length());
@@ -270,6 +302,10 @@ public final class WebCheckoutFixture {
                 }
                 if ("POST".equals(exchange.getRequestMethod())) {
                     String result = new String(exchange.getRequestBody().readNBytes(32), StandardCharsets.UTF_8);
+                    if ("result=refund".equals(result) || "result=disburse".equals(result)) {
+                        settleRefund(exchange, charge, reference, result);
+                        return;
+                    }
                     if ("result=pay".equals(result)) {
                         charge.paid().set(true);
                     } else if (!"result=back".equals(result)) {
@@ -285,13 +321,50 @@ public final class WebCheckoutFixture {
                     reply(exchange, 405, "", "text/plain");
                     return;
                 }
+                String refundControls = "";
+                if (charge.paid().get()) {
+                    String id = refundId(charge);
+                    Refund refund = refunds.get(id);
+                    if (refund == null) {
+                        refundControls = "<button name=\"result\" value=\"refund\">Request fixture refund</button>";
+                    } else {
+                        String state = refund.disbursed().get() ? "<p>Fixture refund disbursed</p>"
+                            : "<button name=\"result\" value=\"disburse\">Disburse fixture refund</button>";
+                        refundControls = "<p>Fixture refund ID: <output id=\"fixture-refund-id\">" + id + "</output></p>" + state;
+                    }
+                }
                 reply(exchange, 200, """
                     <!doctype html><html lang="en"><title>Isolated checkout</title>
                     <h1>Isolated checkout</h1><form method="post">
                     <button name="result" value="back">Return without settlement</button>
-                    <button name="result" value="pay">Settle fixture payment</button></form></html>
-                    """, "text/html; charset=utf-8");
+                    <button name="result" value="pay">Settle fixture payment</button>
+                    %s</form></html>
+                    """.formatted(refundControls), "text/html; charset=utf-8");
             }
+        }
+
+        private void settleRefund(HttpExchange exchange, Charge charge, String reference, String result) throws IOException {
+            String id = refundId(charge);
+            if (!charge.paid().get()) {
+                reply(exchange, 409, "", "text/plain");
+                return;
+            }
+            if ("result=refund".equals(result)) {
+                refunds.putIfAbsent(id, new Refund(charge, new AtomicBoolean()));
+            } else {
+                Refund refund = refunds.get(id);
+                if (refund == null) {
+                    reply(exchange, 409, "", "text/plain");
+                    return;
+                }
+                refund.disbursed().set(true);
+            }
+            exchange.getResponseHeaders().set("Location", HOSTED_PATH + reference);
+            reply(exchange, 303, "", "text/plain");
+        }
+
+        private static String refundId(Charge charge) {
+            return Long.toString(charge.transactionId() + 6_000_000);
         }
 
         private static boolean authorized(HttpExchange exchange) {

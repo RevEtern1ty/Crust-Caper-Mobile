@@ -619,6 +619,7 @@ async function checkGuestCheckout(browser, ca, t) {
     await button(page, 'Open payment').click();
     await button(page, 'Open payment page').click();
     await page.waitForURL(url => url.origin === hostedOrigin && url.pathname.startsWith('/v3/hosted/pay/'));
+    const hostedPayment = page.url();
     await button(page, 'Settle fixture payment').click();
     await page.waitForURL(origin + '/orders');
     await shown(page, 'Order accepted', 42000);
@@ -639,8 +640,8 @@ async function checkGuestCheckout(browser, ca, t) {
     await page.goto(origin + '/orders');
     if (catalogPhotos) {
       await checkOrderPrivacy(browser, ca, order, session.sessionId, cookie);
-      await t.test('manager attaches a correction and the order owner downloads both fiscal documents',
-        () => checkFiscalCorrection(browser, page, ca, order));
+      await t.test('manager verifies a disbursed refund before the owner can download the correction',
+        () => checkFiscalCorrection(browser, page, order, hostedPayment));
     } else {
       await checkSettledOrderRecovery(browser, page, context, ca, order, {
         orderId: order.id, sessionId: session.sessionId, cookie, storageKey,
@@ -902,28 +903,23 @@ async function signInManager(staff) {
   return credentials.username;
 }
 
-function recordFixtureRefund(orderId, username) {
+function verifyFiscalState(orderId, refundId, username, expected) {
   const query = spawnSync('docker', ['exec', '-i', fixtureDatabase(), 'psql', '-XAtq', '-v', 'ON_ERROR_STOP=1',
     '-U', 'storefront_fixture', '-d', 'storefront_fixture',
-    '-v', 'order_id=' + orderId, '-v', 'manager=' + username, '-f', '-',
+    '-v', 'order_id=' + orderId, '-v', 'refund_id=' + refundId, '-v', 'manager=' + username, '-f', '-',
   ], { encoding: 'utf8', timeout: 10000, input: `
-    WITH fixture_refund AS (
-      INSERT INTO verified_refunds (provider_refund_id, attempt_id, provider_transaction_id, amount, currency,
-        refund_status, store_id, operator_id, operator_username, cleared_order_payment)
-      SELECT '6000001', a.id, p.provider_transaction_id, o.total, 'RWF', 'completed-momo', o.store_id, s.id, s.username, true
-      FROM orders o JOIN payment_attempts a ON a.order_id = o.id
-      JOIN payment_exceptions p ON p.attempt_id = a.id AND p.provider_transaction_id = a.provider_transaction_id
-      JOIN operator_accounts s ON s.store_id = o.store_id AND s.username = :'manager' AND s.role = 'manager'
-      WHERE o.id = :'order_id' AND o.status = 'cancelled' AND o.payment_status = 'refund_pending'
-        AND p.reason = 'restaurant_cancelled' AND a.status = 'paid' AND o.receipt_status = 'issued'
-      RETURNING provider_refund_id
-    )
-    UPDATE orders SET payment_status = 'refunded'
-    WHERE id = :'order_id' AND (SELECT count(*) FROM fixture_refund) = 1
-    RETURNING receipt_status;
+    SELECT o.status, o.payment_status, o.receipt_status,
+      count(r.provider_refund_id), count(*) FILTER (
+        WHERE r.provider_refund_id = :'refund_id' AND r.provider_transaction_id = a.provider_transaction_id
+          AND r.amount = o.total AND r.currency = 'RWF' AND r.refund_status = 'completed-momo'
+          AND r.operator_username = :'manager' AND r.store_id = o.store_id AND r.cleared_order_payment)
+    FROM orders o JOIN payment_attempts a ON a.order_id = o.id
+    LEFT JOIN verified_refunds r ON r.attempt_id = a.id
+    WHERE o.id = :'order_id'
+    GROUP BY o.status, o.payment_status, o.receipt_status;
   ` });
-  assert.equal(query.status, 0, 'could not record the synthetic provider refund confirmation');
-  assert.equal(query.stdout.trim(), 'issued');
+  assert.equal(query.status, 0, 'could not inspect the saved order and refund');
+  assert.equal(query.stdout.trim(), expected);
 }
 
 async function attachFiscalDocument(page, card, order, document, correction = false) {
@@ -944,7 +940,6 @@ async function attachFiscalDocument(page, card, order, document, correction = fa
   assert.equal(payload.receiptStatus, correction ? 'corrected' : 'issued');
   assert.equal(payload.receiptReference, 'FIXTURE-ORIGINAL');
   if (correction) assert.equal(payload.correctionReference, reference);
-  return uploaded;
 }
 
 async function assertFiscalDownload(page, label, expected, namePrefix) {
@@ -956,31 +951,77 @@ async function assertFiscalDownload(page, label, expected, namePrefix) {
   assert.deepEqual(Buffer.concat(chunks), expected);
 }
 
-async function checkFiscalCorrection(browser, customer, ca, order) {
+async function checkFiscalCorrection(browser, customer, order, hostedPayment) {
   const original = testReceipt('CrustCaper synthetic original');
   const correction = testReceipt('CrustCaper synthetic correction');
-  const context = await newContext(browser, { viewport: { width: 390, height: 844 } }, false);
+  const context = await newContext(browser, { viewport: { width: 390, height: 844 } });
   try {
     const staff = await context.newPage();
     const manager = await signInManager(staff);
+    const shortId = order.id.slice(-8).toUpperCase();
     await button(staff, 'Fiscal receipts').click();
-    const card = staff.locator('#fiscal-receipts-list > li').filter({ hasText: '#' + order.id.slice(-8).toUpperCase() });
-    const attached = await attachFiscalDocument(staff, card, order, original);
-    const authorization = (await attached.request().allHeaders()).authorization;
-    assert.ok(typeof authorization === 'string' && authorization.startsWith('Bearer '), 'expected an operator session for cancellation');
-    const cancellation = await request(ca, '/api/v1/operator/orders/' + order.id + '/cancel', {
-      method: 'POST', headers: { Authorization: authorization },
-    });
-    assert.equal(cancellation.status, 200);
-    assert.equal(JSON.parse(cancellation.body).paymentStatus, 'refund_pending');
-    // Use confirmed synthetic provider data. The cancellation and both document uploads use the ordinary API.
-    recordFixtureRefund(order.id, manager);
+    const card = staff.getByRole('list', { name: 'Orders for fiscal receipts', exact: true }).getByRole('listitem')
+      .filter({ hasText: '#' + shortId });
+    await attachFiscalDocument(staff, card, order, original);
+    const paidOrder = staff.getByRole('list', { name: 'Orders', exact: true }).getByRole('listitem')
+      .filter({ has: staff.getByRole('heading', { name: 'Order #' + shortId, exact: true }) });
+    await button(paidOrder, 'Cancel order').click();
+    const dialog = staff.getByRole('dialog', { name: `Cancel order #${shortId}?` });
+    const [cancellation] = await Promise.all([
+      staff.waitForResponse(response => response.request().method() === 'POST'
+        && new URL(response.url()).pathname === '/api/v1/operator/orders/' + order.id + '/cancel'),
+      button(dialog, 'Confirm cancellation').click(),
+    ]);
+    assert.equal(cancellation.status(), 200);
+    assert.equal((await cancellation.json()).paymentStatus, 'refund_pending');
+    await paidOrder.waitFor({ state: 'detached' });
+
+    const paymentProvider = await context.newPage();
+    await paymentProvider.goto(hostedPayment);
+    await button(paymentProvider, 'Request fixture refund').click();
+    const refundId = await paymentProvider.locator('#fixture-refund-id').innerText();
+    assert.match(refundId, /^\d+$/);
+    await button(staff, 'Payment review').click();
+    const exception = staff.getByRole('list', { name: 'Payment exceptions' }).getByRole('listitem')
+      .filter({ hasText: order.id });
+    await exception.getByLabel('Provider refund ID').fill(refundId);
+    const verifyRefund = () => Promise.all([
+      staff.waitForResponse(response => response.request().method() === 'POST'
+        && /^\/api\/v1\/operator\/payment-exceptions\/[^/]+\/[^/]+\/refund$/.test(new URL(response.url()).pathname)),
+      button(exception, 'Verify refund').click(),
+    ]).then(([response]) => response);
+
+    const pending = await verifyRefund();
+    assert.equal(pending.status(), 409);
+    assert.equal(pending.request().postDataJSON().providerRefundId, refundId);
+    assert.equal((await pending.json()).code, 'refund_unconfirmed');
+    await shown(staff, 'Flutterwave did not confirm a completed full refund for this payment.');
+    verifyFiscalState(order.id, refundId, manager, 'cancelled|refund_pending|issued|0|0');
+    await customer.goto(origin + '/order/' + order.id);
+    await shown(customer, 'Refund pending');
+
+    await button(paymentProvider, 'Disburse fixture refund').click();
+    await shown(paymentProvider, 'Fixture refund disbursed');
+    const verified = await verifyRefund();
+    assert.equal(verified.status(), 200);
+    assert.equal(verified.request().postDataJSON().providerRefundId, refundId);
+    const { providerRefundId, refundStatus, amount, currency } = await verified.json();
+    assert.deepEqual({ providerRefundId, refundStatus, amount, currency },
+      { providerRefundId: refundId, refundStatus: 'completed-momo', amount: order.total, currency: 'RWF' });
+    await exception.waitFor({ state: 'detached' });
+    await button(staff, 'Verified history').click();
+    await exception.getByText(new RegExp('^Refund verified .*#' + refundId + '$')).waitFor();
+    await capture(staff, 'fiscal-refund-verified');
+
+    await button(staff, 'Fiscal receipts').click();
     await button(staff, 'Refresh fiscal receipts').click();
     await attachFiscalDocument(staff, card, order, correction, true);
     await shown(card, 'Corrected');
+    verifyFiscalState(order.id, refundId, manager, 'cancelled|refunded|corrected|1|1');
     await capture(staff, 'fiscal-correction-manager');
 
     await customer.goto(origin + '/order/' + order.id);
+    await shown(customer, 'Refunded');
     await assertFiscalDownload(customer, 'Download original receipt', original, 'receipt-');
     await assertFiscalDownload(customer, 'Download corrected receipt', correction, 'receipt-correction-');
     await capture(customer, 'fiscal-correction-customer');
