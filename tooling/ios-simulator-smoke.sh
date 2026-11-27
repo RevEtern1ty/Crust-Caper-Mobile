@@ -111,15 +111,25 @@ scheme=${project_name%.xcodeproj}
 workspace="ios/$scheme.xcworkspace"
 test -d "$workspace"
 
-# Release uses embedded JS. Metro and the automatic packager stay off.
-start_phase 'Build unsigned Release for iOS Simulator'
-export RCT_NO_LAUNCH_PACKAGER=1
 derived_data=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/crustcaper-ios.XXXXXX")
+xcode_flags=(ARCHS=arm64 ONLY_ACTIVE_ARCH=NO)
+if [[ "$checkout_smoke" == 1 ]]; then
+  start_phase 'Configure the local simulator app identity for Keychain'
+  checkout_identity="CRUSTCAPER.$expected_id"
+  ruby tooling/ios-checkout-signing-ci.rb "${projects[0]}" "$derived_data/checkout.entitlements"
+  start_phase 'Build locally signed Release for iOS Simulator'
+else
+  xcode_flags+=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO)
+  start_phase 'Build unsigned Release for iOS Simulator'
+fi
+
+# Release uses embedded JS. Metro and the automatic packager stay off.
+export RCT_NO_LAUNCH_PACKAGER=1
 build_log="$derived_data/xcodebuild.log"
 xcodebuild -quiet -workspace "$workspace" -scheme "$scheme" -configuration Release \
   -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath "$derived_data" -jobs 2 \
-  ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build >"$build_log" 2>&1 || {
+  "${xcode_flags[@]}" build >"$build_log" 2>&1 || {
     build_exit_status=$?
     tail -n 120 "$build_log" >&2
     exit "$build_exit_status"
@@ -149,6 +159,35 @@ if [[ "$profile" == local ]]; then
 fi
 test -s "$app/main.jsbundle"
 bundle_bytes=$(wc -c < "$app/main.jsbundle" | tr -d '[:space:]')
+
+if [[ "$checkout_smoke" == 1 ]]; then
+  start_phase 'Verify the simulator app Keychain identity before installation'
+  codesign --verify --strict "$app"
+  embedded_entitlements="$derived_data/checkout-embedded.plist"
+  if codesign --display --entitlements :- "$app" > "$embedded_entitlements" 2>/dev/null \
+      && [[ $(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$embedded_entitlements" 2>/dev/null) == "$checkout_identity" ]]; then
+    entitlement_source='code signature'
+  else
+    # Xcode can link simulator entitlements in the main Mach-O instead of signing them.
+    section=$(xcrun otool -l "$app/$executable" | awk '
+      $1 == "sectname" { found = ($2 == "__entitlements"); size = "" }
+      found && $1 == "segname" && $2 != "__TEXT" { found = 0 }
+      found && $1 == "size" { size = $2 }
+      found && $1 == "offset" { print size, $2; found = 0 }
+    ')
+    if [[ ! "$section" =~ ^(0x[0-9A-Fa-f]+)\ ([0-9]+)$ ]]; then
+      printf 'Xcode did not embed the simulator Keychain identity.\n' >&2
+      exit 1
+    fi
+    section_bytes=$(( BASH_REMATCH[1] ))
+    section_offset=${BASH_REMATCH[2]}
+    dd if="$app/$executable" of="$embedded_entitlements" bs=1 skip="$section_offset" count="$section_bytes" 2>/dev/null
+    test "$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$embedded_entitlements")" = "$checkout_identity"
+    entitlement_source='linked Mach-O section'
+  fi
+  printf 'App signature: local ad hoc\nKeychain application identifier: %s\nEntitlement source: %s\n' \
+    "$checkout_identity" "$entitlement_source" | tee "$evidence_dir/checkout-signing.txt"
+fi
 
 start_phase 'Select an available iPhone simulator'
 selected_device=$(xcrun simctl list devices available --json | node -e '
