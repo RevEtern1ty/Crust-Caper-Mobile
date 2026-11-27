@@ -33,6 +33,13 @@ final class OperatorReceipts {
     private static final String RECEIPT_QUEUE = """
         (o.payment_status = 'paid' OR (o.payment_status = 'refunded' AND f.order_id IS NOT NULL))
         """;
+    private static final String ORIGINAL_RECEIPT_ACCESS = """
+        (? OR (o.status = 'collected' AND o.payment_status = 'paid' AND EXISTS (
+            SELECT 1 FROM operator_order_events e
+            WHERE e.order_id = o.id AND e.store_id = o.store_id AND e.operator_id = ?
+                AND e.previous_status = 'ready' AND e.requested_status = 'collected' AND e.outcome = 'changed'
+        )))
+        """;
 
     record ReceiptOrder(UUID orderId, String status, String receiptStatus, long total, String currency,
                         String receiptReference, String correctionReference, boolean correctionEligible) {}
@@ -51,15 +58,24 @@ final class OperatorReceipts {
     }
 
     List<ReceiptOrder> list(String authorization, String orderCode) {
-        Principal actor = manager(authorization, false);
-        if (orderCode == null) return pendingAndRecent(actor.storeId());
+        if (orderCode == null) return pendingAndRecent(manager(authorization, false).storeId());
 
+        Principal actor = originalReceiptOperator(authorization, false);
         OperatorOrderCode match = OperatorOrderCode.parse(orderCode);
-        List<ReceiptOrder> matches = jdbc.sql(ORDER_FIELDS
-                + " WHERE o.store_id = ? AND " + RECEIPT_QUEUE + " AND " + match.predicate() + " LIMIT 2")
-            .params(actor.storeId(), match.parameter()).query(OperatorReceipts::view).list();
-        if (matches.size() > 1) throw OperatorFailure.conflict("receipt_order_code_ambiguous");
-        return matches;
+        // Detect a short-code collision in the same snapshot without returning any hidden order.
+        return jdbc.sql("""
+            WITH candidates AS (
+                SELECT o.id FROM orders o LEFT JOIN fiscal_receipts f ON f.order_id = o.id
+                WHERE o.store_id = ? AND %s AND %s
+            )
+            SELECT visible.*, (SELECT count(*) > 1 FROM candidates) AS ambiguous
+            FROM (%s JOIN candidates c ON c.id = o.id WHERE %s LIMIT 1) visible
+            """.formatted(RECEIPT_QUEUE, match.predicate(), ORDER_FIELDS, ORIGINAL_RECEIPT_ACCESS))
+            .params(actor.storeId(), match.parameter(), actor.role().equals("manager"), actor.id())
+            .query((row, index) -> {
+                if (row.getBoolean("ambiguous")) throw OperatorFailure.conflict("receipt_order_code_ambiguous");
+                return view(row, index);
+            }).list();
     }
 
     private List<ReceiptOrder> pendingAndRecent(String storeId) {
@@ -77,10 +93,10 @@ final class OperatorReceipts {
     }
 
     void preflight(String authorization, String id, String reference, String total) {
-        Principal actor = manager(authorization, false);
+        Principal actor = originalReceiptOperator(authorization, false);
         UUID orderId = orderId(id);
         Metadata metadata = metadata(reference, total);
-        UploadableOrder order = uploadable(actor.storeId(), orderId, false);
+        UploadableOrder order = uploadable(actor, orderId, false);
         verifyTotal(order, metadata);
     }
 
@@ -89,8 +105,8 @@ final class OperatorReceipts {
         Metadata metadata = metadata(reference, total);
         boolean usable = ReceiptPdf.usable(document);
         return Objects.requireNonNull(transactions.execute(tx -> {
-            Principal actor = manager(authorization, true);
-            UploadableOrder order = uploadable(actor.storeId(), orderId, true);
+            Principal actor = originalReceiptOperator(authorization, true);
+            UploadableOrder order = uploadable(actor, orderId, true);
             verifyTotal(order, metadata);
             return attachLocked(actor, order, metadata, document, usable);
         }));
@@ -98,7 +114,7 @@ final class OperatorReceipts {
 
     void preflightCorrection(String authorization, String id, String reference, String total) {
         Principal actor = manager(authorization, false);
-        UploadableOrder order = uploadable(actor.storeId(), orderId(id), false);
+        UploadableOrder order = uploadable(actor, orderId(id), false);
         verifyCorrection(order, metadata(reference, total));
     }
 
@@ -108,7 +124,7 @@ final class OperatorReceipts {
         boolean usable = ReceiptPdf.usable(document);
         return Objects.requireNonNull(transactions.execute(tx -> {
             Principal actor = manager(authorization, true);
-            UploadableOrder order = uploadable(actor.storeId(), orderId, true);
+            UploadableOrder order = uploadable(actor, orderId, true);
             verifyCorrection(order, metadata);
             Attached existing = jdbc.sql("""
                 SELECT reference, refund_total_rwf, document = ? AS matches_document
@@ -163,16 +179,18 @@ final class OperatorReceipts {
         return new ReceiptOrder(orderId, order.view().status(), "issued", metadata.total(), "RWF", metadata.reference(), null, false);
     }
 
-    private UploadableOrder uploadable(String store, UUID id, boolean lock) {
+    private UploadableOrder uploadable(Principal actor, UUID id, boolean lock) {
+        boolean manager = actor.role().equals("manager");
         if (lock) {
             // Take the order lock before reading joined attachment rows, so a retry sees the winner's commit.
-            jdbc.sql("SELECT id FROM orders WHERE store_id = ? AND id = ? FOR UPDATE").params(store, id)
+            jdbc.sql("SELECT o.id FROM orders o WHERE o.store_id = ? AND o.id = ? AND "
+                    + ORIGINAL_RECEIPT_ACCESS + " FOR UPDATE").params(actor.storeId(), id, manager, actor.id())
                 .query(UUID.class).optional().orElseThrow(OperatorFailure::notFound);
         }
         return jdbc.sql(ORDER_FIELDS + """
-            WHERE o.store_id = ? AND o.id = ? AND (o.payment_status = 'paid' OR f.order_id IS NOT NULL)
-            """)
-            .params(store, id).query((rs, row) -> new UploadableOrder(view(rs, row), rs.getString("receipt_url"),
+            WHERE o.store_id = ? AND o.id = ? AND (o.payment_status = 'paid' OR f.order_id IS NOT NULL) AND
+            """ + ORIGINAL_RECEIPT_ACCESS)
+            .params(actor.storeId(), id, manager, actor.id()).query((rs, row) -> new UploadableOrder(view(rs, row), rs.getString("receipt_url"),
                 rs.getString("refund_id")))
             .optional().orElseThrow(OperatorFailure::notFound);
     }
@@ -194,6 +212,12 @@ final class OperatorReceipts {
     private Principal manager(String authorization, boolean lock) {
         Principal actor = sessions.requirePrincipal(authorization, lock);
         if (!actor.role().equals("manager")) throw OperatorFailure.forbidden();
+        return actor;
+    }
+
+    private Principal originalReceiptOperator(String authorization, boolean lock) {
+        Principal actor = sessions.requirePrincipal(authorization, lock);
+        if (!actor.role().equals("manager") && !actor.role().equals("pickup")) throw OperatorFailure.forbidden();
         return actor;
     }
 

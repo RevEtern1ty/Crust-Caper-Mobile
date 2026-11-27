@@ -202,7 +202,7 @@ class FiscalReceiptIntegrationTest {
 
         api.perform(get(OPERATOR + "/receipts").queryParam("orderCode", code)).andExpect(status().isUnauthorized());
         exactReceipt(kitchen, code).andExpect(status().isForbidden());
-        exactReceipt(pickup, code).andExpect(status().isForbidden());
+        exactReceipt(pickup, code).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(0));
         exactReceipt(manager, code).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(1))
             .andExpect(jsonPath("$[0].orderId").value(paid.id().toString()));
         exactReceipt(otherManager, code).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(1))
@@ -227,6 +227,105 @@ class FiscalReceiptIntegrationTest {
             exactReceipt(manager, match.id().toString()).andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(1)).andExpect(jsonPath("$[0].orderId").value(match.id().toString()));
         }
+        exactReceipt(pickup, code).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(0));
+        collect(manager, pickup, paid);
+        exactReceipt(pickup, code).andExpect(status().isConflict())
+            .andExpect(jsonPath("$.code").value("receipt_order_code_ambiguous"));
+        exactReceipt(pickup, paid.id().toString()).andExpect(status().isOk())
+            .andExpect(jsonPath("$.length()").value(1)).andExpect(jsonPath("$[0].orderId").value(paid.id().toString()));
+        exactReceipt(pickup, collision.id().toString()).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(0));
+    }
+
+    @Test
+    void pickupAttachesAndRetriesTheOriginalReceiptAfterItsOwnHandoff() throws Exception {
+        Manager manager = staff(store, "manager");
+        Manager pickup = staff(store, "pickup");
+        Order paid = order(store, true);
+        collect(manager, pickup, paid);
+
+        exactReceipt(pickup, paid.id().toString().substring(28).toUpperCase(Locale.ROOT))
+            .andExpect(status().isOk()).andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
+            .andExpect(jsonPath("$.length()").value(1)).andExpect(jsonPath("$[0].orderId").value(paid.id().toString()))
+            .andExpect(jsonPath("$[0].status").value("collected")).andExpect(jsonPath("$[0].total").value(9200))
+            .andExpect(jsonPath("$[0].receiptStatus").value("pending"));
+        api.perform(get(OPERATOR + "/receipts").header(HttpHeaders.AUTHORIZATION, pickup.bearer()))
+            .andExpect(status().isForbidden());
+        for (int retry = 0; retry < 2; retry++) {
+            upload(pickup.bearer(), paid.id(), "EBM-PICKUP-001", "9200", PDF).andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("collected")).andExpect(jsonPath("$.receiptStatus").value("issued"))
+                .andExpect(jsonPath("$.receiptReference").value("EBM-PICKUP-001"));
+        }
+        assertThat(jdbc.sql("SELECT attached_by FROM fiscal_receipts WHERE order_id = ?")
+            .param(paid.id()).query(UUID.class).single()).isEqualTo(pickup.id());
+        api.perform(get(receiptPath(paid.id())).header(HttpHeaders.AUTHORIZATION, paid.owner().bearer()))
+            .andExpect(status().isOk()).andExpect(content().contentType(MediaType.APPLICATION_PDF)).andExpect(content().bytes(PDF));
+        api.perform(put(operatorPath(paid.id()) + "-correction").header(HttpHeaders.AUTHORIZATION, pickup.bearer())
+                .header(REF, "EBM-PICKUP-CORRECTION").header(TOTAL, "9200").contentType(MediaType.APPLICATION_PDF).content(PDF))
+            .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void pickupReceiptRequiresACurrentPaidCollectionByThatOperatorAtItsStore() throws Exception {
+        Manager manager = staff(store, "manager");
+        Manager pickup = staff(store, "pickup");
+        Manager colleague = staff(store, "pickup");
+        Manager kitchen = staff(store, "kitchen");
+        Order colleagueOrder = order(store, true);
+        advance(manager, colleagueOrder, "preparing", null).andExpect(status().isOk());
+        advance(manager, colleagueOrder, "ready", null).andExpect(status().isOk());
+        String code = pickupCode(colleagueOrder);
+        String wrongCode = code.equals("000000") ? "999999" : "000000";
+        advance(pickup, colleagueOrder, "collected", wrongCode).andExpect(status().isConflict());
+        advance(colleague, colleagueOrder, "collected", code).andExpect(status().isOk());
+
+        Order pending = order(store, true);
+        Order changed = order(store, true);
+        collect(manager, pickup, changed);
+        jdbc.sql("UPDATE orders SET payment_status = 'unpaid' WHERE id = ?").param(changed.id()).update();
+        String foreignStore = store();
+        Order foreign = order(foreignStore, true);
+        collect(staff(foreignStore, "manager"), foreign);
+        for (Order denied : List.of(colleagueOrder, pending, changed, foreign)) {
+            assertPickupReceiptUnavailable(pickup, denied);
+        }
+        jdbc.sql("UPDATE orders SET status = 'ready', payment_status = 'paid' WHERE id = ?").param(changed.id()).update();
+        assertPickupReceiptUnavailable(pickup, changed);
+
+        exactReceipt(kitchen, colleagueOrder.id().toString()).andExpect(status().isForbidden());
+        upload(kitchen.bearer(), colleagueOrder.id(), "EBM-DENIED", "9200", PDF).andExpect(status().isForbidden());
+        assertThat(jdbc.sql("SELECT count(*) FROM fiscal_receipts WHERE store_id IN (?, ?)")
+            .params(store, foreignStore).query(Long.class).single()).isZero();
+    }
+
+    private void assertPickupReceiptUnavailable(Manager pickup, Order order) throws Exception {
+        exactReceipt(pickup, order.id().toString()).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(0));
+        upload(pickup.bearer(), order.id(), "EBM-DENIED", "9200", PDF)
+            .andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("not_found"));
+    }
+
+    @Test
+    void pickupReceiptRechecksTheCurrentOrderAfterReadingTheUpload() throws Exception {
+        Manager manager = staff(store, "manager");
+        Manager pickup = staff(store, "pickup");
+        Order order = order(store, true);
+        collect(manager, pickup, order);
+        MockHttpServletRequest request = new MockHttpServletRequest() {
+            @Override
+            public ServletInputStream getInputStream() {
+                jdbc.sql("UPDATE orders SET status = 'ready' WHERE id = ?").param(order.id()).update();
+                return super.getInputStream();
+            }
+        };
+        request.setContentType(MediaType.APPLICATION_PDF_VALUE);
+        request.addHeader(REF, "EBM-HANDOFF-CHANGED");
+        request.addHeader(TOTAL, "9200");
+        request.setContent(PDF);
+        assertThatThrownBy(() -> operatorController.attachReceipt(pickup.bearer(), order.id().toString(), request))
+            .isInstanceOf(OperatorFailure.class).hasMessage("not_found");
+        assertThat(jdbc.sql("SELECT status = 'ready' AND receipt_status = 'pending' FROM orders WHERE id = ?")
+            .param(order.id()).query(Boolean.class).single()).isTrue();
+        assertThat(jdbc.sql("SELECT count(*) FROM fiscal_receipts WHERE order_id = ?")
+            .param(order.id()).query(Long.class).single()).isZero();
     }
 
     @Test
@@ -481,14 +580,23 @@ class FiscalReceiptIntegrationTest {
     }
 
     private void collect(Manager manager, Order order) throws Exception {
-        String pickupCode = jdbc.sql("SELECT pickup_code FROM orders WHERE id = ?")
-            .param(order.id()).query(String.class).single();
-        for (String status : List.of("preparing", "ready", "collected")) {
-            api.perform(post(OPERATOR + "/orders/" + order.id() + "/status").header(HttpHeaders.AUTHORIZATION, manager.bearer())
-                .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(
-                    new OperatorModels.StatusInput(status, status.equals("collected") ? pickupCode : null))))
-                .andExpect(status().isOk()).andExpect(jsonPath("$.status").value(status));
-        }
+        collect(manager, manager, order);
+    }
+
+    private void collect(Manager manager, Manager collector, Order order) throws Exception {
+        advance(manager, order, "preparing", null).andExpect(status().isOk()).andExpect(jsonPath("$.status").value("preparing"));
+        advance(manager, order, "ready", null).andExpect(status().isOk()).andExpect(jsonPath("$.status").value("ready"));
+        advance(collector, order, "collected", pickupCode(order)).andExpect(status().isOk())
+            .andExpect(jsonPath("$.status").value("collected"));
+    }
+
+    private ResultActions advance(Manager actor, Order order, String next, String code) throws Exception {
+        return api.perform(post(OPERATOR + "/orders/" + order.id() + "/status").header(HttpHeaders.AUTHORIZATION, actor.bearer())
+            .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(new OperatorModels.StatusInput(next, code))));
+    }
+
+    private String pickupCode(Order order) {
+        return jdbc.sql("SELECT pickup_code FROM orders WHERE id = ?").param(order.id()).query(String.class).single();
     }
 
     private static String operatorPath(UUID order) { return OPERATOR + "/orders/" + order + "/receipt"; }
