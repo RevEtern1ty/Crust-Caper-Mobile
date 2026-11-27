@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { Buffer } = require('node:buffer');
 const { writeFile } = require('node:fs/promises');
 const { join } = require('node:path');
 const { openHttpsWitnesses } = require('./storefront-network-rate-limit.cjs');
