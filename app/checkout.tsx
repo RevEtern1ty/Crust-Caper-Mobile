@@ -384,6 +384,8 @@ export default function CheckoutScreen() {
           {futureSlots.map((option) => {
             const checked = option.id === slot?.id;
             const disabled = !option.available || controlsLocked;
+            const timeLabel = slotLabel(option, locale);
+            const label = option.available ? timeLabel : `${timeLabel} · ${t('Unavailable', 'Ntikiboneka')}`;
             const webKeyboard = Platform.OS === 'web' ? {
               tabIndex: !disabled && option.id === (slot?.id ?? availableSlots[0]?.id) ? 0 as const : -1 as const,
               onKeyDown: (event: { key: string; preventDefault: () => void }) => handleSlotKey(event, option.id),
@@ -396,6 +398,7 @@ export default function CheckoutScreen() {
                   else slotButtons.current.delete(option.id);
                 }}
                 accessibilityRole="radio"
+                accessibilityLabel={label}
                 accessibilityState={{ checked, disabled }}
                 aria-checked={checked}
                 aria-disabled={disabled}
@@ -405,7 +408,7 @@ export default function CheckoutScreen() {
                 style={({ pressed }) => [styles.slot, checked && styles.selected, (pressed || !option.available) && styles.dimmed]}
               >
                 <Icon name={checked ? 'radio-button-on' : 'radio-button-off'} size={20} />
-                <Text style={styles.shrink}>{slotLabel(option, locale)}{!option.available && ` · ${t('Unavailable', 'Ntikiboneka')}`}</Text>
+                <Text style={styles.shrink}>{label}</Text>
               </Pressable>
             );
           })}
