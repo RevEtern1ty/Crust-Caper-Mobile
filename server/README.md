@@ -55,7 +55,7 @@ Optional pickup notifications use Expo. Set the provider and server credentials 
 
 ### Single-host HTTPS staging
 
-The [HTTPS overlay](deploy/compose.https.yml) runs Caddy and the API on a Linux Docker host. It publishes only TCP ports 80 and 443. Caddy redirects HTTP to HTTPS, renews the certificate for the staging hostname, and stores TLS state in the `edge_data` volume. Keep that volume across container updates. When the host already has HTTPS ingress, use the [base Compose file](deploy/compose.yml) alone and route traffic to its loopback API port (`CRUSTCAPER_HTTP_PORT`, default 8080). `docker compose up -d --wait --wait-timeout 90` waits for API readiness in both modes, including PostgreSQL. Both modes use Docker Compose 2.30 or newer and take the same API environment file and PostgreSQL CA settings below. [Docker Compose env files and bind mounts](https://docs.docker.com/reference/compose-file/container-spec/)
+The [HTTPS overlay](deploy/compose.https.yml) runs Caddy and the API on a Linux Docker host. It publishes only TCP ports 80 and 443. Caddy redirects HTTP to HTTPS, renews the certificate for the staging hostname, and stores TLS state in the `edge_data` volume. Keep that volume across container updates. When the host already has HTTPS ingress, use the [base Compose file](deploy/compose.yml) alone and route traffic to its loopback API port (`CRUSTCAPER_HTTP_PORT`, default 8080). `stage_compose up -d --wait --wait-timeout 90` waits for API readiness in both modes, including PostgreSQL. Both modes use Docker Compose 2.30 or newer and take the same API environment file and PostgreSQL CA settings below. [Docker Compose env files and bind mounts](https://docs.docker.com/reference/compose-file/container-spec/)
 
 Set an A record for the staging hostname and allow TCP 80 and 443 through the host firewall. If the hostname also has an AAAA record, verify that IPv6 reaches the ingress as well before certificate issuance. Supply a dedicated private PostgreSQL database, its PEM CA certificate, Flutterwave Test credentials and the signed staging application identities. Use the same hostname for the native client's API and return origin. [Caddy HTTPS requirements](https://caddyserver.com/docs/automatic-https)
 
@@ -78,11 +78,11 @@ For this single-host mode, connect clients directly to Caddy so the limiter can 
 
 Configure `CRUSTCAPER_APP_LINK_IOS_APP_ID` with the signed Apple application identifier and `CRUSTCAPER_APP_LINK_ANDROID_PACKAGE` with the signed Android package. Supply the comma-separated, colon-delimited SHA-256 signing certificate fingerprints in `CRUSTCAPER_APP_LINK_ANDROID_FINGERPRINTS`. An unconfigured platform's association URL returns 404. [Connected release checks](../docs/runbooks/CONNECTED_RELEASE.md)
 
-From the candidate checkout on the staging host, run the same project name and files for validation, start and subsequent updates.
+From the candidate checkout on the staging host, run the same project name and files for validation, start and subsequent updates. The deployment wrapper clears inherited variables beginning with `CRUSTCAPER_` so Compose takes deployment values from the selected environment files. The wrapper preserves Docker configuration and forwards the supplied Compose arguments.
 
 ```sh
 stage_compose() {
-  docker compose --env-file /etc/crustcaper/stage/compose.env \
+  bash server/tooling/deployment-compose.sh --env-file /etc/crustcaper/stage/compose.env \
     --project-name crustcaper-stage \
     -f server/deploy/compose.yml -f server/deploy/compose.https.yml "$@"
 }
@@ -146,15 +146,14 @@ For the stage web pilot, set `CRUSTCAPER_LEGAL_PUBLICATION_FILE` in `compose.env
 ```sh
 node server/tooling/package-deployment.mjs load /secure/crustcaper-images --output /etc/crustcaper/stage/images.env
 
-portable_compose() (
-  unset CRUSTCAPER_API_IMAGE CRUSTCAPER_CATALOG_IMAGE CRUSTCAPER_EDGE_IMAGE
-  docker compose --env-file /etc/crustcaper/stage/compose.env \
+portable_compose() {
+  bash server/tooling/deployment-compose.sh --env-file /etc/crustcaper/stage/compose.env \
     --env-file /etc/crustcaper/stage/images.env --project-name crustcaper-stage \
     -f server/deploy/compose.yml -f server/deploy/compose.https.yml \
     -f server/deploy/compose.storefront.yml -f server/deploy/compose.catalog.yml \
     -f server/deploy/compose.legal.yml \
     -f server/deploy/compose.portable.yml "$@"
-)
+}
 portable_compose config --quiet
 portable_compose up -d --wait --wait-timeout 90
 ```
