@@ -14,6 +14,11 @@ fi
 
 simulator=$1
 mode=${3:-checkout}
+receipt_smoke=${CRUSTCAPER_IOS_RECEIPT_SMOKE:-0}
+if [[ "$receipt_smoke" != 0 && ( "$receipt_smoke" != 1 || "$mode" != checkout ) ]]; then
+  printf 'Receipt sharing verification requires the connected checkout runner.\n' >&2
+  exit 2
+fi
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 mkdir -p -- "$2"
 evidence=$(cd "$2" && pwd -P)
@@ -23,6 +28,7 @@ result_bundle="$evidence/order-ui.xcresult"
 summary="$evidence/ui-test-summary.json"
 receipt="$evidence/ui-runner.txt"
 scheme_evidence="$evidence/CrustCaperOrderUITests.xcscheme"
+fixture_log="$evidence/receipt-fixture.log"
 for output in "$build_log" "$test_log" "$result_bundle" "$summary" "$receipt" "$scheme_evidence"; do
   if [[ -e $output || -L $output ]]; then
     printf 'Order UI evidence already exists at %s\n' "$output" >&2
@@ -32,8 +38,29 @@ done
 
 scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/crustcaper-ios-order-ui.XXXXXXXX")
 phase=preflight
+fixture_pid=''
+
+stop_fixture() {
+  local attempt
+  if [[ -z "$fixture_pid" ]]; then return; fi
+  if kill -0 "$fixture_pid" 2>/dev/null; then
+    kill -TERM "$fixture_pid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 10; attempt++)); do
+      kill -0 "$fixture_pid" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$fixture_pid" 2>/dev/null; then
+      kill -KILL "$fixture_pid" 2>/dev/null || return 1
+    fi
+  fi
+  wait "$fixture_pid" 2>/dev/null || true
+}
+
 cleanup() {
   local status=$? removal=removed
+  if ! stop_fixture; then
+    status=1
+  fi
   if ! rm -rf -- "$scratch"; then
     removal=failed
     if [[ $status -eq 0 ]]; then
@@ -42,6 +69,7 @@ cleanup() {
   fi
   printf 'simulator=%s\nphase=%s\nexit_code=%s\nscratch_cleanup=%s\nmode=%s\n' \
     "$simulator" "$phase" "$status" "$removal" "$mode" > "$receipt"
+  if [[ "$receipt_smoke" == 1 ]]; then printf 'receipt_sharing=1\n' >> "$receipt"; fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -61,6 +89,13 @@ destination="platform=iOS Simulator,id=$simulator,arch=arm64"
 xcode_options=(-project "$project" -scheme "$scheme" -configuration Release -sdk iphonesimulator
   -destination "$destination" -derivedDataPath "$derived_data" -parallel-testing-enabled NO
   ARCHS=arm64 ONLY_ACTIVE_ARCH=YES)
+default_allowance=180
+maximum_allowance=240
+if [[ "$receipt_smoke" == 1 ]]; then
+  xcode_options+=(SWIFT_ACTIVE_COMPILATION_CONDITIONS=CRUSTCAPER_IOS_RECEIPT_SHARING)
+  default_allowance=360
+  maximum_allowance=420
+fi
 cp "$script_dir/$test_source" "$scratch/ios-order-checkout.swift"
 
 phase=build
@@ -74,12 +109,36 @@ phase=build
   exit "$status"
 }
 
+if [[ "$receipt_smoke" == 1 ]]; then
+  phase=receipt-fixture
+  if [[ -e "$fixture_log" || -L "$fixture_log" ]]; then
+    printf 'Use a fresh receipt fixture evidence directory.\n' >&2
+    exit 2
+  fi
+  node "$script_dir/ios-receipt-fixture.cjs" "$evidence" > "$fixture_log" 2>&1 &
+  fixture_pid=$!
+  ready=false
+  for ((attempt = 0; attempt < 40; attempt++)); do
+    kill -0 "$fixture_pid" 2>/dev/null || break
+    if [[ -f "$evidence/receipt-fixture.ready" ]]; then ready=true; break; fi
+    sleep 0.5
+  done
+  if ! $ready; then
+    printf 'The local receipt fixture did not become ready before XCTest.\n' >&2
+    exit 1
+  fi
+fi
+
 phase=test
 xcodebuild "${xcode_options[@]}" test-without-building -test-timeouts-enabled YES \
-  -default-test-execution-time-allowance 180 -maximum-test-execution-time-allowance 240 \
+  -default-test-execution-time-allowance "$default_allowance" -maximum-test-execution-time-allowance "$maximum_allowance" \
   -resultBundlePath "$result_bundle" > "$test_log" 2>&1 || {
     status=$?
     tail -n 100 "$test_log" >&2 || true
+    if [[ "$receipt_smoke" == 1 && -f "$evidence/receipt-fixture.json" ]]; then
+      node "$script_dir/verify-ios-saved-receipt.cjs" "$simulator" "$evidence" \
+        > "$evidence/saved-documents-at-failure.log" 2>&1 || true
+    fi
     exit "$status"
   }
 if [[ ! -d $result_bundle ]]; then
@@ -88,6 +147,11 @@ if [[ ! -d $result_bundle ]]; then
 fi
 
 phase=verify
+if [[ "$receipt_smoke" == 1 ]]; then
+  wait "$fixture_pid"
+  fixture_pid=''
+  node "$script_dir/verify-ios-saved-receipt.cjs" "$simulator" "$evidence"
+fi
 xcrun xcresulttool get test-results summary --path "$result_bundle" > "$summary"
 node - "$summary" <<'NODE'
 const { readFileSync } = require('node:fs');

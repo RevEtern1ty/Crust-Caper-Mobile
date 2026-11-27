@@ -162,9 +162,14 @@ phase='Start the local API and wait for readiness'
 printf '\n%s\n' "$phase"
 origin="http://127.0.0.1:$api_port"
 access_log="$scratch_dir/menu-access.log"
+receipt_provider=''
+if [[ ${CRUSTCAPER_IOS_RECEIPT_SMOKE:-0} == 1 ]]; then
+  receipt_provider=CRUSTCAPER_ORDER_ACCESS_PROVIDER=local
+fi
 env -i PATH="$PATH" CRUSTCAPER_PORT="$api_port" \
   CRUSTCAPER_DB_URL="jdbc:postgresql://127.0.0.1:$pg_port/crustcaper_dev" \
   CRUSTCAPER_DB_USER=crustcaper CRUSTCAPER_DB_PASSWORD="$db_password" \
+  ${receipt_provider:+"$receipt_provider"} \
   "$java_bin" -jar "$jar" --spring.profiles.active=local \
   --server.address=127.0.0.1 --crustcaper.payment.provider=local --crustcaper.push.provider=disabled \
   --server.tomcat.accesslog.enabled=true --server.tomcat.accesslog.buffered=false \

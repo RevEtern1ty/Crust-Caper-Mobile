@@ -25,6 +25,10 @@ on:
         description: Run only the Settings probe on iOS 16.0 with Xcode 16.4 (suite ios-runner-probe)
         type: boolean
         default: false
+      ios_receipt_sharing:
+        description: Extend ios-current-checkout to test receipt sharing and order data export
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -365,6 +369,9 @@ jobs:
       - run: npm ci
       - name: Verify iOS sharing completion in Swift
         run: node --import tsx --test src/checkout/receipt-sharing-ios.test.ts
+      - name: Verify the synthetic receipt fixture
+        if: inputs.suite == 'ios-current-checkout' && inputs.ios_receipt_sharing
+        run: node --test tooling/ios-receipt-fixture.test.cjs
       - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         if: inputs.suite == 'pilot' || inputs.suite == 'ios-minimum' || inputs.suite == 'ios-minimum-checkout' || inputs.suite == 'ios-current-checkout'
         with:
@@ -396,6 +403,7 @@ jobs:
           CRUSTCAPER_VERIFY_IOS_MINIMUM: ${{ inputs.suite == 'ios-minimum' || inputs.suite == 'ios-minimum-checkout' }}
           CRUSTCAPER_IOS_ORDER_SMOKE: ${{ (inputs.suite == 'ios-minimum-checkout' || inputs.suite == 'ios-current-checkout') && '1' || '0' }}
           CRUSTCAPER_IOS_ORDER_RUNTIME: ${{ inputs.suite == 'ios-current-checkout' && '26-5' || '16-0' }}
+          CRUSTCAPER_IOS_RECEIPT_SMOKE: ${{ (inputs.suite == 'ios-current-checkout' && inputs.ios_receipt_sharing) && '1' || '0' }}
         run: |
           evidence_dir="$RUNNER_TEMP/crustcaper-ios-smoke"
           mkdir -p "$evidence_dir"
