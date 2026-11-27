@@ -77,6 +77,7 @@ final class CrustCaperCheckoutTests: XCTestCase {
         let shareRoots = [app, springboard]
         let fileRoots = [app, files, springboard]
         let receipt = buttons(labeled: "Share receipt", in: app)
+        let receiptName = "receipt-\(orderReference.dropFirst().lowercased())"
         XCTAssertTrue(receipt.firstMatch.waitForExistence(timeout: 35), "The paid order must receive its fixture receipt")
         try tap(receipt, named: "Share receipt", in: app, scrolls: 5)
         try waitForShareSheet(in: shareRoots, phase: "receipt-first-share")
@@ -100,13 +101,13 @@ final class CrustCaperCheckoutTests: XCTestCase {
             try closeShareSheet(in: shareRoots, phase: "receipt-returned-share-sheet")
         }
         try tap(receipt, named: "Reopen the same receipt after cancelling Print", in: app, scrolls: 3)
-        try saveToLocalFiles(from: shareRoots, pickerRoots: fileRoots, phase: "receipt")
+        try saveToLocalFiles(from: shareRoots, pickerRoots: fileRoots, documentName: receiptName, phase: "receipt")
         _ = try actionable(receipt, named: "Receipt action restored after Files", in: app, scrolls: 3)
         XCTAssertTrue(text(labeled: orderReference, in: app).exists)
         recordSharingProof("receipt-sharing", """
             Print options opened and cancelled.
             Reopened the same receipt and saved it through On My iPhone.
-            Expected filename: receipt-\(orderReference.dropFirst().lowercased()).pdf
+            Expected filename: \(receiptName).pdf
             """)
 
         let settings = buttons(labeled: "Settings", in: app)
@@ -131,7 +132,8 @@ final class CrustCaperCheckoutTests: XCTestCase {
         dismissOrderDataPopover(in: shareRoots, restoring: orderData.firstMatch)
         captureSystemScreen("order-data-cancelled")
         try tap(orderData, named: "Reopen verified order data after cancelling", in: app, scrolls: 3)
-        try saveToLocalFiles(from: shareRoots, pickerRoots: fileRoots, phase: "order-data")
+        try saveToLocalFiles(from: shareRoots, pickerRoots: fileRoots,
+                             documentName: "crustcaper-order-data", phase: "order-data")
         _ = try actionable(orderData, named: "Order data action restored after Files", in: app, scrolls: 3)
         recordSharingProof("order-data-sharing", """
             Verified the original order, opened and cancelled its export, then reopened it.
@@ -192,9 +194,27 @@ final class CrustCaperCheckoutTests: XCTestCase {
 
     @MainActor
     private func saveToLocalFiles(from shareRoots: [XCUIApplication], pickerRoots: [XCUIApplication],
-                                  phase: String) throws {
+                                  documentName: String, phase: String) throws {
         try waitForShareSheet(in: shareRoots, phase: "\(phase)-reopened-share")
         try systemAction(["Save to Files"], in: shareRoots, phase: "\(phase)-files-action", scrolls: 3).tap()
+        let pickerOpened = waitForSystemState(timeout: 6) {
+            self.systemMatch(["Save"], in: pickerRoots, requireAction: false) != nil
+        }
+        if !pickerOpened {
+            // iOS can leave the same share sheet open after tapping the cell. Retry its visible icon once.
+            let activities = shareRoots[0].otherElements["ActivityListView"]
+            let title = activities.otherElements.matching(NSPredicate(
+                format: "identifier == %@ AND label == %@", "LP.CaptionBar.TopCaption", documentName
+            )).firstMatch
+            let cell = activities.cells.matching(NSPredicate(
+                format: "identifier == %@ AND label == %@", "actionGroupCell", "Save to Files"
+            )).firstMatch
+            let icon = cell.images["activityImageView"].firstMatch
+            if title.exists && cell.isHittable && cell.isEnabled && icon.exists
+                && !icon.frame.isEmpty && cell.frame.contains(icon.frame) {
+                icon.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            }
+        }
         _ = try systemAction(["Save"], in: pickerRoots, phase: "\(phase)-files-picker", readOnly: true)
         let folder = "On My iPhone"
         let folderQuery = NSPredicate(format: "label == %@ OR identifier == %@", folder, folder)
