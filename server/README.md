@@ -96,13 +96,15 @@ Run the [connected release checks](../docs/runbooks/CONNECTED_RELEASE.md) agains
 
 ### Browser storefront
 
-Build the storefront from the repository root with Node 24 using the same HTTPS origin configured on the API. Replace the example hostname and store ID with the approved values for the environment. The command uses one public origin for both the API and the return route and excludes the builder's local Expo environment settings.
+Build the storefront from the repository root with Node 24 using the same HTTPS origin configured on the API. Replace the example hostname and store ID with the approved values for the environment. The command uses one public origin for the API and the return route and excludes the builder's local Expo environment settings. The stage pilot build uses `--legal` so checkout links to the approved ordering terms.
 
 ```sh
 npm ci
 npm run build:storefront -- --origin https://stage.example.test --profile stage \
-  --store-id kigali --psp-hosts checkout.flutterwave.com
+  --store-id kigali --psp-hosts checkout.flutterwave.com --legal
 ```
+
+Set up the [legal publication](#public-menu) for the pilot and verify that **Ordering terms** in EN and **Amabwiriza yo gutumiza** in RW open the corresponding document from checkout. Omit `--legal` when building for an internal stage rehearsal without published documents.
 
 For a production web export, use `--profile production` and provide the registered app identifiers with `--android-package` and `--ios-bundle-id`. Keep staging and production exports in separate directories using `--output-dir dist-storefront-<label>`. Set `CRUSTCAPER_STOREFRONT_DIR` in the Compose environment file to the absolute path of the exported `dist-storefront` directory or the selected output. Mount only the build output. Add `-f server/deploy/compose.storefront.yml` to the existing HTTPS Compose command and keep the same project name. Run the validation and health checks above using all three files. For a different ingress, serve the storefront export and API on a single origin and set `CRUSTCAPER_WEB_ORIGIN` directly in the API environment. Serve `/web-payment-return` as a storefront route with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Keep the native association and `/payment-return` routes on the API. [Caddy static file routing](https://caddyserver.com/docs/caddyfile/directives/file_server)
 
@@ -139,6 +141,8 @@ node server/tooling/package-deployment.mjs export /secure/crustcaper-images \
 
 On the target, use Node 24 and `tar`. Transfer the image directory and the matching source archive. Verify the lock file against the release record before importing. With `--output`, the loader verifies the archive and all three local image references before atomically replacing the Compose file. It creates the new file with owner-only permissions on Linux. A failed load leaves the previous file available. `load DIRECTORY` and `verify DIRECTORY` print the three references to stdout.
 
+For the stage web pilot, set `CRUSTCAPER_LEGAL_PUBLICATION_FILE` in `compose.env` to the approved bilingual publication JSON. Omit `compose.legal.yml` from the command below for an internal rehearsal without a publication.
+
 ```sh
 node server/tooling/package-deployment.mjs load /secure/crustcaper-images --output /etc/crustcaper/stage/images.env
 
@@ -148,12 +152,13 @@ portable_compose() (
     --env-file /etc/crustcaper/stage/images.env --project-name crustcaper-stage \
     -f server/deploy/compose.yml -f server/deploy/compose.https.yml \
     -f server/deploy/compose.storefront.yml -f server/deploy/compose.catalog.yml \
+    -f server/deploy/compose.legal.yml \
     -f server/deploy/compose.portable.yml "$@"
 )
 portable_compose config --quiet
 portable_compose up -d --wait --wait-timeout 90
 ```
 
-Give the Compose file the host-specific storefront export, external PostgreSQL CA and API secret file described above. Add the legal publication overlay before the portable overlay for production. Use the catalog photo overlay before the portable overlay when photos are published. Keep the previous verified image archive and the previous Compose configuration as the inputs for an approved rollback. [Docker image archives](https://docs.docker.com/reference/cli/docker/image/save/)
+Give the Compose file the host-specific storefront export, external PostgreSQL CA and API secret file described above. Use the catalog photo overlay before the portable overlay when photos are published. Keep the previous verified image archive and the previous Compose configuration as the inputs for an approved rollback. [Docker image archives](https://docs.docker.com/reference/cli/docker/image/save/)
 
 For a new database, follow the staging setup in order. Create the closed store with no products, enroll the named manager and obtain recipe approvals before importing the full menu. The shipped API image includes the interactive tools for provisioning that manager. [Staging setup](../docs/runbooks/CONNECTED_RELEASE.md#конфигурация-стенда) · [First manager on portable Linux](docs/OPERATIONS.md#первый-менеджер-из-комплекта-linux)
