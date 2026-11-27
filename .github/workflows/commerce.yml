@@ -190,6 +190,7 @@ jobs:
           npm --prefix storefront test
           node --test server/tooling/check-live-catalog.test.mjs server/tooling/storefront-availability.test.mjs server/tooling/check-app-links.test.mjs
           node --test server/tooling/package-deployment.test.mjs
+          node --test server/tooling/deployment-compose.test.mjs
           npm --prefix storefront audit --omit=dev --audit-level=high
       - name: Build the HTTPS checkout and isolated provider fixture
         run: |

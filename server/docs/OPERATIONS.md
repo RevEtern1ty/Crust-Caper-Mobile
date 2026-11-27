@@ -78,7 +78,7 @@ npm run monitor:storefront -- https://stage.example.com/api/v1 kigali --watch
 ```sh
 (
   while :; do
-    if snapshot=$(timeout -k 3s 12s docker compose --env-file /etc/crustcaper/stage/compose.env \
+    if snapshot=$(timeout -k 3s 12s bash server/tooling/deployment-compose.sh --env-file /etc/crustcaper/stage/compose.env \
         --project-name crustcaper-stage \
         -f server/deploy/compose.yml -f server/deploy/compose.https.yml \
         exec -T edge wget -qO- -T 5 http://api:8080/actuator/commerceerrors 2>/dev/null); then
