@@ -217,6 +217,11 @@ jobs:
         env:
           CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: ${{ runner.temp }}/crustcaper-https-evidence/network-rate-limit
         run: npm run test:storefront:network-rate-limit
+      - name: Verify closed-pilot admission and public callbacks through the HTTPS ingress
+        timeout-minutes: 5
+        env:
+          CRUSTCAPER_HTTPS_TEST_EVIDENCE_DIR: ${{ runner.temp }}/crustcaper-https-evidence/pilot-access
+        run: npm run test:storefront:pilot-access
       - name: Verify scheduled payment reconciliation and the open kitchen board after a forced API stop
         timeout-minutes: 5
         env:

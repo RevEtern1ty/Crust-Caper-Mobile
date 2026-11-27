@@ -9,7 +9,7 @@ const peerNames = ['rate-client-a', 'rate-client-b'];
 const menuPath = '/api/v1/stores/kigali/menu?channel=mobile';
 const sessionPath = '/api/v1/guest-sessions';
 
-function networkRateWitnesses() {
+function httpsWitnesses() {
   return Object.fromEntries(peerNames.map(name => [name, {
     image: '${CRUSTCAPER_CATALOG_IMAGE:?Set the verified catalog image or digest}',
     pull_policy: 'never',
@@ -25,7 +25,7 @@ function networkRateWitnesses() {
 }
 
 // This function runs inside the witness container, on the same isolated bridge as the edge.
-function requestFromWitness({ fixtureHost, method, path, headers, ca }) {
+function requestFromWitness({ fixtureHost, method, path, headers, ca, payload }) {
   const { request } = require('node:https');
   return new Promise((resolve, reject) => {
     const call = request({
@@ -43,23 +43,29 @@ function requestFromWitness({ fixtureHost, method, path, headers, ca }) {
       });
       response.on('error', reject);
       response.on('end', () => {
+        const mediaType = response.headers['content-type']?.split(';', 1)[0].trim();
         let data;
-        try {
-          data = JSON.parse(body);
-        } catch (error) {
-          reject(error);
-          return;
+        if (body && /^application\/(?:[a-z0-9.-]+\+)?json$/i.test(mediaType ?? '')) {
+          try {
+            data = JSON.parse(body);
+          } catch (error) {
+            reject(error);
+            return;
+          }
         }
         resolve({
           localAddress, remoteAddress, status: response.statusCode,
           cacheControl: response.headers['cache-control'], retryAfter: response.headers['retry-after'],
-          code: data?.code,
+          code: data?.code, mediaType, location: response.headers.location, emptyBody: body.length === 0,
           guestIssued: typeof data?.accessToken === 'string', storeId: data?.store?.id,
+          webGuestIssued: typeof data?.sessionId === 'string'
+            && (response.headers['set-cookie'] ?? []).some(value => value.startsWith('__Host-crustcaper-web=')),
+          ...(path.startsWith('/.well-known/') && { association: data }),
         });
       });
     });
     call.on('error', reject);
-    call.end();
+    call.end(payload);
   });
 }
 
@@ -80,16 +86,20 @@ function retryDelay(response) {
   return Number(response.retryAfter);
 }
 
-async function runNetworkRateLimit({ compose, fixtureHost, browserCa, evidence, signal }) {
+async function openHttpsWitnesses({ compose, fixtureHost, browserCa, signal }) {
   const ca = await readFile(browserCa, 'utf8');
-  async function probe(peer, method, path, headers = {}) {
-    const result = JSON.parse(await compose('Request HTTPS from an isolated rate-limit witness',
+  return async (peer, method, path, headers = {}, payload) => {
+    const result = JSON.parse(await compose('Request HTTPS from an isolated network witness',
       ['exec', '-T', peerNames[peer], 'node', '-e', witnessProgram], {
-        signal, capture: true, timeout: 8_000, input: JSON.stringify({ fixtureHost, method, path, headers, ca }),
+        signal, capture: true, timeout: 8_000, input: JSON.stringify({ fixtureHost, method, path, headers, ca, payload }),
       }));
     assert.ok(isIPv4(result.localAddress) && isIPv4(result.remoteAddress), 'Expected direct IPv4 connections to the fixture edge');
     return result;
-  }
+  };
+}
+
+async function runNetworkRateLimit({ evidence, signal, ...fixture }) {
+  const probe = await openHttpsWitnesses({ ...fixture, signal });
 
   const menuB = await probe(1, 'GET', menuPath);
   assert.equal(menuB.status, 200);
@@ -147,4 +157,4 @@ async function runNetworkRateLimit({ compose, fixtureHost, browserCa, evidence, 
   process.stdout.write(output);
 }
 
-module.exports = { networkRateSessionLimit, networkRateWitnesses, runNetworkRateLimit };
+module.exports = { networkRateSessionLimit, httpsWitnesses, openHttpsWitnesses, runNetworkRateLimit };

@@ -1,4 +1,5 @@
 const { Buffer } = require('node:buffer');
+const { rejects } = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { randomBytes, randomUUID } = require('node:crypto');
 const { access, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } = require('node:fs/promises');
@@ -6,7 +7,8 @@ const { tmpdir } = require('node:os');
 const { basename, dirname, join, resolve } = require('node:path');
 const { openStorefrontFixture } = require('./storefront-load.cjs');
 const { openStaffSession } = require('./storefront-load-kitchen.cjs');
-const { networkRateWitnesses, networkRateSessionLimit, runNetworkRateLimit } = require('./storefront-network-rate-limit.cjs');
+const { httpsWitnesses, networkRateSessionLimit, runNetworkRateLimit } = require('./storefront-network-rate-limit.cjs');
+const { runPilotAccess } = require('./storefront-pilot-access.cjs');
 const { fixtureDatabaseUrl, preparePostgresTls, postgresCaMount, postgresJdbcTlsQuery, postgresTlsEntrypoint,
   postgresTlsMount, postgresTlsRuntime } = require('./storefront-postgres-tls.cjs');
 
@@ -22,6 +24,7 @@ const database = 'storefront_fixture';
 const recoveredDatabase = 'storefront_recovered';
 const recoveryHost = 'postgres-recovery';
 const testMain = 'com.crustcaper.api.payment.WebCheckoutFixture';
+const fixtureWebhookSecret = 'fixture-restart-webhook-v1';
 const scratchPrefix = 'cc-storefront-';
 const fixturePhoto = { sku: 'double-smash', file: 'double-smash-r39.jpg' };
 const fixtureBootstrapVersion = 'catalog-bootstrap';
@@ -120,7 +123,11 @@ function postgresService(host, name, password, tlsDirectory, volumes, labels) {
   };
 }
 
-async function prepareFixture(directory, testClasses, env, { paymentRestart, errorRehearsal, databaseRecovery, networkRateLimit }) {
+async function prepareFixture(directory, testClasses, env, {
+  paymentRestart, errorRehearsal, databaseRecovery, networkRateLimit, pilotAccess,
+}) {
+  const flutterwaveFixture = paymentRestart || pilotAccess;
+  const networkWitnesses = networkRateLimit || pilotAccess;
   const fixturePassword = randomBytes(24).toString('hex');
   const fixtureMfaKey = randomBytes(32).toString('base64');
   const apiEnvironment = join(directory, 'api.env');
@@ -158,7 +165,7 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
   }
   await writeFile(apiEnvironment, [
     'SPRING_PROFILES_ACTIVE=stage',
-    `CRUSTCAPER_PAYMENT_PROVIDER=${paymentRestart ? 'flutterwave' : 'fixture'}`,
+    `CRUSTCAPER_PAYMENT_PROVIDER=${flutterwaveFixture ? 'flutterwave' : 'fixture'}`,
     'CRUSTCAPER_ORDER_ACCESS_PROVIDER=disabled',
     `CRUSTCAPER_DB_URL=${fixtureDatabaseUrl(database)}`,
     `CRUSTCAPER_DB_USER=${database}`,
@@ -167,8 +174,8 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
     `CRUSTCAPER_APP_LINK_ANDROID_PACKAGE=${fixtureAppLinks.androidPackage}`,
     `CRUSTCAPER_APP_LINK_ANDROID_FINGERPRINTS=${fixtureAppLinks.androidFingerprint}`,
     `CRUSTCAPER_APP_LINK_IOS_APP_ID=${fixtureAppLinks.iosAppId}`,
-    ...(paymentRestart ? [
-      'FLUTTERWAVE_WEBHOOK_SECRET=fixture-restart-webhook-v1',
+    ...(flutterwaveFixture ? [
+      'FLUTTERWAVE_WEBHOOK_SECRET=' + fixtureWebhookSecret,
       `CRUST_PAYMENT_RETURN_URL=https://${fixtureHost}/payment-return`,
     ] : []),
     '',
@@ -179,7 +186,7 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
   const site = 'https://{$CRUSTCAPER_HTTPS_HOST} {';
   const deployedCaddyfile = await readFile(join(deploy, 'Caddyfile'), 'utf8');
   if (deployedCaddyfile.split(site).length !== 2) throw new Error('Could not locate the deployed Caddy HTTPS site');
-  const hostedUpstream = paymentRestart ? 'provider' : 'api';
+  const hostedUpstream = flutterwaveFixture ? 'provider' : 'api';
   const providerSite = [
     '',
     'https://checkout.flutterwave.com {',
@@ -203,17 +210,17 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
         entrypoint: fixtureEntrypoint,
         depends_on: {
           postgres: { condition: 'service_healthy' },
-          ...(paymentRestart && { provider: { condition: 'service_started' } }),
+          ...(flutterwaveFixture && { provider: { condition: 'service_started' } }),
         },
         ...(networkRateLimit && { environment: { CRUSTCAPER_EDGE_RATE_SESSIONS_PER_MINUTE: String(networkRateSessionLimit) } }),
         volumes: [fixtureClasses],
-        ...(paymentRestart && { command: ['--restart-api'], restart: 'no' }),
+        ...(flutterwaveFixture && { command: ['--restart-api'], restart: 'no' }),
       },
-      ...(paymentRestart && { provider: {
+      ...(flutterwaveFixture && { provider: {
         image: '${CRUSTCAPER_API_IMAGE:?Set the verified API image or digest}',
         pull_policy: 'never',
         entrypoint: fixtureEntrypoint,
-        command: [databaseRecovery ? '--recovery-provider' : '--provider'],
+        command: [databaseRecovery || pilotAccess ? '--recovery-provider' : '--provider'],
         ...(databaseRecovery && { labels: recoveryLabel }),
         environment: { CRUSTCAPER_STOREFRONT_RESTART_PROVIDER: '1' },
         networks: ['default'],
@@ -228,7 +235,7 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
       catalog: { pull_policy: 'never' },
       edge: {
         volumes: [mount(caddyfile, '/etc/caddy/Caddyfile')],
-        ...(networkRateLimit && { networks: ['default', 'catalog_private', 'network_rate_clients'] }),
+        ...(networkWitnesses && { networks: ['default', 'catalog_private', 'network_rate_clients'] }),
       },
       postgres: postgresService('postgres', database, fixturePassword, tlsDirectory, [
         mount(join(root, 'server', 'tooling', 'import-catalog.psql'), '/fixture/import-catalog.psql'),
@@ -237,10 +244,10 @@ async function prepareFixture(directory, testClasses, env, { paymentRestart, err
         ...(databaseRecovery ? ['source_db:/var/lib/postgresql/data'] : []),
       ], databaseRecovery ? recoveryLabel : errorRehearsal ? errorRehearsalLabel : undefined),
       ...(databaseRecovery && { [recoveryHost]: recoveryPostgres }),
-      ...(networkRateLimit && networkRateWitnesses()),
+      ...(networkWitnesses && httpsWitnesses()),
     },
     ...(databaseRecovery && { volumes: { source_db: {}, recovered_db: {} } }),
-    ...(networkRateLimit && { networks: { network_rate_clients: { internal: true } } }),
+    ...(networkWitnesses && { networks: { network_rate_clients: { internal: true } } }),
   }, null, 2), { mode: 0o600 });
   return { apiEnvironment, edgeRateEnvironment, composeEnvironment, databaseCa, overlay, recoveryOverlay, fixtureMfaKey };
 }
@@ -331,10 +338,11 @@ async function main() {
   const errorRehearsal = mode === '--error-rehearsal';
   const databaseRecovery = mode === '--database-recovery';
   const networkRateLimit = mode === '--network-rate-limit';
+  const pilotAccess = mode === '--pilot-access';
   const kitchenRestart = mode === '--kitchen-restart';
   const paymentRestart = mode === '--payment-restart' || kitchenRestart || databaseRecovery;
-  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart && !availability && !errorRehearsal && !networkRateLimit)) {
-    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart | --availability | --error-rehearsal | --database-recovery | --network-rate-limit]');
+  if (modes.length > 1 || (mode !== undefined && !load && !webPerf && !catalogPhotos && !paymentRestart && !availability && !errorRehearsal && !networkRateLimit && !pilotAccess)) {
+    throw new Error('Usage: node tooling/storefront-stack.cjs [--load | --load-smoke | --web-perf | --catalog-photos | --payment-restart | --kitchen-restart | --availability | --error-rehearsal | --database-recovery | --network-rate-limit | --pilot-access]');
   }
   const script = databaseRecovery ? 'tooling/storefront-database-recovery.cjs'
     : errorRehearsal ? 'tooling/storefront-error-rehearsal.cjs'
@@ -381,7 +389,7 @@ async function main() {
       await writeFile(join(photos, 'double-smash-r39.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
     }
     const settings = await prepareFixture(directory, testClasses, hostEnv,
-      { paymentRestart, errorRehearsal, databaseRecovery, networkRateLimit });
+      { paymentRestart, errorRehearsal, databaseRecovery, networkRateLimit, pilotAccess });
     const env = {
       ...hostEnv,
       CRUSTCAPER_API_IMAGE: apiImage,
@@ -419,6 +427,30 @@ async function main() {
     ]);
     await importCatalog(compose, { load, catalogPhotos, availability, project, browserCa, fixtureMfaKey: settings.fixtureMfaKey });
     if (evidence) await mkdir(evidence, { recursive: true });
+    if (pilotAccess) {
+      await runPilotAccess({ compose, fixtureHost, browserCa, evidence, appLinks: fixtureAppLinks,
+        webhookSecret: fixtureWebhookSecret, signal: AbortSignal.any([interruption.signal, AbortSignal.timeout(85_000)]),
+        async activate(networks) {
+          const pilot = [...command, '-f', dockerPath(join(deploy, 'compose.pilot.yml'))];
+          const config = [...pilot, 'config', '--quiet'];
+          const validate = [...pilot, 'run', '--rm', '--no-deps', 'edge',
+            'caddy', 'validate', '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile'];
+          await rejects(run('Reject a pilot overlay without CIDRs', 'docker', config, { env, capture: true }), /failed \(1\)$/);
+          for (const invalid of ['0.0.0.0/0', '999.0.0.1/32']) {
+            await rejects(run('Reject an invalid pilot CIDR', 'docker', validate, {
+              env: { ...env, CRUSTCAPER_PILOT_ALLOWED_NETWORKS: invalid }, capture: true,
+            }), /failed \(1\)$/);
+          }
+          const pilotEnv = { ...env, CRUSTCAPER_PILOT_ALLOWED_NETWORKS: networks };
+          await run('Validate the closed pilot Compose overlay', 'docker', config, { env: pilotEnv });
+          await run('Validate the closed pilot Caddy configuration', 'docker', validate, { env: pilotEnv, capture: true });
+          await run('Recreate only the fixture HTTPS ingress with closed-pilot admission', 'docker',
+            [...pilot, 'up', '-d', '--no-deps', '--force-recreate', '--wait', '--wait-timeout', '35', 'edge'],
+            { env: pilotEnv, timeout: 50_000 });
+        },
+      });
+      return;
+    }
     if (networkRateLimit) {
       await runNetworkRateLimit({ compose, fixtureHost, browserCa, evidence,
         signal: AbortSignal.any([interruption.signal, AbortSignal.timeout(85_000)]) });
