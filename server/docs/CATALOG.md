@@ -53,7 +53,27 @@ $catalogInput | psql -X --no-password --dbname='service=crustcaper-stage' -v "ca
 $catalogInput | psql -X --no-password --dbname='service=crustcaper-stage' -v "catalog_database=$catalogDatabase" -v catalog_apply=true -f server/tooling/import-catalog.psql
 ```
 
-Для входа через другую оболочку передайте в stdin одну строку Base64 исходного файла. `psql` читает эту строку через `\copy ... FROM PSTDIN`. [Документация PostgreSQL](https://www.postgresql.org/docs/17/app-psql.html)
+На Linux из корня распакованных исходников сохраните исходные байты в одну строку Base64 и выполните пробный прогон. Укажите файл реквизитов для первого импорта или согласованный файл полного каталога.
+
+```bash
+catalog_database='crustcaper_stage'
+catalog_file=./approved-catalog.json
+catalog_input=$(base64 --wrap=0 -- "$catalog_file")
+catalog_import() (
+  set -o pipefail
+  builtin printf '%s\n' "$catalog_input" |
+    psql -X --no-password --dbname='service=crustcaper-stage' \
+      -v "catalog_database=$catalog_database" -f server/tooling/import-catalog.psql "$@"
+)
+catalog_import
+```
+
+После проверки результата примените тот же ввод.
+
+```bash
+catalog_import -v catalog_apply=true
+unset catalog_input
+```
 
 При конфликте версии прочтите текущий каталог, сверьте изменения и заново выполните пробный прогон. Новые и перенесённые окна проверяются на пересечение со всем расписанием точки, включая окна из панели менеджера. Для отката подготовьте предыдущие значения с текущей `expectedVersion` и новой `version`. Ограничения для занятых окон применяются и при откате.
 
@@ -65,7 +85,7 @@ $catalogInput | psql -X --no-password --dbname='service=crustcaper-stage' -v "ca
 
 ## Проверка перед приёмом заказов
 
-После импорта и открытия точки из корня репозитория запустите команду с Node.js 24. Передайте HTTPS-адрес API и ожидаемые `store.id` и `store.version` из утверждённого файла.
+После импорта и открытия точки из корня репозитория запустите команду с Node.js 24. Передайте HTTPS-адрес API, ID точки и ожидаемую версию опубликованного каталога. Действие **Accept new orders** меняет версию. После открытия через панель возьмите `version` из ответа `PATCH /api/v1/operator/availability`.
 
 ```sh
 node server/tooling/check-live-catalog.mjs https://stage.example.com/api/v1 kigali catalog-001

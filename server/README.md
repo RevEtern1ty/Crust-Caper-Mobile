@@ -155,3 +155,5 @@ portable_compose up -d --wait --wait-timeout 90
 ```
 
 Give the Compose file the host-specific storefront export, external PostgreSQL CA and API secret file described above. Add the legal publication overlay before the portable overlay for production. Use the catalog photo overlay before the portable overlay when photos are published. Keep the previous verified image archive and the previous Compose configuration as the inputs for an approved rollback. [Docker image archives](https://docs.docker.com/reference/cli/docker/image/save/)
+
+For a new database, follow the staging setup in order. Create the closed store with no products, enroll the named manager and obtain recipe approvals before importing the full menu. The shipped API image includes the interactive tools for provisioning that manager. [Staging setup](../docs/runbooks/CONNECTED_RELEASE.md#конфигурация-стенда) · [First manager on portable Linux](docs/OPERATIONS.md#первый-менеджер-из-комплекта-linux)

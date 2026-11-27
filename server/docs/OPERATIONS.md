@@ -238,6 +238,71 @@ try {
 
 Используйте один и тот же UUID после неопределённого результата создания. Если инструмент сообщает о существующей записи, сверьте сотрудника и точку в реестре. Вывод инструмента содержит результат операции и число отозванных сессий. Хеш при передаче через stdin требует той же защиты, что и другие секреты.
 
+### Первый менеджер из комплекта Linux
+
+После запуска API и импорта реквизитов закрытой точки используйте интерактивный Bash на хосте. Выполняйте команды из корня распакованных исходников с той же функцией `portable_compose`, которая запускала стенд. Для административного подключения установите клиент PostgreSQL и настройте service `crustcaper-stage` с проверкой TLS-сертификата и имени сервера. [Переносимые образы](../README.md#transfer-verified-linux-images) · [Подготовка данных точки](CATALOG.md#подготовка-данных)
+
+Сгенерируйте хеш пароля в контейнере API. Обычный `exec` в интерактивном терминале выделяет TTY, необходимый генератору. [Docker Compose exec](https://docs.docker.com/reference/cli/docker/compose/exec/) · [Spring Boot PropertiesLauncher](https://docs.spring.io/spring-boot/4.0/specification/executable-jar/property-launcher.html)
+
+```bash
+portable_compose exec api java \
+  -Dloader.main=com.crustcaper.api.operator.OperatorPasswordHash \
+  -cp /app/app.jar org.springframework.boot.loader.launch.PropertiesLauncher
+```
+
+Укажите точное имя базы, точки и именную запись. Создайте UUID один раз и сохраните его в реестре доступа для привязки MFA и повторов.
+
+```bash
+operator_database='crustcaper_stage'
+operator_store='kigali'
+operator_username='manager-example'
+operator_id=$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')
+printf '%s\n' "$operator_id"
+```
+
+Вставьте хеш в скрытое приглашение. Блок передаёт его через stdin в Node и `psql`.
+
+```bash
+(
+  set +ax
+  set -o pipefail
+  unset operator_hash
+  IFS= read -r -s -p 'Generated staff password hash: ' operator_hash < /dev/tty || exit 1
+  printf '\n' >&2
+  builtin printf '%s' "$operator_hash" | node -e '
+    const [storeId, accountId, username] = process.argv.slice(1);
+    const passwordHash = require("node:fs").readFileSync(0, "utf8");
+    const request = { operation: "create", storeId, accountId, username, role: "manager", passwordHash };
+    console.log(Buffer.from(JSON.stringify(request), "utf8").toString("base64"));
+  ' "$operator_store" "$operator_id" "$operator_username" |
+    psql -X --no-password --dbname='service=crustcaper-stage' \
+      -v "operator_database=$operator_database" -f server/tooling/operator-accounts.psql
+)
+```
+
+С теми же реквизитами сотрудника выполните [настройку аутентификатора](#аутентификатор-сотрудника). На переносимом стенде генератор использует ключ MFA из конфигурации запущенного API.
+
+```bash
+portable_compose exec api java \
+  -Dloader.main=com.crustcaper.api.operator.OperatorTotpEnrollment \
+  -cp /app/app.jar org.springframework.boot.loader.launch.PropertiesLauncher
+```
+
+После подтверждения кода аутентификатора вставьте выданную зашифрованную строку привязки в скрытое приглашение. Затем проверьте вход менеджера на стенде с паролем и новым кодом.
+
+```bash
+(
+  set +ax
+  set -o pipefail
+  unset operator_enrollment
+  IFS= read -r -s -p 'Encrypted staff enrollment: ' operator_enrollment < /dev/tty || exit 1
+  printf '\n' >&2
+  builtin printf '%s\n' "$operator_enrollment" |
+    psql -X --no-password --dbname='service=crustcaper-stage' \
+      -v "operator_database=$operator_database" -f server/tooling/operator-accounts.psql
+)
+```
+
 ### Аутентификатор сотрудника
 
 На подключённом стенде и в production для каждой записи обязательны пароль и код аутентификатора. Установите `CRUSTCAPER_OPERATOR_MFA_KEY` из хранилища секретов целевого окружения. Это отдельный ключ из 32 случайных байтов в Base64. Для восстановления базы храните резервную копию ключа в хранилище секретов. Прежние сессии, выданные только по паролю, при обновлении требуют нового входа.
