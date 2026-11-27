@@ -261,6 +261,17 @@ if [[ "$profile" == local ]]; then
     | tee -a "$evidence_dir/evidence.txt"
 fi
 if [[ "$checkout_smoke" == 1 ]]; then
+  start_phase 'Stop the launch probe before the cold checkout test'
+  xcrun simctl terminate "$simulator" "$bundle_id"
+  for (( seconds = 0; seconds < 10; seconds++ )); do
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    printf 'The observed launch process was still running before XCTest.\n' >&2
+    exit 1
+  fi
+  printf 'Launch probe process stopped before the cold checkout test.\n' >> "$evidence_dir/evidence.txt"
   start_phase 'Verify checkout through the installed iOS Release'
   bash tooling/ios-order-ui-ci.sh "$simulator" "$evidence_dir/checkout"
   installed_app=$(xcrun simctl get_app_container "$simulator" "$bundle_id" app)
