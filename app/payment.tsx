@@ -6,6 +6,7 @@ import { Platform, StyleSheet, View } from 'react-native';
 import { useCheckout, useOrderStatus, useRouteActionGuard } from '../src/checkout/context';
 import { checkoutError, delayedPaymentLabel, displayOrderId, paymentLabel } from '../src/checkout/labels';
 import { hasInconsistentPayment } from '../src/checkout/pickup-hold';
+import { useOrderStatusAnnouncement } from '../src/checkout/use-order-status-announcement';
 import type { DemoPaymentResult } from '../src/domain/types';
 import { useShop } from '../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../src/ui/core';
@@ -19,6 +20,7 @@ export default function PaymentScreen() {
   const active = journal?.active;
   const orderId = active && active.phase !== 'creating' ? active.orderId : null;
   const { order, failed, error, loading, refresh, delayedPayment } = useOrderStatus(orderId);
+  useOrderStatusAnnouncement(order, locale, 'payment');
   const [busy, setBusy] = useState<DemoPaymentResult | 'browser' | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const running = useRef(false);

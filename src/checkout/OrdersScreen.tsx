@@ -8,6 +8,7 @@ import { checkoutError, delayedPaymentLabel, displayOrderId, kitchenLabel, order
 import { OrderAccessForm } from './OrderAccessForm';
 import { ReorderPanel } from './reorder-panel';
 import { reorderOfferForCart } from './reorder-review';
+import { useOrderStatusAnnouncement } from './use-order-status-announcement';
 import { savedPaymentReturnOrderId } from './payment-return';
 import { PickupAlertPanel } from './pickup-alert';
 import { hasInconsistentPayment, isAwaitingUnpaidHold, isExpiredUnpaidHold } from './pickup-hold';
@@ -41,6 +42,7 @@ export default function OrdersScreen({ directOrderId }: { directOrderId?: string
   const { order, loading, failed, error: statusError, refresh, delayedPayment } = useOrderStatus(orderId, {
     readOnly: !!directOrderId, watchPendingReceipt: true,
   });
+  useOrderStatusAnnouncement(order, locale, 'orders');
   const t = (en: string, rw: string) => copy(locale, en, rw);
   const showDelayedPayment = !!order && delayedPayment && !failed;
   const savedOrderId = savedPaymentReturnOrderId(orderId ?? undefined, journal?.orderIds ?? []);
