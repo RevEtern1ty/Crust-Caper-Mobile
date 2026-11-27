@@ -731,7 +731,7 @@ paths:
       security: [{ operatorBearer: [] }]
       responses:
         '200':
-          description: Active CrustCaper and manually registered delivery orders for the session's assigned store.
+          description: Active CrustCaper and manually registered delivery orders for the session's assigned store. The kitchen role receives order and recipe details with monetary fields omitted.
           headers:
             Cache-Control:
               schema: { type: string, const: no-store }
@@ -988,7 +988,7 @@ paths:
                 required: [pickupCode]
       responses:
         '200':
-          description: Updated order. The server checks store, role, sequence and pickup code.
+          description: Updated order. The server checks store, role, sequence and pickup code. Monetary fields are omitted for the kitchen role.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OperatorOrder' }
@@ -1929,7 +1929,7 @@ components:
         recordedAt: { $ref: '#/components/schemas/Timestamp' }
     OperatorOrderDetails:
       type: object
-      required: [id, lines, total, currency, pickupStartsAt, pickupEndsAt, acceptedAt]
+      required: [id, lines, pickupStartsAt, pickupEndsAt, acceptedAt]
       properties:
         id: { type: string, format: uuid }
         lines:
@@ -1941,11 +1941,11 @@ components:
               sku: { type: string }
               modifierIds: { type: array, items: { type: string } }
               quantity: { type: integer, minimum: 1 }
-              soldItem: { $ref: '#/components/schemas/SoldItem' }
+              soldItem: { $ref: '#/components/schemas/OperatorSoldItem' }
         total:
           $ref: '#/components/schemas/Amount'
-          description: Persisted total of the direct order in whole RWF.
-        currency: { type: string, const: RWF }
+          description: Persisted total of the direct order in whole RWF. Omitted for kitchen.
+        currency: { type: string, const: RWF, description: Omitted for kitchen. }
         pickupStartsAt: { $ref: '#/components/schemas/Timestamp' }
         pickupEndsAt: { $ref: '#/components/schemas/Timestamp' }
         acceptedAt:
@@ -1953,6 +1953,28 @@ components:
           anyOf:
             - $ref: '#/components/schemas/Timestamp'
             - type: 'null'
+    OperatorSoldItem:
+      type: object
+      readOnly: true
+      required: [catalogVersion, name, ingredients, allergens, modifiers]
+      description: Saved catalog facts. Historical lines without saved facts omit the entire sold item.
+      properties:
+        catalogVersion: { type: string }
+        name: { $ref: '#/components/schemas/Localized' }
+        ingredients: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+        allergens: { type: array, items: { $ref: '#/components/schemas/Localized' } }
+        modifiers:
+          type: array
+          maxItems: 25
+          items:
+            type: object
+            required: [id, name]
+            properties:
+              id: { type: string }
+              name: { $ref: '#/components/schemas/Localized' }
+              price:
+                $ref: '#/components/schemas/Amount'
+                description: Original modifier price in whole RWF. Omitted for kitchen.
     OperatorOrderReference:
       type: string
       pattern: '^(?:[0-9A-Fa-f]{8}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$'
@@ -2007,10 +2029,12 @@ components:
       allOf:
         - $ref: '#/components/schemas/OperatorOrderDetails'
         - type: object
-          required: [status, paymentStatus]
+          required: [status, paymentStatus, total, currency]
           properties:
             status: { type: string, const: cancelled }
             paymentStatus: { type: string, enum: [refund_pending, refunded] }
+            total: { $ref: '#/components/schemas/Amount' }
+            currency: { type: string, const: RWF }
     ReconciliationBucket:
       type: object
       additionalProperties: false

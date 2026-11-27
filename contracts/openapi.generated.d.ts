@@ -1081,16 +1081,32 @@ export interface components {
                 sku: string;
                 modifierIds: string[];
                 quantity: number;
-                soldItem?: components["schemas"]["SoldItem"];
+                soldItem?: components["schemas"]["OperatorSoldItem"];
             }[];
-            /** @description Persisted total of the direct order in whole RWF. */
-            total: components["schemas"]["Amount"];
-            /** @constant */
-            currency: "RWF";
+            /** @description Persisted total of the direct order in whole RWF. Omitted for kitchen. */
+            total?: components["schemas"]["Amount"];
+            /**
+             * @description Omitted for kitchen.
+             * @constant
+             */
+            currency?: "RWF";
             pickupStartsAt: components["schemas"]["Timestamp"];
             pickupEndsAt: components["schemas"]["Timestamp"];
             /** @description Time of the verified payment and accepted kitchen transition. Null for historical orders without this timestamp. */
             acceptedAt: components["schemas"]["Timestamp"] | null;
+        };
+        /** @description Saved catalog facts. Historical lines without saved facts omit the entire sold item. */
+        OperatorSoldItem: {
+            catalogVersion: string;
+            name: components["schemas"]["Localized"];
+            ingredients: components["schemas"]["Localized"][];
+            allergens: components["schemas"]["Localized"][];
+            modifiers: {
+                id: string;
+                name: components["schemas"]["Localized"];
+                /** @description Original modifier price in whole RWF. Omitted for kitchen. */
+                price?: components["schemas"]["Amount"];
+            }[];
         };
         OperatorOrderReference: string;
         OperatorOrder: components["schemas"]["OperatorOrderDetails"] & {
@@ -1126,6 +1142,9 @@ export interface components {
             status: "cancelled";
             /** @enum {string} */
             paymentStatus: "refund_pending" | "refunded";
+            total: components["schemas"]["Amount"];
+            /** @constant */
+            currency: "RWF";
         };
         ReconciliationBucket: {
             /** Format: int64 */
@@ -2725,7 +2744,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Active CrustCaper and manually registered delivery orders for the session's assigned store. */
+            /** @description Active CrustCaper and manually registered delivery orders for the session's assigned store. The kitchen role receives order and recipe details with monetary fields omitted. */
             200: {
                 headers: {
                     "Cache-Control"?: "no-store";
@@ -3020,7 +3039,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Updated order. The server checks store, role, sequence and pickup code. */
+            /** @description Updated order. The server checks store, role, sequence and pickup code. Monetary fields are omitted for the kitchen role. */
             200: {
                 headers: {
                     [name: string]: unknown;
