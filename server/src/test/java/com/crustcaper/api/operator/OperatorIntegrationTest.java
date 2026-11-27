@@ -16,6 +16,7 @@ import com.crustcaper.api.payment.PaymentGateway.PaymentResult;
 import com.crustcaper.api.payment.PaymentGateway.VerifiedPayment;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
@@ -96,7 +97,7 @@ class OperatorIntegrationTest {
     }
 
     @Test
-    void queueContainsOnlyPaidOrdersFromTheOperatorStoreAndOmitsCustomerAndPaymentData() throws Exception {
+    void kitchenQueueContainsOnlyPaidOrdersFromItsStoreAndOmitsCustomerAndFinancialFields() throws Exception {
         Staff kitchen = newStaff(store, "kitchen");
         String staffBearer = login(kitchen);
         OrderFixture accepted = newOrder(store, true);
@@ -116,25 +117,23 @@ class OperatorIntegrationTest {
         assertThat(visible.path("id").asString("")).isEqualTo(accepted.orderId());
         assertThat(visible.path("status").asString("")).isEqualTo("accepted");
         assertThat(visible.path("paymentStatus").asString("")).isEqualTo("paid");
-        JsonNode customerOrder = body(api.perform(get(API + "/orders/" + accepted.orderId())
-                .header(HttpHeaders.AUTHORIZATION, accepted.guestBearer())).andExpect(status().isOk()));
-        assertThat(visible.get("total")).isEqualTo(customerOrder.get("total"));
-        assertThat(visible.get("currency")).isEqualTo(customerOrder.get("currency"));
-        assertThat(keys(visible)).containsExactlyInAnyOrder("id", "status", "paymentStatus", "lines", "total",
-                "currency", "pickupStartsAt", "pickupEndsAt", "acceptedAt");
+        assertThat(keys(visible)).containsExactlyInAnyOrder("id", "status", "paymentStatus", "lines",
+                "pickupStartsAt", "pickupEndsAt", "acceptedAt");
         assertThat(Instant.parse(queue.path("serverTime").asString()))
                 .isAfterOrEqualTo(Instant.parse(visible.path("acceptedAt").asString()));
         assertThat(keys(visible.path("lines").get(0))).containsExactlyInAnyOrder("sku", "modifierIds", "quantity");
         change(staffBearer, accepted.orderId(), "preparing", null).andExpect(status().isOk())
-                .andExpect(jsonPath("$.total").value(customerOrder.get("total").asLong()))
-                .andExpect(jsonPath("$.currency").value("RWF"));
+                .andExpect(jsonPath("$.total").doesNotHaveJsonPath())
+                .andExpect(jsonPath("$.currency").doesNotHaveJsonPath());
         change(staffBearer, differentStore.orderId(), "preparing", null).andExpect(status().isNotFound());
         change(staffBearer, unpaid.orderId(), "preparing", null).andExpect(status().isNotFound());
     }
 
     @Test
-    void kitchenReadsSoldFactsAndHistoricalFallbackAfterCatalogChanges() throws Exception {
+    void kitchenReadsSoldFactsWithoutPricesAndOtherRolesKeepTheFullOrder() throws Exception {
         String kitchen = login(newStaff(store, "kitchen"));
+        String pickup = login(newStaff(store, "pickup"));
+        String manager = login(newStaff(store, "manager"));
         OrderFixture sold = newOrder(store, true);
         OrderFixture historical = newOrder(store, true);
         removeSoldItem(historical);
@@ -144,6 +143,8 @@ class OperatorIntegrationTest {
                  "allergens":[{"en":"Sale allergen","rw":"Allergène yagurishijwe"}],
                  "modifiers":[{"id":"extra-cheese","name":{"en":"Sold cheese","rw":"Foromaje yagurishijwe"},"price":500}]}
                 """);
+        JsonNode kitchenSnapshot = snapshot.deepCopy();
+        ((ObjectNode) kitchenSnapshot.path("modifiers").get(0)).remove("price");
         jdbc.sql("""
                 UPDATE orders SET lines = jsonb_set(lines, '{0,soldItem}', CAST(? AS jsonb)) WHERE id = ?
                 """).params(snapshot.toString(), UUID.fromString(sold.orderId())).update();
@@ -158,13 +159,35 @@ class OperatorIntegrationTest {
         for (JsonNode order : orders) lines.put(order.path("id").asString(), order.path("lines").get(0));
         JsonNode soldLine = lines.get(sold.orderId());
         assertThat(keys(soldLine)).containsExactlyInAnyOrder("sku", "modifierIds", "quantity", "soldItem");
-        assertThat(soldLine.get("soldItem")).isEqualTo(snapshot);
+        assertThat(soldLine.get("soldItem")).isEqualTo(kitchenSnapshot);
         JsonNode historicalLine = lines.get(historical.orderId());
         assertThat(keys(historicalLine)).containsExactlyInAnyOrder("sku", "modifierIds", "quantity");
         assertThat(historicalLine.path("sku").asString()).isEqualTo("double-smash");
         assertThat(historicalLine.path("modifierIds").get(0).asString()).isEqualTo("extra-cheese");
-        JsonNode preparing = body(change(kitchen, sold.orderId(), "preparing", null).andExpect(status().isOk()));
-        assertThat(preparing.path("lines").get(0).path("soldItem")).isEqualTo(snapshot);
+        JsonNode preparing = body(change(kitchen, sold.orderId(), "preparing", null).andExpect(status().isOk())
+                .andExpect(jsonPath("$.total").doesNotHaveJsonPath()).andExpect(jsonPath("$.currency").doesNotHaveJsonPath()));
+        assertThat(preparing.path("lines").get(0).path("soldItem")).isEqualTo(kitchenSnapshot);
+
+        JsonNode buyer = body(api.perform(get(API + "/orders/" + sold.orderId())
+                .header(HttpHeaders.AUTHORIZATION, sold.guestBearer())).andExpect(status().isOk()));
+        JsonNode managerQueue = queuedOrder(manager, sold.orderId());
+        JsonNode pickupQueue = queuedOrder(pickup, sold.orderId());
+        JsonNode ready = body(change(manager, sold.orderId(), "ready", null).andExpect(status().isOk()));
+        JsonNode collected = body(change(pickup, sold.orderId(), "collected", sold.code()).andExpect(status().isOk()));
+        for (JsonNode response : List.of(buyer, managerQueue, pickupQueue, ready, collected)) {
+            assertThat(response.path("total").asLong()).isEqualTo(9700);
+            assertThat(response.path("currency").asString()).isEqualTo("RWF");
+            assertThat(response.path("lines").get(0).path("soldItem")).isEqualTo(snapshot);
+        }
+    }
+
+    private JsonNode queuedOrder(String bearer, String id) throws Exception {
+        JsonNode queue = body(api.perform(get(OPERATOR + "/orders").header(HttpHeaders.AUTHORIZATION, bearer))
+                .andExpect(status().isOk()));
+        for (JsonNode order : queue.path("orders")) {
+            if (id.equals(order.path("id").asString())) return order;
+        }
+        throw new AssertionError("Order is missing from the paid queue");
     }
 
     private void removeSoldItem(OrderFixture order) {

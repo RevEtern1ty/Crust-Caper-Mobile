@@ -1,6 +1,6 @@
 package com.crustcaper.api.operator;
 
-import com.crustcaper.api.ApiModels.SoldItem;
+import com.crustcaper.api.ApiModels.Localized;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import java.time.Instant;
@@ -29,11 +29,26 @@ final class OperatorModels {
         public String toString() { return "StatusInput[redacted]"; }
     }
 
+    record SoldModifier(String id, Localized name, @JsonInclude(JsonInclude.Include.NON_NULL) Long price) { }
+
+    record SoldItem(String catalogVersion, Localized name, List<Localized> ingredients, List<Localized> allergens,
+                    List<SoldModifier> modifiers) { }
+
     @JsonIgnoreProperties(ignoreUnknown = true)
     record OrderLine(String sku, List<String> modifierIds, int quantity,
-                     @JsonInclude(JsonInclude.Include.NON_NULL) SoldItem soldItem) { }
+                     @JsonInclude(JsonInclude.Include.NON_NULL) SoldItem soldItem) {
+        OrderLine withoutModifierPrices() {
+            if (soldItem == null) return this;
+            List<SoldModifier> modifiers = soldItem.modifiers().stream()
+                    .map(modifier -> new SoldModifier(modifier.id(), modifier.name(), null)).toList();
+            return new OrderLine(sku, modifierIds, quantity, new SoldItem(soldItem.catalogVersion(), soldItem.name(),
+                    soldItem.ingredients(), soldItem.allergens(), modifiers));
+        }
+    }
 
-    record OrderView(UUID id, String status, String paymentStatus, List<OrderLine> lines, long total, String currency,
+    record OrderView(UUID id, String status, String paymentStatus, List<OrderLine> lines,
+                     @JsonInclude(JsonInclude.Include.NON_NULL) Long total,
+                     @JsonInclude(JsonInclude.Include.NON_NULL) String currency,
                      Instant pickupStartsAt, Instant pickupEndsAt,
                      @JsonInclude(JsonInclude.Include.ALWAYS) Instant acceptedAt) { }
 

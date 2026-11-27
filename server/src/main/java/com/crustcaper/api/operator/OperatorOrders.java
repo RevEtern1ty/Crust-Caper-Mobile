@@ -77,7 +77,7 @@ final class OperatorOrders {
                  FROM orders
                  WHERE store_id = ? AND payment_status = 'paid' AND status IN ('accepted', 'preparing', 'ready')
                  ORDER BY pickup_starts_at, id
-                """).param(actor.storeId()).query(this::orderRow).list();
+                """).param(actor.storeId()).query((row, number) -> orderRow(row, actor)).list();
         List<OperatorExternalOrders.Order> external = externalOrders.active(actor);
         return new Queue(active, jdbc.sql("SELECT clock_timestamp()").query(OffsetDateTime.class).single().toInstant(), external);
     }
@@ -210,7 +210,8 @@ final class OperatorOrders {
             if (!actor.role().equals("manager")) throw OperatorFailure.forbidden();
             UUID id = orderId(rawId);
             OrderView existing = jdbc.sql("SELECT " + ORDER_FIELDS + " FROM orders WHERE id = ? AND store_id = ? FOR UPDATE")
-                    .params(id, actor.storeId()).query(this::orderRow).optional().orElseThrow(OperatorFailure::notFound);
+                    .params(id, actor.storeId()).query((row, number) -> orderRow(row, actor))
+                    .optional().orElseThrow(OperatorFailure::notFound);
             if (existing.status().equals("cancelled")
                     && (existing.paymentStatus().equals("refund_pending") || existing.paymentStatus().equals("refunded"))) {
                 PaidReference primary = currentPaidReference(id);
@@ -277,7 +278,7 @@ final class OperatorOrders {
         ProfiledOrder existing = jdbc.sql("SELECT " + ORDER_FIELDS + """
                 , pickup_code FROM orders WHERE id = ? AND store_id = ? AND payment_status = 'paid' FOR UPDATE
                 """).params(id, actor.storeId())
-                .query((rs, row) -> new ProfiledOrder(orderRow(rs, row), rs.getString("pickup_code")))
+                .query((row, number) -> new ProfiledOrder(orderRow(row, actor), row.getString("pickup_code")))
                 .optional().orElseThrow(OperatorFailure::notFound);
 
         if (!transition.from().equals(existing.order().status())) {
@@ -336,16 +337,19 @@ final class OperatorOrders {
                 """).params(id, actor.storeId(), actor.id(), actor.role(), previousStatus, requestedStatus, outcome).update();
     }
 
-    private OrderView orderRow(ResultSet row, int number) throws SQLException {
+    private OrderView orderRow(ResultSet row, Principal actor) throws SQLException {
         List<OrderLine> lines;
         try {
             lines = lineReader.readValue(row.getString("lines"));
         } catch (JacksonException ignored) {
             throw new OperatorFailure(HttpStatus.SERVICE_UNAVAILABLE, "service_unavailable");
         }
+        boolean showAmounts = actor.role().equals("pickup") || actor.role().equals("manager");
+        if (!showAmounts) lines = lines.stream().map(OrderLine::withoutModifierPrices).toList();
         OffsetDateTime acceptedAt = row.getObject("accepted_at", OffsetDateTime.class);
         return new OrderView(row.getObject("id", UUID.class), row.getString("status"), row.getString("payment_status"),
-                lines, row.getLong("total"), "RWF", row.getObject("pickup_starts_at", OffsetDateTime.class).toInstant(),
+                lines, showAmounts ? row.getLong("total") : null, showAmounts ? "RWF" : null,
+                row.getObject("pickup_starts_at", OffsetDateTime.class).toInstant(),
                 row.getObject("pickup_ends_at", OffsetDateTime.class).toInstant(),
                 acceptedAt == null ? null : acceptedAt.toInstant());
     }
