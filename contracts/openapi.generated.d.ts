@@ -779,6 +779,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
+        /** @description Managers can review fiscal receipts for the assigned store. Pickup staff can look up only a paid order they collected in that store. */
         get: operations["listOperatorReceipts"];
         put?: never;
         post?: never;
@@ -813,6 +814,7 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
+        /** @description Attach a PDF original issued by the seller's EBM. A manager can attach a receipt to an eligible order in the assigned store. Pickup staff can attach it only to a paid order they collected in that store. */
         put: operations["attachFiscalReceipt"];
         post?: never;
         delete?: never;
@@ -3254,7 +3256,7 @@ export interface operations {
     listOperatorReceipts: {
         parameters: {
             query?: {
-                /** @description Exact case-insensitive match on the eight-hex order number or the full hyphenated order ID. Omit it for the rolling queue. */
+                /** @description Exact case-insensitive match on the eight-hex order number or the full hyphenated order ID. Required for pickup staff. The manager can omit it for the rolling queue. */
                 orderCode?: components["schemas"]["OperatorOrderReference"];
             };
             header?: never;
@@ -3263,7 +3265,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Up to 100 paid orders for the manager's store, starting with orders awaiting a receipt. An exact lookup returns one matching paid order or an empty list. */
+            /** @description Up to 100 eligible orders for the manager's store, starting with orders awaiting a receipt. An exact lookup returns one order eligible for the authenticated operator or an empty list. */
             200: {
                 headers: {
                     "Cache-Control"?: "no-store";

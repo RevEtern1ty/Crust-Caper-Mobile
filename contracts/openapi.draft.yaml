@@ -1152,15 +1152,16 @@ paths:
   /operator/receipts:
     get:
       operationId: listOperatorReceipts
+      description: Managers can review fiscal receipts for the assigned store. Pickup staff can look up only a paid order they collected in that store.
       security: [{ operatorBearer: [] }]
       parameters:
         - name: orderCode
           in: query
-          description: Exact case-insensitive match on the eight-hex order number or the full hyphenated order ID. Omit it for the rolling queue.
+          description: Exact case-insensitive match on the eight-hex order number or the full hyphenated order ID. Required for pickup staff. The manager can omit it for the rolling queue.
           schema: { $ref: '#/components/schemas/OperatorOrderReference' }
       responses:
         '200':
-          description: Up to 100 paid orders for the manager's store, starting with orders awaiting a receipt. An exact lookup returns one matching paid order or an empty list.
+          description: Up to 100 eligible orders for the manager's store, starting with orders awaiting a receipt. An exact lookup returns one order eligible for the authenticated operator or an empty list.
           headers:
             Cache-Control:
               schema: { type: string, const: no-store }
@@ -1218,6 +1219,7 @@ paths:
   /operator/orders/{id}/receipt:
     put:
       operationId: attachFiscalReceipt
+      description: Attach a PDF original issued by the seller's EBM. A manager can attach a receipt to an eligible order in the assigned store. Pickup staff can attach it only to a paid order they collected in that store.
       security: [{ operatorBearer: [] }]
       parameters:
         - $ref: '#/components/parameters/OrderId'
