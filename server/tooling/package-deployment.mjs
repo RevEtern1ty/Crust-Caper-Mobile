@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { lstat, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 const execute = promisify(execFile);
@@ -175,16 +175,38 @@ async function loadImages(directory, importArchive) {
   if (importArchive) await docker('Load the locked linux/amd64 images', ['image', 'load', '--platform', platform, '--input', archive], 300_000);
   const ids = {};
   for (const role of roles) ids[role] = await requireLockedImage(role, images[role]);
-  for (const role of roles) console.log(`CRUSTCAPER_${role.toUpperCase()}_IMAGE=${ids[role]}`);
+  return roles.map(role => `CRUSTCAPER_${role.toUpperCase()}_IMAGE=${ids[role]}\n`).join('');
+}
+
+async function writeImagePins(path, pins) {
+  const temporary = join(dirname(path), `.crustcaper-image-pins-${randomBytes(16).toString('hex')}.tmp`);
+  const file = await open(temporary, 'wx', 0o600);
+  let promoted = false;
+  try {
+    try {
+      await file.writeFile(pins, 'utf8');
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    await rename(temporary, path);
+    promoted = true;
+  } finally {
+    if (!promoted) await rm(temporary, { force: true });
+  }
 }
 
 async function main([mode, directory, ...args]) {
+  const output = mode === 'load' && args.length === 2 && args[0] === '--output' ? args[1] : undefined;
   requireMatch(directory && ((mode === 'export' && args.length === 3)
-    || ((mode === 'load' || mode === 'verify') && !args.length)),
-  'Usage: node server/tooling/package-deployment.mjs export DIRECTORY REVISION API_IMAGE CATALOG_IMAGE | load DIRECTORY | verify DIRECTORY');
+    || (mode === 'load' && (!args.length || output?.trim()))
+    || (mode === 'verify' && !args.length)),
+  'Usage: node server/tooling/package-deployment.mjs export DIRECTORY REVISION API_IMAGE CATALOG_IMAGE | load DIRECTORY [--output FILE] | verify DIRECTORY');
   await requireLocalDocker();
-  if (mode === 'export') await exportImages(resolve(directory), ...args);
-  else await loadImages(resolve(directory), mode === 'load');
+  if (mode === 'export') return exportImages(resolve(directory), ...args);
+  const pins = await loadImages(resolve(directory), mode === 'load');
+  if (output) await writeImagePins(resolve(output), pins);
+  else process.stdout.write(pins);
 }
 
 main(process.argv.slice(2)).catch(error => {

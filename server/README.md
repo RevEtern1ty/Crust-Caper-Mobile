@@ -137,10 +137,10 @@ node server/tooling/package-deployment.mjs export /secure/crustcaper-images \
   "$(git rev-parse HEAD)" crustcaper-api:stage crustcaper-catalog:stage
 ```
 
-On the target, use Node 24 and `tar`. Transfer the image directory and the matching source archive. Verify the lock file against the release record before importing. The loader checks the image archive against the lock and emits local immutable image references for Compose.
+On the target, use Node 24 and `tar`. Transfer the image directory and the matching source archive. Verify the lock file against the release record before importing. With `--output`, the loader verifies the archive and all three local image references before atomically replacing the Compose file. It creates the new file with owner-only permissions on Linux. A failed load leaves the previous file available. `load DIRECTORY` and `verify DIRECTORY` print the three references to stdout.
 
 ```sh
-node server/tooling/package-deployment.mjs load /secure/crustcaper-images > /etc/crustcaper/stage/images.env
+node server/tooling/package-deployment.mjs load /secure/crustcaper-images --output /etc/crustcaper/stage/images.env
 
 portable_compose() (
   unset CRUSTCAPER_API_IMAGE CRUSTCAPER_CATALOG_IMAGE CRUSTCAPER_EDGE_IMAGE
