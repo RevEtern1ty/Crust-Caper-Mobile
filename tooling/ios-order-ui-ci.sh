@@ -20,7 +20,8 @@ test_log="$evidence/ui-test.log"
 result_bundle="$evidence/order-ui.xcresult"
 summary="$evidence/ui-test-summary.json"
 receipt="$evidence/ui-runner.txt"
-for output in "$build_log" "$test_log" "$result_bundle" "$summary" "$receipt"; do
+scheme_evidence="$evidence/CrustCaperOrderUITests.xcscheme"
+for output in "$build_log" "$test_log" "$result_bundle" "$summary" "$receipt" "$scheme_evidence"; do
   if [[ -e $output || -L $output ]]; then
     printf 'Order UI evidence already exists at %s\n' "$output" >&2
     exit 2
@@ -49,31 +50,25 @@ xcrun simctl get_app_container "$simulator" com.crustcaper.mobile.local app >/de
 scheme=CrustCaperOrderUITests
 project="$scratch/$scheme.xcodeproj"
 derived_data="$scratch/DerivedData"
-destination="platform=iOS Simulator,id=$simulator"
+destination="platform=iOS Simulator,id=$simulator,arch=arm64"
+xcode_options=(-project "$project" -scheme "$scheme" -configuration Release -sdk iphonesimulator
+  -destination "$destination" -derivedDataPath "$derived_data" -parallel-testing-enabled NO
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=YES)
 cp "$script_dir/ios-order-checkout.swift" "$scratch/ios-order-checkout.swift"
 
 phase=build
 {
   ruby "$script_dir/ios-order-ui-project.rb" "$project" &&
-    xcodebuild -project "$project" -scheme "$scheme" -configuration Release \
-      -sdk iphonesimulator -destination "$destination" -derivedDataPath "$derived_data" \
-      -jobs 2 -parallel-testing-enabled NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES build-for-testing
+    cp "$project/xcshareddata/xcschemes/$scheme.xcscheme" "$scheme_evidence" &&
+    xcodebuild "${xcode_options[@]}" -jobs 2 build-for-testing
 } > "$build_log" 2>&1 || {
   status=$?
   tail -n 100 "$build_log" >&2 || true
   exit "$status"
 }
 
-shopt -s nullglob
-manifests=("$derived_data"/Build/Products/*.xctestrun)
-if [[ ${#manifests[@]} -ne 1 || ! -s ${manifests[0]} ]]; then
-  printf 'Xcode must generate one nonempty XCTest run manifest.\n' >&2
-  exit 1
-fi
-
 phase=test
-xcodebuild test-without-building -xctestrun "${manifests[0]}" -destination "$destination" \
-  -parallel-testing-enabled NO -test-timeouts-enabled YES \
+xcodebuild "${xcode_options[@]}" test-without-building -test-timeouts-enabled YES \
   -default-test-execution-time-allowance 180 -maximum-test-execution-time-allowance 240 \
   -resultBundlePath "$result_bundle" > "$test_log" 2>&1 || {
     status=$?

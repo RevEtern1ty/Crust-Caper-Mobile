@@ -25,4 +25,7 @@ scheme = Xcodeproj::XCScheme.new
 scheme.add_build_target(target, false)
 scheme.add_test_target(target)
 scheme.test_action.build_configuration = 'Release'
+# The iOS 16.0 runner in CI stayed suspended when the default scheme requested LLDB.
+scheme.test_action.xml_element.attributes['selectedDebuggerIdentifier'] = ''
+scheme.test_action.xml_element.attributes['selectedLauncherIdentifier'] = 'Xcode.IDEFoundation.Launcher.PosixSpawn'
 scheme.save_as(project_path, target.name, true)
