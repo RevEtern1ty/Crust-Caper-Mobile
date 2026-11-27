@@ -2,6 +2,7 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback } from 'react';
 import { Image, Pressable, StyleSheet, View } from 'react-native';
 import { cartLineUnavailable } from '../src/checkout/cart-review';
+import { itemOptions } from '../src/checkout/labels';
 import { lineKey, MAX_QUANTITY, useShop } from '../src/state/shop';
 import { Button, Card, colors, Icon, Screen, Text } from '../src/ui/core';
 import { copy, money } from '../src/ui/format';
@@ -44,14 +45,16 @@ export default function CartScreen() {
         const key = lineKey(line);
         const photo = menuPhoto(line.sku, fixturePhotos, product?.photoUrl);
         const name = product?.name[locale] ?? line.sku;
-        const options = line.modifierIds.map(id => product?.modifiers.find(option => option.id === id)?.name[locale] ?? id);
+        const options = itemOptions(line, locale, menu);
+        const hasOtherVariant = cart.some(other => other !== line && other.sku === line.sku);
+        const lineName = hasOtherVariant && options ? `${name}, ${options}` : name;
         const addingDisabled = line.quantity >= MAX_QUANTITY || unavailable !== null;
         return <Card key={key}>
           <View style={styles.product}>
             {photo && <Image source={photo} style={styles.thumb} accessible={false} />}
             <View style={styles.productCopy}>
               <Text variant="heading">{name}</Text>
-              {options.length > 0 && <Text variant="small" tone="muted">{options.join(' · ')}</Text>}
+              {!!options && <Text variant="small" tone="muted">{options}</Text>}
               {unavailable && <Text variant="small" tone="red">{unavailable === 'item'
                 ? copy(locale, 'Unavailable. Remove this item to continue.', 'Ntiboneka. Kuramo iri funguro kugira ngo ukomeze.')
                 : copy(locale, 'Some options are unavailable. Edit or remove this item.', 'Bimwe mu byo wahisemo ntibiboneka. Hindura iri funguro cyangwa urikuremo.')}</Text>}
@@ -59,12 +62,12 @@ export default function CartScreen() {
           </View>
           <View style={styles.itemBar}>
             <View style={styles.stepper}>
-              <Pressable accessibilityRole="button" accessibilityLabel={copy(locale, `Remove one ${name}`, `Kuramo imwe muri ${name}`)}
+              <Pressable accessibilityRole="button" accessibilityLabel={copy(locale, `Remove one ${lineName}`, `Kuramo imwe muri ${lineName}`)}
                 style={styles.quantityButton} onPress={() => changeQuantity(key, -1)}>
                 <Icon name={line.quantity === 1 ? 'trash-outline' : 'remove'} size={20} />
               </Pressable>
               <Text variant="label" accessibilityLiveRegion="polite">{line.quantity}</Text>
-              <Pressable accessibilityRole="button" accessibilityLabel={copy(locale, `Add one ${name}`, `Ongeramo imwe muri ${name}`)}
+              <Pressable accessibilityRole="button" accessibilityLabel={copy(locale, `Add one ${lineName}`, `Ongeramo imwe muri ${lineName}`)}
                 accessibilityState={{ disabled: addingDisabled }}
                 disabled={addingDisabled} style={[styles.quantityButton, addingDisabled && styles.disabled]}
                 onPress={() => changeQuantity(key, 1)}>
@@ -73,8 +76,10 @@ export default function CartScreen() {
             </View>
             <Text variant="label">{money(line.unitPrice * line.quantity)}</Text>
           </View>
-          {product?.available && (product.modifiers.length > 0 || line.modifierIds.length > 0) && <Pressable accessibilityRole="button" style={styles.edit} onPress={() =>
-            router.push({ pathname: '/product/[sku]', params: { sku: line.sku, line: key } })}>
+          {product?.available && (product.modifiers.length > 0 || line.modifierIds.length > 0) && <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={items.length > 1 ? copy(locale, `Edit options for ${lineName}`, `Hindura ibyo wahisemo kuri ${lineName}`) : undefined}
+            style={styles.edit} onPress={() => router.push({ pathname: '/product/[sku]', params: { sku: line.sku, line: key } })}>
             <Text variant="label" tone="green">{copy(locale, 'Edit options', 'Hindura ibyo wahisemo')}</Text>
           </Pressable>}
         </Card>;
