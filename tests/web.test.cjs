@@ -72,10 +72,21 @@ async function reviewCheckout(page, { validatePhone = false, withKeyboard = fals
   else await slot.click();
   assert.equal(await slot.getAttribute('aria-checked'), 'true');
   if (validatePhone) {
+    const phone = page.getByLabel('Demo phone number');
+    const message = 'Enter the demo phone number shown here.';
+    assert.notEqual(await phone.getAttribute('aria-invalid'), 'true');
     await button(page, 'Review order').click();
-    await shown(page, 'Enter the demo phone number shown here.');
+    await shown(page, message);
+    assert.equal(await phone.getAttribute('aria-invalid'), 'true');
+    await phone.and(page.locator(':focus')).waitFor();
+    assert.equal(await phone.evaluate(input => document.getElementById(input.getAttribute('aria-describedby'))?.textContent), message);
   }
   await button(page, 'Use demo number').click();
+  if (validatePhone) {
+    const phone = page.getByLabel('Demo phone number');
+    assert.notEqual(await phone.getAttribute('aria-invalid'), 'true');
+    assert.equal(await page.getByText('Enter the demo phone number shown here.', { exact: true }).count(), 0);
+  }
   const review = button(page, 'Review order');
   if (withKeyboard) await review.press('Enter');
   else await review.click();
@@ -94,6 +105,41 @@ const draftStorageKey = 'crustcaper.draft.v1';
 function savedCartQuantity(page) {
   return page.evaluate(key => JSON.parse(sessionStorage[key]).cart[0].quantity, draftStorageKey);
 }
+
+test('cart keyboard controls identify each configuration in both languages', async t => {
+  const { page, errors } = await newPage(await newContext(t, 320));
+  await fillCart(page);
+  await page.goto(base);
+  await button(page, /^Double Smash,/).click();
+  await button(page, /Extra cheese/).press('Space');
+  await button(page, /^Add to cart/).press('Enter');
+  await button(page, /^View cart/).press('Enter');
+  await shown(page, 'Your cart');
+  await shown(page, 'Extra cheese');
+
+  const quantities = () => page.evaluate(key => JSON.parse(sessionStorage[key]).cart
+    .map(line => [line.modifierIds.join(','), line.quantity]), draftStorageKey);
+  assert.equal(await button(page, 'Edit options for Double Smash').count(), 1);
+  await button(page, /^Add one Double Smash.*Extra cheese/).press('Enter');
+  assert.deepEqual(await quantities(), [['', 1], ['extra-cheese', 2]]);
+  assert.equal(await button(page, /^Remove one Double Smash.*Extra cheese/).count(), 1);
+  assert.equal(await button(page, /^Edit options.*Double Smash.*Extra cheese/).count(), 1);
+
+  await page.goto(base + '/settings');
+  await button(page, 'Kinyarwanda').press('Space');
+  await shown(page, 'Amagenamiterere');
+  await page.goto(base + '/cart');
+  await shown(page, 'Igitebo cyawe');
+  const cheese = 'Foromaje y’inyongera';
+  const rwAdd = button(page, new RegExp('^Ongeramo imwe muri Double Smash.*' + cheese));
+  const rwRemove = button(page, new RegExp('^Kuramo imwe muri Double Smash.*' + cheese));
+  const rwEdit = button(page, new RegExp('^Hindura ibyo wahisemo.*Double Smash.*' + cheese));
+  await rwRemove.press('Enter');
+  assert.deepEqual(await quantities(), [['', 1], ['extra-cheese', 1]]);
+  assert.equal(await rwAdd.count(), 1);
+  assert.equal(await rwEdit.count(), 1);
+  assert.deepEqual(errors, []);
+});
 
 test('rapid quantity changes accumulate while respecting the cart limit', async t => {
   const { page, errors } = await newPage(await newContext(t));

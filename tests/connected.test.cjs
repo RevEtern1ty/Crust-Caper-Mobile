@@ -21,6 +21,14 @@ async function shown(page, phrase) {
   await page.getByText(phrase, { exact: typeof phrase === 'string' }).filter({ visible: true }).first().waitFor();
 }
 
+async function assertFieldError(page, field, message) {
+  await shown(page, message);
+  assert.equal(await field.getAttribute('aria-invalid'), 'true');
+  await field.and(page.locator(':focus')).waitFor();
+  const description = await field.evaluate(input => document.getElementById(input.getAttribute('aria-describedby'))?.textContent);
+  assert.equal(description, message);
+}
+
 async function capture(page, name) {
   const directory = process.env.CRUST_SCREENSHOT_DIR;
   if (!directory) return;
@@ -233,10 +241,28 @@ test('checkout shows the server-confirmed item names when the buyer menu is stal
   await button(page, /^View cart/).click();
   await button(page, 'Choose pickup time').click();
   await page.getByRole('radiogroup', { name: 'Pickup time' }).getByRole('radio', { disabled: false }).nth(2).click();
-  await page.getByLabel('Phone number', { exact: true }).fill(contact.phone);
-  await page.getByLabel('Email address', { exact: true }).fill(contact.email);
+  const phone = page.getByLabel('Phone number', { exact: true });
+  const email = page.getByLabel('Email address', { exact: true });
+  const review = button(page, 'Review order');
+  const quotes = [];
+  page.on('request', request => {
+    if (request.url() === api + '/quotes' && request.method() === 'POST') quotes.push(request);
+  });
+  for (const [field, invalidValue, validValue, message] of [
+    [phone, '123', contact.phone, 'Use a phone number with a country code, starting with +.'],
+    [email, 'incorrect-email', contact.email, 'Enter a valid email address.'],
+  ]) {
+    await field.fill(invalidValue);
+    assert.notEqual(await field.getAttribute('aria-invalid'), 'true');
+    await review.press('Enter');
+    await assertFieldError(page, field, message);
+    assert.equal(quotes.length, 0);
+    await field.fill(validValue);
+    assert.notEqual(await field.getAttribute('aria-invalid'), 'true');
+    assert.equal(await page.getByText(message, { exact: true }).count(), 0);
+  }
   const reply = page.waitForResponse(response => response.url() === api + '/quotes' && response.request().method() === 'POST');
-  await button(page, 'Review order').click();
+  await review.press('Enter');
   const response = await reply;
   assert.equal(response.status(), 200);
   assert.deepEqual((await response.json()).lines[0].soldItem.name, product.name);
@@ -3163,14 +3189,23 @@ test('connected checkout, receipt, pickup, recovery, payment return and restaura
   await capture(secondDevice, 'expired-guest-order');
   await button(secondDevice, 'Verify this order by phone').click();
   assert.equal(await secondDevice.getByLabel('Order number', { exact: true }).inputValue(), order.id.slice(-8).toUpperCase());
-  await secondDevice.getByLabel('Phone number', { exact: true }).fill(contact.phone);
+  const recoveryPhone = secondDevice.getByLabel('Phone number', { exact: true });
+  await recoveryPhone.fill('123');
+  await button(secondDevice, 'Request verification code').press('Enter');
+  await assertFieldError(secondDevice, recoveryPhone, 'Enter the phone number with a country code, starting with +.');
+  assert.equal(freshGuests, 0);
+  await recoveryPhone.fill(contact.phone);
   await button(secondDevice, 'Request verification code').click();
   await shown(secondDevice, 'Verify your phone');
   await capture(secondDevice, 'connected-order-recovery');
   assert.equal(freshGuests, 1);
   assert.equal(await secondDevice.evaluate(key => JSON.parse(sessionStorage.getItem(key)).expiresAt, afterExpiry.guestKey),
     '2020-01-01T00:00:00Z', 'The original session remains installed until verification succeeds');
-  await secondDevice.getByLabel('Verification code', { exact: true }).fill('418263');
+  const recoveryCode = secondDevice.getByLabel('Verification code', { exact: true });
+  await recoveryCode.fill('41826');
+  await button(secondDevice, 'Verify and open order').press('Enter');
+  await assertFieldError(secondDevice, recoveryCode, 'Enter the six-digit verification code.');
+  await recoveryCode.fill('418263');
   let recovery;
   for (let attempt = 0; attempt < 5; attempt++) {
     const result = secondDevice.waitForResponse(response =>
