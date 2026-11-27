@@ -7,8 +7,10 @@ final class CrustCaperCheckoutTests: XCTestCase {
         let app = XCUIApplication(bundleIdentifier: "com.crustcaper.mobile.local")
         app.launch()
 
-        try tap(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Double Smash,")),
-                named: "Double Smash menu item", in: app, scrolls: 3)
+        let menuItem = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Double Smash,")).firstMatch
+        // The connected menu arrives asynchronously after a cold launch.
+        XCTAssertTrue(menuItem.waitForExistence(timeout: 30), "The connected menu must show Double Smash")
+        menuItem.tap()
         try tap(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Add to cart ·")),
                 named: "Add to cart", in: app)
         try tap(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "View cart ·")),
