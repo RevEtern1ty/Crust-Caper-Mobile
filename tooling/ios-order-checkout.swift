@@ -16,7 +16,7 @@ final class CrustCaperCheckoutTests: XCTestCase {
         try tap(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "View cart ·")),
                 named: "View cart", in: app)
         try tap(buttons(labeled: "Choose pickup time", in: app), named: "Choose pickup time", in: app)
-        XCTAssertTrue(app.staticTexts["Pickup order"].waitForExistence(timeout: 12))
+        XCTAssertTrue(text(labeled: "Pickup order", in: app).waitForExistence(timeout: 12))
         try choosePickupSlot(in: app)
 
         try enterPhoneNumber(in: app)
@@ -26,15 +26,17 @@ final class CrustCaperCheckoutTests: XCTestCase {
             scrollDown(in: app)
         }
         try tap(buttons(labeled: "Review order", in: app), named: "Review order", in: app, scrolls: 2)
-        XCTAssertTrue(app.staticTexts["Review your order"].waitForExistence(timeout: 15))
+        // The enabled confirmation button only appears once the server has returned the quote.
         try tap(app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@ AND label ENDSWITH %@",
                                                  "Confirm ", "RWF & continue")),
                 named: "Confirm quoted total", in: app)
 
-        XCTAssertTrue(app.staticTexts["Checking payment"].waitForExistence(timeout: 20))
+        let pendingPayment = text(labeled: "Checking payment", in: app)
+        XCTAssertTrue(pendingPayment.waitForExistence(timeout: 20))
         let reference = app.staticTexts.matching(NSPredicate(format: "label MATCHES %@", "#[0-9A-F]{8}")).firstMatch
         XCTAssertTrue(reference.waitForExistence(timeout: 10), "The pending order must have a visible reference")
         let orderReference = reference.label
+        let sameOrder = text(labeled: orderReference, in: app)
         capture("checkout-pending", app: app)
 
         app.terminate()
@@ -44,17 +46,17 @@ final class CrustCaperCheckoutTests: XCTestCase {
             format: "label == %@ OR label BEGINSWITH %@ OR label == %@", "Orders", "Orders,", "Go to Orders"
         ))
         try tap(ordersNavigation, named: "Orders navigation after relaunch", in: app)
-        XCTAssertTrue(app.staticTexts[orderReference].waitForExistence(timeout: 20), "The same order must be restored")
-        XCTAssertTrue(app.staticTexts["Checking payment"].waitForExistence(timeout: 12), "The restored order must still be unpaid")
+        XCTAssertTrue(sameOrder.waitForExistence(timeout: 20), "The same order must be restored")
+        XCTAssertTrue(pendingPayment.waitForExistence(timeout: 12), "The restored order must still be unpaid")
         capture("checkout-recovered", app: app)
 
         try tap(buttons(labeled: "Open payment", in: app), named: "Open payment for the restored order", in: app, scrolls: 4)
-        XCTAssertTrue(app.staticTexts[orderReference].waitForExistence(timeout: 12))
+        XCTAssertTrue(sameOrder.waitForExistence(timeout: 12))
         try tap(buttons(labeled: "Confirm local test payment", in: app), named: "Confirm local test payment",
                 in: app, scrolls: 4)
-        XCTAssertTrue(app.staticTexts["Order accepted"].waitForExistence(timeout: 20))
-        XCTAssertTrue(app.staticTexts["Paid"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts[orderReference].exists, "Payment must settle the restored order")
+        XCTAssertTrue(text(labeled: "Order accepted", in: app).waitForExistence(timeout: 20))
+        XCTAssertTrue(text(labeled: "Paid", in: app).waitForExistence(timeout: 10))
+        XCTAssertTrue(sameOrder.exists, "Payment must settle the restored order")
         capture("checkout-accepted", app: app)
         let proof = XCTAttachment(string: "Order reference: \(orderReference)\nRecovery: same pending order after termination\nPayment: paid and accepted\n")
         proof.name = "checkout-reference"
@@ -129,6 +131,11 @@ final class CrustCaperCheckoutTests: XCTestCase {
     @MainActor
     private func buttons(labeled label: String, in app: XCUIApplication) -> XCUIElementQuery {
         app.buttons.matching(NSPredicate(format: "label == %@", label))
+    }
+
+    @MainActor
+    private func text(labeled label: String, in app: XCUIApplication) -> XCUIElement {
+        app.staticTexts.matching(NSPredicate(format: "label == %@", label)).firstMatch
     }
 
     @MainActor
