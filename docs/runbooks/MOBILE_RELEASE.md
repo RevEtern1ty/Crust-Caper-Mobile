@@ -43,6 +43,8 @@ bash tooling/android-emulator-smoke.sh android/app/build/outputs/apk/release/app
 
 Если XCTest останавливается до начала сценария, запустите `ios-runner-probe`. Он проверяет запуск XCTest и доступ к системным настройкам на iOS 16.0 и контрольной версии iOS. Сборка приложения и заказ проверяются набором `ios-minimum-checkout`.
 
+Для отдельной проверки с Xcode 16.4 включите `ios_legacy_runner_probe` в наборе `ios-runner-probe`. На `macos-15` пройдёт один запуск системных настроек на iPhone 14 с iOS 16.0 (`20A360`). При необходимости среда устанавливается из каталога Apple через Xcode 26.2. Симулятор загружается и XCTest запускается через Xcode 16.4 (`16F6`). Сохраните `xctest-xcode.txt`, `minimum-provisioning.txt` и результат XCTest из артефакта `mobile-ios-runner-probe-16.4-16.0-<SHA>`.
+
 ### Заказ в локальном Android APK
 
 Соберите APK профиля `local` из чистой копии проверяемого SHA. Вариант для Linux использует образ `reactnativecommunity/react-native-android@sha256:71884cd2953769cdaedced1922970d3168d9028f74f78246c5f0cbc6d60598df`. В нём установлены JDK 17, Android API 36, Build Tools 36.0.0, CMake 3.30.5 и NDK 27.1.12297006. Подключите Node.js 24.22.0 согласно `.nvmrc` для установки зависимостей и сборки JS. [Dockerfile v20.1](https://github.com/react-native-community/docker-android/blob/v20.1/Dockerfile) · [Node.js 24.22.0](https://nodejs.org/dist/v24.22.0/)

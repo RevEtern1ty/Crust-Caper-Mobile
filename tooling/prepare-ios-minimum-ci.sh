@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 1 || -z $1 || -z ${GITHUB_OUTPUT:-} ]]; then
-  printf 'Usage: GITHUB_OUTPUT=PATH bash tooling/prepare-ios-minimum-ci.sh EVIDENCE_DIR\n' >&2
+if [[ $# -lt 1 || $# -gt 2 || -z $1 || -z ${GITHUB_OUTPUT:-} ]]; then
+  printf 'Usage: GITHUB_OUTPUT=PATH bash tooling/prepare-ios-minimum-ci.sh EVIDENCE_DIR [RUNTIME_INSTALL_DEVELOPER_DIR]\n' >&2
   exit 2
 fi
 
@@ -106,14 +106,26 @@ else
   [[ $? == 1 ]] || fail 'Unable to read the simulator runtime inventory.'
   phase='Download iOS 16.0 from Apple'
   record "Phase: $phase"
+  installer_dir=${2:-$DEVELOPER_DIR}
+  if [[ $installer_dir != "$DEVELOPER_DIR" ]]; then
+    [[ -d $installer_dir ]] || fail 'The runtime installer Xcode developer directory is unavailable.'
+    installer_version=$(DEVELOPER_DIR="$installer_dir" xcodebuild -version 2>/dev/null) \
+      || fail 'Unable to identify the runtime installer Xcode.'
+    installer_release=${installer_version%%$'\n'*}
+    installer_build=${installer_version#*$'\n'}
+    [[ $installer_release =~ ^Xcode\ [0-9]+(\.[0-9]+)+$ && $installer_build =~ ^Build\ version\ [0-9A-Za-z]+$ ]] \
+      || fail 'Unexpected runtime installer Xcode version format.'
+    record "Runtime installer: $installer_release (${installer_build#Build version })"
+  fi
   scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/crustcaper-ios-minimum.XXXXXXXX")
-  run_apple_platform_command download xcodebuild -downloadPlatform iOS -exportPath "$scratch" -buildVersion "$runtime_version"
+  run_apple_platform_command download env DEVELOPER_DIR="$installer_dir" xcodebuild \
+    -downloadPlatform iOS -exportPath "$scratch" -buildVersion "$runtime_version"
   set -- "$scratch"/*.dmg
   [[ $# == 1 && -f $1 && -s $1 && ! -L $1 ]] \
     || fail 'Expected exactly one regular simulator runtime disk image from Apple.'
   phase='Import the Apple simulator runtime'
   record "Phase: $phase"
-  run_apple_platform_command import xcodebuild -importPlatform "$1"
+  run_apple_platform_command import env DEVELOPER_DIR="$installer_dir" xcodebuild -importPlatform "$1"
   phase='Verify the imported iOS simulator runtime'
   probe_runtime || fail 'The exact iOS 16.0 (20A360) runtime is unavailable after import.'
   runtime_source=Apple-download

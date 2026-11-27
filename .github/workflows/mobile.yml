@@ -21,6 +21,10 @@ on:
         description: Successful Mobile CI run ID with a demo APK for pilot checks
         type: string
         required: false
+      ios_legacy_runner_probe:
+        description: Run only the Settings probe on iOS 16.0 with Xcode 16.4 (suite ios-runner-probe)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -432,13 +436,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { runner: macos-26, xcode: '26.6', runtime: '16.0' }
-          - { runner: macos-26, xcode: '26.6', runtime: '26.5' }
-          - { runner: macos-15, xcode: '26.2', runtime: '16.0' }
+        include: >-
+          ${{ fromJSON(inputs.ios_legacy_runner_probe
+            && '[{"runner":"macos-15","xcode":"16.4","runtime":"16.0"}]'
+            || '[{"runner":"macos-26","xcode":"26.6","runtime":"16.0"},{"runner":"macos-26","xcode":"26.6","runtime":"26.5"},{"runner":"macos-15","xcode":"26.2","runtime":"16.0"}]') }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_${{ matrix.xcode }}.app/Contents/Developer
       PROBE_RUNTIME: ${{ matrix.runtime }}
+      LEGACY_PROBE: ${{ inputs.ios_legacy_runner_probe }}
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
         with:
@@ -454,7 +459,12 @@ jobs:
         run: |
           evidence="$RUNNER_TEMP/crustcaper-ios-probe"
           mkdir -p "$evidence"
-          if [[ "$PROBE_RUNTIME" == 16.0 ]]; then
+          if [[ "$LEGACY_PROBE" == true ]]; then
+            xcodebuild -version > "$evidence/xctest-xcode.txt"
+            diff -u <(printf 'Xcode 16.4\nBuild version 16F6\n') "$evidence/xctest-xcode.txt"
+            # Use the Apple catalog path already proven on this image, then boot and test with Xcode 16.4.
+            bash tooling/prepare-ios-minimum-ci.sh "$evidence" /Applications/Xcode_26.2.app/Contents/Developer
+          elif [[ "$PROBE_RUNTIME" == 16.0 ]]; then
             bash tooling/prepare-ios-minimum-ci.sh "$evidence"
           else
             bash tooling/prepare-ios-current-ci.sh "$evidence"
