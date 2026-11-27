@@ -1,11 +1,12 @@
 import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { AppState, Platform, Pressable, StyleSheet, type Text as NativeText, TextInput, View } from 'react-native';
 
 import { reviewCheckoutCart } from '../src/checkout/cart-review';
 import { useCheckout, useRouteActionGuard } from '../src/checkout/context';
 import { normalizePhone } from '../src/checkout/contact';
 import type { CheckoutContact } from '../src/checkout/controller';
+import { fieldErrorProps } from '../src/checkout/field-error';
 import { checkoutError, changeLabel, itemName, itemOptions, orderItemLabels } from '../src/checkout/labels';
 import { DEMO_PHONE } from '../src/domain/demo-api';
 import { ApiError, type CartLine, type OrderLine, type PickupSlot, type Quote } from '../src/domain/types';
@@ -17,6 +18,7 @@ import { LegalDocumentLink } from '../src/ui/legal-document-link';
 const demoPhoneLabel = '+250 700 000 000';
 const pickupWindowKey = ({ id, startsAt, endsAt }: PickupSlot) => JSON.stringify([id, startsAt, endsAt]);
 type Expiry = 'pickup_started' | 'slot_unavailable' | 'quote_expired';
+type ContactField = 'phone' | 'email';
 
 export default function CheckoutScreen() {
   const { resume } = useLocalSearchParams<{ resume?: string }>();
@@ -27,8 +29,10 @@ export default function CheckoutScreen() {
   const [clockTick, setClockTick] = useState(0);
   const [phone, setPhone] = useState('');
   const [email, setEmail] = useState('');
-  const [phoneInvalid, setPhoneInvalid] = useState(false);
-  const [emailInvalid, setEmailInvalid] = useState(false);
+  const [invalidContact, setInvalidContact] = useState<{ field: ContactField } | null>(null);
+  const contactFormId = useId();
+  const phoneErrorId = contactFormId + '-checkout-phone-error';
+  const emailErrorId = contactFormId + '-checkout-email-error';
   const [review, setReview] = useState<{ quote: Quote; cartKey: string; slotKey: string } | null>(null);
   const [requestingQuote, setRequestingQuote] = useState(false);
   const [problem, setProblem] = useState<{ message: string; canEditCart: boolean } | null>(null);
@@ -41,6 +45,8 @@ export default function CheckoutScreen() {
   const previousStepWasReview = useRef(false);
   const slotButtons = useRef(new Map<string, View>());
   const t = (en: string, rw: string) => copy(locale, en, rw);
+  const phoneInvalid = invalidContact?.field === 'phone';
+  const emailInvalid = invalidContact?.field === 'email';
 
   const closed = status === 'ready' && menu?.store.open === false;
   const now = pickupNow();
@@ -140,24 +146,27 @@ export default function CheckoutScreen() {
     previousStepWasReview.current = reviewing;
   }, [reviewing]);
 
+  useEffect(() => {
+    if (invalidContact?.field === 'phone') phoneInput.current?.focus();
+    else if (invalidContact?.field === 'email') emailInput.current?.focus();
+  }, [invalidContact]);
+
   function updatePhone(value: string) {
     setPhone(value);
-    setPhoneInvalid(false);
+    if (phoneInvalid) setInvalidContact(null);
   }
 
   function readContact(): CheckoutContact | null {
     const e164 = normalizePhone(phone);
     if (!e164 || (demo && e164 !== DEMO_PHONE)) {
-      setPhoneInvalid(true);
-      phoneInput.current?.focus();
+      setInvalidContact({ field: 'phone' });
       return null;
     }
     if (demo) return { phone: e164 };
 
     const address = email.trim();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)) {
-      setEmailInvalid(true);
-      emailInput.current?.focus();
+      setInvalidContact({ field: 'email' });
       return null;
     }
     return { phone: e164, email: address };
@@ -261,6 +270,7 @@ export default function CheckoutScreen() {
       <TextInput
         ref={phoneInput}
         accessibilityLabel={demo ? t('Demo phone number', 'Nimero y’igerageza') : t('Phone number', 'Nimero ya telefoni')}
+        {...fieldErrorProps(phoneInvalid, phoneErrorId)}
         autoComplete={demo ? 'off' : 'tel'}
         keyboardType="phone-pad"
         editable={!controlsLocked}
@@ -271,7 +281,7 @@ export default function CheckoutScreen() {
         placeholderTextColor={colors.muted}
         style={[styles.input, phoneInvalid && styles.invalidInput]}
       />
-      {phoneInvalid && <Text accessibilityRole="alert" tone="red">{demo
+      {phoneInvalid && <Text nativeID={phoneErrorId} accessibilityRole="alert" tone="red">{demo
         ? t('Enter the demo phone number shown here.', 'Andika nimero y’igerageza yerekanwe hano.')
         : t('Use a phone number with a country code, starting with +.', 'Andika nimero ifite indangagihugu, itangizwa na +.')}</Text>}
       {demo ? (
@@ -281,18 +291,21 @@ export default function CheckoutScreen() {
           <TextInput
             ref={emailInput}
             accessibilityLabel={t('Email address', 'Aderesi ya imeyili')}
+            {...fieldErrorProps(emailInvalid, emailErrorId)}
             autoCapitalize="none"
             autoComplete="email"
             keyboardType="email-address"
             editable={!controlsLocked}
             maxLength={254}
             value={email}
-            onChangeText={(value) => { setEmail(value); setEmailInvalid(false); }}
+            onChangeText={(value) => { setEmail(value); if (emailInvalid) setInvalidContact(null); }}
             placeholder={t('Email address', 'Aderesi ya imeyili')}
             placeholderTextColor={colors.muted}
             style={[styles.input, emailInvalid && styles.invalidInput]}
           />
-          {emailInvalid && <Text accessibilityRole="alert" tone="red">{t('Enter a valid email address.', 'Andika aderesi ya imeyili yemewe.')}</Text>}
+          {emailInvalid && <Text nativeID={emailErrorId} accessibilityRole="alert" tone="red">
+            {t('Enter a valid email address.', 'Andika aderesi ya imeyili yemewe.')}
+          </Text>}
         </>
       )}
     </Card>

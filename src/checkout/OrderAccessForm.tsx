@@ -1,5 +1,5 @@
 import { router } from 'expo-router';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { StyleSheet, TextInput, View } from 'react-native';
 import { ApiError } from '../domain/types';
 import { useShop } from '../state/shop';
@@ -7,6 +7,7 @@ import { Button, Card, colors, Screen, Text } from '../ui/core';
 import { copy } from '../ui/format';
 import { normalizePhone } from './contact';
 import { useCheckout, useRouteActionGuard } from './context';
+import { fieldErrorProps } from './field-error';
 import { checkoutError } from './labels';
 
 type Step = { kind: 'details' } | { kind: 'code'; challengeId: string }
@@ -38,7 +39,9 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
   const [pending, setPending] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [waiting, setWaiting] = useState(false);
-  const [invalid, setInvalid] = useState<Field | null>(null);
+  const [invalid, setInvalid] = useState<{ field: Field; message: string } | null>(null);
+  const formId = useId();
+  const errorId = (field: Field) => formId + '-order-access-' + field + '-error';
   const orderInput = useRef<TextInput>(null);
   const phoneInput = useRef<TextInput>(null);
   const codeInput = useRef<TextInput>(null);
@@ -75,16 +78,30 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
     setCode('');
   }, [suspended]);
 
+  useEffect(() => {
+    if (!invalid || pending) return;
+    const input = invalid.field === 'orderCode' ? orderInput : invalid.field === 'phone' ? phoneInput : codeInput;
+    input.current?.focus();
+  }, [invalid, pending]);
+
   function goToOrders() {
     if (!pendingOrder && from === 'orders' && router.canGoBack()) router.back();
     else router.replace('/(tabs)/orders');
   }
 
   function showInputError(field: Field, message: string) {
-    const input = field === 'orderCode' ? orderInput : field === 'phone' ? phoneInput : codeInput;
-    setInvalid(field);
-    setProblem(message);
-    input.current?.focus();
+    setInvalid({ field, message });
+    setProblem(null);
+  }
+
+  function clearInputError(field: Field) {
+    setInvalid(current => current?.field === field ? null : current);
+  }
+
+  function renderFieldError(field: Field) {
+    return invalid?.field === field && (
+      <Text nativeID={errorId(field)} tone="red" accessibilityRole="alert">{invalid.message}</Text>
+    );
   }
 
   async function submit() {
@@ -262,18 +279,22 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
             <>
               <Text variant="label">{t('Order number', 'Nimero ya komande')}</Text>
               <TextInput ref={orderInput} accessibilityLabel={t('Order number', 'Nimero ya komande')}
-                value={linkedCode ?? orderCode} onChangeText={(value) => { setOrderCode(value); setInvalid(null); }}
+                {...fieldErrorProps(invalid?.field === 'orderCode', errorId('orderCode'))}
+                value={linkedCode ?? orderCode} onChangeText={(value) => { setOrderCode(value); clearInputError('orderCode'); }}
                 placeholder="#1A2B3C4D" placeholderTextColor={colors.muted}
                 autoCapitalize="characters" autoComplete="off" autoCorrect={false} maxLength={12} editable={!pending && !linkedCode}
-                style={[styles.input, invalid === 'orderCode' && styles.invalid]} />
+                style={[styles.input, invalid?.field === 'orderCode' && styles.invalid]} />
+              {renderFieldError('orderCode')}
             </>
           )}
           <Text variant="label">{t('Phone number', 'Nimero ya telefoni')}</Text>
           <TextInput ref={phoneInput} accessibilityLabel={t('Phone number', 'Nimero ya telefoni')}
-            value={phone} onChangeText={(value) => { setPhone(value); setInvalid(null); }}
+            {...fieldErrorProps(invalid?.field === 'phone', errorId('phone'))}
+            value={phone} onChangeText={(value) => { setPhone(value); clearInputError('phone'); }}
             placeholder="+250 …" placeholderTextColor={colors.muted}
             autoComplete="tel" keyboardType="phone-pad" maxLength={24} editable={!pending}
-            style={[styles.input, invalid === 'phone' && styles.invalid]} />
+            style={[styles.input, invalid?.field === 'phone' && styles.invalid]} />
+          {renderFieldError('phone')}
           {waiting && <Text accessibilityLiveRegion="polite">{t(
             'The previous request can still finish. Wait a moment and check again.',
             'Icyifuzo cya mbere kiracyashobora kurangira. Tegereza gato wongere ugenzure.',
@@ -285,9 +306,11 @@ export function OrderAccessForm({ from, savedCode, pendingOrder = false, onPriva
           <Text>{t('If the details match, you’ll receive a six-digit code by SMS.', 'Amakuru namara guhura, uzahabwa kode y’imibare itandatu muri SMS.')}</Text>
           <Text variant="label">{t('Verification code', 'Kode yo kwemeza')}</Text>
           <TextInput ref={codeInput} accessibilityLabel={t('Verification code', 'Kode yo kwemeza')}
-            value={code} onChangeText={(value) => { setCode(value.replace(/[^0-9]/g, '')); setInvalid(null); }}
+            {...fieldErrorProps(invalid?.field === 'code', errorId('code'))}
+            value={code} onChangeText={(value) => { setCode(value.replace(/[^0-9]/g, '')); clearInputError('code'); }}
             autoComplete="one-time-code" keyboardType="number-pad" maxLength={6} editable={!pending}
-            style={[styles.input, invalid === 'code' && styles.invalid]} />
+            style={[styles.input, invalid?.field === 'code' && styles.invalid]} />
+          {renderFieldError('code')}
           <Button label={t('Request a new code', 'Saba indi kode')} variant="ghost" disabled={pending} onPress={changeDetails} />
         </Card>
       )}
