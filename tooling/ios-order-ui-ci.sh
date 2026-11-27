@@ -135,6 +135,10 @@ xcodebuild "${xcode_options[@]}" test-without-building -test-timeouts-enabled YE
   -resultBundlePath "$result_bundle" > "$test_log" 2>&1 || {
     status=$?
     tail -n 100 "$test_log" >&2 || true
+    if [[ -d $result_bundle ]] &&
+        xcrun xcresulttool get test-results summary --path "$result_bundle" > "$scratch/failed-summary.json"; then
+      cp "$scratch/failed-summary.json" "$summary" || true
+    fi
     if [[ "$receipt_smoke" == 1 && -f "$evidence/receipt-fixture.json" ]]; then
       node "$script_dir/verify-ios-saved-receipt.cjs" "$simulator" "$evidence" \
         > "$evidence/saved-documents-at-failure.log" 2>&1 || true
@@ -147,11 +151,6 @@ if [[ ! -d $result_bundle ]]; then
 fi
 
 phase=verify
-if [[ "$receipt_smoke" == 1 ]]; then
-  wait "$fixture_pid"
-  fixture_pid=''
-  node "$script_dir/verify-ios-saved-receipt.cjs" "$simulator" "$evidence"
-fi
 xcrun xcresulttool get test-results summary --path "$result_bundle" > "$summary"
 node - "$summary" <<'NODE'
 const { readFileSync } = require('node:fs');
@@ -162,5 +161,12 @@ if (result !== 'Passed' || !Number.isInteger(totalTestCount) || totalTestCount <
   throw new Error('Xcode did not report a completed passing UI test.');
 }
 NODE
+
+if [[ "$receipt_smoke" == 1 ]]; then
+  phase=verify-receipt-sharing
+  wait "$fixture_pid"
+  fixture_pid=''
+  node "$script_dir/verify-ios-saved-receipt.cjs" "$simulator" "$evidence"
+fi
 
 phase=passed
