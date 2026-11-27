@@ -723,13 +723,25 @@ async function placeBrowserOrder(page, origin, buyer, screenshot) {
 
 test('an open product refreshes at sales hours after a transient failure and stays quiet while hidden', { timeout: 25_000 }, async t => {
   const server = createPreviewServer(dist);
+  const slowMenuRequest = Promise.withResolvers();
+  const releaseSlowMenu = Promise.withResolvers();
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolve);
   });
-  t.after(() => new Promise(resolve => server.close(resolve)));
-  const browser = await chromium.launch({ channel: 'chrome' });
-  t.after(() => browser.close());
+  let browser;
+  t.after(async () => {
+    releaseSlowMenu.resolve();
+    try {
+      await browser?.close();
+    } finally {
+      await new Promise(resolve => {
+        server.close(resolve);
+        server.closeAllConnections();
+      });
+    }
+  }, { timeout: 10_000 });
+  browser = await chromium.launch({ channel: 'chrome' });
   const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   page.setDefaultTimeout(5000);
   await page.clock.install();
@@ -747,9 +759,6 @@ test('an open product refreshes at sales hours after a transient failure and sta
     { available: true, checkedAt: 31_100 },
   ];
   const menuUrl = api + '/stores/kigali/menu?channel=mobile';
-  const slowMenuRequest = Promise.withResolvers();
-  const releaseSlowMenu = Promise.withResolvers();
-  t.after(() => { releaseSlowMenu.resolve(); });
   let reads = 0;
   await page.route(menuUrl, async route => {
     const observation = observations[Math.min(reads++, observations.length - 1)];
@@ -811,7 +820,11 @@ test('an open product refreshes at sales hours after a transient failure and sta
   await page.clock.fastForward(4000);
   await setVisible(false);
   await setVisible(true);
-  await slowMenuRequest.promise;
+  await Promise.race([
+    slowMenuRequest.promise,
+    delay(5000, undefined, { ref: false, signal: t.signal })
+      .then(() => assert.fail('The delayed menu revalidation did not reach the browser route')),
+  ]);
   await page.clock.fastForward(7000);
   assert.equal(reads, 5, 'the scheduled refresh waits for the previous request');
   releaseSlowMenu.resolve();

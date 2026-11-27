@@ -76,20 +76,58 @@ jobs:
       - run: npm run check
       - run: npm run build:connected-web
       - name: Verify customer checkout, recovery and operator pickup
+        timeout-minutes: 8
         env:
           CRUSTCAPER_ORDER_ACCESS_PROVIDER: local
           CRUSTCAPER_ORDER_ACCESS_NEGATIVE_DELAY: PT0S
         shell: bash
         run: |
+          set -euo pipefail
           java -jar server/build/libs/crustcaper-api.jar --spring.profiles.active=local >"$RUNNER_TEMP/crustcaper-api.log" 2>&1 &
           api_pid=$!
-          trap 'kill "$api_pid" 2>/dev/null || true; wait "$api_pid" 2>/dev/null || true' EXIT
-          for attempt in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:18080/actuator/health/readiness >/dev/null; then
-              npm run test:connected
-              exit
+          api_running() {
+            jobs -pr | grep -Fxq -- "$api_pid"
+          }
+          stop_api() {
+            local status=$? attempt
+            trap - EXIT
+            trap '' INT TERM
+            if api_running; then
+              kill -TERM "$api_pid" 2>/dev/null || true
+              for attempt in {1..10}; do
+                api_running || break
+                sleep 1
+              done
             fi
-            kill -0 "$api_pid" || break
+            if api_running; then
+              kill -KILL "$api_pid" 2>/dev/null || true
+              for attempt in {1..3}; do
+                api_running || break
+                sleep 1
+              done
+            fi
+            if api_running; then
+              echo '::error::The task-owned checkout API did not stop.'
+              if (( status == 0 )); then status=1; fi
+            else
+              wait "$api_pid" 2>/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap stop_api EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          for attempt in {1..30}; do
+            api_running || break
+            if curl --noproxy '*' --max-time 1 --fail --silent http://127.0.0.1:18080/actuator/health/readiness >/dev/null; then
+              if timeout --kill-after=20s 6m npm run test:connected; then
+                exit 0
+              else
+                status=$?
+                if (( status == 124 )); then echo '::error::Connected checkout exceeded six minutes.'; fi
+                exit "$status"
+              fi
+            fi
             sleep 1
           done
           sed -n '1,100p' "$RUNNER_TEMP/crustcaper-api.log"
