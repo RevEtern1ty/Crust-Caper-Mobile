@@ -257,7 +257,7 @@ test('delivery intake and handoff recover lost replies alongside a paid direct o
   const kitchen = await operator('demo-kitchen');
   const pickup = await operator('demo-pickup');
   const manager = await operator('demo-manager');
-  const direct = await readyForPickup(kitchen);
+  const direct = await readyForPickup(kitchen, { modifierIds: ['extra-cheese'] });
   t.after(async () => {
     await send(`/operator/orders/${direct.id}/status`, {
       method: 'POST', token: pickup, data: { status: 'collected', pickupCode: direct.pickupCode },
@@ -285,6 +285,10 @@ test('delivery intake and handoff recover lost replies alongside a paid direct o
   assert.equal(direct.currency, 'RWF');
   const paidTotal = `Paid total ${direct.total.toLocaleString('en-GB')} RWF`;
   await shown(directCard(staffPage), paidTotal);
+  const managerPage = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  await signIn(managerPage, 'demo-manager');
+  await shown(directCard(managerPage), paidTotal);
+  await managerPage.close();
   await button(staffPage, 'Add delivery order').click();
   const platform = staffPage.getByLabel('Delivery platform', { exact: true });
   await platform.selectOption('test-platform');
@@ -337,15 +341,18 @@ test('delivery intake and handoff recover lost replies alongside a paid direct o
   await signIn(kitchenPage, 'demo-kitchen');
   const external = card(kitchenPage);
   await external.waitFor();
-  await shown(kitchenPage, `Order ${direct.number}`);
-  await shown(directCard(kitchenPage), paidTotal);
+  const kitchenDirect = directCard(kitchenPage);
+  await shown(kitchenDirect, 'Double Smash');
+  await shown(kitchenDirect, 'Extra cheese');
+  assert.ok((await kitchenDirect.locator('.pickup-window').textContent()).trim());
   assert.equal(await external.getByText(/Paid total/).count(), 0);
   assert.equal(Object.hasOwn(registered, 'total'), false);
   for (const width of [320, 390, 430]) {
     await kitchenPage.setViewportSize({ width, height: 844 });
     for (const scale of [100, 200]) {
       await kitchenPage.evaluate(value => { document.documentElement.style.fontSize = `${value}%`; }, scale);
-      await shown(directCard(kitchenPage), paidTotal);
+      await shown(kitchenDirect, 'Extra cheese');
+      assert.equal(await kitchenDirect.getByText(/\bRWF\b/).count(), 0);
       assert.equal(await kitchenPage.evaluate(() => document.documentElement.scrollWidth), width);
     }
   }
@@ -356,6 +363,24 @@ test('delivery intake and handoff recover lost replies alongside a paid direct o
   assert.match(await external.innerText(), /Platform sandwich/);
   assert.match(await external.innerText(), /No onion/);
   await capture(kitchenPage, 'delivery-kitchen-mixed-390');
+
+  const queueUrl = api + '/operator/orders';
+  await kitchenPage.route(queueUrl, async (route) => {
+    const response = await route.fetch();
+    assert.equal(response.status(), 200);
+    const queue = await response.json();
+    const legacy = queue.orders.find(order => order.id === direct.id);
+    legacy.total = direct.total;
+    legacy.currency = direct.currency;
+    const modifier = legacy.lines[0].soldItem.modifiers[0];
+    modifier.name.en = 'Extra cheese from an older server';
+    modifier.price = 500;
+    await route.fulfill({ response, json: queue });
+  });
+  await button(kitchenPage, 'Refresh').click();
+  await shown(kitchenDirect, 'Extra cheese from an older server');
+  assert.equal(await kitchenDirect.getByText(/\bRWF\b/).count(), 0);
+  await kitchenPage.unroute(queueUrl);
   await button(external, 'Start preparing').click();
   await button(external, 'Mark ready').click();
 
@@ -386,7 +411,13 @@ test('delivery intake and handoff recover lost replies alongside a paid direct o
   await staffCard.waitFor({ state: 'hidden' });
 
   const queue = await send('/operator/orders', { token: kitchen }).then(response => response.json());
-  assert.ok(queue.orders.some(order => order.id === direct.id && order.paymentStatus === 'paid'));
+  const kitchenOrder = queue.orders.find(order => order.id === direct.id);
+  assert.equal(kitchenOrder?.paymentStatus, 'paid');
+  assert.equal(Object.hasOwn(kitchenOrder, 'total'), false);
+  assert.equal(Object.hasOwn(kitchenOrder, 'currency'), false);
+  const [cheese] = kitchenOrder.lines[0].soldItem.modifiers;
+  assert.equal(cheese.id, 'extra-cheese');
+  assert.equal(Object.hasOwn(cheese, 'price'), false);
   assert.ok(!queue.externalOrders?.some(order => order.id === registered.id));
   assert.equal((await send(`/orders/${registered.id}`, { token: direct.token })).status, 404);
   assert.equal((await send(`/operator/orders/${registered.id}/pickup-status`, { token: pickup })).status, 404);

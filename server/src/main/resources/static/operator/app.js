@@ -519,7 +519,7 @@ function localizedText(value) {
     && typeof value.rw === 'string' && value.rw.trim().length > 0;
 }
 
-function checkedLine(line) {
+function checkedLine(line, financialDetails) {
   if (!line || typeof line.sku !== 'string' || !Number.isInteger(line.quantity) || line.quantity <= 0
     || !Array.isArray(line.modifierIds) || !line.modifierIds.every((id) => typeof id === 'string')) {
     throw new ApiError(502, 'invalid_response');
@@ -533,7 +533,7 @@ function checkedLine(line) {
     || !Array.isArray(soldItem.allergens) || !soldItem.allergens.every(localizedText)
     || !Array.isArray(soldItem.modifiers) || soldItem.modifiers.length !== modifierIds.length
     || !soldItem.modifiers.every((option) => typeof option?.id === 'string' && localizedText(option.name)
-      && Number.isSafeInteger(option.price) && option.price >= 0)) {
+      && (!financialDetails || (Number.isSafeInteger(option.price) && option.price >= 0)))) {
     throw new ApiError(502, 'invalid_response');
   }
   const optionsById = new Map(soldItem.modifiers.map(({ id, name }) => [id, name.en]));
@@ -549,11 +549,12 @@ function checkedLine(line) {
   };
 }
 
-function checkedOrder(order, completed = false) {
+function checkedOrder(order, role, completed = false) {
+  const financialDetails = role !== 'kitchen';
   if (!order || typeof order.id !== 'string' || !order.id || order.paymentStatus !== 'paid'
     || (!Object.hasOwn(statuses, order.status) && !(completed && order.status === 'collected'))
     || !Number.isFinite(Date.parse(order.pickupStartsAt)) || !Number.isFinite(Date.parse(order.pickupEndsAt))
-    || ((order.total !== undefined || order.currency !== undefined)
+    || (financialDetails && (order.total !== undefined || order.currency !== undefined)
       && (!Number.isSafeInteger(order.total) || order.total <= 0 || order.currency !== 'RWF'))
     || (order.acceptedAt != null && (typeof order.acceptedAt !== 'string' || !Number.isFinite(Date.parse(order.acceptedAt))))
     || !Array.isArray(order.lines)) {
@@ -563,12 +564,11 @@ function checkedOrder(order, completed = false) {
     id: order.id,
     status: order.status,
     paymentStatus: order.paymentStatus,
-    total: order.total,
-    currency: order.currency,
+    ...(financialDetails ? { total: order.total, currency: order.currency } : {}),
     acceptedAt: order.acceptedAt ?? null,
     pickupStartsAt: order.pickupStartsAt,
     pickupEndsAt: order.pickupEndsAt,
-    lines: order.lines.map(checkedLine),
+    lines: order.lines.map((line) => checkedLine(line, financialDetails)),
   };
 }
 
@@ -1369,7 +1369,7 @@ async function refreshQueue(force = false) {
     if (serverTime !== null && (typeof data.serverTime !== 'string' || !Number.isFinite(serverTime))) {
       throw new ApiError(502, 'invalid_response');
     }
-    const nextOrders = data.orders.map((order) => checkedOrder(order));
+    const nextOrders = data.orders.map((order) => checkedOrder(order, current.role));
     const nextExternal = (data.externalOrders ?? []).map((order) => readExternalOrder(order, true));
     if (new Set(nextExternal.map(({ id }) => id)).size !== nextExternal.length) throw new ApiError(502, 'invalid_response');
     orders = nextOrders;
@@ -1690,7 +1690,7 @@ async function submitTransition(order, action, button, problem, input) {
   try {
     const data = await request(`/orders/${encodeURIComponent(order.id)}/status`, { method: 'POST', token: current.accessToken, body });
     if (session !== current || (kitchenAction && queueEpoch !== epoch)) return;
-    const updated = checkedOrder(data, true);
+    const updated = checkedOrder(data, current.role, true);
     if (updated.id !== order.id || updated.status !== action.status) throw new ApiError(502, 'invalid_response');
 
     if (!kitchenAction) {
